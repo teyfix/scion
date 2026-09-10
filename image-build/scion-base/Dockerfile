@@ -22,7 +22,7 @@ FROM base AS builder
 USER root
 WORKDIR /src
 ENV PATH="/usr/local/go/bin:${PATH}"
-ENV CGO_ENABLED=1
+ENV CGO_ENABLED=0
 
 # Build arguments for version info
 ARG GIT_COMMIT
@@ -52,8 +52,8 @@ RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \
         SCION_LDFLAGS="${SCION_LDFLAGS} -X ${SCION_PKG}.Commit=${GIT_COMMIT}"; \
         SCIONTOOL_LDFLAGS="${SCIONTOOL_LDFLAGS} -X ${SCIONTOOL_PKG}.Commit=${GIT_COMMIT}"; \
     fi && \
-    go build -buildvcs=false -tags no_embed_web -ldflags="${SCION_LDFLAGS}" -o /usr/local/bin/scion ./cmd/scion/ && \
-    go build -buildvcs=false -tags no_embed_web -ldflags="${SCIONTOOL_LDFLAGS}" -o /usr/local/bin/sciontool ./cmd/sciontool/
+    go build -buildvcs=false -trimpath -tags no_embed_web -ldflags="${SCION_LDFLAGS}" -o /usr/local/bin/scion ./cmd/scion/ && \
+    go build -buildvcs=false -trimpath -tags no_embed_web -ldflags="${SCIONTOOL_LDFLAGS}" -o /usr/local/bin/sciontool ./cmd/sciontool/
 
 # Final stage
 FROM base

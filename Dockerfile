@@ -24,7 +24,14 @@ COPY --from=frontend /web/dist/client web/dist/client
 
 # Build a static binary (CGO_ENABLED=0) so it runs on the debian runtime image
 # without musl/glibc mismatch from the Alpine builder.
-RUN CGO_ENABLED=0 go build -o /scion ./cmd/scion/
+ARG GIT_COMMIT
+ARG VERSION
+ARG BUILD_TIME
+RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \
+    SCION_PKG="github.com/GoogleCloudPlatform/scion/pkg/version" && \
+    CGO_ENABLED=0 go build -buildvcs=false -trimpath \
+      -ldflags="-s -w -X ${SCION_PKG}.Commit=${GIT_COMMIT} -X ${SCION_PKG}.Version=${VERSION} -X ${SCION_PKG}.BuildTime=${BUILD_TIME}" \
+      -o /scion ./cmd/scion/
 
 # Stage 3: Create a minimal runtime image
 FROM debian:bookworm-slim
