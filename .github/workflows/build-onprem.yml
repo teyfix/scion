@@ -93,6 +93,7 @@ jobs:
     timeout-minutes: 360
     env:
       BUILD_TAG: ${{ needs.prepare.outputs.build_tag }}
+      SCION_GHA_CACHE_SCOPE_PREFIX: onprem
     steps:
       - uses: actions/checkout@v7
         with:
@@ -106,6 +107,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Inline buildx commands need the runner's ephemeral cache credentials.
+      - name: Enable GitHub Actions cache access
+        uses: crazy-max/ghaction-github-runtime@v4
       - name: Build core base, then Scion base
         run: |
           set -euo pipefail
@@ -151,6 +155,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enable GitHub Actions cache access
+        uses: crazy-max/ghaction-github-runtime@v4
       - name: Build catalog harness for both architectures
         run: |
           set -euo pipefail
@@ -166,6 +172,8 @@ jobs:
           docker buildx build --platform linux/amd64,linux/arm64 \
             --file "$(step_dockerfile "${IMAGE}")" \
             "${build_args[@]}" \
+            --cache-from "type=gha,version=2,scope=onprem-${IMAGE}" \
+            --cache-to "type=gha,version=2,scope=onprem-${IMAGE},mode=max" \
             --label "org.opencontainers.image.source=${SOURCE}" \
             --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
             --label "org.opencontainers.image.version=${VERSION_TAG}" \
@@ -195,11 +203,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enable GitHub Actions cache access
+        uses: crazy-max/ghaction-github-runtime@v4
       - name: Build Hub with embedded dashboard
         run: |
           set -euo pipefail
           docker buildx build --platform linux/amd64,linux/arm64 \
             --file Dockerfile \
+            --cache-from type=gha,version=2,scope=onprem-scion-hub \
+            --cache-to type=gha,version=2,scope=onprem-scion-hub,mode=max \
             --build-arg "GIT_COMMIT=${COMMIT_SHA}" \
             --build-arg "VERSION=${VERSION_TAG}" \
             --label "org.opencontainers.image.source=${SOURCE}" \
