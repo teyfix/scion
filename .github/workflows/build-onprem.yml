@@ -20,6 +20,14 @@ on:
         required: true
         default: false
         type: boolean
+      build_scope:
+        description: 'Feature artifacts, or the complete stock image catalog'
+        required: true
+        default: feature
+        type: choice
+        options:
+          - feature
+          - all
 
 permissions:
   contents: read
@@ -45,6 +53,7 @@ jobs:
       short_sha: ${{ steps.source.outputs.short_sha }}
       version_tag: ${{ steps.source.outputs.version_tag }}
       build_tag: ${{ steps.source.outputs.build_tag }}
+      build_scope: ${{ steps.source.outputs.build_scope }}
       harnesses: ${{ steps.source.outputs.harnesses }}
     steps:
       - name: Checkout selected fork revision
@@ -57,11 +66,16 @@ jobs:
         id: source
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'feature' }}
         run: |
           set -euo pipefail
           commit_sha="$(git rev-parse HEAD)"
           short_sha="$(git rev-parse --short HEAD)"
           VERSION_TAG="${VERSION_TAG:-onprem-${commit_sha:0:6}}"
+          if [[ "${BUILD_SCOPE}" != feature && "${BUILD_SCOPE}" != all ]]; then
+            echo '::error::build_scope must be feature or all'
+            exit 1
+          fi
           if [[ ! "${VERSION_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo '::error::version_tag is not a valid image tag'
             exit 1
@@ -82,11 +96,12 @@ jobs:
             echo "short_sha=${short_sha}"
             echo "version_tag=${VERSION_TAG}"
             echo "build_tag=build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "build_scope=${BUILD_SCOPE}"
             echo "harnesses=${harnesses}"
           } >> "${GITHUB_OUTPUT}"
 
-  # Bases are serial dependencies. Push their multi-arch manifests before
-  # a different runner builds a child image.
+  # Bases are serial dependencies. Push them before a different runner builds
+  # a child image.
   bases:
     needs: prepare
     runs-on: ubuntu-latest
@@ -100,7 +115,6 @@ jobs:
           repository: teyfix/scion
           ref: ${{ needs.prepare.outputs.commit_sha }}
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -116,21 +130,21 @@ jobs:
           for target in core-base scion-base; do
             bash image-build/scripts/build-images.sh \
               --builder local-docker --registry "${REGISTRY}" \
-              --target "${target}" --tag "${BUILD_TAG}" --platform all --push
+              --target "${target}" --tag "${BUILD_TAG}" \
+              --platform linux/amd64 --push
           done
           # The existing script also emits short-SHA tags. Human/full-SHA
           # aliases and index metadata are applied after all jobs succeed.
       - name: Verify base binary contract
         run: |
           set -euo pipefail
-          for arch in amd64 arm64; do
-            docker run --rm --platform "linux/${arch}" --entrypoint /bin/sh \
-              "${REGISTRY}/scion-base:${BUILD_TAG}" -ec \
-              '/usr/local/bin/scion version; /usr/local/bin/sciontool version'
-          done
+          docker run --rm --platform linux/amd64 --entrypoint /bin/sh \
+            "${REGISTRY}/scion-base:${BUILD_TAG}" -ec \
+            '/usr/local/bin/scion version; /usr/local/bin/sciontool version'
 
   harnesses:
     needs: [prepare, bases]
+    if: needs.prepare.outputs.build_scope == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -148,7 +162,6 @@ jobs:
           repository: teyfix/scion
           ref: ${{ needs.prepare.outputs.commit_sha }}
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -157,7 +170,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Enable GitHub Actions cache access
         uses: crazy-max/ghaction-github-runtime@v4
-      - name: Build catalog harness for both architectures
+      - name: Build catalog harness for linux/amd64
         run: |
           set -euo pipefail
           export REPO_ROOT="${GITHUB_WORKSPACE}"
@@ -169,7 +182,7 @@ jobs:
           while IFS= read -r arg; do
             [[ -z "${arg}" ]] || build_args+=(--build-arg "${arg}")
           done < <(step_build_args "${IMAGE}")
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --platform linux/amd64 \
             --file "$(step_dockerfile "${IMAGE}")" \
             "${build_args[@]}" \
             --cache-from "type=gha,version=2,scope=onprem-${IMAGE}" \
@@ -196,7 +209,6 @@ jobs:
           repository: teyfix/scion
           ref: ${{ needs.prepare.outputs.commit_sha }}
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -208,7 +220,7 @@ jobs:
       - name: Build Hub with embedded dashboard
         run: |
           set -euo pipefail
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --platform linux/amd64 \
             --file Dockerfile \
             --cache-from type=gha,version=2,scope=onprem-scion-hub \
             --cache-to type=gha,version=2,scope=onprem-scion-hub,mode=max \
@@ -218,41 +230,46 @@ jobs:
             --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
             --label "org.opencontainers.image.version=${VERSION_TAG}" \
             --tag "${REGISTRY}/scion-hub:${BUILD_TAG}" --push .
-      - name: Verify dashboard is served on both architectures
+      - name: Verify dashboard is served on linux/amd64
         run: |
           set -euo pipefail
-          for arch in amd64 arm64; do
-            container="$(docker run -d --platform "linux/${arch}" \
-              -p 127.0.0.1:18080:8080 "${REGISTRY}/scion-hub:${BUILD_TAG}" \
-              server start --foreground --hosted --enable-hub --enable-web \
-              --enable-runtime-broker=false --host 0.0.0.0 --web-port 8080)"
-            trap 'docker logs "${container}"; docker rm -f "${container}"' EXIT
-            curl --fail --silent --show-error --retry 30 --retry-delay 2 \
-              --retry-connrefused --retry-all-errors --max-time 10 \
-              http://127.0.0.1:18080/healthz > /dev/null
-            curl --fail --silent --show-error \
-              --output "${RUNNER_TEMP}/dashboard-${arch}.html" \
-              http://127.0.0.1:18080/login
-            grep -q '/assets/main.js' "${RUNNER_TEMP}/dashboard-${arch}.html"
-            # Missing assets may fall back to HTML: verify MIME and body too.
-            curl --fail --silent --show-error \
-              --dump-header "${RUNNER_TEMP}/dashboard-${arch}.headers" \
-              --output "${RUNNER_TEMP}/dashboard-${arch}.js" \
-              http://127.0.0.1:18080/assets/main.js
-            grep -Eiq '^content-type:.*(javascript|ecmascript)' "${RUNNER_TEMP}/dashboard-${arch}.headers"
-            test -s "${RUNNER_TEMP}/dashboard-${arch}.js"
-            docker rm -f "${container}"
-            trap - EXIT
-          done
+          container="$(docker run -d --platform linux/amd64 \
+            -p 127.0.0.1:18080:8080 "${REGISTRY}/scion-hub:${BUILD_TAG}" \
+            server start --foreground --hosted --enable-hub --enable-web \
+            --enable-runtime-broker=false --host 0.0.0.0 --web-port 8080)"
+          trap 'docker logs "${container}"; docker rm -f "${container}"' EXIT
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 \
+            --retry-connrefused --retry-all-errors --max-time 10 \
+            http://127.0.0.1:18080/healthz > /dev/null
+          curl --fail --silent --show-error \
+            --output "${RUNNER_TEMP}/dashboard.html" \
+            http://127.0.0.1:18080/login
+          grep -q '/assets/main.js' "${RUNNER_TEMP}/dashboard.html"
+          # Missing assets may fall back to HTML: verify MIME and body too.
+          curl --fail --silent --show-error \
+            --dump-header "${RUNNER_TEMP}/dashboard.headers" \
+            --output "${RUNNER_TEMP}/dashboard.js" \
+            http://127.0.0.1:18080/assets/main.js
+          grep -Eiq '^content-type:.*(javascript|ecmascript)' "${RUNNER_TEMP}/dashboard.headers"
+          test -s "${RUNNER_TEMP}/dashboard.js"
+          docker rm -f "${container}"
+          trap - EXIT
 
   publish:
     needs: [prepare, bases, harnesses, hub]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.bases.result == 'success' &&
+      needs.hub.result == 'success' &&
+      (needs.harnesses.result == 'success' || needs.harnesses.result == 'skipped')
     runs-on: ubuntu-latest
     env:
       BUILD_TAG: ${{ needs.prepare.outputs.build_tag }}
       COMMIT_SHA: ${{ needs.prepare.outputs.commit_sha }}
       SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
       VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+      BUILD_SCOPE: ${{ needs.prepare.outputs.build_scope }}
       PUBLISH_LATEST: ${{ inputs.publish_latest || false }}
     steps:
       - uses: actions/checkout@v7
@@ -272,7 +289,14 @@ jobs:
           export REPO_ROOT="${GITHUB_WORKSPACE}"
           export IMAGE_BUILD_DIR="${REPO_ROOT}/image-build"
           source image-build/scripts/lib/targets.sh
-          while IFS= read -r image; do
+          images=(core-base scion-base scion-hub)
+          if [[ "${BUILD_SCOPE}" == all ]]; then
+            images=()
+            while IFS= read -r image; do
+              images+=("${image}")
+            done < <(resolve_targets all)
+          fi
+          for image in "${images[@]}"; do
             tag_args=(
               --tag "${REGISTRY}/${image}:${VERSION_TAG}"
               --tag "${REGISTRY}/${image}:${SHORT_SHA}"
@@ -286,17 +310,22 @@ jobs:
               --annotation "index:org.opencontainers.image.revision=${COMMIT_SHA}" \
               --annotation "index:org.opencontainers.image.version=${VERSION_TAG}" \
               "${tag_args[@]}" "${REGISTRY}/${image}:${BUILD_TAG}"
-          done < <(resolve_targets all)
+          done
       - name: Publish summary
         run: |
           set -euo pipefail
           {
             echo '## On-Prem SCION images published'
             echo "- Fork commit: ${COMMIT_SHA}"
+            echo "- Build scope: ${BUILD_SCOPE}"
             echo "- Tags: ${VERSION_TAG}, ${SHORT_SHA}, sha-${COMMIT_SHA}"
             echo "- Latest updated: ${PUBLISH_LATEST}"
-            echo '- Platforms: linux/amd64, linux/arm64'
-            echo '- Images: core-base, scion-base, every catalog harness, scion-hub'
+            echo '- Platform: linux/amd64'
+            if [[ "${BUILD_SCOPE}" == all ]]; then
+              echo '- Images: core-base, scion-base, every catalog harness, scion-hub'
+            else
+              echo '- Images: core-base, scion-base, scion-hub'
+            fi
             echo '- scion-base: /usr/local/bin/scion and /usr/local/bin/sciontool'
             echo '- scion-hub: /usr/local/bin/scion with embedded dashboard (no sciontool)'
             echo '- Hub startup: server start --foreground --hosted --enable-hub --enable-web --host 0.0.0.0'
