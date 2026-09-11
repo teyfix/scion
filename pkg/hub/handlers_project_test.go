@@ -289,6 +289,43 @@ func TestPopulateAgentConfig_StampsHarnessConfigID(t *testing.T) {
 	}
 }
 
+func TestPopulateAgentConfig_NoAuthAllowDoesNotForceNoAuth(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+
+	hc := &store.HarnessConfig{
+		ID:          "a1000000-0000-0000-0000-000000000001",
+		Name:        "codex-external-auth",
+		Slug:        "codex-external-auth",
+		Harness:     "codex",
+		Scope:       store.HarnessConfigScopeGlobal,
+		Status:      store.HarnessConfigStatusActive,
+		ContentHash: "allow-auth-hash",
+		Config: &store.HarnessConfigData{
+			NoAuthBehavior: "allow",
+		},
+	}
+	if err := st.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("create harness config: %v", err)
+	}
+
+	agent := &store.Agent{
+		ID:      "agent-external-auth",
+		OwnerID: "owner-external-auth",
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "codex-external-auth",
+		},
+	}
+
+	srv.populateAgentConfig(ctx, agent, nil, nil)
+
+	assert.False(t, agent.AppliedConfig.NoAuth,
+		"allow must leave normal harness startup enabled for runtime-supplied credentials")
+	assert.Empty(t, agent.AppliedConfig.HarnessAuth,
+		"allow must not claim that SCION selected or projected an auth method")
+	assert.Equal(t, hc.ID, agent.AppliedConfig.HarnessConfigID)
+}
+
 // TestPopulateAgentConfig_HarnessConfigFromTemplateDefault verifies the fallback
 // path: when the agent has no explicit harness-config name, the template's
 // DefaultHarnessConfig is used to resolve and stamp the harness-config ID.

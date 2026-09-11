@@ -132,6 +132,27 @@ func TestBootstrapHarnessConfigsFromDir_PersistsConfigImage(t *testing.T) {
 	}
 }
 
+func TestBootstrapHarnessConfigsFromDir_PersistsNoAuthAllow(t *testing.T) {
+	srv, s, _ := testTemplateBootstrapServer(t)
+	ctx := context.Background()
+
+	dir := makeHarnessConfigDir(t, "codex", map[string]string{
+		"config.yaml": "harness: codex\nimage: scion-codex:latest\nuser: scion\nno_auth:\n  behavior: allow\n",
+	})
+
+	if err := srv.BootstrapHarnessConfigsFromDir(ctx, dir); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+
+	hc, err := s.GetHarnessConfigBySlug(ctx, "codex", store.HarnessConfigScopeGlobal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hc.Config == nil || hc.Config.NoAuthBehavior != "allow" {
+		t.Fatalf("expected persisted NoAuthBehavior %q, got %#v", "allow", hc.Config)
+	}
+}
+
 func TestBootstrapHarnessConfigsFromDir_MultipleConfigs(t *testing.T) {
 	srv, s, _ := testTemplateBootstrapServer(t)
 	ctx := context.Background()

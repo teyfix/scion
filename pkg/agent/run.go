@@ -470,9 +470,23 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// standing up a full agent; see resolveAuthEnvOverlay.
 	authEnvOverlay := resolveAuthEnvOverlay(&opts, settings, profileName, harnessConfigName)
 
-	canFallbackToNoAuth := func() bool {
-		return opts.HarnessAuth == "" && noAuthConfig != nil &&
-			(noAuthConfig.Behavior == "drop-to-shell" || noAuthConfig.Behavior == "allow")
+	handleUnavailableAuth := func(reason string) bool {
+		if opts.HarnessAuth != "" || noAuthConfig == nil {
+			return false
+		}
+		switch noAuthConfig.Behavior {
+		case "drop-to-shell":
+			util.Debugf("auth: %s, falling back to no-auth shell", reason)
+			opts.NoAuth = true
+			warnings = append(warnings, "Auth: no credentials found, starting in no-auth mode")
+			return true
+		case "allow":
+			util.Debugf("auth: %s, continuing with runtime-provided credentials", reason)
+			warnings = append(warnings, "Auth: SCION-managed credentials unavailable; relying on runtime-provided credentials")
+			return true
+		default:
+			return false
+		}
 	}
 
 	var auth api.AuthConfig
@@ -500,20 +514,14 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		util.Debugf("auth: after overlay — selectedType=%q", auth.SelectedType)
 		resolved, err := h.ResolveAuth(auth)
 		if err != nil {
-			if canFallbackToNoAuth() {
-				util.Debugf("auth: resolution failed, falling back to no-auth mode: %v", err)
-				opts.NoAuth = true
-				warnings = append(warnings, "Auth: no credentials found, starting in no-auth mode")
+			if handleUnavailableAuth(fmt.Sprintf("resolution failed: %v", err)) {
 				goto authDone
 			}
 			return nil, fmt.Errorf("auth resolution failed: %w", err)
 		}
 		if resolved == nil {
 			// ResolveAuth returned nil without error — treat as no auth available.
-			if canFallbackToNoAuth() {
-				util.Debugf("auth: resolution returned nil, falling back to no-auth mode")
-				opts.NoAuth = true
-				warnings = append(warnings, "Auth: no credentials found, starting in no-auth mode")
+			if handleUnavailableAuth("resolution returned nil") {
 				goto authDone
 			}
 			return nil, fmt.Errorf("auth resolution returned nil for method %q", auth.SelectedType)
@@ -536,10 +544,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 		util.Debugf("auth: resolved — method=%q, envVars=%v, files=%d", resolved.Method, resolved.EnvVars, len(resolved.Files))
 		if err := harness.ValidateAuth(resolved, opts.BrokerMode); err != nil {
-			if canFallbackToNoAuth() {
-				util.Debugf("auth: validation failed, falling back to no-auth mode: %v", err)
-				opts.NoAuth = true
-				warnings = append(warnings, "Auth: credential validation failed, starting in no-auth mode")
+			if handleUnavailableAuth(fmt.Sprintf("validation failed: %v", err)) {
 				goto authDone
 			}
 			return nil, fmt.Errorf("auth validation failed: %w", err)
@@ -1089,8 +1094,7 @@ authDone:
 		GitClone:   opts.GitClone,
 		SharedDirs: effectiveSharedDirs,
 		BrokerMode: opts.BrokerMode,
-		NoAuth: opts.NoAuth && noAuthConfig != nil &&
-			(noAuthConfig.Behavior == "drop-to-shell" || noAuthConfig.Behavior == "allow"),
+		NoAuth:     opts.NoAuth && noAuthConfig != nil && noAuthConfig.Behavior == "drop-to-shell",
 		NoAuthMessage: func() string {
 			if opts.NoAuth && noAuthConfig != nil && noAuthConfig.Behavior == "drop-to-shell" {
 				return noAuthConfig.Message

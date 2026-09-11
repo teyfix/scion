@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -317,6 +318,119 @@ profiles:
 	// OPENAI_API_KEY should be omitted (empty and not resolved)
 	if _, ok := envMap["OPENAI_API_KEY"]; ok {
 		t.Error("expected OPENAI_API_KEY to be omitted, but it was present")
+	}
+}
+
+func TestStartBrokerMode_NoAuthAllowLaunchesHarness(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+	t.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	hcDir := filepath.Join(globalScionDir, "harness-configs", "external-auth")
+	_ = os.MkdirAll(hcDir, 0755)
+	_ = os.WriteFile(filepath.Join(hcDir, "config.yaml"), []byte(`harness: codex
+image: test-image:latest
+user: scion
+provisioner:
+  type: container-script
+  interface_version: 1
+command:
+  base: ["codex", "exec"]
+no_auth:
+  behavior: allow
+auth:
+  default_type: auth-file
+  types:
+    auth-file:
+      required_files:
+        - name: CODEX_AUTH
+          type: file
+          target_suffix: "/.codex/auth.json"
+          field: CodexAuthFile
+`), 0644)
+
+	_ = os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+`), 0644)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	agentDir := filepath.Join(projectScionDir, "agents", "external-auth")
+	_ = os.MkdirAll(filepath.Join(agentDir, "home"), 0755)
+	_ = os.WriteFile(filepath.Join(agentDir, "scion-agent.json"), []byte(`{
+		"harness": "codex",
+		"harness_config": "external-auth",
+		"image": "test-image:latest"
+	}`), 0644)
+
+	var captured runtime.RunConfig
+	mockRT := &runtime.MockRuntime{
+		ListFunc: func(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
+			return nil, nil
+		},
+		RunFunc: func(ctx context.Context, runConfig runtime.RunConfig) (string, error) {
+			captured = runConfig
+			return "mock-id", nil
+		},
+	}
+
+	mgr := NewManager(mockRT)
+	_, err := mgr.Start(context.Background(), api.StartOptions{
+		Name:          "external-auth",
+		ProjectPath:   projectScionDir,
+		Profile:       "local",
+		HarnessConfig: "external-auth",
+		BrokerMode:    true,
+	})
+	if err != nil {
+		t.Fatalf("Start with no_auth.behavior=allow failed: %v", err)
+	}
+	if captured.NoAuth {
+		t.Fatal("allow must launch the normal harness, not the no-auth shell")
+	}
+	if captured.ResolvedAuth == nil || captured.ResolvedAuth.Method != "container-script" {
+		t.Fatalf("expected container-script auth plan without projected credentials, got %#v", captured.ResolvedAuth)
+	}
+	if len(captured.ResolvedSecrets) != 0 {
+		t.Fatalf("expected no SCION-projected secrets, got %#v", captured.ResolvedSecrets)
+	}
+	if got := captured.Harness.GetCommand("", false, nil); !slices.Equal(got, []string{"codex", "exec"}) {
+		t.Fatalf("expected normal harness command, got %q", got)
+	}
+
+	// An explicit NoAuth request must still honor allow's normal-harness
+	// semantics rather than turning it into drop-to-shell.
+	explicitAgentDir := filepath.Join(projectScionDir, "agents", "external-auth-explicit")
+	_ = os.MkdirAll(filepath.Join(explicitAgentDir, "home"), 0755)
+	_ = os.WriteFile(filepath.Join(explicitAgentDir, "scion-agent.json"), []byte(`{
+		"harness": "codex",
+		"harness_config": "external-auth",
+		"image": "test-image:latest"
+	}`), 0644)
+	captured = runtime.RunConfig{}
+	_, err = mgr.Start(context.Background(), api.StartOptions{
+		Name:          "external-auth-explicit",
+		ProjectPath:   projectScionDir,
+		Profile:       "local",
+		HarnessConfig: "external-auth",
+		BrokerMode:    true,
+		NoAuth:        true,
+	})
+	if err != nil {
+		t.Fatalf("Start with explicit NoAuth and behavior=allow failed: %v", err)
+	}
+	if captured.NoAuth {
+		t.Fatal("allow must not be converted into drop-to-shell by an explicit NoAuth request")
+	}
+	if got := captured.Harness.GetCommand("", false, nil); !slices.Equal(got, []string{"codex", "exec"}) {
+		t.Fatalf("expected normal harness command for explicit NoAuth, got %q", got)
 	}
 }
 

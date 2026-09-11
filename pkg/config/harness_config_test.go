@@ -104,6 +104,52 @@ auth:
 	}
 }
 
+func TestLoadHarnessConfigDir_NoAuthAllow(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "codex")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configYAML := `harness: codex
+image: scion-codex:latest
+user: scion
+no_auth:
+  behavior: allow
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hc, err := LoadHarnessConfigDir(configDir)
+	if err != nil {
+		t.Fatalf("LoadHarnessConfigDir failed: %v", err)
+	}
+	if hc.Config.NoAuthConfig == nil || hc.Config.NoAuthConfig.Behavior != "allow" {
+		t.Fatalf("expected no_auth.behavior allow, got %#v", hc.Config.NoAuthConfig)
+	}
+}
+
+func TestLoadHarnessConfigDir_RejectsUnknownNoAuthBehavior(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "codex")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configYAML := `harness: codex
+image: scion-codex:latest
+user: scion
+no_auth:
+  behavior: ignore-everything
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadHarnessConfigDir(configDir); err == nil {
+		t.Fatal("expected unknown no_auth behavior to fail validation")
+	}
+}
+
 func TestLoadHarnessConfigDir_InvalidUnknownField(t *testing.T) {
 	tmpDir := t.TempDir()
 	configDir := filepath.Join(tmpDir, "claude")
