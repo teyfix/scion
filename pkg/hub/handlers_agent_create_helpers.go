@@ -222,6 +222,14 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 					agent.AppliedConfig.InlineConfig.Telemetry = resolvedTemplate.Config.Telemetry
 				}
 			}
+			// Merge template Docker config as default (explicit inline config overrides).
+			// Clone the template Docker config so the agent does not alias the template pointer.
+			if resolvedTemplate.Config.Docker != nil {
+				tplDockerCfg := &api.ScionConfig{
+					Docker: config.CloneDockerConfig(resolvedTemplate.Config.Docker),
+				}
+				agent.AppliedConfig.InlineConfig = config.MergeScionConfig(tplDockerCfg, agent.AppliedConfig.InlineConfig)
+			}
 		}
 	}
 

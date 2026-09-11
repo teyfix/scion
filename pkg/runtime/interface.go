@@ -55,6 +55,7 @@ type RunConfig struct {
 	NetworkMode          string   // Container network mode (e.g. "host" for --network=host)
 	Project              string   // Project name (e.g., "global" or "my-project")
 	ProjectID            string   // Project ID (e.g., "550e8400-e29b-41d4-a716-446655440000")
+	Privileged           bool     // Run the container in privileged mode (Docker runtime only)
 
 	// WorkspaceBackendName is the name of the backend chosen by the workspace
 	// backend selector: "local", "nfs", "cloudrun-volume" or

@@ -1427,6 +1427,28 @@ func TestMapSectionsSchemaValidation(t *testing.T) {
 	if len(errs) == 0 {
 		t.Error("expected validation error for harness_configs entry missing 'harness' field")
 	}
+
+	// Valid profiles doc with docker.privileged (true and false).
+	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": true}}}`))
+	if len(errs) > 0 {
+		t.Errorf("expected valid profiles doc with docker.privileged=true, got errors: %v", errs)
+	}
+	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": false}}}`))
+	if len(errs) > 0 {
+		t.Errorf("expected valid profiles doc with docker.privileged=false, got errors: %v", errs)
+	}
+
+	// Invalid profiles doc with non-boolean docker.privileged.
+	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": "not-a-bool"}}}`))
+	if len(errs) == 0 {
+		t.Error("expected validation error for profiles doc with non-boolean docker.privileged")
+	}
+
+	// Invalid profiles doc with unknown field in docker.
+	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": true, "unsupported": 123}}}`))
+	if len(errs) == 0 {
+		t.Error("expected validation error for profiles doc with unknown field in docker")
+	}
 }
 
 // TestMapSectionsInSectionNames verifies that the three new sections appear

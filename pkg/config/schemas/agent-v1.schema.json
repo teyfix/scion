@@ -154,6 +154,17 @@
           }
         }
       }
+    },
+    "docker": {
+      "type": "object",
+      "description": "Docker runtime configuration.",
+      "properties": {
+        "privileged": {
+          "type": "boolean",
+          "description": "Run the Docker container in privileged mode."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "$defs": {

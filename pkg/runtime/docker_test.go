@@ -88,3 +88,67 @@ echo "$@"
 		t.Errorf("expected '--user scion' in exec output, got %q", out)
 	}
 }
+
+func TestDockerRuntime_Run_PrivilegedFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockDocker := filepath.Join(tmpDir, "mock-docker")
+
+	script := `#!/bin/sh
+echo "$@"
+`
+	if err := os.WriteFile(mockDocker, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock docker: %v", err)
+	}
+
+	runtime := &DockerRuntime{
+		Command: mockDocker,
+	}
+
+	t.Run("privileged enabled emits exactly one --privileged", func(t *testing.T) {
+		config := RunConfig{
+			Harness:      &harness.Generic{},
+			Name:         "test-agent",
+			UnixUsername: "scion",
+			Image:        "scion-agent:latest",
+			Task:         "hello",
+			Privileged:   true,
+		}
+
+		out, err := runtime.Run(context.Background(), config)
+		if err != nil {
+			t.Fatalf("runtime.Run failed: %v", err)
+		}
+
+		count := strings.Count(out, "--privileged")
+		if count != 1 {
+			t.Errorf("expected exactly 1 '--privileged' flag in output, got %d (output: %q)", count, out)
+		}
+
+		// Verify --privileged appears before the image argument
+		privIdx := strings.Index(out, "--privileged")
+		imgIdx := strings.Index(out, "scion-agent:latest")
+		if privIdx == -1 || imgIdx == -1 || privIdx > imgIdx {
+			t.Errorf("expected '--privileged' before image name, got privIdx=%d, imgIdx=%d", privIdx, imgIdx)
+		}
+	})
+
+	t.Run("privileged disabled omits --privileged", func(t *testing.T) {
+		config := RunConfig{
+			Harness:      &harness.Generic{},
+			Name:         "test-agent",
+			UnixUsername: "scion",
+			Image:        "scion-agent:latest",
+			Task:         "hello",
+			Privileged:   false,
+		}
+
+		out, err := runtime.Run(context.Background(), config)
+		if err != nil {
+			t.Fatalf("runtime.Run failed: %v", err)
+		}
+
+		if strings.Contains(out, "--privileged") {
+			t.Errorf("expected '--privileged' to be absent in output, got %q", out)
+		}
+	})
+}

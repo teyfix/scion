@@ -311,6 +311,11 @@ func ValidateVolumes(volumes []VolumeMount) error {
 	return nil
 }
 
+// DockerConfig holds Docker runtime-specific configuration.
+type DockerConfig struct {
+	Privileged *bool `json:"privileged,omitempty" yaml:"privileged,omitempty"`
+}
+
 type KubernetesConfig struct {
 	Context               string            `json:"context,omitempty" yaml:"context,omitempty"`
 	Namespace             string            `json:"namespace,omitempty" yaml:"namespace,omitempty"`
@@ -448,6 +453,7 @@ type ScionConfig struct {
 	Model            string            `json:"model,omitempty" yaml:"model,omitempty"`
 	ThinkingLevel    *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
 	Kubernetes       *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
+	Docker           *DockerConfig     `json:"docker,omitempty" yaml:"docker,omitempty"`
 	AuthSelectedType string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
 	Resources        *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
 	Image            string            `json:"image,omitempty" yaml:"image,omitempty"`

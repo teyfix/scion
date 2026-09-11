@@ -696,6 +696,7 @@ type TemplateConfig struct {
 	CommandArgs []string             `json:"commandArgs,omitempty"`
 	Model       string               `json:"model,omitempty"`
 	Kubernetes  *KubernetesConfig    `json:"kubernetes,omitempty"`
+	Docker      *api.DockerConfig    `json:"docker,omitempty"`
 	HubAccess   *HubAccessConfig     `json:"hubAccess,omitempty"`
 	Secrets     []api.RequiredSecret `json:"secrets,omitempty"`
 	Telemetry   *api.TelemetryConfig `json:"telemetry,omitempty"`

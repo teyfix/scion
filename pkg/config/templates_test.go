@@ -2229,3 +2229,98 @@ func TestMergeScionConfig_ThinkingLevel_NoAliasing(t *testing.T) {
 			"the merged result aliases the caller-owned override pointer", *got.ThinkingLevel)
 	}
 }
+
+func TestMergeScionConfig_Docker_Privileged_Precedence(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     *api.DockerConfig
+		override *api.DockerConfig
+		want     *bool
+	}{
+		{
+			name:     "base nil, override true",
+			base:     nil,
+			override: &api.DockerConfig{Privileged: boolPtr(true)},
+			want:     boolPtr(true),
+		},
+		{
+			name:     "base nil, override false",
+			base:     nil,
+			override: &api.DockerConfig{Privileged: boolPtr(false)},
+			want:     boolPtr(false),
+		},
+		{
+			name:     "base true, override false (explicit false overrides true)",
+			base:     &api.DockerConfig{Privileged: boolPtr(true)},
+			override: &api.DockerConfig{Privileged: boolPtr(false)},
+			want:     boolPtr(false),
+		},
+		{
+			name:     "base false, override true",
+			base:     &api.DockerConfig{Privileged: boolPtr(false)},
+			override: &api.DockerConfig{Privileged: boolPtr(true)},
+			want:     boolPtr(true),
+		},
+		{
+			name:     "base true, override nil Docker (base preserved)",
+			base:     &api.DockerConfig{Privileged: boolPtr(true)},
+			override: nil,
+			want:     boolPtr(true),
+		},
+		{
+			name:     "base true, override Docker with nil Privileged (base preserved)",
+			base:     &api.DockerConfig{Privileged: boolPtr(true)},
+			override: &api.DockerConfig{},
+			want:     boolPtr(true),
+		},
+		{
+			name:     "base nil, override nil",
+			base:     nil,
+			override: nil,
+			want:     nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			baseCfg := &api.ScionConfig{Docker: tc.base}
+			overrideCfg := &api.ScionConfig{Docker: tc.override}
+			got := MergeScionConfig(baseCfg, overrideCfg)
+
+			if tc.want == nil {
+				if got.Docker != nil && got.Docker.Privileged != nil {
+					t.Fatalf("got Privileged=%v, want nil", *got.Docker.Privileged)
+				}
+				return
+			}
+
+			if got.Docker == nil || got.Docker.Privileged == nil {
+				t.Fatalf("got Privileged=nil, want %v", *tc.want)
+			}
+			if *got.Docker.Privileged != *tc.want {
+				t.Errorf("got Privileged=%v, want %v", *got.Docker.Privileged, *tc.want)
+			}
+		})
+	}
+}
+
+func TestMergeScionConfig_Docker_Privileged_NoAliasing(t *testing.T) {
+	overridePriv := true
+	base := &api.ScionConfig{}
+	override := &api.ScionConfig{
+		Docker: &api.DockerConfig{Privileged: &overridePriv},
+	}
+
+	got := MergeScionConfig(base, override)
+	if got.Docker == nil || got.Docker.Privileged == nil {
+		t.Fatal("Docker.Privileged = nil, want true")
+	}
+
+	// Mutate the override pointer
+	*override.Docker.Privileged = false
+
+	if *got.Docker.Privileged != true {
+		t.Errorf("Docker.Privileged = %v after mutating the override, want true: "+
+			"the merged result aliases the caller-owned override pointer", *got.Docker.Privileged)
+	}
+}

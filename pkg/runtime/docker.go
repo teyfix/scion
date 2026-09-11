@@ -75,6 +75,10 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	// so we don't use --init to avoid competing init processes.
 	newArgs := []string{"run", "-t"}
 
+	if config.Privileged {
+		newArgs = append(newArgs, "--privileged")
+	}
+
 	// Apply resource constraints from config.
 	//
 	// TODO(cgroup-limits): rootless Podman on cgroup v1 cannot set resource

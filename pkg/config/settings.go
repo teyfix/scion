@@ -62,6 +62,7 @@ type ProfileConfig struct {
 	Volumes          []api.VolumeMount          `json:"volumes,omitempty" yaml:"volumes,omitempty" koanf:"volumes"`
 	Resources        *api.ResourceSpec          `json:"resources,omitempty" yaml:"resources,omitempty" koanf:"resources"`
 	HarnessOverrides map[string]HarnessOverride `json:"harness_overrides,omitempty" yaml:"harness_overrides,omitempty" koanf:"harness_overrides"`
+	Docker           *api.DockerConfig          `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 }
 
 // BucketConfig defines settings for cloud storage bucket persistence.

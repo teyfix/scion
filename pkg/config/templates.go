@@ -826,6 +826,9 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	if override.Kubernetes != nil {
 		result.Kubernetes = mergeKubernetesConfig(result.Kubernetes, override.Kubernetes)
 	}
+	if override.Docker != nil {
+		result.Docker = mergeDockerConfig(result.Docker, override.Docker)
+	}
 	if override.Resources != nil {
 		result.Resources = MergeResourceSpec(result.Resources, override.Resources)
 	}
@@ -945,6 +948,38 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 			}
 		}
 		result.Skills = append(result.Skills, annotated...)
+	}
+
+	return &result
+}
+
+// CloneDockerConfig returns a deep copy of a DockerConfig.
+func CloneDockerConfig(d *api.DockerConfig) *api.DockerConfig {
+	if d == nil {
+		return nil
+	}
+	res := &api.DockerConfig{}
+	if d.Privileged != nil {
+		v := *d.Privileged
+		res.Privileged = &v
+	}
+	return res
+}
+
+func mergeDockerConfig(base, override *api.DockerConfig) *api.DockerConfig {
+	if override == nil {
+		return base
+	}
+
+	if base == nil {
+		base = &api.DockerConfig{}
+	}
+
+	result := *base
+
+	if override.Privileged != nil {
+		v := *override.Privileged
+		result.Privileged = &v
 	}
 
 	return &result

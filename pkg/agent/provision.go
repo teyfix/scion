@@ -713,6 +713,20 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 
 	finalScionCfg := &api.ScionConfig{}
 
+	// Seed profile Docker default through MergeScionConfig (lower precedence than template and inline config)
+	if settings != nil {
+		effectiveProfile := profileName
+		if effectiveProfile == "" {
+			effectiveProfile = settings.ActiveProfile
+		}
+		if p, ok := settings.Profiles[effectiveProfile]; ok && p.Docker != nil {
+			profileDockerCfg := &api.ScionConfig{
+				Docker: p.Docker,
+			}
+			finalScionCfg = config.MergeScionConfig(finalScionCfg, profileDockerCfg)
+		}
+	}
+
 	for _, tpl := range chain {
 		// Load scion-agent config from this template and merge it
 		tplCfg, err := tpl.LoadConfig()

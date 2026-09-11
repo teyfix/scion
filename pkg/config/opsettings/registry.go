@@ -328,7 +328,7 @@ func compileSchemas() {
 				"default_thinking_level":  map[string]interface{}{"type": "integer"},
 				"default_max_agent_role":  getSchemaProperty(root, "default_max_agent_role"),
 				"default_agent_role":      getSchemaProperty(root, "default_agent_role"),
-				"default_runtime_broker": map[string]interface{}{"type": "string"},
+				"default_runtime_broker":  map[string]interface{}{"type": "string"},
 			},
 			"additionalProperties": false,
 		},
@@ -399,6 +399,13 @@ func compileSchemas() {
 					"resources":              map[string]interface{}{"type": "object"},
 					"harness_overrides":      map[string]interface{}{"type": "object"},
 					"secrets":                map[string]interface{}{"type": "array"},
+					"docker": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"privileged": map[string]interface{}{"type": "boolean"},
+						},
+						"additionalProperties": false,
+					},
 				},
 			},
 		},

@@ -1033,6 +1033,7 @@ authDone:
 		NFSSubPath:           nfsSubPath,
 		NFSStorageClass:      nfsStorageClass,
 		TelemetryEnabled:     telemetryEnabled,
+		Privileged:           finalScionCfg != nil && finalScionCfg.Docker != nil && finalScionCfg.Docker.Privileged != nil && *finalScionCfg.Docker.Privileged,
 		Task: func() string {
 			// When task_flag is set, task is delivered via CommandArgs instead
 			if finalScionCfg != nil && finalScionCfg.TaskFlag != "" {

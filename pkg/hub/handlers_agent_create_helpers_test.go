@@ -1357,3 +1357,124 @@ func TestHasAnyKey_NoProgenyForDirectAgent(t *testing.T) {
 			"direct agent should not find secrets via progeny resolution")
 	})
 }
+
+func TestPopulateAgentConfig_DockerTemplateDefaults(t *testing.T) {
+	srv, _ := testServer(t)
+	ctx := context.Background()
+	project := &store.Project{
+		ID:   tid("proj-docker"),
+		Slug: "proj-docker",
+	}
+
+	newBool := func(b bool) *bool { return &b }
+
+	t.Run("template privileged true defaults into inline config when unset", func(t *testing.T) {
+		template := &store.Template{
+			ID:   tid("tmpl-priv"),
+			Slug: "tmpl-priv",
+			Config: &store.TemplateConfig{
+				Docker: &api.DockerConfig{
+					Privileged: newBool(true),
+				},
+			},
+		}
+
+		agent := &store.Agent{
+			ID:            tid("agent-1"),
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		srv.populateAgentConfig(ctx, agent, project, template)
+
+		require.NotNil(t, agent.AppliedConfig.InlineConfig)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
+		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged)
+
+		// Verify no aliasing between template and agent inline config
+		*template.Config.Docker.Privileged = false
+		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
+			"agent inline config must not alias template Docker config")
+	})
+
+	t.Run("explicit inline false overrides template true", func(t *testing.T) {
+		template := &store.Template{
+			ID:   tid("tmpl-priv"),
+			Slug: "tmpl-priv",
+			Config: &store.TemplateConfig{
+				Docker: &api.DockerConfig{
+					Privileged: newBool(true),
+				},
+			},
+		}
+
+		agent := &store.Agent{
+			ID: tid("agent-2"),
+			AppliedConfig: &store.AgentAppliedConfig{
+				InlineConfig: &api.ScionConfig{
+					Docker: &api.DockerConfig{
+						Privileged: newBool(false),
+					},
+				},
+			},
+		}
+
+		srv.populateAgentConfig(ctx, agent, project, template)
+
+		require.NotNil(t, agent.AppliedConfig.InlineConfig)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
+		assert.False(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
+			"explicit inline false must override template true")
+	})
+
+	t.Run("explicit inline true overrides template false", func(t *testing.T) {
+		template := &store.Template{
+			ID:   tid("tmpl-unpriv"),
+			Slug: "tmpl-unpriv",
+			Config: &store.TemplateConfig{
+				Docker: &api.DockerConfig{
+					Privileged: newBool(false),
+				},
+			},
+		}
+
+		agent := &store.Agent{
+			ID: tid("agent-3"),
+			AppliedConfig: &store.AgentAppliedConfig{
+				InlineConfig: &api.ScionConfig{
+					Docker: &api.DockerConfig{
+						Privileged: newBool(true),
+					},
+				},
+			},
+		}
+
+		srv.populateAgentConfig(ctx, agent, project, template)
+
+		require.NotNil(t, agent.AppliedConfig.InlineConfig)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
+		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
+			"explicit inline true must override template false")
+	})
+
+	t.Run("template without docker leaves inline config unset", func(t *testing.T) {
+		template := &store.Template{
+			ID:     tid("tmpl-nodocker"),
+			Slug:   "tmpl-nodocker",
+			Config: &store.TemplateConfig{},
+		}
+
+		agent := &store.Agent{
+			ID:            tid("agent-4"),
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		srv.populateAgentConfig(ctx, agent, project, template)
+
+		if agent.AppliedConfig.InlineConfig != nil && agent.AppliedConfig.InlineConfig.Docker != nil {
+			assert.Nil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
+		}
+	})
+}

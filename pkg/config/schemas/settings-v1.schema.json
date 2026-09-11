@@ -704,6 +704,17 @@
           "type": "array",
           "items": { "$ref": "#/$defs/requiredSecret" },
           "description": "Required secrets for agents created under this profile."
+        },
+        "docker": {
+          "type": "object",
+          "description": "Docker runtime configuration for this profile.",
+          "properties": {
+            "privileged": {
+              "type": "boolean",
+              "description": "Run the Docker container in privileged mode."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

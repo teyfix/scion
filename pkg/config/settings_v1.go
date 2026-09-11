@@ -1042,6 +1042,7 @@ type V1ProfileConfig struct {
 	Resources            *api.ResourceSpec            `json:"resources,omitempty" yaml:"resources,omitempty" koanf:"resources"`
 	HarnessOverrides     map[string]V1HarnessOverride `json:"harness_overrides,omitempty" yaml:"harness_overrides,omitempty" koanf:"harness_overrides"`
 	Secrets              []api.RequiredSecret         `json:"secrets,omitempty" yaml:"secrets,omitempty" koanf:"secrets"`
+	Docker               *api.DockerConfig            `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 }
 
 // resolveEffectiveProjectPath resolves the effective project path for settings loading.
@@ -2032,6 +2033,7 @@ func AdaptLegacySettings(legacy *Settings) (*VersionedSettings, []string) {
 				Env:       pc.Env,
 				Volumes:   pc.Volumes,
 				Resources: pc.Resources,
+				Docker:    CloneDockerConfig(pc.Docker),
 			}
 			// Convert HarnessOverride → V1HarnessOverride (camelCase → snake_case tags)
 			if pc.HarnessOverrides != nil {
@@ -2138,6 +2140,7 @@ func convertVersionedToLegacy(vs *VersionedSettings) *Settings {
 				Env:       pc.Env,
 				Volumes:   pc.Volumes,
 				Resources: pc.Resources,
+				Docker:    CloneDockerConfig(pc.Docker),
 			}
 			if pc.HarnessOverrides != nil {
 				profile.HarnessOverrides = make(map[string]HarnessOverride, len(pc.HarnessOverrides))
