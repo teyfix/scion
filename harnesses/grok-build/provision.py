@@ -184,6 +184,12 @@ def _configure_vertex_ai(
             env[key] = val
             break
 
+    # Normalize "global" to empty — the global Vertex AI endpoint uses the
+    # plain hostname (aiplatform.googleapis.com), not a region-prefixed one.
+    region = region.strip()
+    if region.lower() == "global":
+        region = ""
+
     # Construct Vertex AI base URL.
     if region:
         base_url = (
@@ -214,11 +220,20 @@ def _configure_vertex_ai(
         if not isinstance(aliases, dict):
             aliases = {}
         if raw_model.lower() in aliases:
-            # Scion alias (small, medium, large) — use default Vertex model.
+            # Scion size alias (small, medium, large) — use default Vertex model.
             model_id = _VERTEX_MODEL_ID
             ctx.info(f"vertex-ai: resolved alias '{raw_model}' to {_VERTEX_MODEL_ID}")
+        elif "/" not in raw_model:
+            # Pre-resolved model name without publisher prefix (e.g., "grok-4"
+            # from broker alias resolution). Not a valid Vertex AI model ID —
+            # Vertex requires <publisher>/<model> format.
+            model_id = _VERTEX_MODEL_ID
+            ctx.info(
+                f"vertex-ai: model '{raw_model}' lacks publisher prefix, "
+                f"using default {_VERTEX_MODEL_ID}"
+            )
         else:
-            # Explicit model ID (e.g., "xai/grok-4.2") — use as-is.
+            # Fully-qualified model ID with publisher prefix (e.g., "xai/grok-4.2").
             model_id = raw_model
     else:
         model_id = _VERTEX_MODEL_ID
@@ -515,9 +530,6 @@ def _build_telemetry_env(telemetry: dict[str, Any], env: dict[str, str] | None) 
 # Hooks – sciontool event bridge
 # ---------------------------------------------------------------------------
 
-# Events that send synthetic echo payloads (no stdin from grok).
-_ECHO_EVENTS = {"SessionStart", "SessionEnd"}
-
 # All hook events.
 _GROK_HOOK_EVENTS = [
     "SessionStart",
@@ -531,6 +543,10 @@ _GROK_HOOK_EVENTS = [
     "PostToolUseFailure",
     "SubagentStop",
     "Notification",
+    "PermissionDenied",
+    "SubagentStart",
+    "PreCompact",
+    "PostCompact",
 ]
 
 
@@ -546,14 +562,19 @@ def _write_hooks(home: str) -> None:
     """
     hooks: dict[str, list[dict[str, Any]]] = {}
     for event in _GROK_HOOK_EVENTS:
-        if event in _ECHO_EVENTS:
+        if event == "SessionStart":
             cmd = (
-                f"echo '{{\"hookEventName\": \"{event}\"}}' "
-                f"| sciontool hook --dialect=grok-build"
+                "echo '{\"hookEventName\": \"SessionStart\", \"source\": \"new\"}' "
+                "| sciontool hook --dialect=grok-build"
+            )
+        elif event == "SessionEnd":
+            cmd = (
+                "echo '{\"hookEventName\": \"SessionEnd\", \"reason\": \"end_turn\"}' "
+                "| sciontool hook --dialect=grok-build"
             )
         else:
             cmd = "cat | sciontool hook --dialect=grok-build"
-        timeout = 10 if event == "Stop" else 5
+        timeout = 60 if event in ("Stop", "SubagentStop") else 5
         hooks[event] = [
             {
                 "hooks": [
