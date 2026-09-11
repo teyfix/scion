@@ -64,6 +64,9 @@ type mockRuntimeBrokerClient struct {
 	lastProjectSlug        string
 	lastMessage            string
 	lastInterrupt          bool
+	lastHarnessConfig      string
+	lastHarnessConfigID    string
+	lastHarnessConfigHash  string
 	lastResolvedEnv        map[string]string
 	lastRestartResolvedEnv map[string]string
 	lastInlineConfig       *api.ScionConfig
@@ -98,7 +101,7 @@ func (m *mockRuntimeBrokerClient) CreateAgent(ctx context.Context, brokerID, bro
 	}, nil
 }
 
-func (m *mockRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool) (*RemoteAgentResponse, error) {
+func (m *mockRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool) (*RemoteAgentResponse, error) {
 	m.startCalled = true
 	m.lastBrokerID = brokerID
 	m.lastEndpoint = brokerEndpoint
@@ -106,6 +109,9 @@ func (m *mockRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brok
 	m.lastTask = task
 	m.lastProjectPath = projectPath
 	m.lastProjectSlug = projectSlug
+	m.lastHarnessConfig = harnessConfig
+	m.lastHarnessConfigID = harnessConfigID
+	m.lastHarnessConfigHash = harnessConfigHash
 	m.lastResolvedEnv = resolvedEnv
 	m.lastInlineConfig = inlineConfig
 	if m.returnErr != nil {
@@ -132,11 +138,14 @@ func (m *mockRuntimeBrokerClient) StopAgent(ctx context.Context, brokerID, broke
 	return m.returnErr
 }
 
-func (m *mockRuntimeBrokerClient) RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, resolvedEnv map[string]string) error {
+func (m *mockRuntimeBrokerClient) RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string) error {
 	m.restartCalled = true
 	m.lastBrokerID = brokerID
 	m.lastEndpoint = brokerEndpoint
 	m.lastAgentID = agentID
+	m.lastHarnessConfig = harnessConfig
+	m.lastHarnessConfigID = harnessConfigID
+	m.lastHarnessConfigHash = harnessConfigHash
 	m.lastRestartResolvedEnv = resolvedEnv
 	return m.returnErr
 }
@@ -448,7 +457,7 @@ func TestHTTPRuntimeBrokerClient_StartAgent_InvalidJSONFails(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPRuntimeBrokerClient()
-	_, err := client.StartAgent(context.Background(), tid("host-1"), server.URL, "test-agent", "", "", "", "", "", nil, nil, nil, nil, false, false)
+	_, err := client.StartAgent(context.Background(), tid("host-1"), server.URL, "test-agent", "", "", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err == nil {
 		t.Fatal("expected StartAgent to fail on invalid JSON response")
 	}
@@ -4584,6 +4593,228 @@ func TestDispatchAgentCreate_IncludesHubName(t *testing.T) {
 		t.Error("SCION_HUB_NAME missing from create request resolvedEnv — hubName not injected on create path")
 	} else if got != "create-hub" {
 		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "create-hub")
+	}
+}
+
+func TestDispatchAgentStart_PassesHarnessConfigWireFields(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hc-start"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hc-start"),
+		Name:            "hc-start-agent",
+		Slug:            "hc-start-agent",
+		ProjectID:       tid("project-hc-start"),
+		RuntimeBrokerID: tid("broker-hc-start"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig:     "claude",
+			HarnessConfigID:   "hc-explicit-id",
+			HarnessConfigHash: "hash-explicit-123",
+		},
+	}
+
+	if err := dispatcher.DispatchAgentStart(ctx, agent, "do task", false); err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+	if mockClient.lastHarnessConfig != "claude" {
+		t.Errorf("lastHarnessConfig = %q, want %q", mockClient.lastHarnessConfig, "claude")
+	}
+	if mockClient.lastHarnessConfigID != "hc-explicit-id" {
+		t.Errorf("lastHarnessConfigID = %q, want %q", mockClient.lastHarnessConfigID, "hc-explicit-id")
+	}
+	if mockClient.lastHarnessConfigHash != "hash-explicit-123" {
+		t.Errorf("lastHarnessConfigHash = %q, want %q", mockClient.lastHarnessConfigHash, "hash-explicit-123")
+	}
+}
+
+func TestDispatchAgentStart_ResolvesHarnessConfigFromStore(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hc-resolve-start"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	hc := &store.HarnessConfig{
+		ID:          tid("hc-resolved-1"),
+		Slug:        "custom-claude",
+		Name:        "Custom Claude",
+		Harness:     "claude",
+		Scope:       store.HarnessConfigScopeGlobal,
+		Status:      store.HarnessConfigStatusActive,
+		ContentHash: "hash-store-resolved-456",
+		Created:     time.Now(),
+		Updated:     time.Now(),
+	}
+	if err := memStore.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hc-resolve-start"),
+		Name:            "hc-resolve-start-agent",
+		Slug:            "hc-resolve-start-agent",
+		ProjectID:       tid("project-hc-resolve-start"),
+		RuntimeBrokerID: tid("broker-hc-resolve-start"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "custom-claude", // slug only, no ID or Hash
+		},
+	}
+
+	if err := dispatcher.DispatchAgentStart(ctx, agent, "do task", false); err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+	if mockClient.lastHarnessConfig != "custom-claude" {
+		t.Errorf("lastHarnessConfig = %q, want %q", mockClient.lastHarnessConfig, "custom-claude")
+	}
+	if mockClient.lastHarnessConfigID != hc.ID {
+		t.Errorf("lastHarnessConfigID = %q, want %q", mockClient.lastHarnessConfigID, hc.ID)
+	}
+	if mockClient.lastHarnessConfigHash != hc.ContentHash {
+		t.Errorf("lastHarnessConfigHash = %q, want %q", mockClient.lastHarnessConfigHash, hc.ContentHash)
+	}
+}
+
+func TestDispatchAgentRestart_PassesHarnessConfigWireFields(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hc-restart"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hc-restart"),
+		Name:            "hc-restart-agent",
+		Slug:            "hc-restart-agent",
+		ProjectID:       tid("project-hc-restart"),
+		RuntimeBrokerID: tid("broker-hc-restart"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig:     "gemini",
+			HarnessConfigID:   "hc-restart-id",
+			HarnessConfigHash: "hash-restart-789",
+		},
+	}
+
+	if err := dispatcher.DispatchAgentRestart(ctx, agent); err != nil {
+		t.Fatalf("DispatchAgentRestart failed: %v", err)
+	}
+
+	if !mockClient.restartCalled {
+		t.Fatal("expected RestartAgent to be called")
+	}
+	if mockClient.lastHarnessConfig != "gemini" {
+		t.Errorf("lastHarnessConfig = %q, want %q", mockClient.lastHarnessConfig, "gemini")
+	}
+	if mockClient.lastHarnessConfigID != "hc-restart-id" {
+		t.Errorf("lastHarnessConfigID = %q, want %q", mockClient.lastHarnessConfigID, "hc-restart-id")
+	}
+	if mockClient.lastHarnessConfigHash != "hash-restart-789" {
+		t.Errorf("lastHarnessConfigHash = %q, want %q", mockClient.lastHarnessConfigHash, "hash-restart-789")
+	}
+}
+
+func TestDispatchAgentRestart_ResolvesHarnessConfigFromStore(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hc-resolve-restart"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	hc := &store.HarnessConfig{
+		ID:          tid("hc-resolved-restart-1"),
+		Slug:        "custom-gemini",
+		Name:        "Custom Gemini",
+		Harness:     "gemini",
+		Scope:       store.HarnessConfigScopeGlobal,
+		Status:      store.HarnessConfigStatusActive,
+		ContentHash: "hash-store-restart-999",
+		Created:     time.Now(),
+		Updated:     time.Now(),
+	}
+	if err := memStore.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hc-resolve-restart"),
+		Name:            "hc-resolve-restart-agent",
+		Slug:            "hc-resolve-restart-agent",
+		ProjectID:       tid("project-hc-resolve-restart"),
+		RuntimeBrokerID: tid("broker-hc-resolve-restart"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "custom-gemini",
+		},
+	}
+
+	if err := dispatcher.DispatchAgentRestart(ctx, agent); err != nil {
+		t.Fatalf("DispatchAgentRestart failed: %v", err)
+	}
+
+	if !mockClient.restartCalled {
+		t.Fatal("expected RestartAgent to be called")
+	}
+	if mockClient.lastHarnessConfig != "custom-gemini" {
+		t.Errorf("lastHarnessConfig = %q, want %q", mockClient.lastHarnessConfig, "custom-gemini")
+	}
+	if mockClient.lastHarnessConfigID != hc.ID {
+		t.Errorf("lastHarnessConfigID = %q, want %q", mockClient.lastHarnessConfigID, hc.ID)
+	}
+	if mockClient.lastHarnessConfigHash != hc.ContentHash {
+		t.Errorf("lastHarnessConfigHash = %q, want %q", mockClient.lastHarnessConfigHash, hc.ContentHash)
 	}
 }
 

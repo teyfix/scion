@@ -149,3 +149,136 @@ func TestHandleHarnessConfigFileWrite_UpdatesImage(t *testing.T) {
 		t.Errorf("expected Config.Image = %q, got %q", newImage, updated.Config.Image)
 	}
 }
+
+func TestHandleHarnessConfigFileRead_Raw_QueryParam(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	files := map[string]string{
+		"config.yaml":        "harness: claude\nversion: 1\n",
+		"dialects/script.sh": "#!/bin/bash\necho 'hello world'\n",
+		"home/.bashrc":       "export FOO=bar\n",
+	}
+	hc := createTestHarnessConfigWithFiles(t, s, stor, files)
+
+	// Test reading nested dialect script via ?raw=1
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/dialects/script.sh?raw=1", nil)
+	req.Header.Set("Authorization", "Bearer "+testDevToken)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if ct := w.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("expected Content-Type application/octet-stream, got %q", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); cd != "attachment; filename=script.sh" && cd != `attachment; filename="script.sh"` {
+		t.Errorf("expected Content-Disposition attachment for script.sh, got %q", cd)
+	}
+	if got := w.Body.String(); got != files["dialects/script.sh"] {
+		t.Errorf("expected body %q, got %q", files["dialects/script.sh"], got)
+	}
+}
+
+func TestHandleHarnessConfigFileRead_Raw_AcceptHeader(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	content := "harness: claude\nversion: 2\n"
+	files := map[string]string{
+		"config.yaml": content,
+	}
+	hc := createTestHarnessConfigWithFiles(t, s, stor, files)
+
+	// Test raw download triggered by Accept: application/octet-stream header
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/config.yaml", nil)
+	req.Header.Set("Authorization", "Bearer "+testDevToken)
+	req.Header.Set("Accept", "application/octet-stream")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if ct := w.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("expected Content-Type application/octet-stream, got %q", ct)
+	}
+	if got := w.Body.String(); got != content {
+		t.Errorf("expected body %q, got %q", content, got)
+	}
+}
+
+func TestHandleHarnessConfigFileRead_Raw_BypassesSizeLimit(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	// Create a large file (1.5 MB) exceeding maxInlineFileSize (1 MB)
+	largeData := strings.Repeat("X", 1500*1024)
+	files := map[string]string{
+		"large.bin": largeData,
+	}
+	hc := createTestHarnessConfigWithFiles(t, s, stor, files)
+
+	// 1. Raw download should SUCCEED and bypass the 1MB cap
+	reqRaw := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/large.bin?raw=1", nil)
+	reqRaw.Header.Set("Authorization", "Bearer "+testDevToken)
+	wRaw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wRaw, reqRaw)
+
+	if wRaw.Code != http.StatusOK {
+		t.Fatalf("expected 200 for raw read of 1.5MB file, got %d: %s", wRaw.Code, wRaw.Body.String())
+	}
+	if wRaw.Body.Len() != len(largeData) {
+		t.Errorf("expected %d bytes, got %d", len(largeData), wRaw.Body.Len())
+	}
+
+	// 2. Inline JSON view should FAIL with 413 Payload Too Large
+	reqJSON := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/large.bin", nil)
+	reqJSON.Header.Set("Authorization", "Bearer "+testDevToken)
+	wJSON := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wJSON, reqJSON)
+
+	if wJSON.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413 for inline JSON view of 1.5MB file, got %d: %s", wJSON.Code, wJSON.Body.String())
+	}
+}
+
+func TestHandleHarnessConfigFileRead_NotFound(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	hc := createTestHarnessConfigWithFiles(t, s, stor, map[string]string{
+		"config.yaml": "harness: claude\n",
+	})
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/nonexistent.sh?raw=1", nil)
+	req.Header.Set("Authorization", "Bearer "+testDevToken)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing file, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleHarnessConfigFileRead_Unauthorized(t *testing.T) {
+	srv, s, stor := testHarnessConfigFileServer(t)
+
+	hc := createTestHarnessConfigWithFiles(t, s, stor, map[string]string{
+		"config.yaml": "harness: claude\n",
+	})
+
+	// Missing authorization header
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/harness-configs/"+hc.ID+"/files/config.yaml?raw=1", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for unauthenticated request, got %d: %s", w.Code, w.Body.String())
+	}
+}

@@ -331,6 +331,12 @@ func (s *Server) createHarnessConfig(w http.ResponseWriter, r *http.Request) {
 	if len(req.Files) > 0 && stor != nil {
 		uploadURLs, manifestURL, err := generateUploadURLs(ctx, stor, storagePath, req.Files)
 		if err == nil || len(uploadURLs) > 0 {
+			// For local storage, rewrite file:// URLs to HTTP proxy URLs
+			if stor.Provider() == storage.ProviderLocal {
+				hubURL := s.advertisedOrRequestURL(r)
+				uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "harness-configs", hc.ID)
+				manifestURL = ""
+			}
 			response.UploadURLs = uploadURLs
 			response.ManifestURL = manifestURL
 		}
@@ -668,6 +674,13 @@ func (s *Server) handleHarnessConfigUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// For local storage, rewrite file:// URLs to HTTP proxy URLs
+	if stor.Provider() == storage.ProviderLocal {
+		hubURL := s.advertisedOrRequestURL(r)
+		uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "harness-configs", id)
+		manifestURL = ""
+	}
+
 	writeJSON(w, http.StatusOK, UploadResponse{
 		UploadURLs:  uploadURLs,
 		ManifestURL: manifestURL,
@@ -850,6 +863,10 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 
 	hc, err := s.store.GetHarnessConfig(ctx, id)
@@ -873,6 +890,13 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		RuntimeError(w, fmt.Sprintf("harness-config %q: %s — run 'scion harness-config validate %s' to diagnose", hc.Name, err, hc.Name))
 		return
+	}
+
+	// For local storage, rewrite file:// URLs to HTTP proxy URLs
+	if stor.Provider() == storage.ProviderLocal {
+		hubURL := s.advertisedOrRequestURL(r)
+		downloadURLs = rewriteLocalDownloadURLs(downloadURLs, hubURL, "harness-configs", id)
+		manifestURL = ""
 	}
 
 	writeJSON(w, http.StatusOK, DownloadResponse{

@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -111,6 +112,8 @@ func TestControlChannelBrokerClient_StartAgentSignsTunneledRequest(t *testing.T)
 		"/tmp/project",
 		"project-slug",
 		"",
+		"",
+		"",
 		nil,
 		nil,
 		nil,
@@ -137,6 +140,100 @@ func TestControlChannelBrokerClient_StartAgentSignsTunneledRequest(t *testing.T)
 	expectedPath := "/api/v1/agents/agent-1/start?projectId=project-id-1"
 	if got := tunnel.lastRequest.Path; got != expectedPath {
 		t.Fatalf("unexpected path: %s (expected %s)", got, expectedPath)
+	}
+}
+
+func TestControlChannelBrokerClient_StartAgent_HarnessConfigWireFields(t *testing.T) {
+	tunnel := &mockControlChannelTunnel{connected: true}
+	signer := &mockBrokerSigner{}
+	client := &ControlChannelBrokerClient{
+		manager: tunnel,
+		signer:  signer,
+	}
+
+	_, err := client.StartAgent(
+		context.Background(),
+		"broker-1",
+		"unused",
+		"agent-1",
+		"project-id-1",
+		"run task",
+		"/tmp/project",
+		"project-slug",
+		"claude-custom",
+		"hc-123",
+		"hash-456",
+		nil,
+		nil,
+		nil,
+		nil,
+		false,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartAgent returned error: %v", err)
+	}
+
+	if tunnel.lastRequest == nil || len(tunnel.lastRequest.Body) == 0 {
+		t.Fatal("expected tunneled request with body")
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(tunnel.lastRequest.Body, &body); err != nil {
+		t.Fatalf("failed to parse tunneled request body: %v", err)
+	}
+
+	if body["harnessConfig"] != "claude-custom" {
+		t.Errorf("expected harnessConfig 'claude-custom', got %v", body["harnessConfig"])
+	}
+	if body["harnessConfigId"] != "hc-123" {
+		t.Errorf("expected harnessConfigId 'hc-123', got %v", body["harnessConfigId"])
+	}
+	if body["harnessConfigHash"] != "hash-456" {
+		t.Errorf("expected harnessConfigHash 'hash-456', got %v", body["harnessConfigHash"])
+	}
+}
+
+func TestControlChannelBrokerClient_RestartAgent_HarnessConfigWireFields(t *testing.T) {
+	tunnel := &mockControlChannelTunnel{connected: true}
+	signer := &mockBrokerSigner{}
+	client := &ControlChannelBrokerClient{
+		manager: tunnel,
+		signer:  signer,
+	}
+
+	err := client.RestartAgent(
+		context.Background(),
+		"broker-1",
+		"unused",
+		"agent-1",
+		"project-id-1",
+		"claude-custom",
+		"hc-123",
+		"hash-456",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("RestartAgent returned error: %v", err)
+	}
+
+	if tunnel.lastRequest == nil || len(tunnel.lastRequest.Body) == 0 {
+		t.Fatal("expected tunneled request with body")
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(tunnel.lastRequest.Body, &body); err != nil {
+		t.Fatalf("failed to parse tunneled request body: %v", err)
+	}
+
+	if body["harnessConfig"] != "claude-custom" {
+		t.Errorf("expected harnessConfig 'claude-custom', got %v", body["harnessConfig"])
+	}
+	if body["harnessConfigId"] != "hc-123" {
+		t.Errorf("expected harnessConfigId 'hc-123', got %v", body["harnessConfigId"])
+	}
+	if body["harnessConfigHash"] != "hash-456" {
+		t.Errorf("expected harnessConfigHash 'hash-456', got %v", body["harnessConfigHash"])
 	}
 }
 

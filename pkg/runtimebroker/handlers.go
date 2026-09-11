@@ -992,16 +992,21 @@ func (s *Server) hydrateTemplate(ctx context.Context, cfg *CreateAgentConfig, co
 // consume path that makes harness-configs usable from a broker that lacks the
 // config on its local filesystem.
 func (s *Server) hydrateHarnessConfig(ctx context.Context, cfg *CreateAgentConfig, conn *HubConnection) (string, error) {
-	if cfg == nil || (cfg.HarnessConfigID == "" && cfg.HarnessConfigHash == "") {
+	if cfg == nil {
 		return "", nil
+	}
+	// Hydrate only when HarnessConfigID or HarnessConfigHash identifies a Hub-managed resource.
+	// A plain HarnessConfig name without Hub identity must continue to fall back to the broker's local search.
+	if cfg.HarnessConfigID == "" && cfg.HarnessConfigHash == "" {
+		return "", nil
+	}
+	ref := cfg.HarnessConfigID
+	if ref == "" {
+		ref = cfg.HarnessConfig
 	}
 
 	// Local-backend direct read (co-located workstation mode).
 	if conn.LocalStorage != nil {
-		ref := cfg.HarnessConfigID
-		if ref == "" {
-			ref = cfg.HarnessConfig
-		}
 		path, err := s.resolveLocalResource(ctx, storage.ResourceKindHarnessConfig, ref, conn)
 		if err != nil {
 			return "", err
@@ -1017,11 +1022,11 @@ func (s *Server) hydrateHarnessConfig(ctx context.Context, cfg *CreateAgentConfi
 		return "", nil
 	}
 
-	if cfg.HarnessConfigHash != "" && cfg.HarnessConfigID != "" {
-		return resolver.ResolveWithHash(ctx, cfg.HarnessConfigID, cfg.HarnessConfigHash)
+	if cfg.HarnessConfigHash != "" && ref != "" {
+		return resolver.ResolveWithHash(ctx, ref, cfg.HarnessConfigHash)
 	}
-	if cfg.HarnessConfigID != "" {
-		return resolver.Resolve(ctx, cfg.HarnessConfigID)
+	if ref != "" {
+		return resolver.Resolve(ctx, ref)
 	}
 
 	return "", nil
@@ -1308,6 +1313,8 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		GrovePath          string                 `json:"grovePath"`
 		GroveSlug          string                 `json:"groveSlug"`
 		HarnessConfig      string                 `json:"harnessConfig"`
+		HarnessConfigID    string                 `json:"harnessConfigId,omitempty"`
+		HarnessConfigHash  string                 `json:"harnessConfigHash,omitempty"`
 		ResolvedEnv        map[string]string      `json:"resolvedEnv"`
 		EnvClassifications map[string]api.EnvKind `json:"envClassifications,omitempty"`
 		ResolvedSecrets    []api.ResolvedSecret   `json:"resolvedSecrets,omitempty"`
@@ -1338,12 +1345,14 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 
 	// Build config for buildStartContext (startAgent uses a subset of CreateAgentConfig)
 	var cfg *CreateAgentConfig
-	if startReq.Task != "" || startReq.HarnessConfig != "" || len(startReq.SharedDirs) > 0 || startReq.SharedWorkspace {
+	if startReq.Task != "" || startReq.HarnessConfig != "" || startReq.HarnessConfigID != "" || len(startReq.SharedDirs) > 0 || startReq.SharedWorkspace {
 		cfg = &CreateAgentConfig{
-			Task:            startReq.Task,
-			HarnessConfig:   startReq.HarnessConfig,
-			SharedDirs:      startReq.SharedDirs,
-			SharedWorkspace: startReq.SharedWorkspace,
+			Task:              startReq.Task,
+			HarnessConfig:     startReq.HarnessConfig,
+			HarnessConfigID:   startReq.HarnessConfigID,
+			HarnessConfigHash: startReq.HarnessConfigHash,
+			SharedDirs:        startReq.SharedDirs,
+			SharedWorkspace:   startReq.SharedWorkspace,
 		}
 	}
 
@@ -1601,8 +1610,11 @@ func (s *Server) stopAgent(w http.ResponseWriter, r *http.Request, id, projectID
 func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
 	ctx := r.Context()
 
-	// Read optional resolvedEnv from request body (hub sends fresh auth token)
+	// Read optional harnessConfig and resolvedEnv from request body (hub sends fresh auth token and harness config)
 	var restartReq struct {
+		HarnessConfig      string                 `json:"harnessConfig,omitempty"`
+		HarnessConfigID    string                 `json:"harnessConfigId,omitempty"`
+		HarnessConfigHash  string                 `json:"harnessConfigHash,omitempty"`
 		ResolvedEnv        map[string]string      `json:"resolvedEnv"`
 		EnvClassifications map[string]api.EnvKind `json:"envClassifications,omitempty"`
 	}
@@ -1626,9 +1638,19 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projec
 		}
 	}
 
+	var cfg *CreateAgentConfig
+	if restartReq.HarnessConfig != "" || restartReq.HarnessConfigID != "" {
+		cfg = &CreateAgentConfig{
+			HarnessConfig:     restartReq.HarnessConfig,
+			HarnessConfigID:   restartReq.HarnessConfigID,
+			HarnessConfigHash: restartReq.HarnessConfigHash,
+		}
+	}
+
 	sc, err := s.buildStartContext(ctx, startContextInputs{
 		Name:               agentName,
 		ProjectPath:        projectPath,
+		Config:             cfg,
 		ResolvedEnv:        restartReq.ResolvedEnv,
 		EnvClassifications: restartReq.EnvClassifications,
 		HTTPRequest:        r,

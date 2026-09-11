@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -342,6 +343,23 @@ func requestBaseURL(r *http.Request) string {
 	return "http://" + host
 }
 
+// advertisedOrRequestURL returns the Hub's configured public/advertised endpoint URL
+// if set; otherwise it derives the external base URL from the incoming HTTP request.
+func (s *Server) advertisedOrRequestURL(r *http.Request) string {
+	if s != nil && s.config.HubEndpoint != "" {
+		return strings.TrimRight(s.config.HubEndpoint, "/")
+	}
+	return requestBaseURL(r)
+}
+
+func escapePathSegments(filePath string) string {
+	parts := strings.Split(filePath, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
 func rewriteLocalUploadURLs(urls []UploadURLInfo, hubEndpoint, resourceType, resourceID string) []UploadURLInfo {
 	if hubEndpoint == "" {
 		return urls
@@ -349,7 +367,7 @@ func rewriteLocalUploadURLs(urls []UploadURLInfo, hubEndpoint, resourceType, res
 	hubEndpoint = strings.TrimRight(hubEndpoint, "/")
 	for i := range urls {
 		if strings.HasPrefix(urls[i].URL, "file://") {
-			urls[i].URL = fmt.Sprintf("%s/api/v1/%s/%s/files/%s", hubEndpoint, resourceType, resourceID, urls[i].Path)
+			urls[i].URL = fmt.Sprintf("%s/api/v1/%s/%s/files/%s", hubEndpoint, resourceType, resourceID, escapePathSegments(urls[i].Path))
 			urls[i].Method = http.MethodPut
 			urls[i].Headers = map[string]string{
 				"Content-Type": "application/octet-stream",
@@ -370,7 +388,7 @@ func rewriteLocalDownloadURLs(urls []DownloadURLInfo, hubEndpoint, resourceType,
 	hubEndpoint = strings.TrimRight(hubEndpoint, "/")
 	for i := range urls {
 		if strings.HasPrefix(urls[i].URL, "file://") {
-			urls[i].URL = hubEndpoint + "/api/v1/" + resourceType + "/" + resourceID + "/files/" + urls[i].Path + "?raw=1"
+			urls[i].URL = fmt.Sprintf("%s/api/v1/%s/%s/files/%s?raw=1", hubEndpoint, resourceType, resourceID, escapePathSegments(urls[i].Path))
 		}
 	}
 	return urls

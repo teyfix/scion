@@ -1547,16 +1547,16 @@ func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
 		s.hubMu.RLock()
 		conn, ok := s.hubConnections[connName]
 		s.hubMu.RUnlock()
-		if ok && conn.Hydrator != nil {
+		if ok && (conn.Hydrator != nil || conn.HCResolver != nil) {
 			return conn
 		}
 	}
 
-	// Fallback: return first available connection with a hydrator
+	// Fallback: return first available connection with a hydrator or resolver
 	s.hubMu.RLock()
 	defer s.hubMu.RUnlock()
 	for _, conn := range s.hubConnections {
-		if conn.Hydrator != nil {
+		if conn.Hydrator != nil || conn.HCResolver != nil {
 			return conn
 		}
 	}

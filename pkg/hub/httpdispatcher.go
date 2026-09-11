@@ -68,16 +68,16 @@ func (c *HTTPRuntimeBrokerClient) CreateAgent(ctx context.Context, brokerID, bro
 	return c.transport.CreateAgent(ctx, brokerID, brokerEndpoint, req)
 }
 
-func (c *HTTPRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool) (*RemoteAgentResponse, error) {
-	return c.transport.StartAgent(ctx, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, resolvedEnv, resolvedSecrets, inlineConfig, sharedDirs, sharedWorkspace, resume)
+func (c *HTTPRuntimeBrokerClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool) (*RemoteAgentResponse, error) {
+	return c.transport.StartAgent(ctx, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv, resolvedSecrets, inlineConfig, sharedDirs, sharedWorkspace, resume)
 }
 
 func (c *HTTPRuntimeBrokerClient) StopAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string) error {
 	return c.transport.StopAgent(ctx, brokerID, brokerEndpoint, agentID, projectID)
 }
 
-func (c *HTTPRuntimeBrokerClient) RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, resolvedEnv map[string]string) error {
-	return c.transport.RestartAgent(ctx, brokerID, brokerEndpoint, agentID, projectID, resolvedEnv)
+func (c *HTTPRuntimeBrokerClient) RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string) error {
+	return c.transport.RestartAgent(ctx, brokerID, brokerEndpoint, agentID, projectID, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv)
 }
 
 func (c *HTTPRuntimeBrokerClient) ResetAuthAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, token string) error {
@@ -2135,8 +2135,29 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	// Use agent name as identifier (runtime broker uses name or ID)
 	// Pass the agent's harness config so the broker starts with the correct harness.
 	harnessConfig := ""
+	harnessConfigID := ""
+	harnessConfigHash := ""
 	if agent.AppliedConfig != nil {
 		harnessConfig = agent.AppliedConfig.HarnessConfig
+		harnessConfigID = agent.AppliedConfig.HarnessConfigID
+		harnessConfigHash = agent.AppliedConfig.HarnessConfigHash
+	}
+	if (harnessConfigID == "" || harnessConfigHash == "") && harnessConfig != "" && d.store != nil {
+		var hc *store.HarnessConfig
+		if agent.ProjectID != "" {
+			hc, _ = d.store.GetHarnessConfigBySlug(ctx, harnessConfig, store.HarnessConfigScopeProject, agent.ProjectID)
+		}
+		if hc == nil {
+			hc, _ = d.store.GetHarnessConfigBySlug(ctx, harnessConfig, store.HarnessConfigScopeGlobal, "")
+		}
+		if hc != nil {
+			if harnessConfigID == "" {
+				harnessConfigID = hc.ID
+			}
+			if harnessConfigHash == "" {
+				harnessConfigHash = hc.ContentHash
+			}
+		}
 	}
 
 	// Thread through updated InlineConfig so the broker can apply config
@@ -2152,10 +2173,10 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	// until #1350 is done — otherwise fail-closed + nil map = total outage.
 	_ = envClassifications // avoid unused-variable error until #1350 wire threading
 
-	resp, err := d.client.StartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, task, projectPath, projectSlug, harnessConfig, resolvedEnv, resolvedSecrets, inlineConfig, projectInfo.sharedDirs, projectInfo.sharedWorkspace, resume)
+	resp, err := d.client.StartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv, resolvedSecrets, inlineConfig, projectInfo.sharedDirs, projectInfo.sharedWorkspace, resume)
 	if isHashMismatchError(err) {
 		if repairErr := d.repairHashMismatch(ctx, agent, err); repairErr == nil {
-			resp, err = d.client.StartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, task, projectPath, projectSlug, harnessConfig, resolvedEnv, resolvedSecrets, inlineConfig, projectInfo.sharedDirs, projectInfo.sharedWorkspace, resume)
+			resp, err = d.client.StartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv, resolvedSecrets, inlineConfig, projectInfo.sharedDirs, projectInfo.sharedWorkspace, resume)
 		}
 	}
 	if errors.Is(err, ErrLifecycleDeferred) {
@@ -2415,7 +2436,38 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	// until #1350 is done — otherwise fail-closed + nil map = total outage.
 	_ = envClassifications // avoid unused-variable error until #1350 wire threading
 
-	err = d.client.RestartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, resolvedEnv)
+	harnessConfig := ""
+	harnessConfigID := ""
+	harnessConfigHash := ""
+	if agent.AppliedConfig != nil {
+		harnessConfig = agent.AppliedConfig.HarnessConfig
+		harnessConfigID = agent.AppliedConfig.HarnessConfigID
+		harnessConfigHash = agent.AppliedConfig.HarnessConfigHash
+	}
+	if (harnessConfigID == "" || harnessConfigHash == "") && harnessConfig != "" && d.store != nil {
+		var hc *store.HarnessConfig
+		if agent.ProjectID != "" {
+			hc, _ = d.store.GetHarnessConfigBySlug(ctx, harnessConfig, store.HarnessConfigScopeProject, agent.ProjectID)
+		}
+		if hc == nil {
+			hc, _ = d.store.GetHarnessConfigBySlug(ctx, harnessConfig, store.HarnessConfigScopeGlobal, "")
+		}
+		if hc != nil {
+			if harnessConfigID == "" {
+				harnessConfigID = hc.ID
+			}
+			if harnessConfigHash == "" {
+				harnessConfigHash = hc.ContentHash
+			}
+		}
+	}
+
+	err = d.client.RestartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv)
+	if isHashMismatchError(err) {
+		if repairErr := d.repairHashMismatch(ctx, agent, err); repairErr == nil {
+			err = d.client.RestartAgent(ctx, agent.RuntimeBrokerID, endpoint, agent.Slug, agent.ProjectID, harnessConfig, harnessConfigID, harnessConfigHash, resolvedEnv)
+		}
+	}
 	if errors.Is(err, ErrLifecycleDeferred) {
 		return d.deferredRestart(ctx, agent)
 	}

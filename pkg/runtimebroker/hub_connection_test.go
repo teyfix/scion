@@ -34,6 +34,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
+	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
+	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 )
 
 // makeTestCreds creates BrokerCredentials with a base64-encoded secret key.
@@ -60,6 +62,12 @@ func newTestServerWithInMemoryCreds(creds *brokercredentials.BrokerCredentials) 
 	// Most tests in this file focus on hub connection behavior, not auth gates.
 	cfg.BrokerAuthEnabled = false
 	cfg.ForceRuntime = "mock"
+
+	tempDir, err := os.MkdirTemp("", "scion-broker-test-*")
+	if err == nil {
+		cfg.TemplateCacheDir = filepath.Join(tempDir, "cache", "templates")
+		cfg.StateDir = filepath.Join(tempDir, "state")
+	}
 
 	mgr := &mockManager{}
 	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
@@ -125,6 +133,8 @@ func TestHubConnection_MultipleConnections(t *testing.T) {
 	cfg.HubEnabled = true
 	cfg.HubEndpoint = "http://localhost:8080"
 	cfg.InMemoryCredentials = localCreds
+	cfg.TemplateCacheDir = filepath.Join(tmpDir, "cache", "templates")
+	cfg.StateDir = filepath.Join(tmpDir, "state")
 
 	mgr := &mockManager{}
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
@@ -438,6 +448,260 @@ func TestHydrateHarnessConfig_NoResolverIsGraceful(t *testing.T) {
 	}
 	if path != "" {
 		t.Errorf("expected empty path when no resolver, got %q", path)
+	}
+}
+
+type stubHCSClient struct {
+	hubclient.Client
+	hcs hubclient.HarnessConfigService
+}
+
+func (c *stubHCSClient) HarnessConfigs() hubclient.HarnessConfigService { return c.hcs }
+
+type stubHCService struct {
+	hubclient.HarnessConfigService
+	getFunc                 func(ctx context.Context, id string) (*hubclient.HarnessConfig, error)
+	requestDownloadURLsFunc func(ctx context.Context, id string) (*hubclient.DownloadResponse, error)
+	downloadFileFunc        func(ctx context.Context, url string) ([]byte, error)
+}
+
+func (s *stubHCService) Get(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
+	if s.getFunc != nil {
+		return s.getFunc(ctx, id)
+	}
+	return nil, nil
+}
+
+func (s *stubHCService) RequestDownloadURLs(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
+	if s.requestDownloadURLsFunc != nil {
+		return s.requestDownloadURLsFunc(ctx, id)
+	}
+	return nil, nil
+}
+
+func (s *stubHCService) DownloadFile(ctx context.Context, url string) ([]byte, error) {
+	if s.downloadFileFunc != nil {
+		return s.downloadFileFunc(ctx, url)
+	}
+	return nil, nil
+}
+
+func TestResolveHubConnection_WithHCResolverOnly(t *testing.T) {
+	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
+	srv := newTestServerWithInMemoryCreds(creds)
+
+	srv.hubMu.Lock()
+	conn := srv.hubConnections["local"]
+	// Clear all other resolvers, keep only HCResolver
+	conn.Hydrator = nil
+	conn.LocalStorage = nil
+	cache, err := templatecache.New(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{})
+	srv.hubMu.Unlock()
+
+	// 1. Resolve with connection header
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-1/start", nil)
+	req.Header.Set("X-Scion-Hub-Connection", "local")
+	resolved := srv.resolveHubConnection(req)
+	if resolved != conn {
+		t.Errorf("expected connection to resolve when HCResolver is set, got %v", resolved)
+	}
+
+	// 2. Resolve via fallback (no connection header)
+	reqNoHeader := httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-1/start", nil)
+	resolvedFallback := srv.resolveHubConnection(reqNoHeader)
+	if resolvedFallback != conn {
+		t.Errorf("expected fallback connection to resolve when HCResolver is set, got %v", resolvedFallback)
+	}
+
+	// 3. When HCResolver is also nil, resolveHubConnection returns nil
+	srv.hubMu.Lock()
+	conn.HCResolver = nil
+	srv.hubMu.Unlock()
+
+	resolvedNil := srv.resolveHubConnection(req)
+	if resolvedNil != nil {
+		t.Errorf("expected nil when all resolvers are cleared, got %v", resolvedNil)
+	}
+}
+
+func TestHydrateHarnessConfig_ResolverColdAndWarmCache(t *testing.T) {
+	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
+	srv := newTestServerWithInMemoryCreds(creds)
+
+	cacheDir := t.TempDir()
+	cache, err := templatecache.New(cacheDir, 0)
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	fileBytes := []byte("harness: claude\nversion: 1\n")
+	fileHash := transfer.HashBytes(fileBytes)
+	contentHash := "test-content-hash-123"
+
+	downloadCalls := 0
+	stubService := &stubHCService{
+		getFunc: func(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
+			return &hubclient.HarnessConfig{
+				ID:          id,
+				ContentHash: contentHash,
+			}, nil
+		},
+		requestDownloadURLsFunc: func(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
+			return &hubclient.DownloadResponse{
+				Files: []hubclient.DownloadURLInfo{
+					{
+						Path: "config.yaml",
+						URL:  "http://hub.local/api/v1/harness-configs/" + id + "/files/config.yaml?raw=1",
+						Hash: fileHash,
+						Size: int64(len(fileBytes)),
+					},
+				},
+			}, nil
+		},
+		downloadFileFunc: func(ctx context.Context, url string) ([]byte, error) {
+			downloadCalls++
+			return fileBytes, nil
+		},
+	}
+
+	srv.hubMu.Lock()
+	conn := srv.hubConnections["local"]
+	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
+	srv.hubMu.Unlock()
+
+	cfg := &CreateAgentConfig{
+		HarnessConfigID:   "hc-remote-1",
+		HarnessConfigHash: contentHash,
+	}
+
+	// Cold cache: downloads and hydrates
+	path1, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
+	if err != nil {
+		t.Fatalf("hydrateHarnessConfig failed on cold cache: %v", err)
+	}
+	if path1 == "" {
+		t.Fatal("expected non-empty path from hydration")
+	}
+	if downloadCalls != 1 {
+		t.Errorf("expected 1 download call on cold cache, got %d", downloadCalls)
+	}
+
+	// Verify file was written to disk
+	gotContent, err := os.ReadFile(filepath.Join(path1, "config.yaml"))
+	if err != nil {
+		t.Fatalf("failed to read hydrated file: %v", err)
+	}
+	if string(gotContent) != string(fileBytes) {
+		t.Errorf("hydrated content mismatch: got %q, want %q", string(gotContent), string(fileBytes))
+	}
+
+	// Warm cache: returns cached directory without downloading
+	path2, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
+	if err != nil {
+		t.Fatalf("hydrateHarnessConfig failed on warm cache: %v", err)
+	}
+	if path2 != path1 {
+		t.Errorf("expected warm cache to return same path %q, got %q", path1, path2)
+	}
+	if downloadCalls != 1 {
+		t.Errorf("expected no additional download calls on warm cache, got %d", downloadCalls)
+	}
+}
+
+func TestHydrateHarnessConfig_ResolverHashMismatchFails(t *testing.T) {
+	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
+	srv := newTestServerWithInMemoryCreds(creds)
+
+	cacheDir := t.TempDir()
+	cache, err := templatecache.New(cacheDir, 0)
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	expectedHash := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	corruptBytes := []byte("corrupted or tampered content")
+
+	stubService := &stubHCService{
+		getFunc: func(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
+			return &hubclient.HarnessConfig{
+				ID:          id,
+				ContentHash: "hash-mismatch-test",
+			}, nil
+		},
+		requestDownloadURLsFunc: func(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
+			return &hubclient.DownloadResponse{
+				Files: []hubclient.DownloadURLInfo{
+					{
+						Path: "config.yaml",
+						URL:  "http://hub.local/api/v1/harness-configs/" + id + "/files/config.yaml?raw=1",
+						Hash: expectedHash,
+						Size: int64(len(corruptBytes)),
+					},
+				},
+			}, nil
+		},
+		downloadFileFunc: func(ctx context.Context, url string) ([]byte, error) {
+			return corruptBytes, nil
+		},
+	}
+
+	srv.hubMu.Lock()
+	conn := srv.hubConnections["local"]
+	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
+	srv.hubMu.Unlock()
+
+	cfg := &CreateAgentConfig{
+		HarnessConfigID:   "hc-corrupt-1",
+		HarnessConfigHash: "hash-mismatch-test",
+	}
+
+	path, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
+	if err == nil {
+		t.Errorf("expected hash mismatch error, got path %q", path)
+	}
+	if !strings.Contains(err.Error(), "hash mismatch") {
+		t.Errorf("expected error to mention 'hash mismatch', got %v", err)
+	}
+}
+
+func TestHydrateHarnessConfig_PlainNameFallsBackToLocalDisk(t *testing.T) {
+	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
+	srv := newTestServerWithInMemoryCreds(creds)
+
+	cacheDir := t.TempDir()
+	cache, err := templatecache.New(cacheDir, 0)
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	stubService := &stubHCService{
+		getFunc: func(ctx context.Context, ref string) (*hubclient.HarnessConfig, error) {
+			t.Errorf("unexpected call to Hub getFunc for plain harness config name: %q", ref)
+			return nil, nil
+		},
+	}
+
+	srv.hubMu.Lock()
+	conn := srv.hubConnections["local"]
+	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
+	srv.hubMu.Unlock()
+
+	// Plain HarnessConfig name without Hub identity (no ID and no ContentHash)
+	// must not hydrate via Hub and must fall back to broker local search.
+	cfg := &CreateAgentConfig{
+		HarnessConfig: "claude",
+	}
+
+	path, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if path != "" {
+		t.Errorf("expected empty path (fallback to disk) for plain harness config, got %q", path)
 	}
 }
 
@@ -973,6 +1237,7 @@ func TestBuildAuthMiddleware_NoKeys(t *testing.T) {
 }
 
 func TestBuildAuthMiddleware_WithKeys(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 
 	cfg := DefaultServerConfig()
@@ -1001,6 +1266,7 @@ func TestDefaultServerConfig_SecureBrokerAuthDefaults(t *testing.T) {
 }
 
 func TestRuntimeBroker_DefaultAuth_DeniesUnauthenticatedRequests(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 
 	cfg := DefaultServerConfig()
@@ -1167,6 +1433,7 @@ func TestColocated_RemoteConnection_GetsHeartbeat(t *testing.T) {
 }
 
 func TestColocated_ComboMode_HeartbeatPerConnection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	// In combo mode (co-located local + remote), verify that both connections
 	// get heartbeat services.
 	tmpDir := t.TempDir()
@@ -1254,6 +1521,7 @@ func TestColocated_ComboMode_HeartbeatPerConnection(t *testing.T) {
 }
 
 func TestColocated_CredentialWatcher_PreservesLocalConnection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	// When credentials are reloaded, the "local" connection from InMemoryCredentials
 	// must be preserved even if it's not in the multi-store.
 	tmpDir := t.TempDir()
@@ -1341,6 +1609,7 @@ func TestColocated_CredentialWatcher_PreservesLocalConnection(t *testing.T) {
 }
 
 func TestColocated_CredentialWatcher_AddRemoteAlongsideLocal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	// Start with only the local co-located connection, then add a remote one
 	// via credential watcher.
 	tmpDir := t.TempDir()
@@ -1442,6 +1711,7 @@ func TestColocated_GlobalProjectRejection_ComboMode(t *testing.T) {
 }
 
 func TestColocated_MultipleRemoteConnections(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	// Test co-located mode with multiple remote connections alongside the local.
 	tmpDir := t.TempDir()
 	credDir := filepath.Join(tmpDir, "hub-credentials")

@@ -21,9 +21,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -397,4 +399,197 @@ func hasAction(c *Capabilities, action Action) bool {
 		}
 	}
 	return false
+}
+
+func TestHandleHarnessConfigDownload_LocalStorage_RewritesURLs(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	locStor, err := storage.NewLocal(storage.Config{
+		Bucket:    "test-bucket",
+		LocalPath: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create local storage: %v", err)
+	}
+	srv.SetStorage(locStor)
+
+	hc := &store.HarnessConfig{
+		ID:            tid("hc_dl_test"),
+		Slug:          "dl-hc",
+		Name:          "Download HC",
+		Harness:       "claude",
+		Scope:         store.HarnessConfigScopeGlobal,
+		Status:        store.HarnessConfigStatusActive,
+		StoragePath:   "harness-configs/global/dl-hc",
+		StorageBucket: "test-bucket",
+		Files: []store.TemplateFile{
+			{Path: "config.yaml", Size: 42, Hash: "sha256:abc"},
+			{Path: "home/nested file#1.txt", Size: 100, Hash: "sha256:def"},
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet, fmt.Sprintf("/api/v1/harness-configs/%s/download", hc.ID), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp DownloadResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Manifest URL must be empty for local storage (never file://)
+	if resp.ManifestURL != "" {
+		t.Errorf("expected empty ManifestURL for local storage, got %q", resp.ManifestURL)
+	}
+
+	if len(resp.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(resp.Files))
+	}
+
+	for _, f := range resp.Files {
+		if strings.HasPrefix(f.URL, "file://") {
+			t.Errorf("file URL must not start with file://: %q", f.URL)
+		}
+		if !strings.Contains(f.URL, "/api/v1/harness-configs/"+hc.ID+"/files/") {
+			t.Errorf("file URL should route through Hub file handler: %q", f.URL)
+		}
+		if !strings.HasSuffix(f.URL, "?raw=1") {
+			t.Errorf("file URL should have ?raw=1 suffix: %q", f.URL)
+		}
+	}
+
+	// Verify escaping of special characters in nested file
+	wantNestedSuffix := "home/nested%20file%231.txt?raw=1"
+	if !strings.HasSuffix(resp.Files[1].URL, wantNestedSuffix) {
+		t.Errorf("expected URL to end with escaped path %q, got %q", wantNestedSuffix, resp.Files[1].URL)
+	}
+}
+
+func TestHandleHarnessConfigUpload_LocalStorage_RewritesURLs(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	locStor, err := storage.NewLocal(storage.Config{
+		Bucket:    "test-bucket",
+		LocalPath: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create local storage: %v", err)
+	}
+	srv.SetStorage(locStor)
+
+	hc := &store.HarnessConfig{
+		ID:            tid("hc_ul_test"),
+		Slug:          "ul-hc",
+		Name:          "Upload HC",
+		Harness:       "claude",
+		Scope:         store.HarnessConfigScopeGlobal,
+		Status:        store.HarnessConfigStatusActive,
+		StoragePath:   "harness-configs/global/ul-hc",
+		StorageBucket: "test-bucket",
+		Created:       time.Now(),
+		Updated:       time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	body := UploadRequest{
+		Files: []FileUploadRequest{
+			{Path: "config.yaml", Size: 42},
+			{Path: "dialects/custom dialect#1.yaml", Size: 100},
+		},
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, fmt.Sprintf("/api/v1/harness-configs/%s/upload", hc.ID), body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp UploadResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.ManifestURL != "" {
+		t.Errorf("expected empty ManifestURL for local storage, got %q", resp.ManifestURL)
+	}
+
+	if len(resp.UploadURLs) != 2 {
+		t.Fatalf("expected 2 upload URLs, got %d", len(resp.UploadURLs))
+	}
+
+	for _, f := range resp.UploadURLs {
+		if strings.HasPrefix(f.URL, "file://") {
+			t.Errorf("upload URL must not start with file://: %q", f.URL)
+		}
+		if f.Method != http.MethodPut {
+			t.Errorf("expected upload method PUT, got %q", f.Method)
+		}
+		if f.Headers["Content-Type"] != "application/octet-stream" {
+			t.Errorf("expected Content-Type application/octet-stream, got %q", f.Headers["Content-Type"])
+		}
+	}
+
+	wantNestedSuffix := "dialects/custom%20dialect%231.yaml"
+	if !strings.HasSuffix(resp.UploadURLs[1].URL, wantNestedSuffix) {
+		t.Errorf("expected URL to end with escaped path %q, got %q", wantNestedSuffix, resp.UploadURLs[1].URL)
+	}
+}
+
+func TestHandleHarnessConfigDownload_AdvertisedURL(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	srv.config.HubEndpoint = "https://advertised.hub.local:9443"
+
+	locStor, err := storage.NewLocal(storage.Config{
+		Bucket:    "test-bucket",
+		LocalPath: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create local storage: %v", err)
+	}
+	srv.SetStorage(locStor)
+
+	hc := &store.HarnessConfig{
+		ID:            tid("hc_adv_test"),
+		Slug:          "adv-hc",
+		Name:          "Advertised HC",
+		Harness:       "claude",
+		Scope:         store.HarnessConfigScopeGlobal,
+		Status:        store.HarnessConfigStatusActive,
+		StoragePath:   "harness-configs/global/adv-hc",
+		StorageBucket: "test-bucket",
+		Files: []store.TemplateFile{
+			{Path: "config.yaml", Size: 42, Hash: "sha256:abc"},
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet, fmt.Sprintf("/api/v1/harness-configs/%s/download", hc.ID), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp DownloadResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	wantURL := "https://advertised.hub.local:9443/api/v1/harness-configs/" + hc.ID + "/files/config.yaml?raw=1"
+	if resp.Files[0].URL != wantURL {
+		t.Errorf("expected advertised URL %q, got %q", wantURL, resp.Files[0].URL)
+	}
 }

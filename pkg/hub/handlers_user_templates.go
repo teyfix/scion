@@ -214,8 +214,9 @@ func (s *Server) createUserTemplate(w http.ResponseWriter, r *http.Request) {
 		uploadURLs, manifestURL, err := generateUploadURLs(ctx, stor, storagePath, req.Files)
 		if err == nil || len(uploadURLs) > 0 {
 			if stor.Provider() == storage.ProviderLocal {
-				hubURL := requestBaseURL(r)
+				hubURL := s.advertisedOrRequestURL(r)
 				uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "templates", template.ID)
+				manifestURL = ""
 			}
 			response.UploadURLs = uploadURLs
 			response.ManifestURL = manifestURL

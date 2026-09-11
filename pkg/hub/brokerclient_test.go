@@ -211,7 +211,7 @@ func TestAuthenticatedBrokerClient_StartAgent(t *testing.T) {
 	client := NewAuthenticatedBrokerClient(db, false)
 
 	// Make request
-	resp, err := client.StartAgent(context.Background(), brokerID, server.URL, "my-agent", "", "", "", "", "", nil, nil, nil, nil, false, false)
+	resp, err := client.StartAgent(context.Background(), brokerID, server.URL, "my-agent", "", "", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err != nil {
 		t.Fatalf("StartAgent failed: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestAuthenticatedBrokerClient_StartAgent_InvalidJSONFails(t *testing.T) {
 	defer server.Close()
 
 	client := NewAuthenticatedBrokerClient(db, false)
-	_, err = client.StartAgent(context.Background(), brokerID, server.URL, tid("agent-1"), "", "", "", "", "", nil, nil, nil, nil, false, false)
+	_, err = client.StartAgent(context.Background(), brokerID, server.URL, tid("agent-1"), "", "", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err == nil {
 		t.Fatal("expected StartAgent to fail on invalid JSON response")
 	}
@@ -492,7 +492,7 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 		t.Errorf("CreateAgent failed: %v", err)
 	}
 
-	_, err = client.StartAgent(ctx, brokerID, server.URL, "test-agent", "", "", "", "", "", nil, nil, nil, nil, false, false)
+	_, err = client.StartAgent(ctx, brokerID, server.URL, "test-agent", "", "", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err != nil {
 		t.Errorf("StartAgent failed: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 		t.Errorf("StopAgent failed: %v", err)
 	}
 
-	err = client.RestartAgent(ctx, brokerID, server.URL, "test-agent", "", nil)
+	err = client.RestartAgent(ctx, brokerID, server.URL, "test-agent", "", "", "", "", nil)
 	if err != nil {
 		t.Errorf("RestartAgent failed: %v", err)
 	}
@@ -531,5 +531,84 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 		if _, ok := requests[path]; !ok {
 			t.Errorf("missing request to %s", path)
 		}
+	}
+}
+
+func TestBrokerHTTPTransport_StartAgent_HarnessConfigWireFields(t *testing.T) {
+	var receivedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&RemoteAgentResponse{Agent: &RemoteAgentInfo{ID: "agent-1", Status: "running"}})
+	}))
+	defer server.Close()
+
+	transport := newBrokerHTTPTransport(false, nil)
+	_, err := transport.StartAgent(
+		context.Background(),
+		"broker-1",
+		server.URL,
+		"agent-1",
+		"project-1",
+		"test task",
+		"/tmp/proj",
+		"proj-slug",
+		"claude-custom",
+		"hc-123",
+		"hash-456",
+		nil,
+		nil,
+		nil,
+		nil,
+		false,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartAgent failed: %v", err)
+	}
+
+	if receivedBody["harnessConfig"] != "claude-custom" {
+		t.Errorf("expected harnessConfig 'claude-custom', got %v", receivedBody["harnessConfig"])
+	}
+	if receivedBody["harnessConfigId"] != "hc-123" {
+		t.Errorf("expected harnessConfigId 'hc-123', got %v", receivedBody["harnessConfigId"])
+	}
+	if receivedBody["harnessConfigHash"] != "hash-456" {
+		t.Errorf("expected harnessConfigHash 'hash-456', got %v", receivedBody["harnessConfigHash"])
+	}
+}
+
+func TestBrokerHTTPTransport_RestartAgent_HarnessConfigWireFields(t *testing.T) {
+	var receivedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	transport := newBrokerHTTPTransport(false, nil)
+	err := transport.RestartAgent(
+		context.Background(),
+		"broker-1",
+		server.URL,
+		"agent-1",
+		"project-1",
+		"claude-custom",
+		"hc-123",
+		"hash-456",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("RestartAgent failed: %v", err)
+	}
+
+	if receivedBody["harnessConfig"] != "claude-custom" {
+		t.Errorf("expected harnessConfig 'claude-custom', got %v", receivedBody["harnessConfig"])
+	}
+	if receivedBody["harnessConfigId"] != "hc-123" {
+		t.Errorf("expected harnessConfigId 'hc-123', got %v", receivedBody["harnessConfigId"])
+	}
+	if receivedBody["harnessConfigHash"] != "hash-456" {
+		t.Errorf("expected harnessConfigHash 'hash-456', got %v", receivedBody["harnessConfigHash"])
 	}
 }

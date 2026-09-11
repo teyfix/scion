@@ -788,7 +788,7 @@ func (s *Server) publishSkillVersion(w http.ResponseWriter, r *http.Request, ski
 			uploadURLs, _, err := generateUploadURLs(ctx, stor, versionPath, req.Files)
 			if err == nil && len(uploadURLs) > 0 {
 				if stor.Provider() == storage.ProviderLocal {
-					hubURL := requestBaseURL(r)
+					hubURL := s.advertisedOrRequestURL(r)
 					uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "skills", skillID)
 				}
 				response.UploadURLs = uploadURLs
@@ -1054,8 +1054,9 @@ func (s *Server) handleSkillUpload(w http.ResponseWriter, r *http.Request, skill
 	}
 
 	if stor.Provider() == storage.ProviderLocal {
-		hubURL := requestBaseURL(r)
+		hubURL := s.advertisedOrRequestURL(r)
 		uploadURLs = rewriteLocalUploadURLs(uploadURLs, hubURL, "skills", skillID)
+		manifestURL = ""
 	}
 
 	writeJSON(w, http.StatusOK, UploadResponse{
@@ -1231,8 +1232,9 @@ func (s *Server) handleSkillDownload(w http.ResponseWriter, r *http.Request, ski
 	}
 
 	if stor.Provider() == storage.ProviderLocal {
-		hubURL := requestBaseURL(r)
+		hubURL := s.advertisedOrRequestURL(r)
 		downloadURLs = rewriteLocalDownloadURLs(downloadURLs, hubURL, "skills", skillID)
+		manifestURL = ""
 	}
 
 	writeJSON(w, http.StatusOK, DownloadResponse{
@@ -1424,7 +1426,7 @@ func (s *Server) handleSkillsResolve(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if stor.Provider() == storage.ProviderLocal {
-				hubURL := requestBaseURL(r)
+				hubURL := s.advertisedOrRequestURL(r)
 				downloadURLs = rewriteLocalDownloadURLs(downloadURLs, hubURL, "skills", skill.ID)
 			}
 			entry.Files = downloadURLs

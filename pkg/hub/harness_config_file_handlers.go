@@ -18,9 +18,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"mime"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -96,6 +101,10 @@ func (s *Server) handleHarnessConfigFileRead(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 
 	hc, err := s.store.GetHarnessConfig(ctx, id)
@@ -116,22 +125,50 @@ func (s *Server) handleHarnessConfigFileRead(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if found.Size > maxHarnessConfigFileSize {
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-			"File too large for inline viewing. Use the download endpoint instead.", nil)
-		return
-	}
-
 	stor := s.GetStorage()
 	if stor == nil {
 		RuntimeError(w, "Storage not configured")
 		return
 	}
 
+	// Raw binary download for local storage proxy flow
+	if r.URL.Query().Get("raw") != "" || strings.Contains(r.Header.Get("Accept"), "application/octet-stream") {
+		objectPath := hc.StoragePath + "/" + filePath
+		reader, _, err := stor.Download(ctx, objectPath)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				NotFound(w, "Harness config file")
+				return
+			}
+			RuntimeError(w, "Failed to read file from storage")
+			return
+		}
+		defer func() { _ = reader.Close() }()
+
+		safeName := filepath.Base(filePath)
+		contentDisposition := mime.FormatMediaType("attachment", map[string]string{"filename": safeName})
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", contentDisposition)
+		w.Header().Set("Content-Length", strconv.FormatInt(found.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.Copy(w, reader); err != nil {
+			slog.Error("Error streaming harness config file to client", "path", objectPath, "error", err)
+		}
+		return
+	}
+
+	// JSON response with size limit
+	if found.Size > maxHarnessConfigFileSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+			"File too large for inline viewing. Use the download endpoint instead.", nil)
+		return
+	}
+
 	objectPath := hc.StoragePath + "/" + filePath
 	reader, _, err := stor.Download(ctx, objectPath)
 	if err != nil {
-		if err == storage.ErrNotFound {
+		if errors.Is(err, storage.ErrNotFound) {
 			NotFound(w, "Harness config file")
 			return
 		}

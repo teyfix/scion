@@ -471,6 +471,30 @@ func TestRestartAgent(t *testing.T) {
 	}
 }
 
+func TestRestartAgent_WithHarnessConfigPayload(t *testing.T) {
+	srv := newTestServer(t)
+	mgr := srv.manager.(*mockManager)
+
+	body := `{"harnessConfig": "claude", "harnessConfigId": "hc-restart-1", "harnessConfigHash": "hash-restart-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/test-agent-1/restart", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, w.Code, w.Body.String())
+	}
+	if mgr.stopCalls != 1 {
+		t.Fatalf("expected Stop to be called once, got %d", mgr.stopCalls)
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected Start to be called once, got %d", mgr.startCalls)
+	}
+	if mgr.lastStartOpts.Name != "test-agent-1" {
+		t.Fatalf("expected restart to start agent 'test-agent-1', got %q", mgr.lastStartOpts.Name)
+	}
+}
+
 func TestRestartAgent_StartFailure(t *testing.T) {
 	srv := newTestServer(t)
 	mgr := srv.manager.(*mockManager)
@@ -1322,6 +1346,30 @@ func TestStartAgentEndpoint(t *testing.T) {
 	// Created should be false for a start (not a create)
 	if resp.Created {
 		t.Error("expected Created to be false for start operation")
+	}
+}
+
+func TestStartAgent_WithHarnessConfigPayload(t *testing.T) {
+	srv := newTestServer(t)
+	mgr := srv.manager.(*mockManager)
+
+	body := `{"harnessConfig": "gemini", "harnessConfigId": "hc-start-1", "harnessConfigHash": "hash-start-1", "task": "custom start task"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/test-agent-1/start", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusAccepted, w.Code, w.Body.String())
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected Start to be called once, got %d", mgr.startCalls)
+	}
+	if mgr.lastStartOpts.Name != "test-agent-1" {
+		t.Fatalf("expected agent 'test-agent-1', got %q", mgr.lastStartOpts.Name)
+	}
+	if mgr.lastStartOpts.Task != "custom start task" {
+		t.Fatalf("expected task 'custom start task', got %q", mgr.lastStartOpts.Task)
 	}
 }
 
