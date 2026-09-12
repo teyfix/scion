@@ -195,6 +195,73 @@ func TestBundleInstall_Codex(t *testing.T) {
 	}
 }
 
+// TestBundleInstall_Jcode validates that the jcode bundle parses, survives a
+// local install copy, and stages its container-side provisioner.
+func TestBundleInstall_Jcode(t *testing.T) {
+	src := bundlePath(t, "jcode")
+	hc, err := config.LoadHarnessConfigDir(src)
+	if err != nil {
+		t.Fatalf("LoadHarnessConfigDir(%s): %v", src, err)
+	}
+	if hc.Config.Harness != "jcode" {
+		t.Errorf("harness=%q want jcode", hc.Config.Harness)
+	}
+	if hc.Config.Provisioner == nil || hc.Config.Provisioner.Type != "container-script" {
+		t.Fatalf("expected provisioner.type=container-script, got %+v", hc.Config.Provisioner)
+	}
+	if hc.Config.NoAuthConfig == nil || hc.Config.NoAuthConfig.Behavior != "allow" {
+		t.Fatalf("expected no_auth.behavior=allow, got %+v", hc.Config.NoAuthConfig)
+	}
+	if hc.Config.MCP == nil || hc.Config.MCP.GlobalConfigFile != ".jcode/mcp.json" {
+		t.Fatalf("unexpected jcode MCP config: %+v", hc.Config.MCP)
+	}
+
+	installDir := filepath.Join(t.TempDir(), "jcode-test")
+	if err := util.CopyDir(src, installDir); err != nil {
+		t.Fatalf("CopyDir (install): %v", err)
+	}
+	installedHC, err := config.LoadHarnessConfigDir(installDir)
+	if err != nil {
+		t.Fatalf("LoadHarnessConfigDir (installed): %v", err)
+	}
+	for _, name := range []string{
+		"config.yaml", "provision.py", "scion_harness.py", "Dockerfile", "README.md",
+	} {
+		if _, err := os.Stat(filepath.Join(installDir, name)); err != nil {
+			t.Errorf("expected %s at bundle root: %v", name, err)
+		}
+	}
+
+	scripted, err := NewContainerScriptHarness(installDir, installedHC.Config)
+	if err != nil {
+		t.Fatalf("NewContainerScriptHarness: %v", err)
+	}
+	wantCommand := []string{
+		"jcode", "--no-update", "--no-selfdev", "run",
+		"--model", "gpt-5.6-sol", "fix the failing test",
+	}
+	gotCommand := scripted.GetCommand(
+		"fix the failing test", false, []string{"--model", "gpt-5.6-sol"},
+	)
+	if strings.Join(gotCommand, "\x00") != strings.Join(wantCommand, "\x00") {
+		t.Errorf("GetCommand()=%q want %q", gotCommand, wantCommand)
+	}
+	agentHome := t.TempDir()
+	if err := scripted.Provision(context.Background(), "test-agent", agentHome, agentHome, "/workspace"); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	bundle := filepath.Join(agentHome, ".scion", "harness")
+	for _, name := range []string{"provision.py", "config.yaml", "manifest.json", "scion_harness.py"} {
+		if _, err := os.Stat(filepath.Join(bundle, name)); err != nil {
+			t.Errorf("expected %s in staged bundle: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(agentHome, ".scion", "hooks", "pre-start.d", "20-harness-provision")); err != nil {
+		t.Fatalf("hook wrapper missing after provision: %v", err)
+	}
+}
+
 // TestBundleInstall_Antigravity validates the harnesses/antigravity/ bundle
 // install path, config.yaml schema acceptance (including mcp, oauth-token,
 // vertex-ai auth types, and dialect.yaml), and provisioning staging.

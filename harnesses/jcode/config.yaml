@@ -1,0 +1,108 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+harness: jcode
+image: scion-jcode:latest
+user: scion
+env:
+  # jcode requires explicit consent before reading an existing Codex login.
+  # A broker deployment can supply its own user's ~/.codex/auth.json; no
+  # Hub-managed credential is required.
+  JCODE_ALLOW_CODEX_LEGACY_AUTH: "1"
+  # Agent runs should not emit jcode's anonymous usage telemetry.
+  JCODE_NO_TELEMETRY: "1"
+
+provisioner:
+  type: container-script
+  interface_version: 1
+  lib: vendored
+  command: ["python3", "/home/scion/.scion/harness/provision.py"]
+  timeout: 30s
+  lifecycle_events:
+    - pre-start
+  required_image_tools:
+    - python3
+
+config_dir: .jcode
+skills_dir: .jcode/skills
+interrupt_key: C-c
+# jcode loads ~/AGENTS.md as global instructions and also discovers the
+# repository's own AGENTS.md files from the working directory.
+instructions_file: AGENTS.md
+system_prompt_mode: prepend_to_instructions
+
+model_aliases:
+  small: gpt-5.4-mini
+  medium: gpt-5.4
+  large: gpt-5.6-sol
+  extra-large: gpt-5.5
+
+command:
+  # jcode's TUI has no initial-prompt flag. `run` is its supported autonomous
+  # single-task entry point and streams output until the agent turn completes.
+  base: ["jcode", "--no-update", "--no-selfdev", "run"]
+  task_position: after_base_args
+
+capabilities:
+  limits:
+    max_turns: { support: "no", reason: "jcode does not expose a stable external turn-limit control" }
+    max_model_calls: { support: "no", reason: "jcode does not expose a stable external model-call limit" }
+    max_duration: { support: "yes" }
+  telemetry:
+    enabled: { support: "no", reason: "No native Scion telemetry emitter is configured" }
+    native_emitter: { support: "no", reason: "No native Scion telemetry emitter is configured" }
+  prompts:
+    system_prompt: { support: "partial", reason: "System prompt is projected into ~/AGENTS.md" }
+    agent_instructions: { support: "yes" }
+  auth:
+    api_key: { support: "yes" }
+    auth_file: { support: "yes", reason: "Reuses the broker user's Codex auth file with explicit jcode consent" }
+    oauth_token: { support: "no" }
+    vertex_ai: { support: "no", reason: "Vertex AI auth is not configured for this harness" }
+  mcp:
+    stdio: { support: "yes" }
+    sse: { support: "no", reason: "jcode v0.58.0 supports stdio MCP servers only" }
+    streamable_http: { support: "no", reason: "jcode v0.58.0 supports stdio MCP servers only" }
+    project_scope: { support: "no", reason: "Project-scoped entries are demoted to the global jcode MCP config" }
+  resume: { support: "partial", reason: "jcode can resume by session ID, but Scion does not persist that ID yet" }
+
+no_auth:
+  # Hosted brokers intentionally do not scan the broker process's home. Allow
+  # jcode to use credentials projected by that broker's container lifecycle.
+  behavior: allow
+
+auth:
+  default_type: auth-file
+  types:
+    api-key:
+      required_env:
+        - any_of: ["OPENAI_API_KEY"]
+    auth-file:
+      required_files:
+        - name: CODEX_AUTH
+          type: file
+          target_suffix: "/.codex/auth.json"
+          field: CodexAuthFile
+  autodetect:
+    env:
+      OPENAI_API_KEY: api-key
+    files:
+      CODEX_AUTH: auth-file
+
+mcp:
+  global_config_file: .jcode/mcp.json
+  global_config_path: mcpServers
+  transport_field: type
+  transport_map:
+    stdio: stdio

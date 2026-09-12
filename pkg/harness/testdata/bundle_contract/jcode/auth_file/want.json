@@ -1,0 +1,11 @@
+{
+  "exit_code": 0,
+  "resolved_auth": {
+    "method": "auth-file",
+    "harness": "jcode"
+  },
+  "env": {
+    "JCODE_ALLOW_CODEX_LEGACY_AUTH": "1",
+    "JCODE_NO_TELEMETRY": "1"
+  }
+}
