@@ -315,6 +315,7 @@ func ValidateVolumes(volumes []VolumeMount) error {
 type DockerConfig struct {
 	Privileged *bool             `json:"privileged,omitempty" yaml:"privileged,omitempty"`
 	Networks   []string          `json:"networks,omitempty" yaml:"networks,omitempty"`
+	Devices    []string          `json:"devices,omitempty" yaml:"devices,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 }
 

@@ -206,6 +206,12 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		addArg("--network", config.NetworkMode)
 	}
 
+	for _, device := range config.Devices {
+		if device != "" {
+			addArg("--device", device)
+		}
+	}
+
 	if config.HomeDir != "" {
 		registerMount(config.HomeDir, util.GetHomeDir(config.UnixUsername), false, true)
 	}

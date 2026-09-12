@@ -966,6 +966,9 @@ func CloneDockerConfig(d *api.DockerConfig) *api.DockerConfig {
 	if d.Networks != nil {
 		res.Networks = append([]string(nil), d.Networks...)
 	}
+	if d.Devices != nil {
+		res.Devices = append([]string(nil), d.Devices...)
+	}
 	if d.Labels != nil {
 		res.Labels = make(map[string]string, len(d.Labels))
 		for k, v := range d.Labels {
@@ -1015,6 +1018,33 @@ func mergeDockerConfig(base, override *api.DockerConfig) *api.DockerConfig {
 			}
 		}
 		result.Networks = mergedNets
+	}
+
+	// Devices: Profile device grants are required and must be retained. Docker
+	// accepts both host device mappings and CDI selectors (for example,
+	// nvidia.com/gpu=all) through repeated --device arguments.
+	if len(base.Devices) > 0 || len(override.Devices) > 0 {
+		seen := make(map[string]struct{}, len(base.Devices)+len(override.Devices))
+		var mergedDevices []string
+		for _, device := range base.Devices {
+			if device == "" {
+				continue
+			}
+			if _, exists := seen[device]; !exists {
+				seen[device] = struct{}{}
+				mergedDevices = append(mergedDevices, device)
+			}
+		}
+		for _, device := range override.Devices {
+			if device == "" {
+				continue
+			}
+			if _, exists := seen[device]; !exists {
+				seen[device] = struct{}{}
+				mergedDevices = append(mergedDevices, device)
+			}
+		}
+		result.Devices = mergedDevices
 	}
 
 	// Labels: deterministic map merge where override keys overwrite base keys.

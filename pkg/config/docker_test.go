@@ -49,6 +49,30 @@ profiles:
 			wantValid: true,
 		},
 		{
+			name: "profile with Docker CDI device",
+			yamlData: `schema_version: "1"
+profiles:
+  onprem:
+    runtime: docker
+    docker:
+      devices:
+        - nvidia.com/gpu=all
+`,
+			wantValid: true,
+		},
+		{
+			name: "profile with empty Docker device rejected",
+			yamlData: `schema_version: "1"
+profiles:
+  onprem:
+    runtime: docker
+    docker:
+      devices:
+        - ""
+`,
+			wantValid: false,
+		},
+		{
 			name: "profile without docker",
 			yamlData: `schema_version: "1"
 profiles:
@@ -110,6 +134,15 @@ docker:
 			wantValid: true,
 		},
 		{
+			name: "agent config with Docker CDI device",
+			yamlData: `schema_version: "1"
+docker:
+  devices:
+    - nvidia.com/gpu=all
+`,
+			wantValid: true,
+		},
+		{
 			name: "agent config without docker",
 			yamlData: `schema_version: "1"
 `,
@@ -149,6 +182,8 @@ profiles:
     runtime: docker
     docker:
       privileged: true
+      devices:
+        - nvidia.com/gpu=all
   unprivileged:
     runtime: docker
     docker:
@@ -166,6 +201,9 @@ profiles:
 	}
 	if onprem.Docker == nil || onprem.Docker.Privileged == nil || !*onprem.Docker.Privileged {
 		t.Errorf("expected onprem.Docker.Privileged=true, got %v", onprem.Docker)
+	}
+	if len(onprem.Docker.Devices) != 1 || onprem.Docker.Devices[0] != "nvidia.com/gpu=all" {
+		t.Errorf("expected onprem.Docker.Devices=[nvidia.com/gpu=all], got %v", onprem.Docker.Devices)
 	}
 
 	unpriv, ok := vs.Profiles["unprivileged"]
@@ -185,6 +223,9 @@ profiles:
 	if legacyOnprem.Docker == nil || legacyOnprem.Docker.Privileged == nil || !*legacyOnprem.Docker.Privileged {
 		t.Errorf("expected legacy onprem.Docker.Privileged=true, got %v", legacyOnprem.Docker)
 	}
+	if len(legacyOnprem.Docker.Devices) != 1 || legacyOnprem.Docker.Devices[0] != "nvidia.com/gpu=all" {
+		t.Errorf("expected legacy onprem.Docker.Devices=[nvidia.com/gpu=all], got %v", legacyOnprem.Docker.Devices)
+	}
 
 	// Test AdaptLegacySettings
 	adapted, warnings := AdaptLegacySettings(legacy)
@@ -198,10 +239,17 @@ profiles:
 	if adaptedOnprem.Docker == nil || adaptedOnprem.Docker.Privileged == nil || !*adaptedOnprem.Docker.Privileged {
 		t.Errorf("expected adapted onprem.Docker.Privileged=true, got %v", adaptedOnprem.Docker)
 	}
+	if len(adaptedOnprem.Docker.Devices) != 1 || adaptedOnprem.Docker.Devices[0] != "nvidia.com/gpu=all" {
+		t.Errorf("expected adapted onprem.Docker.Devices=[nvidia.com/gpu=all], got %v", adaptedOnprem.Docker.Devices)
+	}
 
 	// Verify deep copy / no aliasing between legacy and adapted
 	*legacyOnprem.Docker.Privileged = false
+	legacyOnprem.Docker.Devices[0] = "mutated"
 	if !*adaptedOnprem.Docker.Privileged {
 		t.Errorf("mutating legacy Docker mutated adapted Docker: expected deep copy")
+	}
+	if adaptedOnprem.Docker.Devices[0] != "nvidia.com/gpu=all" {
+		t.Errorf("mutating legacy Docker devices mutated adapted Docker: expected deep copy")
 	}
 }

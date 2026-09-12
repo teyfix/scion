@@ -408,6 +408,7 @@ export interface AgentInlineConfig {
 export interface DockerRuntimeConfig {
   privileged?: boolean;
   networks?: string[];
+  devices?: string[];
   labels?: Record<string, string>;
 }
 

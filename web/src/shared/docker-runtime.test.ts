@@ -22,7 +22,7 @@ describe('buildDockerRuntimeConfig', () => {
   it('normalizes networks and labels while preserving other Docker fields', () => {
     expect(
       buildDockerRuntimeConfig(
-        { privileged: true },
+        { privileged: true, devices: ['nvidia.com/gpu=all'] },
         [' traefik_proxy ', 'backend', 'traefik_proxy', ''],
         [
           { key: ' traefik.enable ', value: ' true ' },
@@ -31,19 +31,25 @@ describe('buildDockerRuntimeConfig', () => {
       )
     ).toEqual({
       privileged: true,
+      devices: ['nvidia.com/gpu=all'],
       networks: ['traefik_proxy', 'backend'],
       labels: { 'traefik.enable': 'true' },
     });
   });
 
-  it('removes cleared network and label overrides without dropping privileged', () => {
+  it('removes cleared network and label overrides without dropping unrelated fields', () => {
     expect(
       buildDockerRuntimeConfig(
-        { privileged: false, networks: ['old'], labels: { old: 'value' } },
+        {
+          privileged: false,
+          devices: ['/dev/dri'],
+          networks: ['old'],
+          labels: { old: 'value' },
+        },
         [],
         []
       )
-    ).toEqual({ privileged: false });
+    ).toEqual({ privileged: false, devices: ['/dev/dri'] });
   });
 
   it('returns undefined when no Docker override remains', () => {

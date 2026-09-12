@@ -1757,6 +1757,35 @@ func TestBuildCommonRunArgs_Networks(t *testing.T) {
 	}
 }
 
+func TestBuildCommonRunArgs_Devices(t *testing.T) {
+	cfg := RunConfig{
+		Name:    "agent-1",
+		Devices: []string{"nvidia.com/gpu=all", "/dev/dri:/dev/dri", ""},
+		Harness: &harness.Generic{},
+	}
+	args, err := buildCommonRunArgs(cfg)
+	if err != nil {
+		t.Fatalf("buildCommonRunArgs failed: %v", err)
+	}
+
+	var devices []string
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--device" {
+			devices = append(devices, args[i+1])
+		}
+	}
+
+	want := []string{"nvidia.com/gpu=all", "/dev/dri:/dev/dri"}
+	if len(devices) != len(want) {
+		t.Fatalf("devices = %v, want %v", devices, want)
+	}
+	for i := range want {
+		if devices[i] != want[i] {
+			t.Errorf("devices[%d] = %q, want %q", i, devices[i], want[i])
+		}
+	}
+}
+
 func TestBuildCommonRunArgs_DockerLabels(t *testing.T) {
 	cfg := RunConfig{
 		Name: "agent-1",

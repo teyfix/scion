@@ -1342,7 +1342,7 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		agentID = finalScionCfg.Env["SCION_AGENT_ID"]
 	}
 
-	// Resolve and validate Docker runtime configuration (networks & labels)
+	// Resolve and validate Docker runtime configuration (networks, devices, and labels).
 	if finalScionCfg.Docker != nil {
 		if len(finalScionCfg.Docker.Labels) > 0 {
 			// Merge finalScionCfg.Env with profile.Env for label variable resolution.
@@ -1380,6 +1380,20 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 				}
 			}
 			finalScionCfg.Docker.Networks = cleanNets
+		}
+		if len(finalScionCfg.Docker.Devices) > 0 {
+			var cleanDevices []string
+			seenDevices := make(map[string]struct{}, len(finalScionCfg.Docker.Devices))
+			for _, device := range finalScionCfg.Docker.Devices {
+				if device == "" {
+					continue
+				}
+				if _, exists := seenDevices[device]; !exists {
+					seenDevices[device] = struct{}{}
+					cleanDevices = append(cleanDevices, device)
+				}
+			}
+			finalScionCfg.Docker.Devices = cleanDevices
 		}
 	}
 

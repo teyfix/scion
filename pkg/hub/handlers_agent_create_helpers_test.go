@@ -1398,6 +1398,33 @@ func TestPopulateAgentConfig_DockerTemplateDefaults(t *testing.T) {
 			"agent inline config must not alias template Docker config")
 	})
 
+	t.Run("template devices default into inline config without aliasing", func(t *testing.T) {
+		template := &store.Template{
+			ID:   tid("tmpl-devices"),
+			Slug: "tmpl-devices",
+			Config: &store.TemplateConfig{
+				Docker: &api.DockerConfig{
+					Devices: []string{"nvidia.com/gpu=all"},
+				},
+			},
+		}
+
+		agent := &store.Agent{
+			ID:            tid("agent-devices"),
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		srv.populateAgentConfig(ctx, agent, project, template)
+
+		require.NotNil(t, agent.AppliedConfig.InlineConfig)
+		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
+		assert.Equal(t, []string{"nvidia.com/gpu=all"}, agent.AppliedConfig.InlineConfig.Docker.Devices)
+
+		template.Config.Docker.Devices[0] = "mutated"
+		assert.Equal(t, []string{"nvidia.com/gpu=all"}, agent.AppliedConfig.InlineConfig.Docker.Devices,
+			"agent inline config must not alias template Docker devices")
+	})
+
 	t.Run("explicit inline false overrides template true", func(t *testing.T) {
 		template := &store.Template{
 			ID:   tid("tmpl-priv"),

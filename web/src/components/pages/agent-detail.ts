@@ -2087,6 +2087,7 @@ export class ScionPageAgentDetail extends LitElement {
     const isPrivileged = agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
     const requireGpu = agent.appliedConfig?.requireGpu;
     const dockerNetworks = inline?.docker?.networks ?? [];
+    const dockerDevices = inline?.docker?.devices ?? [];
     const dockerLabels = Object.entries(inline?.docker?.labels ?? {}).sort(([a], [b]) =>
       a.localeCompare(b)
     );
@@ -2169,6 +2170,16 @@ export class ScionPageAgentDetail extends LitElement {
                     ${dockerNetworks.map(
                       (network) => html`<span class="tag-item">${network}</span>`
                     )}
+                  </span>
+                </div>
+              `
+            : ''}
+          ${dockerDevices.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Devices</span>
+                  <span class="info-value tag-list">
+                    ${dockerDevices.map((device) => html`<span class="tag-item">${device}</span>`)}
                   </span>
                 </div>
               `

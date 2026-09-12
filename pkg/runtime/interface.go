@@ -54,6 +54,7 @@ type RunConfig struct {
 	ExtraHosts           []string          // Extra /etc/hosts entries (e.g. "host.docker.internal:host-gateway")
 	NetworkMode          string            // Container network mode (e.g. "host" for --network=host)
 	Networks             []string          // Explicit container networks to join
+	Devices              []string          // Docker device mappings or CDI selectors
 	DockerLabels         map[string]string // Resolved custom Docker container labels
 	Project              string            // Project name (e.g., "global" or "my-project")
 	ProjectID            string            // Project ID (e.g., "550e8400-e29b-41d4-a716-446655440000")

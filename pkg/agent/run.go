@@ -73,6 +73,23 @@ func isTmuxShellNotFoundError(err error) bool {
 		strings.Contains(msg, "tmux: not found")
 }
 
+func validateDockerDeviceRuntime(runtimeName string, devices []string) error {
+	for _, device := range devices {
+		if device == "" {
+			continue
+		}
+
+		switch runtimeName {
+		case "docker", "podman", "mock":
+			return nil
+		default:
+			return fmt.Errorf("docker.devices is not supported by runtime %q; use the docker or podman runtime", runtimeName)
+		}
+	}
+
+	return nil
+}
+
 func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
 	// Resolve project name early so we can scope the container lookup below.
 	projectDir, err := config.GetResolvedProjectDir(opts.ProjectPath)
@@ -173,6 +190,11 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			finalScionCfg.Harness, finalScionCfg.HarnessConfig, finalScionCfg.DefaultHarnessConfig, finalScionCfg.Image)
 	} else {
 		util.Debugf("Start: GetAgent returned nil config")
+	}
+	if finalScionCfg != nil && finalScionCfg.Docker != nil {
+		if err := validateDockerDeviceRuntime(m.Runtime.Name(), finalScionCfg.Docker.Devices); err != nil {
+			return nil, err
+		}
 	}
 
 	promptFile := filepath.Join(agentDir, "prompt.md")
@@ -1045,6 +1067,12 @@ authDone:
 		Networks: func() []string {
 			if finalScionCfg != nil && finalScionCfg.Docker != nil {
 				return finalScionCfg.Docker.Networks
+			}
+			return nil
+		}(),
+		Devices: func() []string {
+			if finalScionCfg != nil && finalScionCfg.Docker != nil {
+				return finalScionCfg.Docker.Devices
 			}
 			return nil
 		}(),

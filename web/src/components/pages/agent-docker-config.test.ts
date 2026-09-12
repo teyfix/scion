@@ -57,14 +57,15 @@ describe('agent Docker configuration forms', () => {
     });
   });
 
-  it('preserves privileged mode when a provisioned agent Docker config is edited', () => {
+  it('preserves unrelated Docker fields when a provisioned agent config is edited', () => {
     const page = new ScionPageAgentConfigure() as unknown as TestableConfigurePage;
-    page.dockerConfigBase = { privileged: true };
+    page.dockerConfigBase = { privileged: true, devices: ['nvidia.com/gpu=all'] };
     page.dockerNetworks = ['traefik_proxy'];
     page.dockerLabelEntries = [{ key: 'route', value: '${SCION_AGENT_SLUG}' }];
 
     expect(page.buildConfig().docker).toEqual({
       privileged: true,
+      devices: ['nvidia.com/gpu=all'],
       networks: ['traefik_proxy'],
       labels: { route: '${SCION_AGENT_SLUG}' },
     });
@@ -85,6 +86,7 @@ describe('agent Docker configuration forms', () => {
       page.renderRuntimeCard(agent, {
         docker: {
           networks: ['traefik_proxy', 'backend'],
+          devices: ['nvidia.com/gpu=all'],
           labels: { 'traefik.enable': 'true' },
         },
       }),
@@ -94,6 +96,8 @@ describe('agent Docker configuration forms', () => {
     expect(container.textContent).toContain('Configured Docker Networks');
     expect(container.textContent).toContain('traefik_proxy');
     expect(container.textContent).toContain('backend');
+    expect(container.textContent).toContain('Configured Docker Devices');
+    expect(container.textContent).toContain('nvidia.com/gpu=all');
     expect(container.textContent).toContain('Configured Docker Labels');
     expect(container.textContent).toContain('traefik.enable=true');
   });

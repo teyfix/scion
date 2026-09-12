@@ -24,6 +24,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
 func TestDockerConfig_PrecedenceAndResolution(t *testing.T) {
@@ -43,7 +44,7 @@ func TestDockerConfig_PrecedenceAndResolution(t *testing.T) {
 
 	seedTestHarnessConfig(t, globalScionDir, "test-harness", "test-harness")
 
-	// Template with networks and labels (using scoped variable references)
+	// Template with networks, devices, and labels (using scoped variable references)
 	tplDir := filepath.Join(globalTemplatesDir, "docker-tpl")
 	_ = os.MkdirAll(tplDir, 0755)
 	tplConfig := `{
@@ -53,6 +54,7 @@ func TestDockerConfig_PrecedenceAndResolution(t *testing.T) {
 		},
 		"docker": {
 			"networks": ["shared_net", "template_net"],
+			"devices": ["/dev/fuse", "/dev/dri"],
 			"labels": {
 				"router.rule": "Host(${SCION_AGENT_SLUG}.${APP_DOMAIN})",
 				"overwrite.me": "from-template",
@@ -75,6 +77,9 @@ profiles:
       networks:
         - profile_net
         - shared_net
+      devices:
+        - nvidia.com/gpu=all
+        - /dev/fuse
       labels:
         service.domain: "${APP_DOMAIN}"
         profile.key: "profile-val"
@@ -89,6 +94,7 @@ harness_configs:
 	inlineConfig := &api.ScionConfig{
 		Docker: &api.DockerConfig{
 			Networks: []string{"inline_net"},
+			Devices:  []string{"/dev/dri", "/dev/kvm"},
 			Labels: map[string]string{
 				"overwrite.me": "from-inline",
 				"inline.agent": "${SCION_AGENT_NAME}",
@@ -130,7 +136,18 @@ harness_configs:
 		}
 	}
 
-	// 2. Verify Labels precedence and scoped dynamic expansion
+	// 2. Verify Devices union with deduplication and order retention.
+	wantDevices := []string{"nvidia.com/gpu=all", "/dev/fuse", "/dev/dri", "/dev/kvm"}
+	if len(cfg.Docker.Devices) != len(wantDevices) {
+		t.Fatalf("cfg.Docker.Devices = %v, want %v", cfg.Docker.Devices, wantDevices)
+	}
+	for i, device := range wantDevices {
+		if cfg.Docker.Devices[i] != device {
+			t.Errorf("cfg.Docker.Devices[%d] = %q, want %q", i, cfg.Docker.Devices[i], device)
+		}
+	}
+
+	// 3. Verify Labels precedence and scoped dynamic expansion
 	wantLabels := map[string]string{
 		"profile.key":    "profile-val",
 		"template.key":   "template-val",
@@ -149,7 +166,7 @@ harness_configs:
 		}
 	}
 
-	// 3. Verify on-disk persistence in scion-agent.json
+	// 4. Verify on-disk persistence in scion-agent.json
 	agentDir := config.GetAgentDir(projectScionDir, agentName, false)
 	savedFile := filepath.Join(agentDir, "scion-agent.json")
 	savedData, err := os.ReadFile(savedFile)
@@ -168,9 +185,113 @@ harness_configs:
 	if len(diskCfg.Docker.Networks) != len(wantNets) {
 		t.Errorf("persisted networks = %v, want %v", diskCfg.Docker.Networks, wantNets)
 	}
+	if len(diskCfg.Docker.Devices) != len(wantDevices) {
+		t.Errorf("persisted devices = %v, want %v", diskCfg.Docker.Devices, wantDevices)
+	}
+	for i, device := range wantDevices {
+		if diskCfg.Docker.Devices[i] != device {
+			t.Errorf("persisted devices[%d] = %q, want %q", i, diskCfg.Docker.Devices[i], device)
+		}
+	}
 	for k, wantVal := range wantLabels {
 		if diskCfg.Docker.Labels[k] != wantVal {
 			t.Errorf("persisted label[%q] = %q, want %q", k, diskCfg.Docker.Labels[k], wantVal)
+		}
+	}
+}
+
+func TestValidateDockerDeviceRuntime(t *testing.T) {
+	tests := []struct {
+		name        string
+		runtimeName string
+		devices     []string
+		wantErr     bool
+	}{
+		{name: "Docker CDI", runtimeName: "docker", devices: []string{"nvidia.com/gpu=all"}},
+		{name: "Podman host mapping", runtimeName: "podman", devices: []string{"/dev/dri:/dev/dri"}},
+		{name: "mock supports unit tests", runtimeName: "mock", devices: []string{"nvidia.com/gpu=all"}},
+		{name: "no device request", runtimeName: "kubernetes"},
+		{name: "empty device request", runtimeName: "cloudrun", devices: []string{""}},
+		{name: "Apple container rejected", runtimeName: "container", devices: []string{"nvidia.com/gpu=all"}, wantErr: true},
+		{name: "Kubernetes rejected", runtimeName: "kubernetes", devices: []string{"nvidia.com/gpu=all"}, wantErr: true},
+		{name: "Cloud Run rejected", runtimeName: "cloudrun", devices: []string{"nvidia.com/gpu=all"}, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDockerDeviceRuntime(tc.runtimeName, tc.devices)
+			if tc.wantErr && err == nil {
+				t.Fatal("validateDockerDeviceRuntime() error = nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateDockerDeviceRuntime() error = %v, want nil", err)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), tc.runtimeName) {
+				t.Errorf("error %q does not identify runtime %q", err, tc.runtimeName)
+			}
+		})
+	}
+}
+
+func TestStartPassesDockerDevicesToRuntime(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
+
+	tplDir := filepath.Join(globalScionDir, "templates", "device-tpl")
+	_ = os.MkdirAll(tplDir, 0755)
+	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(`{
+		"default_harness_config": "generic",
+		"docker": {"devices": ["nvidia.com/gpu=all", "/dev/dri"]}
+	}`), 0644)
+	_ = os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+`), 0644)
+
+	projectScionDir := filepath.Join(tmpDir, "project", ".scion")
+	_ = os.MkdirAll(projectScionDir, 0755)
+
+	var captured runtime.RunConfig
+	mockRuntime := &runtime.MockRuntime{
+		ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) {
+			return nil, nil
+		},
+		RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
+			captured = cfg
+			return "mock-id", nil
+		},
+	}
+
+	mgr := NewManager(mockRuntime)
+	_, err := mgr.Start(context.Background(), api.StartOptions{
+		Name:        "device-agent",
+		Template:    "device-tpl",
+		ProjectPath: projectScionDir,
+		NoAuth:      true,
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	want := []string{"nvidia.com/gpu=all", "/dev/dri"}
+	if len(captured.Devices) != len(want) {
+		t.Fatalf("RunConfig.Devices = %v, want %v", captured.Devices, want)
+	}
+	for i := range want {
+		if captured.Devices[i] != want[i] {
+			t.Errorf("RunConfig.Devices[%d] = %q, want %q", i, captured.Devices[i], want[i])
 		}
 	}
 }

@@ -718,6 +718,11 @@
               "items": { "type": "string" },
               "description": "Custom Docker networks to join."
             },
+            "devices": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Docker device mappings or CDI selectors to grant to the container."
+            },
             "labels": {
               "type": "object",
               "additionalProperties": { "type": "string" },

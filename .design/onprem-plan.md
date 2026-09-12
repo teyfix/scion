@@ -87,12 +87,13 @@ handlers and runtime broker hydration cache.
 
 ## MS2 — Docker execution, networks, and runtime labels
 
-- [ ] Carry privileged mode and CDI requests such as `nvidia.com/gpu=all`
+- [x] Carry privileged mode and CDI requests such as `nvidia.com/gpu=all`
   through configuration, Hub applied config, dispatch, and Docker execution.
   (Privileged mode tri-state UI/API/dispatch/Docker execution and NvidiaGPU
-  broker requirement matching completed; Docker CDI device flag forwarding remains).
+  broker requirement matching completed; Docker CDI/device flag forwarding
+  completed via `docker.devices`.)
 - [ ] Verify existing environment, volumes, resources, and user handling;
-  complete required device, capability, security-option, and network transport
+  complete required capability, security-option, and network transport
   without silently dropping configured options or introducing WSL paths.
 - [ ] Add per-service `user: root` and `required: true`. A required service's
   startup/readiness failure or permanent runtime failure must fail the agent.

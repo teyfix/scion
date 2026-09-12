@@ -2334,6 +2334,7 @@ func TestCloneDockerConfig(t *testing.T) {
 	orig := &api.DockerConfig{
 		Privileged: &priv,
 		Networks:   []string{"net1", "net2"},
+		Devices:    []string{"nvidia.com/gpu=all", "/dev/fuse"},
 		Labels: map[string]string{
 			"key1": "val1",
 			"key2": "val2",
@@ -2350,6 +2351,9 @@ func TestCloneDockerConfig(t *testing.T) {
 	if len(clone.Networks) != 2 || clone.Networks[0] != "net1" || clone.Networks[1] != "net2" {
 		t.Errorf("clone.Networks = %v, want [net1 net2]", clone.Networks)
 	}
+	if len(clone.Devices) != 2 || clone.Devices[0] != "nvidia.com/gpu=all" || clone.Devices[1] != "/dev/fuse" {
+		t.Errorf("clone.Devices = %v, want [nvidia.com/gpu=all /dev/fuse]", clone.Devices)
+	}
 	if len(clone.Labels) != 2 || clone.Labels["key1"] != "val1" || clone.Labels["key2"] != "val2" {
 		t.Errorf("clone.Labels = %v, want key1:val1, key2:val2", clone.Labels)
 	}
@@ -2357,6 +2361,7 @@ func TestCloneDockerConfig(t *testing.T) {
 	// Verify deep copy isolation
 	*orig.Privileged = false
 	orig.Networks[0] = "mutated"
+	orig.Devices[0] = "mutated"
 	orig.Labels["key1"] = "mutated"
 
 	if *clone.Privileged != true {
@@ -2365,15 +2370,19 @@ func TestCloneDockerConfig(t *testing.T) {
 	if clone.Networks[0] != "net1" {
 		t.Errorf("clone.Networks mutated with original")
 	}
+	if clone.Devices[0] != "nvidia.com/gpu=all" {
+		t.Errorf("clone.Devices mutated with original")
+	}
 	if clone.Labels["key1"] != "val1" {
 		t.Errorf("clone.Labels mutated with original")
 	}
 }
 
-func TestMergeScionConfig_Docker_NetworksAndLabels(t *testing.T) {
+func TestMergeScionConfig_Docker_NetworksDevicesAndLabels(t *testing.T) {
 	base := &api.ScionConfig{
 		Docker: &api.DockerConfig{
 			Networks: []string{"profile-net", "shared-net"},
+			Devices:  []string{"nvidia.com/gpu=all", "/dev/fuse"},
 			Labels: map[string]string{
 				"env":     "prod",
 				"profile": "default",
@@ -2384,6 +2393,7 @@ func TestMergeScionConfig_Docker_NetworksAndLabels(t *testing.T) {
 	override := &api.ScionConfig{
 		Docker: &api.DockerConfig{
 			Networks: []string{"shared-net", "template-net", ""},
+			Devices:  []string{"/dev/fuse", "/dev/dri", ""},
 			Labels: map[string]string{
 				"env":      "staging", // should overwrite base
 				"template": "agent-v1",
@@ -2404,6 +2414,17 @@ func TestMergeScionConfig_Docker_NetworksAndLabels(t *testing.T) {
 	for i, net := range expectedNets {
 		if merged.Docker.Networks[i] != net {
 			t.Errorf("merged.Docker.Networks[%d] = %q, want %q", i, merged.Docker.Networks[i], net)
+		}
+	}
+
+	// Verify Devices union and deduplication preserving base order.
+	expectedDevices := []string{"nvidia.com/gpu=all", "/dev/fuse", "/dev/dri"}
+	if len(merged.Docker.Devices) != len(expectedDevices) {
+		t.Fatalf("merged.Docker.Devices = %v, want %v", merged.Docker.Devices, expectedDevices)
+	}
+	for i, device := range expectedDevices {
+		if merged.Docker.Devices[i] != device {
+			t.Errorf("merged.Docker.Devices[%d] = %q, want %q", i, merged.Docker.Devices[i], device)
 		}
 	}
 
