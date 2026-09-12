@@ -265,6 +265,23 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 		}
 	}
 
+	var parsedCaps *store.BrokerCapabilities
+	if len(req.Capabilities) > 0 {
+		parsedCaps = &store.BrokerCapabilities{}
+		for _, c := range req.Capabilities {
+			switch strings.ToLower(c) {
+			case "sync":
+				parsedCaps.Sync = true
+			case "attach":
+				parsedCaps.Attach = true
+			case "gpu", "nvidiagpu":
+				parsedCaps.NvidiaGPU = true
+			case "webpty":
+				parsedCaps.WebPTY = true
+			}
+		}
+	}
+
 	if existingBroker != nil {
 		// Reuse existing broker - update its metadata
 		brokerID = existingBroker.ID
@@ -272,6 +289,9 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 		existingBroker.AutoProvide = req.AutoProvide
 		existingBroker.GCPHostServiceAccountEmail = req.GCPHostServiceAccountEmail
 		existingBroker.GCPHostProjectID = req.GCPHostProjectID
+		if parsedCaps != nil {
+			existingBroker.Capabilities = parsedCaps
+		}
 		// Merge request labels into existing labels to preserve any
 		// user-set labels while updating registration-provided ones.
 		if len(req.Labels) > 0 {
@@ -300,6 +320,7 @@ func (s *BrokerAuthService) CreateBrokerRegistration(ctx context.Context, req Cr
 			Slug:                       slugify(req.Name),
 			Status:                     store.BrokerStatusOffline,
 			AutoProvide:                req.AutoProvide,
+			Capabilities:               parsedCaps,
 			Labels:                     req.Labels,
 			GCPHostServiceAccountEmail: req.GCPHostServiceAccountEmail,
 			GCPHostProjectID:           req.GCPHostProjectID,

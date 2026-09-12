@@ -536,16 +536,17 @@ func runBrokerRegister(cmd *cobra.Command, args []string) error {
 	// Phase 1 & 2: Create broker and complete join if needed
 	if needsJoin || brokerID == "" {
 		fmt.Printf("Registering broker with Hub...\n")
+		baseCaps := []string{"sync", "attach"}
+		if os.Getenv("SCION_NVIDIA_GPU") == "true" {
+			baseCaps = append(baseCaps, "gpu")
+		}
 
 		// Phase 1: Create broker registration
 		createReq := &hubclient.CreateBrokerRequest{
-			BrokerID: stableBrokerID,
-			Name:     brokerName,
-			Capabilities: []string{
-				"sync",
-				"attach",
-			},
-			AutoProvide: brokerAutoProvide,
+			BrokerID:     stableBrokerID,
+			Name:         brokerName,
+			Capabilities: baseCaps,
+			AutoProvide:  brokerAutoProvide,
 			Labels: map[string]string{
 				"scion.io/broker-role": "remote",
 			},
@@ -567,15 +568,12 @@ func runBrokerRegister(cmd *cobra.Command, args []string) error {
 
 		// Phase 2: Complete broker join with join token
 		joinReq := &hubclient.JoinBrokerRequest{
-			BrokerID:  createResp.BrokerID,
-			JoinToken: createResp.JoinToken,
-			Hostname:  brokerName,
-			Version:   version.Version,
-			Capabilities: []string{
-				"sync",
-				"attach",
-			},
-			Profiles: profiles,
+			BrokerID:     createResp.BrokerID,
+			JoinToken:    createResp.JoinToken,
+			Hostname:     brokerName,
+			Version:      version.Version,
+			Capabilities: baseCaps,
+			Profiles:     profiles,
 		}
 
 		joinResp, err := client.RuntimeBrokers().Join(ctx, joinReq)
