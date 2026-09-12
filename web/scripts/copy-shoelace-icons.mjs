@@ -123,6 +123,7 @@ const USED_ICONS = [
   'grid-3x3-gap',
   'hammer',
   'google',
+  'gpu-card',
   'hash',
   'hdd-rack',
   'heart-pulse',
@@ -204,6 +205,13 @@ for (const name of USED_ICONS) {
     console.warn(`  warning: icon "${name}.svg" not found in Shoelace or Bootstrap Icons`);
     missing++;
   }
+}
+
+// Also provide 'gpu' alias for 'gpu-card' if requested
+const gpuCardDest = resolve(DEST, 'gpu-card.svg');
+const gpuDest = resolve(DEST, 'gpu.svg');
+if (existsSync(gpuCardDest)) {
+  cpSync(gpuCardDest, gpuDest);
 }
 
 console.log(`Shoelace icons: ${copied} copied${missing ? `, ${missing} missing` : ''}`);

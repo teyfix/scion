@@ -1187,6 +1187,13 @@ export class ScionPageAgentDetail extends LitElement {
               mode=${agent.messageMode || 'project'}
               size="medium"
             ></scion-message-mode-badge>
+            ${agent.appliedConfig?.inlineConfig?.docker?.privileged === true ||
+            agent.appliedConfig?.docker?.privileged === true
+              ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+              : ''}
+            ${agent.appliedConfig?.requireGpu === true
+              ? html`<scion-status-badge status="neutral" icon="gpu">GPU</scion-status-badge>`
+              : ''}
           </div>
           <div class="header-meta">
             <span class="template-badge">
@@ -2080,6 +2087,9 @@ export class ScionPageAgentDetail extends LitElement {
     const image = agent.image || inline?.image || agent.appliedConfig?.image;
     const branch = inline?.branch;
     const profile = agent.appliedConfig?.profile;
+    const isPrivileged =
+      agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
+    const requireGpu = agent.appliedConfig?.requireGpu;
 
     return html`
       <div class="card">
@@ -2117,6 +2127,24 @@ export class ScionPageAgentDetail extends LitElement {
                 </div>
               `
             : ''}
+          <div class="info-item">
+            <span class="info-label">Privileged</span>
+            <span class="info-value">
+              ${isPrivileged !== undefined
+                ? isPrivileged
+                  ? html`<sl-badge variant="warning">Privileged</sl-badge>`
+                  : html`<sl-badge variant="neutral">Unprivileged</sl-badge>`
+                : html`<span style="color: var(--scion-text-muted, #888);">Default</span>`}
+            </span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">GPU Required</span>
+            <span class="info-value">
+              ${requireGpu
+                ? html`<sl-badge variant="primary">Required</sl-badge>`
+                : html`<span style="color: var(--scion-text-muted, #888);">No</span>`}
+            </span>
+          </div>
           ${image
             ? html`
                 <div class="info-item">

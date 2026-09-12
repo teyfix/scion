@@ -154,6 +154,7 @@ type AgentAppliedConfig struct {
 	Branch        string              `json:"branch,omitempty"`    // Git branch name (defaults to agent slug if empty)
 	Workspace     string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
 	GitClone      *api.GitCloneConfig `json:"gitClone,omitempty"`
+	RequireGPU    bool                `json:"requireGpu,omitempty"`
 
 	// Template info for Runtime Broker hydration
 	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching
@@ -441,18 +442,20 @@ type RuntimeBroker struct {
 
 // BrokerCapabilities describes what a runtime broker can do.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
+	WebPTY    bool `json:"webPty"`
+	Sync      bool `json:"sync"`
+	Attach    bool `json:"attach"`
+	NvidiaGPU bool `json:"nvidiaGpu,omitempty"`
 }
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
-	Type      string `json:"type"` // docker, kubernetes, apple
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`   // K8s context
-	Namespace string `json:"namespace,omitempty"` // K8s namespace
+	Name       string `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
+	Type       string `json:"type"` // docker, kubernetes, apple
+	Available  bool   `json:"available"`
+	Context    string `json:"context,omitempty"`   // K8s context
+	Namespace  string `json:"namespace,omitempty"` // K8s namespace
+	Privileged *bool  `json:"privileged,omitempty"`
 }
 
 // ProjectProvider links a runtime broker to a project.

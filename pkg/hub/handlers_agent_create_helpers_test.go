@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -1476,5 +1477,272 @@ func TestPopulateAgentConfig_DockerTemplateDefaults(t *testing.T) {
 		if agent.AppliedConfig.InlineConfig != nil && agent.AppliedConfig.InlineConfig.Docker != nil {
 			assert.Nil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
 		}
+	})
+}
+
+func TestBuildAppliedConfig_RequireGPU(t *testing.T) {
+	srv, _ := testServer(t)
+
+	// When RequireGPU is true
+	req := CreateAgentRequest{
+		RequireGPU: true,
+		Task:       "run training",
+	}
+	ac := srv.buildAppliedConfig(req, "test-harness", "alice", AgentRoleBaseline)
+	assert.True(t, ac.RequireGPU)
+
+	// When RequireGPU is false
+	reqFalse := CreateAgentRequest{
+		RequireGPU: false,
+		Task:       "run build",
+	}
+	acFalse := srv.buildAppliedConfig(reqFalse, "test-harness", "alice", AgentRoleBaseline)
+	assert.False(t, acFalse.RequireGPU)
+}
+
+func TestResolveRuntimeBroker_RequireGPU_Explicit(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := contextWithIdentity(context.Background(), NewDevUser(DevUserConfig{
+		Username:    "dev",
+		DisplayName: "Dev User",
+		Email:       "dev@localhost",
+	}))
+
+	gpuBroker := &store.RuntimeBroker{
+		ID:     tid("gpu-broker"),
+		Name:   "GPU Broker",
+		Slug:   "gpu-broker",
+		Status: store.BrokerStatusOnline,
+		Capabilities: &store.BrokerCapabilities{
+			NvidiaGPU: true,
+		},
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, gpuBroker))
+
+	noGpuBroker := &store.RuntimeBroker{
+		ID:     tid("nogpu-broker"),
+		Name:   "No GPU Broker",
+		Slug:   "nogpu-broker",
+		Status: store.BrokerStatusOnline,
+		Capabilities: &store.BrokerCapabilities{
+			NvidiaGPU: false,
+		},
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, noGpuBroker))
+
+	project := &store.Project{
+		ID:   tid("gpu-proj"),
+		Slug: "gpu-proj",
+		Name: "GPU Project",
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   gpuBroker.ID,
+		BrokerName: gpuBroker.Name,
+		Status:     store.BrokerStatusOnline,
+	}))
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   noGpuBroker.ID,
+		BrokerName: noGpuBroker.Name,
+		Status:     store.BrokerStatusOnline,
+	}))
+
+	t.Run("explicit broker with GPU succeeds", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, gpuBroker.ID, project, true)
+		assert.NoError(t, err)
+		assert.Equal(t, gpuBroker.ID, brokerID)
+	})
+
+	t.Run("explicit broker without GPU returns 422 ErrCodeBrokerLacksGPU", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, noGpuBroker.ID, project, true)
+		assert.ErrorIs(t, err, ErrBrokerLacksGPU)
+		assert.Empty(t, brokerID)
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, ErrCodeBrokerLacksGPU, resp.Error.Code)
+	})
+
+	t.Run("auto-linking broker with GPU succeeds", func(t *testing.T) {
+		unlinkedGPUBroker := &store.RuntimeBroker{
+			ID:     tid("unlinked-gpu"),
+			Name:   "Unlinked GPU",
+			Slug:   "unlinked-gpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: true,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, unlinkedGPUBroker))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, unlinkedGPUBroker.ID, project, true)
+		assert.NoError(t, err)
+		assert.Equal(t, unlinkedGPUBroker.ID, brokerID)
+	})
+
+	t.Run("auto-linking broker without GPU returns 422 ErrCodeBrokerLacksGPU", func(t *testing.T) {
+		unlinkedNoGPUBroker := &store.RuntimeBroker{
+			ID:     tid("unlinked-nogpu"),
+			Name:   "Unlinked No GPU",
+			Slug:   "unlinked-nogpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: false,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, unlinkedNoGPUBroker))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, unlinkedNoGPUBroker.ID, project, true)
+		assert.ErrorIs(t, err, ErrBrokerLacksGPU)
+		assert.Empty(t, brokerID)
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, ErrCodeBrokerLacksGPU, resp.Error.Code)
+	})
+}
+
+func TestResolveRuntimeBroker_RequireGPU_AutoSelect(t *testing.T) {
+	ctx := contextWithIdentity(context.Background(), NewDevUser(DevUserConfig{
+		Username:    "dev",
+		DisplayName: "Dev User",
+		Email:       "dev@localhost",
+	}))
+
+	t.Run("single provider without GPU returns error when GPU required", func(t *testing.T) {
+		srv, s := testServer(t)
+		broker := &store.RuntimeBroker{
+			ID:     tid("single-nogpu"),
+			Name:   "Single No GPU",
+			Slug:   "single-nogpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: false,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+		project := &store.Project{ID: tid("single-nogpu-proj"), Slug: "single-nogpu-proj", Name: "Single No GPU Proj"}
+		require.NoError(t, s.CreateProject(ctx, project))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: broker.ID, BrokerName: broker.Name, Status: store.BrokerStatusOnline,
+		}))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
+		assert.Error(t, err)
+		assert.Empty(t, brokerID)
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	})
+
+	t.Run("single provider with GPU is auto-selected when GPU required", func(t *testing.T) {
+		srv, s := testServer(t)
+		broker := &store.RuntimeBroker{
+			ID:     tid("single-gpu"),
+			Name:   "Single GPU",
+			Slug:   "single-gpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: true,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+		project := &store.Project{ID: tid("single-gpu-proj"), Slug: "single-gpu-proj", Name: "Single GPU Proj"}
+		require.NoError(t, s.CreateProject(ctx, project))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: broker.ID, BrokerName: broker.Name, Status: store.BrokerStatusOnline,
+		}))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
+		assert.NoError(t, err)
+		assert.Equal(t, broker.ID, brokerID)
+	})
+
+	t.Run("multiple providers with only one GPU broker auto-selects the GPU broker", func(t *testing.T) {
+		srv, s := testServer(t)
+		gpuBroker := &store.RuntimeBroker{
+			ID:     tid("multi-gpu"),
+			Name:   "Multi GPU",
+			Slug:   "multi-gpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: true,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, gpuBroker))
+
+		cpuBroker := &store.RuntimeBroker{
+			ID:     tid("multi-cpu"),
+			Name:   "Multi CPU",
+			Slug:   "multi-cpu",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: false,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, cpuBroker))
+
+		project := &store.Project{ID: tid("multi-proj"), Slug: "multi-proj", Name: "Multi Proj"}
+		require.NoError(t, s.CreateProject(ctx, project))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: gpuBroker.ID, BrokerName: gpuBroker.Name, Status: store.BrokerStatusOnline,
+		}))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: cpuBroker.ID, BrokerName: cpuBroker.Name, Status: store.BrokerStatusOnline,
+		}))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
+		assert.NoError(t, err)
+		assert.Equal(t, gpuBroker.ID, brokerID)
+	})
+
+	t.Run("multiple providers with multiple GPU brokers requires explicit selection", func(t *testing.T) {
+		srv, s := testServer(t)
+		gpu1 := &store.RuntimeBroker{
+			ID:     tid("multi-gpu-1"),
+			Name:   "Multi GPU 1",
+			Slug:   "multi-gpu-1",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: true,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, gpu1))
+
+		gpu2 := &store.RuntimeBroker{
+			ID:     tid("multi-gpu-2"),
+			Name:   "Multi GPU 2",
+			Slug:   "multi-gpu-2",
+			Status: store.BrokerStatusOnline,
+			Capabilities: &store.BrokerCapabilities{
+				NvidiaGPU: true,
+			},
+		}
+		require.NoError(t, s.CreateRuntimeBroker(ctx, gpu2))
+
+		project := &store.Project{ID: tid("multi-gpu-proj"), Slug: "multi-gpu-proj", Name: "Multi GPU Proj"}
+		require.NoError(t, s.CreateProject(ctx, project))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: gpu1.ID, BrokerName: gpu1.Name, Status: store.BrokerStatusOnline,
+		}))
+		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+			ProjectID: project.ID, BrokerID: gpu2.ID, BrokerName: gpu2.Name, Status: store.BrokerStatusOnline,
+		}))
+
+		w := httptest.NewRecorder()
+		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
+		assert.Error(t, err)
+		assert.Empty(t, brokerID)
+		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
 	})
 }

@@ -84,19 +84,21 @@ func (r BrokerInfoResponse) MarshalJSON() ([]byte, error) {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Available  bool   `json:"available"`
+	Context    string `json:"context,omitempty"`
+	Namespace  string `json:"namespace,omitempty"`
+	Privileged *bool  `json:"privileged,omitempty"`
 }
 
 // BrokerCapabilities describes what this runtime broker can do.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
-	Exec   bool `json:"exec"`
+	WebPTY    bool `json:"webPty"`
+	Sync      bool `json:"sync"`
+	Attach    bool `json:"attach"`
+	Exec      bool `json:"exec"`
+	NvidiaGPU bool `json:"nvidiaGpu,omitempty"`
 }
 
 // ProjectInfo is a summary of a project registered on this broker.

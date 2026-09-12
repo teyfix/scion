@@ -1964,12 +1964,18 @@ func buildBrokerProfiles(settings *config.Settings) []hubclient.BrokerProfile {
 			}
 		}
 
+		var privileged *bool
+		if profileCfg.Docker != nil {
+			privileged = profileCfg.Docker.Privileged
+		}
+
 		profiles = append(profiles, hubclient.BrokerProfile{
-			Name:      name,
-			Type:      runtimeType,
-			Available: true,
-			Context:   context,
-			Namespace: namespace,
+			Name:       name,
+			Type:       runtimeType,
+			Available:  true,
+			Context:    context,
+			Namespace:  namespace,
+			Privileged: privileged,
 		})
 	}
 

@@ -402,6 +402,7 @@ export interface AgentInlineConfig {
   task?: string;
   image?: string;
   telemetry?: TelemetryConfig;
+  docker?: { privileged?: boolean };
 }
 
 export type SupportLevel = 'no' | 'partial' | 'yes';
@@ -455,6 +456,8 @@ export interface AgentAppliedConfig {
   inlineConfig?: AgentInlineConfig;
   gcpIdentity?: GCPIdentityConfig;
   agentRole?: string;
+  docker?: { privileged?: boolean };
+  requireGpu?: boolean;
 }
 
 /**
@@ -674,6 +677,7 @@ export interface BrokerCapabilities {
   webPTY: boolean;
   sync: boolean;
   attach: boolean;
+  nvidiaGpu?: boolean;
 }
 
 /**
@@ -683,6 +687,7 @@ export interface BrokerProfile {
   name: string;
   type: string;
   available: boolean;
+  privileged?: boolean | null;
 }
 
 /**

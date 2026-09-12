@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -91,6 +92,7 @@ func (s *Server) buildAppliedConfig(req CreateAgentRequest, harnessConfig string
 		Workspace:     req.Workspace,
 		CreatorName:   creatorName,
 		AgentRole:     string(effectiveRole),
+		RequireGPU:    req.RequireGPU,
 	}
 
 	ac.NoAuth = req.NoAuth
@@ -952,7 +954,9 @@ func (s *Server) handleExistingAgent(
 //  5. No providers - returns error
 //
 // Returns the runtime broker ID or an error (after writing the HTTP error response).
-func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter, requestedBrokerID string, project *store.Project) (string, error) {
+func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter, requestedBrokerID string, project *store.Project, requireGPU ...bool) (string, error) {
+	needGPU := len(requireGPU) > 0 && requireGPU[0]
+
 	// Get ALL providers for this project (regardless of status)
 	allProviders, err := s.store.GetProjectProviders(ctx, project.ID)
 	if err != nil {
@@ -967,13 +971,24 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		return "", err
 	}
 
+	if needGPU {
+		var gpuBrokers []store.RuntimeBroker
+		for _, b := range availableBrokers {
+			if b.Capabilities != nil && b.Capabilities.NvidiaGPU {
+				gpuBrokers = append(gpuBrokers, b)
+			}
+		}
+		availableBrokers = gpuBrokers
+	}
+
 	slog.Debug("Resolving runtime broker",
 		"project_id", project.ID, "projectName", project.Name,
 		"requestedBroker", requestedBrokerID,
 		"totalProviders", len(allProviders),
 		"onlineProviders", len(availableBrokers),
 		"defaultBroker", project.DefaultRuntimeBrokerID,
-		"isHubNative", project.GitRemote == "")
+		"isHubNative", project.GitRemote == "",
+		"requireGPU", needGPU)
 
 	// Convert to summary for error responses, marking and prioritizing the default broker
 	brokerSummaries := make([]RuntimeBrokerSummary, 0, len(availableBrokers))
@@ -1000,13 +1015,28 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 	if requestedBrokerID != "" {
 		// Check if the requested broker is a provider to this project (by ID, Name, or Slug)
 		for _, p := range allProviders {
+			var matchedBroker *store.RuntimeBroker
 			if p.BrokerID == requestedBrokerID || p.BrokerName == requestedBrokerID {
-				return p.BrokerID, nil
+				b, err := s.store.GetRuntimeBroker(ctx, p.BrokerID)
+				if err != nil {
+					writeErrorFromErr(w, err, "")
+					return "", err
+				}
+				matchedBroker = b
+			} else {
+				// Fetch broker to check slug
+				b, err := s.store.GetRuntimeBroker(ctx, p.BrokerID)
+				if err == nil && b.Slug == requestedBrokerID {
+					matchedBroker = b
+				}
 			}
-			// Fetch broker to check slug
-			broker, err := s.store.GetRuntimeBroker(ctx, p.BrokerID)
-			if err == nil && broker.Slug == requestedBrokerID {
-				return broker.ID, nil
+
+			if matchedBroker != nil {
+				if needGPU && (matchedBroker.Capabilities == nil || !matchedBroker.Capabilities.NvidiaGPU) {
+					BrokerLacksGPU(w, fmt.Sprintf("Runtime broker %q does not support GPU", matchedBroker.Name))
+					return "", ErrBrokerLacksGPU
+				}
+				return matchedBroker.ID, nil
 			}
 		}
 
@@ -1016,6 +1046,10 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		// providers aren't established via CLI registration.
 		broker, err := s.findBrokerByIDOrSlug(ctx, requestedBrokerID)
 		if err == nil && broker != nil {
+			if needGPU && (broker.Capabilities == nil || !broker.Capabilities.NvidiaGPU) {
+				BrokerLacksGPU(w, fmt.Sprintf("Runtime broker %q does not support GPU", broker.Name))
+				return "", ErrBrokerLacksGPU
+			}
 			provider := &store.ProjectProvider{
 				ProjectID:  project.ID,
 				BrokerID:   broker.ID,
@@ -1095,7 +1129,7 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 	// exactly one provider and its broker is online and dispatchable.
 	if len(allProviders) == 1 {
 		broker, brokerErr := s.store.GetRuntimeBroker(ctx, allProviders[0].BrokerID)
-		if brokerErr == nil && broker.Status == store.BrokerStatusOnline && s.canDispatchToBroker(ctx, broker) {
+		if brokerErr == nil && broker.Status == store.BrokerStatusOnline && s.canDispatchToBroker(ctx, broker) && (!needGPU || (broker.Capabilities != nil && broker.Capabilities.NvidiaGPU)) {
 			return allProviders[0].BrokerID, nil
 		}
 		NoRuntimeBroker(w, "No runtime brokers available for this project that you have permission to use", brokerSummaries)

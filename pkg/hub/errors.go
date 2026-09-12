@@ -56,6 +56,7 @@ const (
 	ErrCodeUnavailable          = "unavailable"
 	ErrCodeNoRuntimeBroker      = "no_runtime_broker"
 	ErrCodeRuntimeBrokerUnavail = "runtime_broker_unavailable"
+	ErrCodeBrokerLacksGPU       = "broker_lacks_gpu"
 
 	ErrCodeMissingEnvVars = "missing_env_vars"
 	ErrCodeCloneFailed    = "clone_failed"
@@ -331,6 +332,15 @@ func NoRuntimeBroker(w http.ResponseWriter, message string, availableBrokers []R
 		"availableBrokers": availableBrokers,
 	}
 	writeError(w, http.StatusUnprocessableEntity, ErrCodeNoRuntimeBroker, message, details)
+}
+
+// ErrBrokerLacksGPU is returned when a broker does not satisfy the GPU requirement.
+var ErrBrokerLacksGPU = errors.New("runtime broker lacks GPU capability")
+
+// BrokerLacksGPU writes a 422 Unprocessable Entity response when the requested
+// runtime broker does not support GPU.
+func BrokerLacksGPU(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusUnprocessableEntity, ErrCodeBrokerLacksGPU, message, nil)
 }
 
 // ServiceNotReady writes a 503 Service Unavailable response with a Retry-After

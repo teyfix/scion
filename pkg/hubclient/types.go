@@ -364,18 +364,20 @@ func (b RuntimeBroker) MarshalJSON() ([]byte, error) {
 
 // BrokerCapabilities describes runtime broker capabilities.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
+	WebPTY    bool `json:"webPty"`
+	Sync      bool `json:"sync"`
+	Attach    bool `json:"attach"`
+	NvidiaGPU bool `json:"nvidiaGpu,omitempty"`
 }
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Available  bool   `json:"available"`
+	Context    string `json:"context,omitempty"`
+	Namespace  string `json:"namespace,omitempty"`
+	Privileged *bool  `json:"privileged,omitempty"`
 }
 
 // BrokerProjectInfo describes a project from a broker's perspective.

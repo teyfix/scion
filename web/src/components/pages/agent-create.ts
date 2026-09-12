@@ -81,6 +81,8 @@ export class ScionPageAgentCreate extends LitElement {
   @state() private thinkingLevel: number | null = null;
   @state() private image = '';
   @state() private containerUser = '';
+  @state() private dockerPrivileged: 'inherit' | 'enabled' | 'disabled' = 'inherit';
+  @state() private requireGpu = false;
   @state() private telemetryEnabled = false;
   @state() private autoExposePortsEnabled = false;
   @state() private hubDefaultRuntimeBroker = '';
@@ -806,6 +808,13 @@ export class ScionPageAgentCreate extends LitElement {
     if (this.image) config.image = this.image;
     if (this.containerUser) config.user = this.containerUser;
 
+    // Docker privileged
+    if (this.dockerPrivileged === 'enabled') {
+      config.docker = { privileged: true };
+    } else if (this.dockerPrivileged === 'disabled') {
+      config.docker = { privileged: false };
+    }
+
     // Auth
     if (this.harnessAuth) config.auth_selectedType = this.harnessAuth;
 
@@ -913,6 +922,7 @@ export class ScionPageAgentCreate extends LitElement {
       if (this.task.trim()) body.task = this.task.trim();
       if (this.agentRole) body.agentRole = this.agentRole;
       if (this.messageMode) body.messageMode = this.messageMode;
+      if (this.requireGpu) body.requireGpu = true;
       if (provisionOnly) body.provisionOnly = true;
 
       const builtLabels = this.buildLabels();
@@ -1256,14 +1266,29 @@ export class ScionPageAgentCreate extends LitElement {
             this.autoSelectProfile();
           }}
         >
-          ${this.brokers.map(
-            (b) =>
-              html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
-                ${b.name} (${b.status})
-              </sl-option>`
-          )}
+          ${this.brokers.map((b) => {
+            const hasGpu = Boolean(
+              b.capabilities?.nvidiaGpu ||
+                (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+            );
+            const isGpuDisabled = this.requireGpu && !hasGpu;
+            const disabled = b.status === 'offline' || isGpuDisabled;
+            return html`<sl-option
+              value=${b.id}
+              ?disabled=${disabled}
+              title=${isGpuDisabled ? 'Requires GPU support' : ''}
+            >
+              ${b.name} (${b.status})${hasGpu
+                ? html` <scion-status-badge status="neutral" icon="gpu" size="small">GPU</scion-status-badge>`
+                : ''}
+            </sl-option>`;
+          })}
         </sl-select>
-        <div class="hint">The compute node that will run this agent.</div>
+        <div class="hint">
+          ${this.requireGpu
+            ? 'The compute node that will run this agent (brokers without GPU support are disabled).'
+            : 'The compute node that will run this agent.'}
+        </div>
       </div>
 
       <!-- Runtime Profile (conditional: broker has profiles) -->
@@ -1443,6 +1468,75 @@ export class ScionPageAgentCreate extends LitElement {
             this.containerUser = (e.target as HTMLElement & { value: string }).value;
           }}
         ></sl-input>
+      </div>
+
+      <!-- Container Privileges -->
+      <div class="form-field">
+        <label>Container Privileges</label>
+        <sl-radio-group
+          .value=${this.dockerPrivileged}
+          @sl-change=${(e: Event) => {
+            this.dockerPrivileged = (e.target as HTMLElement & { value: string })
+              .value as typeof this.dockerPrivileged;
+          }}
+        >
+          <sl-radio-button value="inherit">Inherit</sl-radio-button>
+          <sl-radio-button value="enabled">Enabled</sl-radio-button>
+          <sl-radio-button value="disabled">Disabled</sl-radio-button>
+        </sl-radio-group>
+        <div class="hint">
+          ${this.dockerPrivileged === 'enabled'
+            ? 'Container runs with extended privileges (full host capabilities).'
+            : this.dockerPrivileged === 'disabled'
+              ? 'Container runs unprivileged.'
+              : 'Inherit privileged mode from broker profile or runtime defaults.'}
+        </div>
+      </div>
+
+      <!-- Require GPU -->
+      <div class="notify-field">
+        <sl-checkbox
+          ?checked=${this.requireGpu}
+          @sl-change=${(e: Event) => {
+            this.requireGpu = (e.target as HTMLInputElement).checked;
+            if (this.requireGpu) {
+              const currentBroker = this.brokers.find((b) => b.id === this.brokerId);
+              const currentHasGpu =
+                currentBroker &&
+                Boolean(
+                  currentBroker.capabilities?.nvidiaGpu ||
+                    (currentBroker._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                );
+              if (!currentHasGpu) {
+                const gpuBroker =
+                  this.brokers.find(
+                    (b) =>
+                      b.status === 'online' &&
+                      Boolean(
+                        b.capabilities?.nvidiaGpu ||
+                          (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                      )
+                  ) ||
+                  this.brokers.find((b) =>
+                    Boolean(
+                      b.capabilities?.nvidiaGpu ||
+                        (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                    )
+                  );
+                this.brokerId = gpuBroker ? gpuBroker.id : '';
+                this.autoSelectProfile();
+              }
+            }
+          }}
+        >
+          Require GPU
+        </sl-checkbox>
+        <sl-tooltip
+          content="Require an NVIDIA GPU for this agent. Only GPU-capable brokers will be selectable."
+          hoist
+        >
+          <span class="help-badge">?</span>
+        </sl-tooltip>
       </div>
 
       <!-- Telemetry -->

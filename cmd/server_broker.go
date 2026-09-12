@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -121,9 +122,10 @@ func registerGlobalProjectAndBroker(ctx context.Context, s store.Store, brokerID
 			GCPHostServiceAccountEmail: detectedSAEmail,
 			GCPHostProjectID:           detectedProjectID,
 			Capabilities: &store.BrokerCapabilities{
-				WebPTY: false,
-				Sync:   true,
-				Attach: true,
+				WebPTY:    false,
+				Sync:      true,
+				Attach:    true,
+				NvidiaGPU: os.Getenv("SCION_NVIDIA_GPU") == "true",
 			},
 			Profiles: profiles,
 			Labels:   brokerLabels,
@@ -290,12 +292,18 @@ func buildStoreBrokerProfiles(settings *config.Settings, defaultRuntimeType stri
 			}
 		}
 
+		var privileged *bool
+		if profileCfg.Docker != nil {
+			privileged = profileCfg.Docker.Privileged
+		}
+
 		profiles = append(profiles, store.BrokerProfile{
-			Name:      name,
-			Type:      runtimeType,
-			Available: true,
-			Context:   context,
-			Namespace: namespace,
+			Name:       name,
+			Type:       runtimeType,
+			Available:  true,
+			Context:    context,
+			Namespace:  namespace,
+			Privileged: privileged,
 		})
 	}
 

@@ -740,6 +740,9 @@ export class ScionPageBrokerDetail extends LitElement {
           <span class="capability-tag ${capabilities.webPTY ? 'enabled' : ''}">WebPTY</span>
           <span class="capability-tag ${capabilities.sync ? 'enabled' : ''}">Sync</span>
           <span class="capability-tag ${capabilities.attach ? 'enabled' : ''}">Attach</span>
+          ${capabilities.nvidiaGpu
+            ? html`<span class="capability-tag enabled">GPU</span>`
+            : ''}
         </div>
       </div>
     `;
@@ -756,6 +759,9 @@ export class ScionPageBrokerDetail extends LitElement {
             (profile) => html`
               <span class="profile-tag ${profile.available ? 'available' : ''}">
                 ${profile.name}
+                ${profile.privileged === true
+                  ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                  : ''}
                 <span class="profile-type">${profile.type}</span>
               </span>
             `

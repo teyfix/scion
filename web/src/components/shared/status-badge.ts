@@ -131,6 +131,12 @@ export class ScionStatusBadge extends LitElement {
   label = '';
 
   /**
+   * Optional custom icon override
+   */
+  @property({ type: String })
+  icon = '';
+
+  /**
    * Size variant
    */
   @property({ type: String })
@@ -278,15 +284,17 @@ export class ScionStatusBadge extends LitElement {
     const config = resolveStatusConfig(this.status);
     const displayLabel = this.label || config.label || this.status.replace(/_/g, ' ');
     const shouldPulse = this.showPulse && config.pulse;
+    const effectiveIcon = this.icon || config.icon;
+    const resolvedIcon = effectiveIcon === 'gpu' ? 'gpu-card' : effectiveIcon;
 
     return html`
       <span class="badge ${config.variant} ${this.size} ${shouldPulse ? 'pulse' : ''}">
         ${config.emoji
           ? html`<span class="emoji">${config.emoji}</span>`
-          : this.showIcon && config.icon
-            ? html`<sl-icon name="${config.icon}"></sl-icon>`
+          : this.showIcon && resolvedIcon
+            ? html`<sl-icon name="${resolvedIcon}"></sl-icon>`
             : ''}
-        ${displayLabel}
+        <slot>${displayLabel}</slot>
       </span>
     `;
   }

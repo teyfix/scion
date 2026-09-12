@@ -245,6 +245,104 @@ func TestHostInfo(t *testing.T) {
 	}
 }
 
+func TestHostInfo_NvidiaGPU(t *testing.T) {
+	t.Run("SCION_NVIDIA_GPU is true", func(t *testing.T) {
+		t.Setenv("SCION_NVIDIA_GPU", "true")
+		srv := newTestServer(t)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/info", nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var resp BrokerInfoResponse
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if resp.Capabilities == nil || !resp.Capabilities.NvidiaGPU {
+			t.Errorf("expected NvidiaGPU capability to be true")
+		}
+	})
+
+	t.Run("SCION_NVIDIA_GPU is false or unset", func(t *testing.T) {
+		t.Setenv("SCION_NVIDIA_GPU", "false")
+		srv := newTestServer(t)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/info", nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var resp BrokerInfoResponse
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		if resp.Capabilities == nil || resp.Capabilities.NvidiaGPU {
+			t.Errorf("expected NvidiaGPU capability to be false")
+		}
+	})
+}
+
+func TestBuildInfoProfiles_Privileged(t *testing.T) {
+	tmpDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", origHome) }()
+
+	scionDir := filepath.Join(tmpDir, ".scion")
+	if err := os.MkdirAll(scionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsYAML := `schema_version: "1"
+active_profile: priv
+profiles:
+  priv:
+    runtime: docker
+    docker:
+      privileged: true
+  unpriv:
+    runtime: docker
+    docker:
+      privileged: false
+  nodocker:
+    runtime: docker
+`
+	if err := os.WriteFile(filepath.Join(scionDir, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{}
+	profiles := srv.buildInfoProfiles("docker")
+
+	byName := make(map[string]BrokerProfile, len(profiles))
+	for _, p := range profiles {
+		byName[p.Name] = p
+	}
+
+	priv, ok := byName["priv"]
+	if !ok || priv.Privileged == nil || !*priv.Privileged {
+		t.Errorf("expected profile 'priv' to have Privileged=true")
+	}
+
+	unpriv, ok := byName["unpriv"]
+	if !ok || unpriv.Privileged == nil || *unpriv.Privileged {
+		t.Errorf("expected profile 'unpriv' to have Privileged=false")
+	}
+
+	nodocker, ok := byName["nodocker"]
+	if !ok || nodocker.Privileged != nil {
+		t.Errorf("expected profile 'nodocker' to have nil Privileged")
+	}
+}
+
 func TestListAgents(t *testing.T) {
 	srv := newTestServer(t)
 

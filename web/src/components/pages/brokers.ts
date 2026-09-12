@@ -372,6 +372,9 @@ export class ScionPageBrokers extends LitElement {
         <span class="capability-tag ${capabilities.webPTY ? 'enabled' : ''}">WebPTY</span>
         <span class="capability-tag ${capabilities.sync ? 'enabled' : ''}">Sync</span>
         <span class="capability-tag ${capabilities.attach ? 'enabled' : ''}">Attach</span>
+        ${capabilities.nvidiaGpu
+          ? html`<span class="capability-tag enabled">GPU</span>`
+          : ''}
       </div>
     `;
   }
@@ -411,6 +414,9 @@ export class ScionPageBrokers extends LitElement {
           <span class="name-cell">
             <sl-icon name="hdd-rack"></sl-icon>
             ${broker.name} ${this.renderBrokerTypeBadge(broker)}
+            ${broker.capabilities?.nvidiaGpu
+              ? html`<scion-status-badge status="neutral" icon="gpu" size="small">GPU</scion-status-badge>`
+              : ''}
           </span>
         </td>
         <td class="hide-mobile">
@@ -436,6 +442,9 @@ export class ScionPageBrokers extends LitElement {
                   <span class="capability-tag ${broker.capabilities.attach ? 'enabled' : ''}"
                     >Attach</span
                   >
+                  ${broker.capabilities.nvidiaGpu
+                    ? html`<span class="capability-tag enabled">GPU</span>`
+                    : ''}
                 </span>
               `
             : '\u2014'}

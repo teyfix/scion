@@ -171,6 +171,8 @@ type CreateAgentRequest struct {
 	// Valid values: "none", "readonly", "baseline", "full".
 	// When omitted, defaults to the effective ceiling (project max intersected with caller ceiling).
 	AgentRole string `json:"agentRole,omitempty"`
+	// RequireGPU indicates the agent requires a runtime broker with NVIDIA GPU support.
+	RequireGPU bool `json:"requireGpu,omitempty"`
 	// GCPIdentity specifies the GCP identity assignment for the agent.
 	// Controls metadata server behavior and optional service account binding.
 	GCPIdentity *GCPIdentityAssignment `json:"gcp_identity,omitempty"`
@@ -811,7 +813,7 @@ func (s *Server) createAgentInProject(
 	}
 
 	// Resolve the runtime broker
-	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project)
+	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project, req.RequireGPU)
 	if err != nil {
 		// Error response already written by resolveRuntimeBroker
 		return

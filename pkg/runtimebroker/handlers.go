@@ -157,10 +157,11 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		Name:     s.config.BrokerName,
 		Version:  s.version,
 		Capabilities: &BrokerCapabilities{
-			WebPTY: false, // TODO: Implement WebSocket PTY
-			Sync:   true,
-			Attach: true,
-			Exec:   true,
+			WebPTY:    false, // TODO: Implement WebSocket PTY
+			Sync:      true,
+			Attach:    true,
+			Exec:      true,
+			NvidiaGPU: os.Getenv("SCION_NVIDIA_GPU") == "true",
 		},
 		Profiles: s.buildInfoProfiles(runtimeType),
 	}
@@ -214,12 +215,18 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			}
 		}
 
+		var privileged *bool
+		if profileCfg.Docker != nil {
+			privileged = profileCfg.Docker.Privileged
+		}
+
 		profiles = append(profiles, BrokerProfile{
-			Name:      name,
-			Type:      rtType,
-			Available: true,
-			Context:   ctx,
-			Namespace: ns,
+			Name:       name,
+			Type:       rtType,
+			Available:  true,
+			Context:    ctx,
+			Namespace:  ns,
+			Privileged: privileged,
 		})
 	}
 
