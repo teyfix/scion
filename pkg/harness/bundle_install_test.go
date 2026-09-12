@@ -17,10 +17,12 @@ package harness
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
@@ -215,6 +217,9 @@ func TestBundleInstall_Jcode(t *testing.T) {
 	if hc.Config.MCP == nil || hc.Config.MCP.GlobalConfigFile != ".jcode/mcp.json" {
 		t.Fatalf("unexpected jcode MCP config: %+v", hc.Config.MCP)
 	}
+	if hc.Config.Capabilities == nil || hc.Config.Capabilities.MCP.StreamableHTTP.Support != api.SupportPartial {
+		t.Fatalf("expected bridged Streamable HTTP capability, got %+v", hc.Config.Capabilities)
+	}
 
 	installDir := filepath.Join(t.TempDir(), "jcode-test")
 	if err := util.CopyDir(src, installDir); err != nil {
@@ -226,6 +231,7 @@ func TestBundleInstall_Jcode(t *testing.T) {
 	}
 	for _, name := range []string{
 		"config.yaml", "provision.py", "scion_harness.py", "Dockerfile", "README.md",
+		"mcp-remote/package.json", "mcp-remote/bun.lock",
 	} {
 		if _, err := os.Stat(filepath.Join(installDir, name)); err != nil {
 			t.Errorf("expected %s at bundle root: %v", name, err)
@@ -259,6 +265,17 @@ func TestBundleInstall_Jcode(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(agentHome, ".scion", "hooks", "pre-start.d", "20-harness-provision")); err != nil {
 		t.Fatalf("hook wrapper missing after provision: %v", err)
+	}
+}
+
+func TestJcodeProvisioner(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 unavailable")
+	}
+	cmd := exec.Command(python, filepath.Join(bundlePath(t, "jcode"), "provision_test.py"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("jcode provisioner tests: %v\n%s", err, output)
 	}
 }
 

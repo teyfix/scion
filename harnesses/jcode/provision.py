@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,6 +34,7 @@ assert scion_harness.INTERFACE_VERSION >= 2, (
 )
 
 CODEX_AUTH_FILE = "~/.codex/auth.json"
+MCP_BRIDGE = "/usr/local/lib/scion/jcode-mcp-remote.js"
 
 AUTH = scion_harness.AuthSpec(
     "jcode",
@@ -78,6 +83,92 @@ def _install_codex_auth(ctx: scion_harness.ProvisionContext) -> None:
     os.replace(tmp, target)
 
 
+def _mcp_entry(name: str, spec: dict) -> dict:
+    transport = spec.get("transport") or "stdio"
+    if transport == "stdio":
+        entry = {
+            key: value for key, value in spec.items()
+            if key not in ("transport", "scope")
+        }
+        entry["type"] = "stdio"
+        return entry
+    if transport != "streamable-http":
+        raise scion_harness.ProvisionError(
+            f"MCP server {name}: jcode supports stdio or bridged streamable-http, not {transport}"
+        )
+
+    url = spec.get("url")
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        valid = parsed and parsed.scheme in ("http", "https") and parsed.hostname
+        valid = valid and not (parsed.username or parsed.password or parsed.fragment)
+        if parsed:
+            parsed.port  # Validate malformed/out-of-range ports, too.
+    except ValueError:
+        valid = False
+    if not valid:
+        raise scion_harness.ProvisionError(f"MCP server {name}: invalid HTTP(S) endpoint")
+    if not shutil.which("bun") or not os.path.isfile(MCP_BRIDGE):
+        raise scion_harness.ProvisionError(
+            f"MCP server {name}: image requires Bun and {MCP_BRIDGE} for streamable-http"
+        )
+
+    args = [MCP_BRIDGE, url, "--transport", "http-only", "--silent"]
+    if parsed.scheme == "http":
+        args.append("--allow-http")
+    headers = spec.get("headers") or {}
+    if not isinstance(headers, dict):
+        raise scion_harness.ProvisionError(f"MCP server {name}: headers must be an object")
+    for key, value in headers.items():
+        if (
+            not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", key)
+            or not isinstance(value, str) or "\r" in value or "\n" in value
+        ):
+            raise scion_harness.ProvisionError(f"MCP server {name}: invalid HTTP header")
+        # No shell or credential lookup: mcp-remote expands ${ENV_VAR} at runtime.
+        args.extend(["--header", f"{key}: {value}"])
+    return {"type": "stdio", "command": "bun", "args": args}
+
+
+def _apply_mcp_servers(ctx: scion_harness.ProvisionContext, mapping: dict) -> None:
+    """Project into jcode's global config; never mutate staged universal input."""
+    try:
+        servers = scion_harness.read_mcp_servers(ctx.bundle_dir)
+        if not servers:
+            return
+        entries = {name: _mcp_entry(name, spec) for name, spec in servers.items()}
+        target = scion_harness.expand_path(
+            os.path.join("~", mapping.get("global_config_file") or ".jcode/mcp.json")
+        )
+        data = scion_harness.load_json(target) if os.path.isfile(target) else {}
+        if not isinstance(data, dict):
+            raise ValueError("native MCP config must be an object")
+        leaf = data
+        for key in (mapping.get("global_config_path") or "mcpServers").split("."):
+            leaf = leaf.setdefault(key, {})
+            if not isinstance(leaf, dict):
+                raise ValueError("native MCP config path must contain objects")
+        leaf.update(entries)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = None
+        try:
+            # Headers may contain credentials: create the temporary file private.
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8",
+                dir=os.path.dirname(target), delete=False,
+            ) as handle:
+                tmp = handle.name
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp, target)
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+    except (OSError, ValueError) as exc:
+        # Do not log input/config contents, which may include credentials.
+        raise scion_harness.ProvisionError("failed to project jcode MCP config") from exc
+
+
 def provision(ctx: scion_harness.ProvisionContext) -> None:
     resolved = ctx.select_auth(AUTH)
 
@@ -100,9 +191,7 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
 
     mcp_mapping = harness_cfg.get("mcp") or {}
     if mcp_mapping:
-        scion_harness.apply_mcp_servers_simple(
-            ctx.bundle_dir, mcp_mapping, ctx.workspace
-        )
+        _apply_mcp_servers(ctx, mcp_mapping)
 
     extra = {"auth_file_written": True} if resolved.method == "auth-file" else None
     ctx.write_outputs(resolved, env=env, extra=extra)

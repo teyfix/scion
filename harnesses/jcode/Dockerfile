@@ -44,9 +44,22 @@ RUN --mount=type=cache,id=jcode-cargo-registry,target=/usr/local/cargo/registry,
     cargo build --locked --release --no-default-features -p jcode --bin jcode \
   && install -Dm755 target/release/jcode /out/jcode
 
+FROM ${BASE_IMAGE} AS mcp-remote-builder
+
+USER root
+WORKDIR /opt/scion/mcp-remote
+COPY mcp-remote/package.json mcp-remote/bun.lock ./
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
+    bun install --frozen-lockfile --production \
+  && mkdir -p /out \
+  && bun build --target bun ./node_modules/mcp-remote/dist/proxy.js \
+       --outfile /out/jcode-mcp-remote.js
+
 FROM ${BASE_IMAGE}
 
 COPY --from=jcode-builder /out/jcode /usr/local/bin/jcode
+COPY --from=mcp-remote-builder /out/jcode-mcp-remote.js /usr/local/lib/scion/jcode-mcp-remote.js
+COPY --from=mcp-remote-builder /opt/scion/mcp-remote/node_modules/mcp-remote/LICENSE /usr/local/share/licenses/scion-jcode-mcp-remote/LICENSE
 
 ENV JCODE_NO_TELEMETRY=1
 

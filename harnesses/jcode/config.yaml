@@ -33,6 +33,7 @@ provisioner:
     - pre-start
   required_image_tools:
     - python3
+    - bun
 
 config_dir: .jcode
 skills_dir: .jcode/skills
@@ -72,8 +73,8 @@ capabilities:
     vertex_ai: { support: "no", reason: "Vertex AI auth is not configured for this harness" }
   mcp:
     stdio: { support: "yes" }
-    sse: { support: "no", reason: "jcode v0.58.0 supports stdio MCP servers only" }
-    streamable_http: { support: "no", reason: "jcode v0.58.0 supports stdio MCP servers only" }
+    sse: { support: "no", reason: "Legacy SSE is not bridged; use Streamable HTTP" }
+    streamable_http: { support: "partial", reason: "Via pinned Bun mcp-remote HTTP-to-stdio bridge; native jcode support is tracked in upstream issue 483" }
     project_scope: { support: "no", reason: "Project-scoped entries are demoted to the global jcode MCP config" }
   resume: { support: "partial", reason: "jcode can resume by session ID, but Scion does not persist that ID yet" }
 
