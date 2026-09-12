@@ -21,8 +21,7 @@ FROM ${BASE_IMAGE}
 ARG MUSE_VERSION=latest
 
 # Install Muse Code CLI (copy pattern — matches grok-build)
-RUN MUSE_NO_MODIFY_PATH=1 \
-    curl -fsSL https://dev.meta.ai/install.sh | sh && \
+RUN curl -fsSL https://dev.meta.ai/install.sh | MUSE_NO_MODIFY_PATH=1 bash && \
     cp -fL /root/.local/bin/muse /usr/local/bin/muse && \
     chmod +x /usr/local/bin/muse && \
     rm -rf /root/.local/bin/muse
