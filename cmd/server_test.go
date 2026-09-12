@@ -266,6 +266,36 @@ func TestBuildStoreBrokerProfiles_StarterHubKeepsDockerProfiles(t *testing.T) {
 	assert.True(t, types["kubernetes"], "kubernetes profile should be present")
 }
 
+func TestBuildStoreBrokerProfiles_ExtractsEnvKeys(t *testing.T) {
+	settings := &config.Settings{
+		Profiles: map[string]config.ProfileConfig{
+			"with-env": {
+				Runtime: "docker",
+				Env: map[string]string{
+					"ZEBRA":      "val",
+					"APP_DOMAIN": "",
+					"ALPHA":      "1",
+				},
+			},
+			"no-env": {
+				Runtime: "docker",
+			},
+		},
+	}
+
+	profiles := buildStoreBrokerProfiles(settings, "docker")
+	byName := make(map[string]store.BrokerProfile, len(profiles))
+	for _, p := range profiles {
+		byName[p.Name] = p
+	}
+
+	withEnv := byName["with-env"]
+	assert.Equal(t, []string{"ALPHA", "APP_DOMAIN", "ZEBRA"}, withEnv.EnvKeys)
+
+	noEnv := byName["no-env"]
+	assert.Empty(t, noEnv.EnvKeys)
+}
+
 func TestRegisterGlobalGroveAndBroker_CloudRunSuppressesDockerProfile(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

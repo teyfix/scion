@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -297,6 +298,15 @@ func buildStoreBrokerProfiles(settings *config.Settings, defaultRuntimeType stri
 			privileged = profileCfg.Docker.Privileged
 		}
 
+		var envKeys []string
+		if len(profileCfg.Env) > 0 {
+			envKeys = make([]string, 0, len(profileCfg.Env))
+			for k := range profileCfg.Env {
+				envKeys = append(envKeys, k)
+			}
+			sort.Strings(envKeys)
+		}
+
 		profiles = append(profiles, store.BrokerProfile{
 			Name:       name,
 			Type:       runtimeType,
@@ -304,6 +314,7 @@ func buildStoreBrokerProfiles(settings *config.Settings, defaultRuntimeType stri
 			Context:    context,
 			Namespace:  namespace,
 			Privileged: privileged,
+			EnvKeys:    envKeys,
 		})
 	}
 

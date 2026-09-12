@@ -852,18 +852,15 @@ export class ScionPageAgentDetail extends LitElement {
               { title: 'Force Delete', confirmText: 'Force Delete', variant: 'danger' }
             );
             if (forceConfirmed) {
-              const forceResponse = await apiFetch(
-                `/api/v1/agents/${this.agentId}?force=true`,
-                { method: 'DELETE' }
-              );
+              const forceResponse = await apiFetch(`/api/v1/agents/${this.agentId}?force=true`, {
+                method: 'DELETE',
+              });
               if (!forceResponse.ok) {
                 throw new Error(
                   await extractApiError(forceResponse, 'Failed to force delete agent')
                 );
               }
-              window.location.href = this.project
-                ? `/projects/${this.project.id}`
-                : '/agents';
+              window.location.href = this.project ? `/projects/${this.project.id}` : '/agents';
               return;
             }
           }
@@ -2087,9 +2084,12 @@ export class ScionPageAgentDetail extends LitElement {
     const image = agent.image || inline?.image || agent.appliedConfig?.image;
     const branch = inline?.branch;
     const profile = agent.appliedConfig?.profile;
-    const isPrivileged =
-      agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
+    const isPrivileged = agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
     const requireGpu = agent.appliedConfig?.requireGpu;
+    const dockerNetworks = inline?.docker?.networks ?? [];
+    const dockerLabels = Object.entries(inline?.docker?.labels ?? {}).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
 
     return html`
       <div class="card">
@@ -2158,6 +2158,30 @@ export class ScionPageAgentDetail extends LitElement {
                 <div class="info-item">
                   <span class="info-label">Branch</span>
                   <span class="info-value mono">${branch}</span>
+                </div>
+              `
+            : ''}
+          ${dockerNetworks.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Networks</span>
+                  <span class="info-value tag-list">
+                    ${dockerNetworks.map(
+                      (network) => html`<span class="tag-item">${network}</span>`
+                    )}
+                  </span>
+                </div>
+              `
+            : ''}
+          ${dockerLabels.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Labels</span>
+                  <span class="info-value tag-list">
+                    ${dockerLabels.map(
+                      ([key, value]) => html`<span class="tag-item">${key}=${value}</span>`
+                    )}
+                  </span>
                 </div>
               `
             : ''}

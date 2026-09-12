@@ -34,7 +34,13 @@ import type {
   GCPServiceAccount,
   HarnessAdvancedCapabilities,
   MessageMode,
+  DockerRuntimeConfig,
 } from '../../shared/types.js';
+import {
+  BUILT_IN_DOCKER_LABEL_VARIABLES,
+  buildDockerRuntimeConfig,
+  findMissingDockerLabelVariables,
+} from '../../shared/docker-runtime.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { MESSAGE_MODE_DISPLAY } from '../../shared/message-mode.js';
 import type { EnvEntry } from '../shared/env-editor.js';
@@ -61,6 +67,7 @@ interface ScionConfigPayload {
   thinking_level?: number | null;
   env?: Record<string, string>;
   telemetry?: { enabled?: boolean };
+  docker?: DockerRuntimeConfig;
 }
 
 interface AppliedConfig {
@@ -70,6 +77,7 @@ interface AppliedConfig {
   harnessConfig?: string;
   harnessAuth?: string;
   task?: string;
+  profile?: string;
   env?: Record<string, string>;
   gcpIdentity?: GCPIdentityConfig;
   inlineConfig?: ScionConfigPayload & {
@@ -126,6 +134,9 @@ export class ScionPageAgentConfigure extends LitElement {
   // Form fields — Environment
   @state() private envEntries: EnvEntry[] = [];
   @state() private requiredEnvKeys: string[] = [];
+  @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
+  @state() private dockerNetworks: string[] = [];
+  private dockerConfigBase: DockerRuntimeConfig | undefined;
 
   // Form fields — Message Mode
   @state() private messageMode = '';
@@ -136,6 +147,7 @@ export class ScionPageAgentConfigure extends LitElement {
   @state() private gcpServiceAccounts: GCPServiceAccount[] = [];
 
   private agentId = '';
+  @state() private broker: import('../../shared/types.js').RuntimeBroker | null = null;
 
   private get verifiedGCPServiceAccounts(): GCPServiceAccount[] {
     return this.gcpServiceAccounts.filter((sa) => sa.verified);
@@ -429,6 +441,18 @@ export class ScionPageAgentConfigure extends LitElement {
       }
 
       this.agent = (await agentRes.json()) as AgentWithConfig;
+
+      if (this.agent?.runtimeBrokerId) {
+        try {
+          const brokerRes = await apiFetch(`/api/v1/runtime-brokers/${this.agent.runtimeBrokerId}`);
+          if (brokerRes.ok) {
+            this.broker = (await brokerRes.json()) as import('../../shared/types.js').RuntimeBroker;
+          }
+        } catch {
+          // Non-critical
+        }
+      }
+
       dispatchPageTitle(this, 'Configure', this.agent.name || this.agentId);
 
       if (this.agent.phase !== 'created') {
@@ -517,6 +541,14 @@ export class ScionPageAgentConfigure extends LitElement {
     // Detect required keys that are empty (from env gathering)
     this.requiredEnvKeys = this.envEntries.filter((e) => e.key && !e.value).map((e) => e.key);
 
+    const dockerCfg = ic?.docker || {};
+    this.dockerConfigBase = { ...dockerCfg };
+    this.dockerNetworks = Array.isArray(dockerCfg.networks) ? [...dockerCfg.networks] : [];
+    this.dockerLabelEntries = Object.entries(dockerCfg.labels || {}).map(([key, value]) => ({
+      key,
+      value: String(value),
+    }));
+
     // Message Mode
     this.messageMode = this.agent.messageMode || '';
 
@@ -593,6 +625,14 @@ export class ScionPageAgentConfigure extends LitElement {
     if (!this.isUnsupported(caps?.telemetry.enabled)) {
       config.telemetry = { enabled: this.telemetryEnabled };
     }
+
+    // Docker config
+    const dockerConfig = buildDockerRuntimeConfig(
+      this.dockerConfigBase,
+      this.dockerNetworks,
+      this.dockerLabelEntries
+    );
+    if (dockerConfig) config.docker = dockerConfig;
 
     return config;
   }
@@ -1061,7 +1101,12 @@ export class ScionPageAgentConfigure extends LitElement {
                 }}
               >
                 <sl-option value="">Default (inherit from parent)</sl-option>
-                ${(Object.entries(MESSAGE_MODE_DISPLAY) as [MessageMode, typeof MESSAGE_MODE_DISPLAY[MessageMode]][]).map(
+                ${(
+                  Object.entries(MESSAGE_MODE_DISPLAY) as [
+                    MessageMode,
+                    (typeof MESSAGE_MODE_DISPLAY)[MessageMode],
+                  ][]
+                ).map(
                   ([mode, display]) => html`
                     <sl-option value=${mode}>
                       <sl-icon slot="prefix" name=${display.icon}></sl-icon>
@@ -1072,9 +1117,12 @@ export class ScionPageAgentConfigure extends LitElement {
               </sl-select>
               ${this.messageMode === 'none'
                 ? html`<div class="hint" style="color: var(--sl-color-danger-600);">
-                    This agent is configured in sealed mode. It will not be able to send or receive messages.
+                    This agent is configured in sealed mode. It will not be able to send or receive
+                    messages.
                   </div>`
-                : html`<div class="hint">Message authorization scope. Default inherits from the parent agent's mode.</div>`}
+                : html`<div class="hint">
+                    Message authorization scope. Default inherits from the parent agent's mode.
+                  </div>`}
             </div>
           `
         : this.agent?.messageMode
@@ -1088,7 +1136,8 @@ export class ScionPageAgentConfigure extends LitElement {
                   ></scion-message-mode-badge>
                 </div>
                 <div class="hint">
-                  Message mode is read-only for started agents. Use the agent detail page to change it.
+                  Message mode is read-only for started agents. Use the agent detail page to change
+                  it.
                 </div>
               </div>
             `
@@ -1463,15 +1512,160 @@ export class ScionPageAgentConfigure extends LitElement {
     `;
   }
 
+  private getAvailableVariables() {
+    const builtIn = [...BUILT_IN_DOCKER_LABEL_VARIABLES];
+
+    let hostProvided: string[] = [];
+    const profileName = this.agent?.appliedConfig?.profile;
+    if (this.broker && profileName) {
+      const profile = this.broker.profiles?.find((candidate) => candidate.name === profileName);
+      if (profile && profile.envKeys) {
+        hostProvided = profile.envKeys;
+      }
+    }
+
+    const userProvided = this.envEntries
+      .map((entry) => entry.key)
+      .filter((key) => key && key.trim() !== '');
+
+    return { builtIn, hostProvided, userProvided };
+  }
+
+  private getMissingVariables(): string[] {
+    const vars = this.getAvailableVariables();
+    return findMissingDockerLabelVariables(this.dockerLabelEntries, [
+      ...vars.builtIn,
+      ...vars.hostProvided,
+      ...vars.userProvided,
+    ]);
+  }
+
+  private renderDynamicVariableBadges() {
+    const vars = this.getAvailableVariables();
+    const missing = this.getMissingVariables();
+    return html`
+      <div style="display: flex; flex-wrap: wrap; gap: 0.5em; margin-bottom: 1em;">
+        ${vars.builtIn.map((v) => html`<sl-badge variant="primary">\${${v}}</sl-badge>`)}
+        ${vars.hostProvided.map((v) => html`<sl-badge variant="success">\${${v}}</sl-badge>`)}
+        ${vars.userProvided.map((v) => html`<sl-badge variant="neutral">\${${v}}</sl-badge>`)}
+        ${missing.map((v) => html`<sl-badge variant="danger">Missing: \${${v}}</sl-badge>`)}
+      </div>
+    `;
+  }
+
   private renderEnvironmentTab() {
     return html`
-      <scion-env-editor
-        .entries=${this.envEntries}
-        .requiredKeys=${this.requiredEnvKeys}
-        @env-change=${(e: CustomEvent<{ entries: EnvEntry[] }>) => {
-          this.envEntries = e.detail.entries;
-        }}
-      ></scion-env-editor>
+      <div class="form-field">
+        <label>Environment Variables</label>
+        <scion-env-editor
+          .entries=${this.envEntries}
+          .requiredKeys=${this.requiredEnvKeys}
+          @env-change=${(e: CustomEvent<{ entries: EnvEntry[] }>) => {
+            this.envEntries = e.detail.entries;
+          }}
+        ></scion-env-editor>
+      </div>
+
+      <!-- Docker Networks -->
+      <div class="form-field" style="margin-top: 1.5rem;">
+        <label>Docker Networks</label>
+        ${this.dockerNetworks.map(
+          (network, i) => html`
+            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
+              <sl-input
+                size="small"
+                placeholder="network_name"
+                .value=${network}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerNetworks];
+                  updated[i] = (e.target as HTMLElement & { value: string }).value;
+                  this.dockerNetworks = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-icon-button
+                name="x-lg"
+                label="Remove"
+                @click=${() => {
+                  this.dockerNetworks = this.dockerNetworks.filter((_, idx) => idx !== i);
+                }}
+              ></sl-icon-button>
+            </div>
+          `
+        )}
+        <sl-button
+          size="small"
+          variant="text"
+          @click=${() => {
+            this.dockerNetworks = [...this.dockerNetworks, ''];
+          }}
+        >
+          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+          Add network
+        </sl-button>
+        <div class="hint">Custom Docker networks to attach to the agent container.</div>
+      </div>
+
+      <!-- Docker runtime labels -->
+      <div class="form-field" style="margin-top: 1.5rem;">
+        <label>Docker Labels</label>
+        <div class="hint" style="margin-bottom: 1em;">
+          Container runtime labels used by Docker integrations. You can use \${...} dynamic
+          variables in keys and values.
+        </div>
+        ${this.renderDynamicVariableBadges()}
+        ${this.dockerLabelEntries.map(
+          (entry, i) => html`
+            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
+              <sl-input
+                size="small"
+                placeholder="key"
+                .value=${entry.key}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerLabelEntries];
+                  updated[i] = {
+                    ...updated[i],
+                    key: (e.target as HTMLElement & { value: string }).value,
+                  };
+                  this.dockerLabelEntries = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-input
+                size="small"
+                placeholder="value"
+                .value=${entry.value}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerLabelEntries];
+                  updated[i] = {
+                    ...updated[i],
+                    value: (e.target as HTMLElement & { value: string }).value,
+                  };
+                  this.dockerLabelEntries = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-icon-button
+                name="x-lg"
+                label="Remove"
+                @click=${() => {
+                  this.dockerLabelEntries = this.dockerLabelEntries.filter((_, idx) => idx !== i);
+                }}
+              ></sl-icon-button>
+            </div>
+          `
+        )}
+        <sl-button
+          size="small"
+          variant="text"
+          @click=${() => {
+            this.dockerLabelEntries = [...this.dockerLabelEntries, { key: '', value: '' }];
+          }}
+        >
+          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+          Add Docker label
+        </sl-button>
+      </div>
     `;
   }
 }

@@ -402,7 +402,13 @@ export interface AgentInlineConfig {
   task?: string;
   image?: string;
   telemetry?: TelemetryConfig;
-  docker?: { privileged?: boolean };
+  docker?: DockerRuntimeConfig;
+}
+
+export interface DockerRuntimeConfig {
+  privileged?: boolean;
+  networks?: string[];
+  labels?: Record<string, string>;
 }
 
 export type SupportLevel = 'no' | 'partial' | 'yes';
@@ -456,7 +462,7 @@ export interface AgentAppliedConfig {
   inlineConfig?: AgentInlineConfig;
   gcpIdentity?: GCPIdentityConfig;
   agentRole?: string;
-  docker?: { privileged?: boolean };
+  docker?: DockerRuntimeConfig;
   requireGpu?: boolean;
 }
 
@@ -687,6 +693,7 @@ export interface BrokerProfile {
   name: string;
   type: string;
   available: boolean;
+  envKeys?: string[];
   privileged?: boolean | null;
 }
 

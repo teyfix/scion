@@ -26,7 +26,13 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
-import type { Project, RuntimeBroker, Template, GCPServiceAccount, MessageMode } from '../../shared/types.js';
+import type {
+  Project,
+  RuntimeBroker,
+  Template,
+  GCPServiceAccount,
+  MessageMode,
+} from '../../shared/types.js';
 
 interface HarnessConfigEntry {
   id: string;
@@ -38,6 +44,11 @@ interface HarnessConfigEntry {
 }
 
 import { isSharedWorkspace } from '../../shared/types.js';
+import {
+  BUILT_IN_DOCKER_LABEL_VARIABLES,
+  buildDockerRuntimeConfig,
+  findMissingDockerLabelVariables,
+} from '../../shared/docker-runtime.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { MESSAGE_MODE_DISPLAY } from '../../shared/message-mode.js';
@@ -114,6 +125,8 @@ export class ScionPageAgentCreate extends LitElement {
   // ── Additional Options > Environment & Labels Tab ───────────────────
   @state() private envEntries: EnvEntry[] = [];
   @state() private labelEntries: Array<{ key: string; value: string }> = [];
+  @state() private dockerNetworks: string[] = [];
+  @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
 
   // ── Internal ────────────────────────────────────────────────────────
 
@@ -588,7 +601,9 @@ export class ScionPageAgentCreate extends LitElement {
     const user = visible.filter((t) => t.scope === 'user').sort(byName);
     const project = visible.filter((t) => t.scope === 'project').sort(byName);
     const global = visible.filter((t) => t.scope === 'global').sort(byName);
-    const rest = visible.filter((t) => t.scope !== 'user' && t.scope !== 'project' && t.scope !== 'global').sort(byName);
+    const rest = visible
+      .filter((t) => t.scope !== 'user' && t.scope !== 'project' && t.scope !== 'global')
+      .sort(byName);
     return [...user, ...project, ...global, ...rest];
   }
 
@@ -808,12 +823,19 @@ export class ScionPageAgentCreate extends LitElement {
     if (this.image) config.image = this.image;
     if (this.containerUser) config.user = this.containerUser;
 
-    // Docker privileged
-    if (this.dockerPrivileged === 'enabled') {
-      config.docker = { privileged: true };
-    } else if (this.dockerPrivileged === 'disabled') {
-      config.docker = { privileged: false };
-    }
+    // Docker runtime labels are intentionally separate from searchable agent labels.
+    const dockerBase =
+      this.dockerPrivileged === 'enabled'
+        ? { privileged: true }
+        : this.dockerPrivileged === 'disabled'
+          ? { privileged: false }
+          : undefined;
+    const dockerConfig = buildDockerRuntimeConfig(
+      dockerBase,
+      this.dockerNetworks,
+      this.dockerLabelEntries
+    );
+    if (dockerConfig) config.docker = dockerConfig;
 
     // Auth
     if (this.harnessAuth) config.auth_selectedType = this.harnessAuth;
@@ -1269,7 +1291,7 @@ export class ScionPageAgentCreate extends LitElement {
           ${this.brokers.map((b) => {
             const hasGpu = Boolean(
               b.capabilities?.nvidiaGpu ||
-                (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+              (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
             );
             const isGpuDisabled = this.requireGpu && !hasGpu;
             const disabled = b.status === 'offline' || isGpuDisabled;
@@ -1278,8 +1300,11 @@ export class ScionPageAgentCreate extends LitElement {
               ?disabled=${disabled}
               title=${isGpuDisabled ? 'Requires GPU support' : ''}
             >
-              ${b.name} (${b.status})${hasGpu
-                ? html` <scion-status-badge status="neutral" icon="gpu" size="small">GPU</scion-status-badge>`
+              ${b.name}
+              (${b.status})${hasGpu
+                ? html` <scion-status-badge status="neutral" icon="gpu" size="small"
+                    >GPU</scion-status-badge
+                  >`
                 : ''}
             </sl-option>`;
           })}
@@ -1505,7 +1530,7 @@ export class ScionPageAgentCreate extends LitElement {
                 currentBroker &&
                 Boolean(
                   currentBroker.capabilities?.nvidiaGpu ||
-                    (currentBroker._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                  (currentBroker._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
                 );
               if (!currentHasGpu) {
                 const gpuBroker =
@@ -1514,13 +1539,13 @@ export class ScionPageAgentCreate extends LitElement {
                       b.status === 'online' &&
                       Boolean(
                         b.capabilities?.nvidiaGpu ||
-                          (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                        (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
                       )
                   ) ||
                   this.brokers.find((b) =>
                     Boolean(
                       b.capabilities?.nvidiaGpu ||
-                        (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+                      (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
                     )
                   );
                 this.brokerId = gpuBroker ? gpuBroker.id : '';
@@ -1658,7 +1683,12 @@ export class ScionPageAgentCreate extends LitElement {
           }}
         >
           <sl-option value="">Default (inherit from parent)</sl-option>
-          ${(Object.entries(MESSAGE_MODE_DISPLAY) as [MessageMode, typeof MESSAGE_MODE_DISPLAY[MessageMode]][]).map(
+          ${(
+            Object.entries(MESSAGE_MODE_DISPLAY) as [
+              MessageMode,
+              (typeof MESSAGE_MODE_DISPLAY)[MessageMode],
+            ][]
+          ).map(
             ([mode, display]) => html`
               <sl-option value=${mode}>
                 <sl-icon slot="prefix" name=${display.icon}></sl-icon>
@@ -1669,9 +1699,12 @@ export class ScionPageAgentCreate extends LitElement {
         </sl-select>
         ${this.messageMode === 'none'
           ? html`<div class="hint" style="color: var(--sl-color-danger-600);">
-              This agent will be created in sealed mode. It will not be able to send or receive messages.
+              This agent will be created in sealed mode. It will not be able to send or receive
+              messages.
             </div>`
-          : html`<div class="hint">Message authorization scope. Default inherits from the parent agent's mode.</div>`}
+          : html`<div class="hint">
+              Message authorization scope. Default inherits from the parent agent's mode.
+            </div>`}
       </div>
 
       <!-- Harness Authentication -->
@@ -1901,6 +1934,43 @@ export class ScionPageAgentCreate extends LitElement {
 
   // ── Additional Options > Environment & Labels Tab ─────────────────
 
+  private getAvailableVariables() {
+    const builtIn = [...BUILT_IN_DOCKER_LABEL_VARIABLES];
+
+    let hostProvided: string[] = [];
+    const profile = this.selectedBrokerProfiles.find((p) => p.name === this.profile);
+    if (profile && profile.envKeys) {
+      hostProvided = profile.envKeys;
+    }
+
+    const userProvided = this.envEntries.map((e) => e.key).filter((k) => k && k.trim() !== '');
+
+    return { builtIn, hostProvided, userProvided };
+  }
+
+  private getMissingVariables(): string[] {
+    const vars = this.getAvailableVariables();
+    return findMissingDockerLabelVariables(this.dockerLabelEntries, [
+      ...vars.builtIn,
+      ...vars.hostProvided,
+      ...vars.userProvided,
+    ]);
+  }
+
+  private renderDynamicVariableBadges() {
+    const vars = this.getAvailableVariables();
+    const missing = this.getMissingVariables();
+
+    return html`
+      <div style="display: flex; flex-wrap: wrap; gap: 0.5em; margin-bottom: 1em;">
+        ${vars.builtIn.map((v) => html`<sl-badge variant="primary">\${${v}}</sl-badge>`)}
+        ${vars.hostProvided.map((v) => html`<sl-badge variant="success">\${${v}}</sl-badge>`)}
+        ${vars.userProvided.map((v) => html`<sl-badge variant="neutral">\${${v}}</sl-badge>`)}
+        ${missing.map((v) => html`<sl-badge variant="danger">Missing: \${${v}}</sl-badge>`)}
+      </div>
+    `;
+  }
+
   private renderEnvironmentTab() {
     return html`
       <!-- Environment Variables -->
@@ -1914,9 +1984,110 @@ export class ScionPageAgentCreate extends LitElement {
         ></scion-env-editor>
       </div>
 
-      <!-- Labels -->
+      <!-- Docker Networks -->
       <div class="form-field" style="margin-top: 1.5rem;">
-        <label>Labels</label>
+        <label>Docker Networks</label>
+        ${this.dockerNetworks.map(
+          (network, i) => html`
+            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
+              <sl-input
+                size="small"
+                placeholder="network_name"
+                .value=${network}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerNetworks];
+                  updated[i] = (e.target as HTMLElement & { value: string }).value;
+                  this.dockerNetworks = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-icon-button
+                name="x-lg"
+                label="Remove"
+                @click=${() => {
+                  this.dockerNetworks = this.dockerNetworks.filter((_, idx) => idx !== i);
+                }}
+              ></sl-icon-button>
+            </div>
+          `
+        )}
+        <sl-button
+          size="small"
+          variant="text"
+          @click=${() => {
+            this.dockerNetworks = [...this.dockerNetworks, ''];
+          }}
+        >
+          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+          Add network
+        </sl-button>
+        <div class="hint">Custom Docker networks to attach to the agent container.</div>
+      </div>
+
+      <!-- Docker runtime labels -->
+      <div class="form-field" style="margin-top: 1.5rem;">
+        <label>Docker Labels</label>
+        <div class="hint" style="margin-bottom: 1em;">
+          Container runtime labels used by Docker integrations. You can use \${...} dynamic
+          variables in keys and values.
+        </div>
+        ${this.renderDynamicVariableBadges()}
+        ${this.dockerLabelEntries.map(
+          (entry, i) => html`
+            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
+              <sl-input
+                size="small"
+                placeholder="key"
+                .value=${entry.key}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerLabelEntries];
+                  updated[i] = {
+                    ...updated[i],
+                    key: (e.target as HTMLElement & { value: string }).value,
+                  };
+                  this.dockerLabelEntries = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-input
+                size="small"
+                placeholder="value"
+                .value=${entry.value}
+                @sl-input=${(e: Event) => {
+                  const updated = [...this.dockerLabelEntries];
+                  updated[i] = {
+                    ...updated[i],
+                    value: (e.target as HTMLElement & { value: string }).value,
+                  };
+                  this.dockerLabelEntries = updated;
+                }}
+                style="flex: 1;"
+              ></sl-input>
+              <sl-icon-button
+                name="x-lg"
+                label="Remove"
+                @click=${() => {
+                  this.dockerLabelEntries = this.dockerLabelEntries.filter((_, idx) => idx !== i);
+                }}
+              ></sl-icon-button>
+            </div>
+          `
+        )}
+        <sl-button
+          size="small"
+          variant="text"
+          @click=${() => {
+            this.dockerLabelEntries = [...this.dockerLabelEntries, { key: '', value: '' }];
+          }}
+        >
+          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+          Add Docker label
+        </sl-button>
+      </div>
+
+      <!-- Searchable agent labels -->
+      <div class="form-field" style="margin-top: 1.5rem;">
+        <label>Agent Labels</label>
         ${this.labelEntries.map(
           (entry, i) => html`
             <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
@@ -1967,7 +2138,7 @@ export class ScionPageAgentCreate extends LitElement {
               }}
             >
               <sl-icon slot="prefix" name="plus-lg"></sl-icon>
-              Add label
+              Add agent label
             </sl-button>`
           : nothing}
         <div class="hint">Optional key-value labels to organize agents (max 16).</div>

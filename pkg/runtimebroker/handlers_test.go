@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -340,6 +341,58 @@ profiles:
 	nodocker, ok := byName["nodocker"]
 	if !ok || nodocker.Privileged != nil {
 		t.Errorf("expected profile 'nodocker' to have nil Privileged")
+	}
+}
+
+func TestBuildInfoProfiles_EnvKeys(t *testing.T) {
+	tmpDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	_ = os.Setenv("HOME", tmpDir)
+	defer func() { _ = os.Setenv("HOME", origHome) }()
+
+	scionDir := filepath.Join(tmpDir, ".scion")
+	if err := os.MkdirAll(scionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsYAML := `schema_version: "1"
+active_profile: with-env
+profiles:
+  with-env:
+    runtime: docker
+    env:
+      ZEBRA: "val"
+      APP_DOMAIN: ""
+      ALPHA: "1"
+  no-env:
+    runtime: docker
+`
+	if err := os.WriteFile(filepath.Join(scionDir, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{}
+	profiles := srv.buildInfoProfiles("docker")
+
+	byName := make(map[string]BrokerProfile, len(profiles))
+	for _, p := range profiles {
+		byName[p.Name] = p
+	}
+
+	withEnv, ok := byName["with-env"]
+	if !ok {
+		t.Fatalf("expected profile 'with-env'")
+	}
+	expectedKeys := []string{"ALPHA", "APP_DOMAIN", "ZEBRA"}
+	if !slices.Equal(withEnv.EnvKeys, expectedKeys) {
+		t.Errorf("expected EnvKeys %v, got %v", expectedKeys, withEnv.EnvKeys)
+	}
+
+	noEnv, ok := byName["no-env"]
+	if !ok {
+		t.Fatalf("expected profile 'no-env'")
+	}
+	if len(noEnv.EnvKeys) != 0 {
+		t.Errorf("expected empty EnvKeys for 'no-env', got %v", noEnv.EnvKeys)
 	}
 }
 

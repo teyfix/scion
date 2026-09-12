@@ -220,6 +220,15 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			privileged = profileCfg.Docker.Privileged
 		}
 
+		var envKeys []string
+		if len(profileCfg.Env) > 0 {
+			envKeys = make([]string, 0, len(profileCfg.Env))
+			for k := range profileCfg.Env {
+				envKeys = append(envKeys, k)
+			}
+			sort.Strings(envKeys)
+		}
+
 		profiles = append(profiles, BrokerProfile{
 			Name:       name,
 			Type:       rtType,
@@ -227,6 +236,7 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			Context:    ctx,
 			Namespace:  ns,
 			Privileged: privileged,
+			EnvKeys:    envKeys,
 		})
 	}
 

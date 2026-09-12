@@ -450,12 +450,13 @@ type BrokerCapabilities struct {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name       string `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
-	Type       string `json:"type"` // docker, kubernetes, apple
-	Available  bool   `json:"available"`
-	Context    string `json:"context,omitempty"`   // K8s context
-	Namespace  string `json:"namespace,omitempty"` // K8s namespace
-	Privileged *bool  `json:"privileged,omitempty"`
+	Name       string   `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
+	Type       string   `json:"type"` // docker, kubernetes, apple
+	Available  bool     `json:"available"`
+	Context    string   `json:"context,omitempty"`   // K8s context
+	Namespace  string   `json:"namespace,omitempty"` // K8s namespace
+	Privileged *bool    `json:"privileged,omitempty"`
+	EnvKeys    []string `json:"envKeys,omitempty"`
 }
 
 // ProjectProvider links a runtime broker to a project.

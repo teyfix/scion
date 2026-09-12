@@ -372,12 +372,13 @@ type BrokerCapabilities struct {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Available  bool   `json:"available"`
-	Context    string `json:"context,omitempty"`
-	Namespace  string `json:"namespace,omitempty"`
-	Privileged *bool  `json:"privileged,omitempty"`
+	Name       string   `json:"name"`
+	Type       string   `json:"type"`
+	Available  bool     `json:"available"`
+	Context    string   `json:"context,omitempty"`
+	Namespace  string   `json:"namespace,omitempty"`
+	Privileged *bool    `json:"privileged,omitempty"`
+	EnvKeys    []string `json:"envKeys,omitempty"`
 }
 
 // BrokerProjectInfo describes a project from a broker's perspective.
