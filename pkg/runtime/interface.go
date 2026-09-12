@@ -50,12 +50,14 @@ type RunConfig struct {
 	NoAuthMessage        string
 	NoAuthCommand        string
 	Debug                bool
-	MetadataInterception bool     // Add NET_ADMIN cap for iptables-based metadata server interception
-	ExtraHosts           []string // Extra /etc/hosts entries (e.g. "host.docker.internal:host-gateway")
-	NetworkMode          string   // Container network mode (e.g. "host" for --network=host)
-	Project              string   // Project name (e.g., "global" or "my-project")
-	ProjectID            string   // Project ID (e.g., "550e8400-e29b-41d4-a716-446655440000")
-	Privileged           bool     // Run the container in privileged mode (Docker runtime only)
+	MetadataInterception bool              // Add NET_ADMIN cap for iptables-based metadata server interception
+	ExtraHosts           []string          // Extra /etc/hosts entries (e.g. "host.docker.internal:host-gateway")
+	NetworkMode          string            // Container network mode (e.g. "host" for --network=host)
+	Networks             []string          // Explicit container networks to join
+	DockerLabels         map[string]string // Resolved custom Docker container labels
+	Project              string            // Project name (e.g., "global" or "my-project")
+	ProjectID            string            // Project ID (e.g., "550e8400-e29b-41d4-a716-446655440000")
+	Privileged           bool              // Run the container in privileged mode (Docker runtime only)
 
 	// WorkspaceBackendName is the name of the backend chosen by the workspace
 	// backend selector: "local", "nfs", "cloudrun-volume" or

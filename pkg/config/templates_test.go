@@ -2324,3 +2324,100 @@ func TestMergeScionConfig_Docker_Privileged_NoAliasing(t *testing.T) {
 			"the merged result aliases the caller-owned override pointer", *got.Docker.Privileged)
 	}
 }
+
+func TestCloneDockerConfig(t *testing.T) {
+	if CloneDockerConfig(nil) != nil {
+		t.Error("CloneDockerConfig(nil) should return nil")
+	}
+
+	priv := true
+	orig := &api.DockerConfig{
+		Privileged: &priv,
+		Networks:   []string{"net1", "net2"},
+		Labels: map[string]string{
+			"key1": "val1",
+			"key2": "val2",
+		},
+	}
+
+	clone := CloneDockerConfig(orig)
+	if clone == nil {
+		t.Fatal("CloneDockerConfig returned nil for non-nil input")
+	}
+	if clone.Privileged == nil || *clone.Privileged != true {
+		t.Errorf("clone.Privileged = %v, want true", clone.Privileged)
+	}
+	if len(clone.Networks) != 2 || clone.Networks[0] != "net1" || clone.Networks[1] != "net2" {
+		t.Errorf("clone.Networks = %v, want [net1 net2]", clone.Networks)
+	}
+	if len(clone.Labels) != 2 || clone.Labels["key1"] != "val1" || clone.Labels["key2"] != "val2" {
+		t.Errorf("clone.Labels = %v, want key1:val1, key2:val2", clone.Labels)
+	}
+
+	// Verify deep copy isolation
+	*orig.Privileged = false
+	orig.Networks[0] = "mutated"
+	orig.Labels["key1"] = "mutated"
+
+	if *clone.Privileged != true {
+		t.Errorf("clone.Privileged mutated with original")
+	}
+	if clone.Networks[0] != "net1" {
+		t.Errorf("clone.Networks mutated with original")
+	}
+	if clone.Labels["key1"] != "val1" {
+		t.Errorf("clone.Labels mutated with original")
+	}
+}
+
+func TestMergeScionConfig_Docker_NetworksAndLabels(t *testing.T) {
+	base := &api.ScionConfig{
+		Docker: &api.DockerConfig{
+			Networks: []string{"profile-net", "shared-net"},
+			Labels: map[string]string{
+				"env":     "prod",
+				"profile": "default",
+			},
+		},
+	}
+
+	override := &api.ScionConfig{
+		Docker: &api.DockerConfig{
+			Networks: []string{"shared-net", "template-net", ""},
+			Labels: map[string]string{
+				"env":      "staging", // should overwrite base
+				"template": "agent-v1",
+			},
+		},
+	}
+
+	merged := MergeScionConfig(base, override)
+	if merged.Docker == nil {
+		t.Fatal("merged.Docker is nil")
+	}
+
+	// Verify Networks union and deduplication preserving base order
+	expectedNets := []string{"profile-net", "shared-net", "template-net"}
+	if len(merged.Docker.Networks) != len(expectedNets) {
+		t.Fatalf("merged.Docker.Networks = %v, want %v", merged.Docker.Networks, expectedNets)
+	}
+	for i, net := range expectedNets {
+		if merged.Docker.Networks[i] != net {
+			t.Errorf("merged.Docker.Networks[%d] = %q, want %q", i, merged.Docker.Networks[i], net)
+		}
+	}
+
+	// Verify Labels merge with override precedence
+	if len(merged.Docker.Labels) != 3 {
+		t.Fatalf("merged.Docker.Labels count = %d, want 3 (got %v)", len(merged.Docker.Labels), merged.Docker.Labels)
+	}
+	if got := merged.Docker.Labels["env"]; got != "staging" {
+		t.Errorf("merged.Docker.Labels[\"env\"] = %q, want \"staging\"", got)
+	}
+	if got := merged.Docker.Labels["profile"]; got != "default" {
+		t.Errorf("merged.Docker.Labels[\"profile\"] = %q, want \"default\"", got)
+	}
+	if got := merged.Docker.Labels["template"]; got != "agent-v1" {
+		t.Errorf("merged.Docker.Labels[\"template\"] = %q, want \"agent-v1\"", got)
+	}
+}

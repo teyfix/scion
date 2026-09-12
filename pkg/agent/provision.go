@@ -428,6 +428,22 @@ func resolveProjectRoot(settings *config.VersionedSettings, projectDir string) s
 	return projectDir
 }
 
+// effectiveProfileEnv retrieves the environment map defined in the active or specified
+// profile, if present.
+func effectiveProfileEnv(settings *config.VersionedSettings, profileName string) map[string]string {
+	if settings == nil {
+		return nil
+	}
+	name := profileName
+	if name == "" {
+		name = settings.ActiveProfile
+	}
+	if p, ok := settings.Profiles[name]; ok {
+		return p.Env
+	}
+	return nil
+}
+
 // resolveWorkspaceSubdir resolves a relative workspace subdirectory path
 // against a project root, with containment checks to prevent directory
 // traversal and symlink escapes.
@@ -1318,6 +1334,55 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		displayTemplateName = chain[len(chain)-1].Name
 	}
 	projectID, _ := config.ReadProjectID(projectDir)
+	if pid := projectcompat.ProjectIDFromEnv(finalScionCfg.Env); pid != "" {
+		projectID = pid
+	}
+	agentID := agentName
+	if finalScionCfg.Env != nil && finalScionCfg.Env["SCION_AGENT_ID"] != "" {
+		agentID = finalScionCfg.Env["SCION_AGENT_ID"]
+	}
+
+	// Resolve and validate Docker runtime configuration (networks & labels)
+	if finalScionCfg.Docker != nil {
+		if len(finalScionCfg.Docker.Labels) > 0 {
+			// Merge finalScionCfg.Env with profile.Env for label variable resolution.
+			// Profile env is allowed for passthrough (empty values = os.LookupEnv).
+			// This does NOT inject profile env into the container — that path was
+			// intentionally removed in G3-full. This is label-expansion scope only.
+			labelEnv := finalScionCfg.Env
+			if profileEnv := effectiveProfileEnv(settings, profileName); len(profileEnv) > 0 {
+				merged := make(map[string]string, len(labelEnv)+len(profileEnv))
+				for k, v := range profileEnv {
+					merged[k] = v
+				}
+				for k, v := range labelEnv { // finalScionCfg wins over profile
+					merged[k] = v
+				}
+				labelEnv = merged
+			}
+			scopedVars := BuildScopedLabelVars(agentName, agentID, projectName, projectID, labelEnv)
+			resolvedLabels, err := ExpandAndValidateDockerLabels(finalScionCfg.Docker.Labels, scopedVars)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("resolve docker labels: %w", err)
+			}
+			finalScionCfg.Docker.Labels = resolvedLabels
+		}
+		if len(finalScionCfg.Docker.Networks) > 0 {
+			var cleanNets []string
+			seenNets := make(map[string]struct{}, len(finalScionCfg.Docker.Networks))
+			for _, net := range finalScionCfg.Docker.Networks {
+				if net == "" {
+					continue
+				}
+				if _, exists := seenNets[net]; !exists {
+					seenNets[net] = struct{}{}
+					cleanNets = append(cleanNets, net)
+				}
+			}
+			finalScionCfg.Docker.Networks = cleanNets
+		}
+	}
+
 	info := &api.AgentInfo{
 		Project:               projectName,
 		ProjectID:             projectID,

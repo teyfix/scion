@@ -712,6 +712,16 @@
             "privileged": {
               "type": "boolean",
               "description": "Run the Docker container in privileged mode."
+            },
+            "networks": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Custom Docker networks to join."
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Custom Docker container labels."
             }
           },
           "additionalProperties": false

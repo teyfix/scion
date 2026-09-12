@@ -64,3 +64,25 @@ func TestEnvProjectIDConfigKey(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectIDFromEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"nil", nil, ""},
+		{"empty", map[string]string{}, ""},
+		{"canonical", map[string]string{EnvProjectID: "proj-1"}, "proj-1"},
+		{"legacy", map[string]string{EnvGroveID: "proj-legacy"}, "proj-legacy"},
+		{"canonical wins", map[string]string{EnvProjectID: "proj-1", EnvGroveID: "proj-legacy"}, "proj-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ProjectIDFromEnv(tt.env); got != tt.want {
+				t.Fatalf("ProjectIDFromEnv() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

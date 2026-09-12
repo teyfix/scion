@@ -1711,3 +1711,98 @@ func TestParseDockerServerVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildCommonRunArgs_Networks(t *testing.T) {
+	// Case 1: Multiple networks emit multiple --network flags
+	cfg1 := RunConfig{
+		Name:        "agent-1",
+		Networks:    []string{"traefik_proxy", "backend_net", ""},
+		NetworkMode: "host", // Should be ignored because Networks is set
+		Harness:     &harness.Generic{},
+	}
+	args1, err := buildCommonRunArgs(cfg1)
+	if err != nil {
+		t.Fatalf("buildCommonRunArgs failed: %v", err)
+	}
+
+	var networks []string
+	for i := 0; i < len(args1)-1; i++ {
+		if args1[i] == "--network" {
+			networks = append(networks, args1[i+1])
+		}
+	}
+	if len(networks) != 2 || networks[0] != "traefik_proxy" || networks[1] != "backend_net" {
+		t.Errorf("got networks %v, want [traefik_proxy backend_net]", networks)
+	}
+
+	// Case 2: Fallback to NetworkMode when Networks is empty
+	cfg2 := RunConfig{
+		Name:        "agent-2",
+		NetworkMode: "host",
+		Harness:     &harness.Generic{},
+	}
+	args2, err := buildCommonRunArgs(cfg2)
+	if err != nil {
+		t.Fatalf("buildCommonRunArgs failed: %v", err)
+	}
+
+	var networks2 []string
+	for i := 0; i < len(args2)-1; i++ {
+		if args2[i] == "--network" {
+			networks2 = append(networks2, args2[i+1])
+		}
+	}
+	if len(networks2) != 1 || networks2[0] != "host" {
+		t.Errorf("got networks %v, want [host]", networks2)
+	}
+}
+
+func TestBuildCommonRunArgs_DockerLabels(t *testing.T) {
+	cfg := RunConfig{
+		Name: "agent-1",
+		DockerLabels: map[string]string{
+			"traefik.http.routers.my-app.rule": "Host(`app.internal`)",
+			"custom.label.b":                   "value-b",
+			"custom.label.a":                   "value-a",
+		},
+		Harness: &harness.Generic{},
+	}
+	args, err := buildCommonRunArgs(cfg)
+	if err != nil {
+		t.Fatalf("buildCommonRunArgs failed: %v", err)
+	}
+
+	var labels []string
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--label" {
+			labels = append(labels, args[i+1])
+		}
+	}
+
+	// Verify that custom docker labels appear and are sorted by key
+	expectedSorted := []string{
+		"custom.label.a=value-a",
+		"custom.label.b=value-b",
+		"traefik.http.routers.my-app.rule=Host(`app.internal`)",
+	}
+
+	// Find the subsequence in labels
+	foundIdx := -1
+	for i := 0; i <= len(labels)-len(expectedSorted); i++ {
+		match := true
+		for j, exp := range expectedSorted {
+			if labels[i+j] != exp {
+				match = false
+				break
+			}
+		}
+		if match {
+			foundIdx = i
+			break
+		}
+	}
+
+	if foundIdx == -1 {
+		t.Errorf("expected sorted custom labels %v not found in contiguous order in %v", expectedSorted, labels)
+	}
+}

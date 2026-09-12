@@ -806,8 +806,11 @@ authDone:
 	// translated to host.docker.internal, use --network=host so the container
 	// can reach the host's loopback interface directly. This also rewrites any
 	// bridge hostnames back to localhost in opts.Env.
+	// Explicit networks take precedence over automatic host networking.
 	networkMode := runtime.ResolveHostNetworking(m.Runtime.Name(), opts.Env)
-	if networkMode != "" {
+	if finalScionCfg != nil && finalScionCfg.Docker != nil && len(finalScionCfg.Docker.Networks) > 0 {
+		networkMode = ""
+	} else if networkMode != "" {
 		opts.Env["SCION_NETWORK_MODE"] = networkMode
 	}
 
@@ -1039,6 +1042,18 @@ authDone:
 		NFSStorageClass:      nfsStorageClass,
 		TelemetryEnabled:     telemetryEnabled,
 		Privileged:           finalScionCfg != nil && finalScionCfg.Docker != nil && finalScionCfg.Docker.Privileged != nil && *finalScionCfg.Docker.Privileged,
+		Networks: func() []string {
+			if finalScionCfg != nil && finalScionCfg.Docker != nil {
+				return finalScionCfg.Docker.Networks
+			}
+			return nil
+		}(),
+		DockerLabels: func() map[string]string {
+			if finalScionCfg != nil && finalScionCfg.Docker != nil {
+				return finalScionCfg.Docker.Labels
+			}
+			return nil
+		}(),
 		Task: func() string {
 			// When task_flag is set, task is delivered via CommandArgs instead
 			if finalScionCfg != nil && finalScionCfg.TaskFlag != "" {

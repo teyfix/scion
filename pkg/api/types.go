@@ -313,7 +313,9 @@ func ValidateVolumes(volumes []VolumeMount) error {
 
 // DockerConfig holds Docker runtime-specific configuration.
 type DockerConfig struct {
-	Privileged *bool `json:"privileged,omitempty" yaml:"privileged,omitempty"`
+	Privileged *bool             `json:"privileged,omitempty" yaml:"privileged,omitempty"`
+	Networks   []string          `json:"networks,omitempty" yaml:"networks,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 }
 
 type KubernetesConfig struct {

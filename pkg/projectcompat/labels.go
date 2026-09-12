@@ -100,3 +100,19 @@ func CanonicalFieldAliases(key string) (canonical string, legacy bool) {
 func DeprecatedGroveRoute(path string) bool {
 	return path == "/api/v1/groves" || strings.HasPrefix(path, "/api/v1/groves/")
 }
+
+var reservedInternalLabelKeys = map[string]bool{
+	"agent_id":   true,
+	"project_id": true,
+	"grove_id":   true,
+	"project":    true,
+	"grove":      true,
+}
+
+// IsReservedInternalLabel reports whether a label key is reserved by SCION.
+func IsReservedInternalLabel(key string) bool {
+	if strings.HasPrefix(key, "scion.") {
+		return true
+	}
+	return reservedInternalLabelKeys[key]
+}

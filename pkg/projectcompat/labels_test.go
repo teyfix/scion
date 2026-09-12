@@ -143,3 +143,28 @@ func TestDeprecatedGroveRoute(t *testing.T) {
 		}
 	}
 }
+
+func TestIsReservedInternalLabel(t *testing.T) {
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{"scion.agent_name", true},
+		{"scion.project_id", true},
+		{"scion.custom", true},
+		{"agent_id", true},
+		{"project_id", true},
+		{"grove_id", true},
+		{"project", true},
+		{"grove", true},
+		{"custom_key", false},
+		{"traefik.enable", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			if got := IsReservedInternalLabel(tt.key); got != tt.want {
+				t.Errorf("IsReservedInternalLabel(%q) = %v, want %v", tt.key, got, tt.want)
+			}
+		})
+	}
+}

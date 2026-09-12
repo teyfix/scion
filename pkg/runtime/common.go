@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -195,7 +196,13 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 	addArg("--name", config.Name)
 
-	if config.NetworkMode != "" {
+	if len(config.Networks) > 0 {
+		for _, net := range config.Networks {
+			if net != "" {
+				addArg("--network", net)
+			}
+		}
+	} else if config.NetworkMode != "" {
 		addArg("--network", config.NetworkMode)
 	}
 
@@ -431,6 +438,17 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	}
 	for k, v := range config.Annotations {
 		addArg("--label", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	if len(config.DockerLabels) > 0 {
+		dockerLabelKeys := make([]string, 0, len(config.DockerLabels))
+		for k := range config.DockerLabels {
+			dockerLabelKeys = append(dockerLabelKeys, k)
+		}
+		sort.Strings(dockerLabelKeys)
+		for _, k := range dockerLabelKeys {
+			addArg("--label", fmt.Sprintf("%s=%s", k, config.DockerLabels[k]))
+		}
 	}
 
 	// Phase 5: Standard project labels

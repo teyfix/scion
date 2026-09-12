@@ -963,6 +963,15 @@ func CloneDockerConfig(d *api.DockerConfig) *api.DockerConfig {
 		v := *d.Privileged
 		res.Privileged = &v
 	}
+	if d.Networks != nil {
+		res.Networks = append([]string(nil), d.Networks...)
+	}
+	if d.Labels != nil {
+		res.Labels = make(map[string]string, len(d.Labels))
+		for k, v := range d.Labels {
+			res.Labels[k] = v
+		}
+	}
 	return res
 }
 
@@ -980,6 +989,44 @@ func mergeDockerConfig(base, override *api.DockerConfig) *api.DockerConfig {
 	if override.Privileged != nil {
 		v := *override.Privileged
 		result.Privileged = &v
+	}
+
+	// Networks: Profile networks are required attachments and must be retained.
+	// Perform union of base and override networks with deduplication, preserving order.
+	if len(base.Networks) > 0 || len(override.Networks) > 0 {
+		seen := make(map[string]struct{}, len(base.Networks)+len(override.Networks))
+		var mergedNets []string
+		for _, net := range base.Networks {
+			if net == "" {
+				continue
+			}
+			if _, exists := seen[net]; !exists {
+				seen[net] = struct{}{}
+				mergedNets = append(mergedNets, net)
+			}
+		}
+		for _, net := range override.Networks {
+			if net == "" {
+				continue
+			}
+			if _, exists := seen[net]; !exists {
+				seen[net] = struct{}{}
+				mergedNets = append(mergedNets, net)
+			}
+		}
+		result.Networks = mergedNets
+	}
+
+	// Labels: deterministic map merge where override keys overwrite base keys.
+	if len(base.Labels) > 0 || len(override.Labels) > 0 {
+		mergedLabels := make(map[string]string, len(base.Labels)+len(override.Labels))
+		for k, v := range base.Labels {
+			mergedLabels[k] = v
+		}
+		for k, v := range override.Labels {
+			mergedLabels[k] = v
+		}
+		result.Labels = mergedLabels
 	}
 
 	return &result

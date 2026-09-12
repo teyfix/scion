@@ -79,3 +79,15 @@ func EnvProjectIDConfigKey(envName string, hubProjectAsTopLevel bool) (string, b
 		return "", false
 	}
 }
+
+// ProjectIDFromEnv extracts the project ID from an environment map,
+// preferring SCION_PROJECT_ID with fallback to SCION_GROVE_ID.
+func ProjectIDFromEnv(env map[string]string) string {
+	if env == nil {
+		return ""
+	}
+	if pid := env[EnvProjectID]; pid != "" {
+		return pid
+	}
+	return env[EnvGroveID]
+}

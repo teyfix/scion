@@ -66,23 +66,31 @@ upstream contribution remain separate from image publishing.
 ## MS1 — Remote resources
 
 - [ ] Fix harness-config local-storage download URL rewriting and raw HTTP
+- [x] Fix harness-config local-storage download URL rewriting and raw HTTP
   file serving; inspect upload paths used by remote resource publishing too.
 - [ ] Verify authenticated downloads through the advertised HTTP(S) Hub URL,
+- [x] Verify authenticated downloads through the advertised HTTP(S) Hub URL,
   including reverse-proxy paths, escaped filenames, hash checking, and caching.
 - [ ] Cover harness Dockerfiles, provisioners, supporting files, templates,
+- [x] Cover harness Dockerfiles, provisioners, supporting files, templates,
   skills, and configuration without opening Hub filesystem paths on a Runtime
   Broker or requiring shared storage.
 - [ ] Verify create, start/restart, and recreation with cold and warm caches.
+- [x] Verify create, start/restart, and recreation with cold and warm caches.
 
 Template and skill local-storage URL rewriting already exists; harness-config
 rewriting is missing in this fork. Upstream issue #1235 concerns a related
 restart hydration defect, not the identical file-URL bug. Reuse existing
 hydration, transfer authentication, and cache implementations.
+rewriting and remote hydration are implemented via the Hub authenticated download
+handlers and runtime broker hydration cache.
 
 ## MS2 — Docker execution, networks, and runtime labels
 
 - [ ] Carry privileged mode and CDI requests such as `nvidia.com/gpu=all`
   through configuration, Hub applied config, dispatch, and Docker execution.
+  (Privileged mode tri-state UI/API/dispatch/Docker execution and NvidiaGPU
+  broker requirement matching completed; Docker CDI device flag forwarding remains).
 - [ ] Verify existing environment, volumes, resources, and user handling;
   complete required device, capability, security-option, and network transport
   without silently dropping configured options or introducing WSL paths.
@@ -94,7 +102,7 @@ hydration, transfer authentication, and cache implementations.
   must exist before that operation; Buildx setup requiring nested Docker must
   happen after dockerd readiness. Today cloning precedes pre-start hooks and
   services start after those hooks.
-- [ ] Implement the following external-network and runtime-label contract.
+- [x] Implement the following external-network and runtime-label contract.
 
 ### External networks and runtime labels
 
@@ -171,6 +179,8 @@ these SCION acceptance checks.
 - [ ] Add Runtime Broker labels in settings/environment and republish them
   on registration/reconnection: capability, capacity, harness availability,
   and operator-provided name.
+  and operator-provided name. (NvidiaGPU capability reporting, CLI broker
+  registration, and Hub DB mapping completed).
 - [ ] Verify existing searchable agent labels, persistence, online/connected
   status, active-agent count, and explicit Runtime Broker selection.
 
