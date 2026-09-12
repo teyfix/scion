@@ -42,6 +42,8 @@ import {
   isTerminalAvailable,
   getAgentDisplayStatus,
   isAgentRunning,
+  isAgentPrivileged,
+  agentUsesNvidiaGPU,
 } from '../../shared/types.js';
 
 interface AgentNotificationsResponse {
@@ -1184,11 +1186,10 @@ export class ScionPageAgentDetail extends LitElement {
               mode=${agent.messageMode || 'project'}
               size="medium"
             ></scion-message-mode-badge>
-            ${agent.appliedConfig?.inlineConfig?.docker?.privileged === true ||
-            agent.appliedConfig?.docker?.privileged === true
+            ${isAgentPrivileged(agent)
               ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
               : ''}
-            ${agent.appliedConfig?.requireGpu === true
+            ${agentUsesNvidiaGPU(agent)
               ? html`<scion-status-badge status="neutral" icon="gpu">GPU</scion-status-badge>`
               : ''}
           </div>
@@ -2085,6 +2086,7 @@ export class ScionPageAgentDetail extends LitElement {
     const branch = inline?.branch;
     const profile = agent.appliedConfig?.profile;
     const isPrivileged = agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
+    const nvidiaGpu = agent.appliedConfig?.nvidiaGpu;
     const requireGpu = agent.appliedConfig?.requireGpu;
     const dockerNetworks = inline?.docker?.networks ?? [];
     const dockerDevices = inline?.docker?.devices ?? [];
@@ -2139,11 +2141,15 @@ export class ScionPageAgentDetail extends LitElement {
             </span>
           </div>
           <div class="info-item">
-            <span class="info-label">GPU Required</span>
+            <span class="info-label">NVIDIA GPU</span>
             <span class="info-value">
-              ${requireGpu
-                ? html`<sl-badge variant="primary">Required</sl-badge>`
-                : html`<span style="color: var(--scion-text-muted, #888);">No</span>`}
+              ${nvidiaGpu !== undefined
+                ? nvidiaGpu
+                  ? html`<sl-badge variant="primary">Attached</sl-badge>`
+                  : html`<span style="color: var(--scion-text-muted, #888);">Not attached</span>`
+                : requireGpu
+                  ? html`<sl-badge variant="neutral">Required; not reported</sl-badge>`
+                  : html`<span style="color: var(--scion-text-muted, #888);">Not reported</span>`}
             </span>
           </div>
           ${image

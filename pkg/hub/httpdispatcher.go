@@ -987,6 +987,7 @@ func (d *HTTPAgentDispatcher) applyBrokerResponse(agent *store.Agent, resp *Remo
 				agent.AppliedConfig.Profile = resp.Agent.Profile
 			}
 		}
+		applyAgentRuntimeFacts(agent, resp.Agent.Privileged, resp.Agent.NvidiaGPU)
 		if resp.Agent.Runtime != "" {
 			agent.Runtime = resp.Agent.Runtime
 		}
@@ -995,6 +996,36 @@ func (d *HTTPAgentDispatcher) applyBrokerResponse(agent *store.Agent, resp *Remo
 			"agentName", agent.Name,
 		)
 	}
+}
+
+// applyAgentRuntimeFacts stores values observed by the runtime separately from
+// the inline request. This keeps inherited profile settings and Docker-wrapper
+// additions visible without turning them into explicit agent overrides.
+func applyAgentRuntimeFacts(agent *store.Agent, privileged, nvidiaGPU *bool) bool {
+	if agent == nil || (privileged == nil && nvidiaGPU == nil) {
+		return false
+	}
+	if agent.AppliedConfig == nil {
+		agent.AppliedConfig = &store.AgentAppliedConfig{}
+	}
+
+	changed := false
+	if privileged != nil {
+		if agent.AppliedConfig.Docker == nil {
+			agent.AppliedConfig.Docker = &api.DockerConfig{}
+		}
+		if agent.AppliedConfig.Docker.Privileged == nil || *agent.AppliedConfig.Docker.Privileged != *privileged {
+			value := *privileged
+			agent.AppliedConfig.Docker.Privileged = &value
+			changed = true
+		}
+	}
+	if nvidiaGPU != nil && (agent.AppliedConfig.NvidiaGPU == nil || *agent.AppliedConfig.NvidiaGPU != *nvidiaGPU) {
+		value := *nvidiaGPU
+		agent.AppliedConfig.NvidiaGPU = &value
+		changed = true
+	}
+	return changed
 }
 
 // DispatchAgentCreate creates and starts an agent on the runtime broker.

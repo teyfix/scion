@@ -152,3 +152,62 @@ echo "$@"
 		}
 	})
 }
+
+func TestDockerRuntime_ListReportsObservedRuntimeFacts(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockDocker := filepath.Join(tmpDir, "mock-docker")
+
+	script := `#!/bin/sh
+case "$1" in
+  ps)
+    printf '%s\n' \
+      '{"ID":"gpu-id","Names":"gpu-agent","Status":"Up 1 minute","Image":"agent:latest","Labels":"scion.agent=true"}' \
+      '{"ID":"plain-id","Names":"plain-agent","Status":"Exited (0) 1 minute ago","Image":"agent:latest","Labels":"scion.agent=true"}'
+    ;;
+  inspect)
+    printf '%s\n' \
+      '{"id":"gpu-id","privileged":true,"devices":[],"deviceRequests":[{"Driver":"cdi","DeviceIDs":["nvidia.com/gpu=all"],"Capabilities":null}]}' \
+      '{"id":"plain-id","privileged":false,"devices":[],"deviceRequests":[]}'
+    ;;
+esac
+`
+	if err := os.WriteFile(mockDocker, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock docker: %v", err)
+	}
+
+	runtime := &DockerRuntime{Command: mockDocker}
+	agents, err := runtime.List(context.Background(), map[string]string{"scion.agent": "true"})
+	if err != nil {
+		t.Fatalf("runtime.List failed: %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("expected 2 agents, got %d", len(agents))
+	}
+
+	byName := make(map[string]struct {
+		privileged *bool
+		nvidiaGPU  *bool
+	}, len(agents))
+	for _, agent := range agents {
+		byName[agent.Name] = struct {
+			privileged *bool
+			nvidiaGPU  *bool
+		}{agent.Privileged, agent.NvidiaGPU}
+	}
+
+	gpu := byName["gpu-agent"]
+	if gpu.privileged == nil || !*gpu.privileged {
+		t.Fatalf("expected gpu-agent to report privileged=true, got %v", gpu.privileged)
+	}
+	if gpu.nvidiaGPU == nil || !*gpu.nvidiaGPU {
+		t.Fatalf("expected gpu-agent to report nvidiaGpu=true, got %v", gpu.nvidiaGPU)
+	}
+
+	plain := byName["plain-agent"]
+	if plain.privileged == nil || *plain.privileged {
+		t.Fatalf("expected plain-agent to report privileged=false, got %v", plain.privileged)
+	}
+	if plain.nvidiaGPU == nil || *plain.nvidiaGPU {
+		t.Fatalf("expected plain-agent to report nvidiaGpu=false, got %v", plain.nvidiaGPU)
+	}
+}

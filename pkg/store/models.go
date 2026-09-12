@@ -155,6 +155,8 @@ type AgentAppliedConfig struct {
 	Workspace     string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
 	GitClone      *api.GitCloneConfig `json:"gitClone,omitempty"`
 	RequireGPU    bool                `json:"requireGpu,omitempty"`
+	Docker        *api.DockerConfig   `json:"docker,omitempty"`    // Effective runtime Docker settings reported by the broker
+	NvidiaGPU     *bool               `json:"nvidiaGpu,omitempty"` // Effective NVIDIA GPU attachment reported by the broker
 
 	// Template info for Runtime Broker hydration
 	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching

@@ -155,6 +155,97 @@ type dockerListOutput struct {
 	Labels string `json:"Labels"`
 }
 
+type dockerInspectRuntimeFacts struct {
+	ID         string `json:"id"`
+	Privileged bool   `json:"privileged"`
+	Devices    []struct {
+		PathOnHost        string `json:"PathOnHost"`
+		PathInContainer   string `json:"PathInContainer"`
+		CgroupPermissions string `json:"CgroupPermissions"`
+	} `json:"devices"`
+	DeviceRequests []struct {
+		Driver       string     `json:"Driver"`
+		DeviceIDs    []string   `json:"DeviceIDs"`
+		Capabilities [][]string `json:"Capabilities"`
+	} `json:"deviceRequests"`
+}
+
+func dockerFactsHaveNvidiaGPU(facts dockerInspectRuntimeFacts) bool {
+	for _, device := range facts.Devices {
+		if strings.Contains(strings.ToLower(device.PathOnHost), "nvidia") ||
+			strings.Contains(strings.ToLower(device.PathInContainer), "nvidia") {
+			return true
+		}
+	}
+	for _, request := range facts.DeviceRequests {
+		driver := strings.ToLower(request.Driver)
+		if driver == "nvidia" {
+			return true
+		}
+		for _, id := range request.DeviceIDs {
+			if strings.HasPrefix(strings.ToLower(id), "nvidia.com/gpu=") {
+				return true
+			}
+		}
+		for _, capabilitySet := range request.Capabilities {
+			for _, capability := range capabilitySet {
+				if strings.EqualFold(capability, "gpu") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// populateRuntimeFacts records what Docker actually applied to each container.
+// These are observed facts rather than requested settings: wrappers around the
+// Docker CLI may add --privileged or GPU device requests after Scion builds the
+// command line, so only inspection can report the effective runtime state.
+func (r *DockerRuntime) populateRuntimeFacts(ctx context.Context, agents []api.AgentInfo) {
+	if len(agents) == 0 {
+		return
+	}
+
+	args := []string{
+		"inspect",
+		"--format",
+		`{"id":{{json .Id}},"privileged":{{json .HostConfig.Privileged}},"devices":{{json .HostConfig.Devices}},"deviceRequests":{{json .HostConfig.DeviceRequests}}}`,
+	}
+	for i := range agents {
+		args = append(args, agents[i].ContainerID)
+	}
+
+	out, err := exec.CommandContext(ctx, r.Command, args...).CombinedOutput()
+	if err != nil {
+		util.Debugf("docker inspect runtime facts failed: %v", err)
+		return
+	}
+
+	byID := make(map[string]dockerInspectRuntimeFacts, len(agents))
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		var facts dockerInspectRuntimeFacts
+		if err := json.Unmarshal([]byte(line), &facts); err != nil || facts.ID == "" {
+			continue
+		}
+		byID[facts.ID] = facts
+	}
+
+	for i := range agents {
+		facts, ok := byID[agents[i].ContainerID]
+		if !ok {
+			continue
+		}
+		privileged := facts.Privileged
+		nvidiaGPU := dockerFactsHaveNvidiaGPU(facts)
+		agents[i].Privileged = &privileged
+		agents[i].NvidiaGPU = &nvidiaGPU
+	}
+}
+
 func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
 	args := []string{"ps", "-a", "--no-trunc", "--format", "{{json .}}"}
 	cmd := exec.CommandContext(ctx, r.Command, args...)
@@ -236,6 +327,8 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 			agents = append(agents, info)
 		}
 	}
+
+	r.populateRuntimeFacts(ctx, agents)
 
 	return agents, nil
 }

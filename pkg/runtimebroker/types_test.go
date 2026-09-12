@@ -421,6 +421,23 @@ func TestAgentInfoToResponseProfile(t *testing.T) {
 	}
 }
 
+func TestAgentInfoToResponseRuntimeFacts(t *testing.T) {
+	privileged := true
+	nvidiaGPU := true
+	resp := AgentInfoToResponse(api.AgentInfo{
+		Name:       "gpu-agent",
+		Privileged: &privileged,
+		NvidiaGPU:  &nvidiaGPU,
+	})
+
+	if resp.Privileged == nil || !*resp.Privileged {
+		t.Fatalf("expected privileged runtime fact, got %v", resp.Privileged)
+	}
+	if resp.NvidiaGPU == nil || !*resp.NvidiaGPU {
+		t.Fatalf("expected NVIDIA GPU runtime fact, got %v", resp.NvidiaGPU)
+	}
+}
+
 func TestCreateAgentRequest_WorkspaceMode_JSON(t *testing.T) {
 	req := CreateAgentRequest{
 		Name:          "test-agent",

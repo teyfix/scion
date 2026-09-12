@@ -25,7 +25,11 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type { PageData, RuntimeBroker, Agent } from '../../shared/types.js';
-import { getAgentDisplayStatus } from '../../shared/types.js';
+import {
+  agentUsesNvidiaGPU,
+  getAgentDisplayStatus,
+  isAgentPrivileged,
+} from '../../shared/types.js';
 import type { StatusType } from '../shared/status-badge.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
@@ -830,6 +834,14 @@ export class ScionPageBrokerDetail extends LitElement {
             <h3 class="agent-name">
               <sl-icon name="cpu"></sl-icon>
               ${agent.name}
+              ${isAgentPrivileged(agent)
+                ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                : ''}
+              ${agentUsesNvidiaGPU(agent)
+                ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                    >GPU</scion-status-badge
+                  >`
+                : ''}
             </h3>
             <div class="agent-meta"><sl-icon name="code-square"></sl-icon> ${agent.template}</div>
           </div>

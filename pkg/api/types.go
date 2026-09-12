@@ -597,6 +597,8 @@ type AgentInfo struct {
 	Detached   bool              `json:"detached,omitempty"`
 	Runtime    string            `json:"runtime,omitempty"`
 	Profile    string            `json:"profile,omitempty"`
+	Privileged *bool             `json:"privileged,omitempty"` // Observed container privileged mode when reported by the runtime
+	NvidiaGPU  *bool             `json:"nvidiaGpu,omitempty"`  // Observed NVIDIA GPU attachment when reported by the runtime
 	Kubernetes *AgentK8sMetadata `json:"kubernetes,omitempty"`
 	Warnings   []string          `json:"warnings,omitempty"`
 

@@ -465,6 +465,8 @@ export interface AgentAppliedConfig {
   agentRole?: string;
   docker?: DockerRuntimeConfig;
   requireGpu?: boolean;
+  /** NVIDIA GPU attachment observed by the runtime broker. */
+  nvidiaGpu?: boolean;
 }
 
 /**
@@ -531,6 +533,20 @@ export interface Agent {
 
   // Children agent IDs (populated by some API responses)
   childrenIds?: string[];
+}
+
+/** Effective privileged mode, preferring the broker-observed value over the request. */
+export function isAgentPrivileged(agent: Agent): boolean {
+  return (
+    agent.appliedConfig?.docker?.privileged ??
+    agent.appliedConfig?.inlineConfig?.docker?.privileged ??
+    false
+  );
+}
+
+/** Effective NVIDIA GPU attachment, with the scheduling requirement as a legacy fallback. */
+export function agentUsesNvidiaGPU(agent: Agent): boolean {
+  return agent.appliedConfig?.nvidiaGpu ?? agent.appliedConfig?.requireGpu ?? false;
 }
 
 /**

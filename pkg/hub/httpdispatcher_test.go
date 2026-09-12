@@ -4819,3 +4819,32 @@ func TestDispatchAgentRestart_ResolvesHarnessConfigFromStore(t *testing.T) {
 }
 
 func intPtr(i int) *int { return &i }
+
+func TestApplyAgentRuntimeFacts(t *testing.T) {
+	agent := &store.Agent{
+		AppliedConfig: &store.AgentAppliedConfig{
+			InlineConfig: &api.ScionConfig{
+				Docker: &api.DockerConfig{Privileged: boolPtr(false)},
+			},
+		},
+	}
+	privileged := true
+	nvidiaGPU := true
+
+	if !applyAgentRuntimeFacts(agent, &privileged, &nvidiaGPU) {
+		t.Fatal("expected observed runtime facts to change the applied config")
+	}
+	if agent.AppliedConfig.Docker == nil || agent.AppliedConfig.Docker.Privileged == nil ||
+		!*agent.AppliedConfig.Docker.Privileged {
+		t.Fatalf("expected effective privileged=true, got %+v", agent.AppliedConfig.Docker)
+	}
+	if agent.AppliedConfig.NvidiaGPU == nil || !*agent.AppliedConfig.NvidiaGPU {
+		t.Fatalf("expected effective nvidiaGpu=true, got %v", agent.AppliedConfig.NvidiaGPU)
+	}
+	if *agent.AppliedConfig.InlineConfig.Docker.Privileged {
+		t.Fatal("observed facts must not rewrite the explicit inline request")
+	}
+	if applyAgentRuntimeFacts(agent, &privileged, &nvidiaGPU) {
+		t.Fatal("reapplying identical runtime facts should be a no-op")
+	}
+}

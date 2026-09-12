@@ -703,6 +703,8 @@ type RemoteAgentInfo struct {
 	Activity        string `json:"activity,omitempty"` // Runtime activity
 	Status          string `json:"status"`             // Legacy: kept for backward compat with older brokers
 	ContainerStatus string `json:"containerStatus,omitempty"`
+	Privileged      *bool  `json:"privileged,omitempty"`
+	NvidiaGPU       *bool  `json:"nvidiaGpu,omitempty"`
 }
 
 // Server is the Hub API HTTP server.

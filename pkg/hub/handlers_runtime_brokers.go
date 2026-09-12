@@ -775,6 +775,8 @@ type brokerAgentHeartbeat struct {
 	Message         string `json:"message,omitempty"`     // Error or status message from agent
 	HarnessAuth     string `json:"harnessAuth,omitempty"` // Resolved auth method from container labels
 	Profile         string `json:"profile,omitempty"`     // Settings profile used
+	Privileged      *bool  `json:"privileged,omitempty"`  // Observed container privileged mode
+	NvidiaGPU       *bool  `json:"nvidiaGpu,omitempty"`   // Observed NVIDIA GPU attachment
 	ExitCode        *int   `json:"exitCode,omitempty"`    // Structured exit code from runtime (nil = unknown)
 	ExitReason      string `json:"exitReason,omitempty"`  // Terminal reason: "crashed" or "limits_exceeded"
 }
@@ -1040,6 +1042,9 @@ func (s *Server) handleBrokerHeartbeat(w http.ResponseWriter, r *http.Request, i
 					agent.AppliedConfig = &store.AgentAppliedConfig{}
 				}
 				agent.AppliedConfig.Profile = agentHB.Profile
+				needsUpdate = true
+			}
+			if applyAgentRuntimeFacts(agent, agentHB.Privileged, agentHB.NvidiaGPU) {
 				needsUpdate = true
 			}
 			if needsUpdate {

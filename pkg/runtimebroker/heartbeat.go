@@ -283,6 +283,8 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context) []hubclient.
 			ContainerStatus: ag.ContainerStatus,
 			HarnessAuth:     ag.HarnessAuth,
 			Profile:         ag.Profile,
+			Privileged:      ag.Privileged,
+			NvidiaGPU:       ag.NvidiaGPU,
 			ExitCode:        ag.ExitCode,
 			ExitReason:      ag.ExitReason,
 		}
