@@ -66,7 +66,9 @@ jobs:
         id: source
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
-          BUILD_SCOPE: ${{ inputs.build_scope || 'feature' }}
+          # Pushes have no workflow_dispatch inputs. Default them to the full
+          # catalog so every harness shipped by the on-prem branch is built.
+          BUILD_SCOPE: ${{ inputs.build_scope || 'all' }}
         run: |
           set -euo pipefail
           commit_sha="$(git rev-parse HEAD)"
