@@ -71,6 +71,9 @@ func (c *Client) ReportMetrics(ctx context.Context, payload MetricsPayload) erro
 	if !c.IsConfigured() {
 		return fmt.Errorf("hub client not configured")
 	}
+	if err := validateMetricsPayload(payload); err != nil {
+		return fmt.Errorf("invalid metrics payload: %w", err)
+	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/metrics",
 		strings.TrimSuffix(c.hubURL, "/"), c.agentID)
@@ -130,6 +133,33 @@ func (c *Client) ReportMetrics(ctx context.Context, payload MetricsPayload) erro
 	}
 
 	return fmt.Errorf("request failed after %d attempts: %w", attempts, lastErr)
+}
+
+func validateMetricsPayload(payload MetricsPayload) error {
+	if strings.TrimSpace(payload.Session.ID) == "" {
+		return fmt.Errorf("session.id is required")
+	}
+	if payload.Session.StartedAt == "" {
+		return fmt.Errorf("session.started_at is required")
+	}
+
+	startedAt, err := time.Parse(time.RFC3339, payload.Session.StartedAt)
+	if err != nil || startedAt.IsZero() {
+		return fmt.Errorf("session.started_at must be a non-zero RFC3339 timestamp")
+	}
+	if payload.Session.EndedAt == "" {
+		return nil
+	}
+
+	endedAt, err := time.Parse(time.RFC3339, payload.Session.EndedAt)
+	if err != nil {
+		return fmt.Errorf("session.ended_at must be RFC3339")
+	}
+	if endedAt.Before(startedAt) {
+		return fmt.Errorf("session.ended_at cannot be before session.started_at")
+	}
+
+	return nil
 }
 
 // SummaryToMetricsPayload converts a telemetry.SessionSummary (produced by the

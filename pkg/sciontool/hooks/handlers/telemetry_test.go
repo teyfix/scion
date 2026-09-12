@@ -11,6 +11,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/telemetry"
+	"github.com/google/uuid"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -137,6 +138,32 @@ func TestTelemetryHandler_HandleSessionEvents(t *testing.T) {
 		if err := h.Handle(event); err != nil {
 			t.Errorf("Handle(%s) should not return error, got: %v", tc.name, err)
 		}
+	}
+}
+
+func TestTelemetryHandler_SessionEndWithoutStartUsesLifecycleIdentity(t *testing.T) {
+	h := NewTelemetryHandler(nil, nil, nil)
+
+	var summary telemetry.SessionSummary
+	h.OnSessionEnd = func(got telemetry.SessionSummary) {
+		summary = got
+	}
+
+	if err := h.Handle(&hooks.Event{
+		Name: hooks.EventSessionEnd,
+		Data: hooks.EventData{Reason: "container_stop"},
+	}); err != nil {
+		t.Fatalf("Handle session-end: %v", err)
+	}
+
+	if _, err := uuid.Parse(summary.SessionID); err != nil {
+		t.Fatalf("session ID %q is not a UUID: %v", summary.SessionID, err)
+	}
+	if summary.StartedAt.IsZero() {
+		t.Fatal("session start time is zero")
+	}
+	if summary.EndedAt.Before(summary.StartedAt) {
+		t.Fatalf("ended at %s is before started at %s", summary.EndedAt, summary.StartedAt)
 	}
 }
 

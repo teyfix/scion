@@ -583,13 +583,13 @@ func runInit(args []string) int {
 	log.Debug("Waiting for child process startup (100ms check)...")
 	select {
 	case result := <-exitChan:
-		// Child exited immediately - likely a startup error
-		if result.err != nil {
-			log.Error("Child exited immediately with error: %v (uid=%d, gid=%d)", result.err, os.Geteuid(), os.Getegid())
-			return 1
+		outcome := classifyExit(result.code, result.err, nil, false, requestedShutdown.Load())
+		if outcome.isCrash {
+			log.Error("Child exited immediately: %s (uid=%d, gid=%d)", outcome.message, os.Geteuid(), os.Getegid())
+		} else {
+			log.Info("Child exited immediately with code %d (uid=%d, gid=%d)", outcome.exitCode, os.Geteuid(), os.Getegid())
 		}
-		log.Info("Child exited immediately with code %d (uid=%d, gid=%d)", result.code, os.Geteuid(), os.Getegid())
-		return result.code
+		return outcome.exitCode
 	case <-time.After(100 * time.Millisecond):
 		// Process appears to be running, execute post-start hooks
 		log.Info("Running post-start hooks...")
@@ -1018,24 +1018,16 @@ waitLoop:
 
 	if limitsExceeded {
 		log.Info("Exiting with code %d (limits exceeded)", handlers.ExitCodeLimitsExceeded)
-		return handlers.ExitCodeLimitsExceeded
-	}
-
-	if outcome.isCrash {
+	} else if outcome.isCrash {
 		// Propagate the authoritative crash code (which may have come from the
 		// harness exit-code file rather than the supervised child) so the
 		// container's exit status reflects the real failure.
 		log.Error("Agent crashed with exit code %d", finalCode)
-		return finalCode
+	} else {
+		log.Info("Child exited with code %d", finalCode)
 	}
 
-	if result.err != nil {
-		log.Error("Supervisor error: %v", result.err)
-		return 1
-	}
-
-	log.Info("Child exited with code %d", result.code)
-	return result.code
+	return finalCode
 }
 
 // readHarnessExitCode reads and parses the harness exit-code file written by the
