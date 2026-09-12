@@ -17,7 +17,52 @@ package telemetry
 import (
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
+
+func TestAggregator_FinalizeWithoutSessionStart(t *testing.T) {
+	t.Setenv("SCION_AGENT_ID", "agent-1")
+	t.Setenv("SCION_GROVE_ID", "project-1")
+
+	createdAfter := time.Now()
+	a := NewAggregator()
+	summary := a.Finalize(0, 0, 0, 0, "")
+
+	if _, err := uuid.Parse(summary.SessionID); err != nil {
+		t.Fatalf("fallback session ID %q is not a UUID: %v", summary.SessionID, err)
+	}
+	if summary.StartedAt.Before(createdAfter) || summary.StartedAt.IsZero() {
+		t.Fatalf("started at = %s, want aggregator creation time", summary.StartedAt)
+	}
+	if summary.EndedAt.Before(summary.StartedAt) {
+		t.Fatalf("ended at %s is before started at %s", summary.EndedAt, summary.StartedAt)
+	}
+	if summary.AgentID != "agent-1" || summary.ProjectID != "project-1" {
+		t.Fatalf("identity = (%q, %q), want environment identity", summary.AgentID, summary.ProjectID)
+	}
+
+	second := a.Finalize(0, 0, 0, 0, "")
+	if second.SessionID != summary.SessionID || !second.StartedAt.Equal(summary.StartedAt) {
+		t.Fatalf("fallback lifecycle identity changed between finalizations: first=%+v second=%+v", summary, second)
+	}
+}
+
+func TestAggregator_EmptySessionStartPreservesFallbackIdentity(t *testing.T) {
+	a := NewAggregator()
+	before := a.Finalize(0, 0, 0, 0, "")
+
+	a.StartSession(" ")
+	after := a.Finalize(0, 0, 0, 0, "")
+
+	if after.SessionID != before.SessionID {
+		t.Fatalf("empty session start replaced fallback ID %q with %q", before.SessionID, after.SessionID)
+	}
+	if after.StartedAt.Before(before.StartedAt) {
+		t.Fatalf("session start moved startedAt backwards: before=%s after=%s", before.StartedAt, after.StartedAt)
+	}
+}
 
 func TestAggregator_BasicFlow(t *testing.T) {
 	a := &Aggregator{

@@ -16,8 +16,11 @@ package telemetry
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ToolCallStats tracks per-tool invocation counts.
@@ -76,8 +79,10 @@ func NewAggregator() *Aggregator {
 	model := os.Getenv("SCION_MODEL")
 
 	return &Aggregator{
+		sessionID: uuid.NewString(),
 		agentID:   agentID,
 		projectID: projectID,
+		startedAt: time.Now(),
 		model:     model,
 		toolCalls: make(map[string]*ToolCallStats),
 	}
@@ -89,7 +94,9 @@ func (a *Aggregator) StartSession(sessionID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.sessionID = sessionID
+	if strings.TrimSpace(sessionID) != "" {
+		a.sessionID = sessionID
+	}
 	a.startedAt = time.Now()
 	a.turnCount = 0
 	a.apiCallCount = 0
