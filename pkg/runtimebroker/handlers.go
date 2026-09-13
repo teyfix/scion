@@ -505,6 +505,14 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Env-gather: if GatherEnv is true, evaluate env completeness before building full context.
+	createAdmission := &api.CreateAdmission{AgentID: req.ID, ProjectID: req.ProjectID, RuntimeBrokerID: s.config.BrokerID}
+	retainedCreate, admissionErr := agent.ValidateCreateAdmission(api.StartOptions{Name: req.Name, ProjectPath: req.ProjectPath, SharedWorkspace: req.Config != nil && req.Config.SharedWorkspace, InlineConfig: req.InlineConfig, CreateAdmission: createAdmission})
+	if admissionErr != nil {
+		markAttemptFailed(http.StatusConflict, admissionErr.Error())
+		writeError(w, http.StatusConflict, "CREATE_ADMISSION_CONFLICT", admissionErr.Error(), nil)
+		return
+	}
+
 	// This needs the resolved project path and merged env to determine which keys are missing.
 	if req.GatherEnv && !req.NoAuth {
 		// Build a preliminary merged env for env-gather evaluation
@@ -727,6 +735,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := sc.Opts
+	opts.CreateAdmission = createAdmission
 	s.agentLifecycleLog.Info("Agent dispatch: buildStartContext complete",
 		"agent_id", req.ID, "name", req.Name, "elapsed", time.Since(buildCtxStart).String())
 
@@ -853,6 +862,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		// Provision only: set up dirs, worktree, templates without starting the container
 		cfg, err := sc.Manager.Provision(ctx, opts)
 		if err != nil {
+			if errors.Is(err, agent.ErrCreateAdmissionConflict) {
+				markAttemptFailed(http.StatusConflict, err.Error())
+				Conflict(w, err.Error())
+				return
+			}
 			markAttemptFailed(http.StatusInternalServerError, "failed to provision agent")
 			span.SetStatus(codes.Error, err.Error())
 			RuntimeError(w, "Failed to provision agent: "+err.Error())
@@ -897,6 +911,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	startOpStart := time.Now()
 	agentInfo, err := sc.Manager.Start(ctx, opts)
 	if err != nil {
+		if errors.Is(err, agent.ErrCreateAdmissionConflict) {
+			markAttemptFailed(http.StatusConflict, err.Error())
+			Conflict(w, err.Error())
+			return
+		}
 		markAttemptFailed(http.StatusInternalServerError, "failed to create agent")
 
 		s.agentLifecycleLog.Error("Agent create failed",
@@ -904,8 +923,9 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			"name", req.Name, "slug", req.Slug,
 			"error", err)
 
-		// Clean up provisioned agent files so they don't become orphans.
-		if opts.ProjectPath != "" {
+		// Only a genuinely fresh admission owns newly provisioned files.
+		// A failed retry must preserve the retained agent's work and home.
+		if !retainedCreate && opts.ProjectPath != "" {
 			if _, cleanupErr := agent.DeleteAgentFiles(opts.Name, opts.ProjectPath, true); cleanupErr != nil {
 				s.agentLifecycleLog.Warn("Failed to clean up agent files after start failure",
 					"agent_id", req.ID, "project_id", req.ProjectID, "agent", opts.Name, "error", cleanupErr)

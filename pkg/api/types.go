@@ -981,6 +981,14 @@ func HubAgentDefaultsFromContext(ctx context.Context) *HubAgentDefaults {
 	return v
 }
 
+// CreateAdmission is the identity supplied by the authoritative CREATE handler.
+// It is internal lifecycle input, never inferred from config or environment.
+type CreateAdmission struct {
+	AgentID         string
+	ProjectID       string
+	RuntimeBrokerID string
+}
+
 type StartOptions struct {
 	Name              string
 	Task              string
@@ -998,6 +1006,7 @@ type StartOptions struct {
 	Detached          *bool
 	Resume            bool
 	RuntimeRecovery   *RuntimeRecovery // Explicit retained runtime update; ordinary resume is unchanged.
+	CreateAdmission   *CreateAdmission // Nil for ordinary start/resume and runtime recovery.
 	NoAuth            bool
 	Branch            string
 	Workspace         string

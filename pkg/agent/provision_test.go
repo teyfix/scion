@@ -18,9 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -31,6 +33,317 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/resources"
 )
+
+func retainedCreateFixture(t *testing.T, gpu bool) (api.StartOptions, string) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Chdir(root)
+	global := filepath.Join(root, ".scion")
+	seedTestHarnessConfig(t, global, "generic", "generic")
+	template := filepath.Join(global, "templates", "default")
+	if err := os.MkdirAll(template, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(template, "scion-agent.json"), []byte(`{"default_harness_config":"generic"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, "project", ".scion")
+	if err := os.MkdirAll(project, 0755); err != nil {
+		t.Fatal(err)
+	}
+	identity := &api.CreateAdmission{AgentID: "11111111-1111-4111-8111-111111111111", ProjectID: "22222222-2222-4222-8222-222222222222", RuntimeBrokerID: "33333333-3333-4333-8333-333333333333"}
+	opts := api.StartOptions{Name: "retained", ProjectPath: project, Template: "default", NoAuth: true, CreateAdmission: identity, GitClone: &api.GitCloneConfig{URL: "https://example.invalid/repository.git"}}
+	agentDir := config.GetAgentDir(project, opts.Name, false)
+	home := config.GetAgentHomePath(project, opts.Name)
+	files := map[string][]byte{
+		filepath.Join(agentDir, "workspace", "source.txt"): []byte("retained unstaged source"),
+		filepath.Join(agentDir, "workspace", ".git"):       []byte("gitdir: retained-git-admin"),
+		filepath.Join(home, ".provider", "credential"):     []byte("synthetic retained credential"),
+		filepath.Join(home, ".private-docker", "state"):    []byte("retained docker state"),
+	}
+	info := api.AgentInfo{Name: opts.Name, ID: identity.AgentID, ProjectID: identity.ProjectID, RuntimeBrokerID: identity.RuntimeBrokerID, Template: "default"}
+	infoJSON, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := api.ScionConfig{DefaultHarnessConfig: "generic", Docker: &api.DockerConfig{NvidiaGPU: &gpu, Devices: []string{"nvidia.com/gpu=0", "/dev/nvidia0", "/dev/dri"}}, Env: map[string]string{"SCION_AGENT_ID": identity.AgentID, "SCION_PROJECT_ID": identity.ProjectID, "SCION_BROKER_ID": identity.RuntimeBrokerID}}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files[filepath.Join(agentDir, "scion-agent.json")] = cfgJSON
+	files[filepath.Join(home, "agent-info.json")] = infoJSON
+	for path, data := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return opts, agentDir
+}
+
+func retainedCreateSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	result := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		var data []byte
+		if !entry.IsDir() {
+			data, err = os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+		}
+		result[path] = fmt.Sprintf("%o:%s", info.Mode(), data)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestCreateAdmissionRejectsBeforeRetainedMutation(t *testing.T) {
+	for _, operation := range []string{"start", "provision"} {
+		for _, scenario := range []string{"deny-gpu", "enable-gpu", "new-uuid", "wrong-project", "wrong-broker", "missing-authority", "missing-identity", "unreadable-identity", "inconsistent-identity", "malformed-config", "missing-config"} {
+			t.Run(operation+"/"+scenario, func(t *testing.T) {
+				opts, agentDir := retainedCreateFixture(t, scenario != "enable-gpu")
+				requested := scenario != "deny-gpu"
+				opts.InlineConfig = &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &requested}}
+				infoPath := filepath.Join(config.GetAgentHomePath(opts.ProjectPath, opts.Name), "agent-info.json")
+				cfgPath := filepath.Join(agentDir, "scion-agent.json")
+				var err error
+				switch scenario {
+				case "new-uuid":
+					opts.CreateAdmission.AgentID = "44444444-4444-4444-8444-444444444444"
+				case "wrong-project":
+					opts.CreateAdmission.ProjectID = "wrong-project"
+				case "wrong-broker":
+					opts.CreateAdmission.RuntimeBrokerID = "wrong-broker"
+				case "missing-authority":
+					opts.CreateAdmission.AgentID = ""
+				case "missing-identity":
+					err = os.Remove(infoPath)
+				case "unreadable-identity":
+					if err = os.Remove(infoPath); err == nil {
+						err = os.Mkdir(infoPath, 0700)
+					}
+				case "inconsistent-identity":
+					err = os.WriteFile(cfgPath, []byte(`{"env":{"SCION_AGENT_ID":"other"},"docker":{"nvidia_gpu":true}}`), 0600)
+				case "malformed-config":
+					err = os.WriteFile(cfgPath, []byte(`{`), 0600)
+				case "missing-config":
+					opts.InlineConfig = nil // Missing config must fail independently of GPU intent.
+					err = os.Remove(cfgPath)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := retainedCreateSnapshot(t, agentDir)
+				calls := 0
+				rt := &runtime.MockRuntime{ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) { calls++; return nil, nil }, DeleteFunc: func(context.Context, string) error { calls++; return nil }, RunFunc: func(context.Context, runtime.RunConfig) (string, error) { calls++; return "unexpected", nil }}
+				manager := NewManager(rt)
+				if operation == "start" {
+					_, err = manager.Start(context.Background(), opts)
+				} else {
+					_, err = manager.Provision(context.Background(), opts)
+				}
+				if err == nil || !strings.Contains(err.Error(), "CREATE admission") {
+					t.Fatalf("expected visible CREATE admission rejection, got %v", err)
+				}
+				if calls != 0 {
+					t.Fatalf("rejected request reached runtime %d times", calls)
+				}
+				if after := retainedCreateSnapshot(t, agentDir); !reflect.DeepEqual(before, after) {
+					t.Fatal("rejection changed retained configuration, identity, source, credentials or private Docker")
+				}
+			})
+		}
+	}
+}
+
+func TestCreateAdmissionSameIdentityRetryPreservesCloneAndConfig(t *testing.T) {
+	for _, policy := range []string{"nil", "true", "false"} {
+		t.Run(policy, func(t *testing.T) {
+			opts, agentDir := retainedCreateFixture(t, policy != "false")
+			if policy != "nil" {
+				value := policy == "true"
+				opts.InlineConfig = &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &value}}
+			}
+			configPath := filepath.Join(agentDir, "scion-agent.json")
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workspace := filepath.Join(agentDir, "workspace")
+			source := retainedCreateSnapshot(t, workspace)
+			_, err = NewManager(&runtime.MockRuntime{}).Provision(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("same-admission retry: %v", err)
+			}
+			after, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) || !reflect.DeepEqual(source, retainedCreateSnapshot(t, workspace)) {
+				t.Fatal("same-admission retry changed saved configuration or clone")
+			}
+			data, err := os.ReadFile(filepath.Join(config.GetAgentHomePath(opts.ProjectPath, opts.Name), "agent-info.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var info api.AgentInfo
+			if err := json.Unmarshal(data, &info); err != nil {
+				t.Fatal(err)
+			}
+			if info.ID != opts.CreateAdmission.AgentID || info.ProjectID != opts.CreateAdmission.ProjectID || info.RuntimeBrokerID != opts.CreateAdmission.RuntimeBrokerID {
+				t.Fatal("retry changed retained identity")
+			}
+		})
+	}
+}
+
+func TestCreateAdmissionFreshGPUChoicesAndIdentity(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			opts, _ := retainedCreateFixture(t, true)
+			opts.Name = "genuinely-fresh"
+			opts.GitClone = nil
+			opts.InlineConfig = &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &enabled}}
+			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "default", "scion-agent.json")
+			if err := os.WriteFile(template, []byte(`{"default_harness_config":"generic","docker":{"devices":["nvidia.com/gpu=0","/dev/nvidia0","/dev/dri"]}}`), 0644); err != nil {
+				t.Fatal(err)
+			}
+			var actual runtime.RunConfig
+			rt := &runtime.MockRuntime{RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
+				actual = cfg
+				return "fresh-container", nil
+			}}
+			if _, err := NewManager(rt).Start(context.Background(), opts); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"/dev/dri"}
+			if enabled {
+				want = []string{"nvidia.com/gpu=0", "/dev/nvidia0", "/dev/dri"}
+			}
+			if !reflect.DeepEqual(actual.Devices, want) {
+				t.Fatalf("device grants %v, want %v", actual.Devices, want)
+			}
+			if actual.Labels["agent_id"] != opts.CreateAdmission.AgentID {
+				t.Fatal("fresh launch lost admission UUID")
+			}
+			data, err := os.ReadFile(filepath.Join(config.GetAgentHomePath(opts.ProjectPath, opts.Name), "agent-info.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var info api.AgentInfo
+			if err := json.Unmarshal(data, &info); err != nil {
+				t.Fatal(err)
+			}
+			if info.ID != opts.CreateAdmission.AgentID || info.ProjectID != opts.CreateAdmission.ProjectID || info.RuntimeBrokerID != opts.CreateAdmission.RuntimeBrokerID {
+				t.Fatal("fresh provisioning did not retain authoritative admission identity")
+			}
+			if _, err := ValidateCreateAdmission(opts); err != nil {
+				t.Fatalf("freshly saved identity cannot admit its retry: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateAdmissionNilOrdinaryResumeKeepsDevicePolicy(t *testing.T) {
+	opts, agentDir := retainedCreateFixture(t, true)
+	opts.CreateAdmission = nil
+	opts.Resume, opts.GitClone = true, nil
+	before := retainedCreateSnapshot(t, filepath.Join(agentDir, "workspace"))
+	var actual runtime.RunConfig
+	rt := &runtime.MockRuntime{RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) { actual = cfg; return "resumed", nil }}
+	if _, err := NewManager(rt).Start(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(actual.Devices, []string{"nvidia.com/gpu=0", "/dev/nvidia0", "/dev/dri"}) {
+		t.Fatalf("ordinary resume changed grants: %v", actual.Devices)
+	}
+	if !reflect.DeepEqual(before, retainedCreateSnapshot(t, filepath.Join(agentDir, "workspace"))) {
+		t.Fatal("ordinary resume changed source")
+	}
+}
+
+func TestCreateAdmissionRejectsBeforeMissingWorktreeRepair(t *testing.T) {
+	opts, agentDir := retainedCreateFixture(t, true)
+	project := filepath.Dir(opts.ProjectPath)
+	git := func(args ...string) {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", project}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git fixture: %v: %s", err, output)
+		}
+	}
+	git("init", "-q")
+	if err := os.WriteFile(filepath.Join(project, "README"), []byte("committed source"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "README")
+	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+	workspace := filepath.Join(agentDir, "workspace")
+	if err := os.RemoveAll(workspace); err != nil {
+		t.Fatal(err)
+	}
+	git("worktree", "add", "-qb", "retained-branch", workspace)
+	for name, data := range map[string]string{"README": "unstaged source", "staged": "staged source", "untracked": "untracked source"} {
+		if err := os.WriteFile(filepath.Join(workspace, name), []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if output, err := exec.Command("git", "-C", workspace, "add", "staged").CombinedOutput(); err != nil {
+		t.Fatalf("stage fixture: %v: %s", err, output)
+	}
+	// Keep the entire worktree, but leave its registered path absent. Ordinary
+	// GetAgent would attempt pruning/recreation; rejection must precede that.
+	if err := os.Rename(workspace, workspace+"-preserved"); err != nil {
+		t.Fatal(err)
+	}
+	opts.CreateAdmission.AgentID = "44444444-4444-4444-8444-444444444444"
+	before := retainedCreateSnapshot(t, project)
+	if _, err := NewManager(&runtime.MockRuntime{}).Start(context.Background(), opts); err == nil || !strings.Contains(err.Error(), "CREATE admission") {
+		t.Fatalf("expected identity conflict, got %v", err)
+	}
+	if !reflect.DeepEqual(before, retainedCreateSnapshot(t, project)) {
+		t.Fatal("rejection changed Git admin, branch, staged/unstaged/untracked work or retained home")
+	}
+}
+
+func TestCreateAdmissionDoesNotBypassRecoveryDeviceGuard(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		t.Run(fmt.Sprint(saved), func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			f.state.config.Docker = &api.DockerConfig{NvidiaGPU: &saved, Devices: []string{"nvidia.com/gpu=0", "/dev/dri"}}
+			if err := writeRuntimeRecoveryState(f.state); err != nil {
+				t.Fatal(err)
+			}
+			requested := !saved
+			f.opts.RuntimeRecovery.Update.Config.Docker.NvidiaGPU = &requested
+			before := retainedCreateSnapshot(t, f.state.dir)
+			if _, err := NewManager(f.rt).Start(context.Background(), f.opts); err == nil || !strings.Contains(err.Error(), "device permissions") {
+				t.Fatalf("expected unchanged-device recovery guard, got %v", err)
+			}
+			if f.deletes != 0 || f.runs != 0 {
+				t.Fatal("recovery replaced container after device change")
+			}
+			if !reflect.DeepEqual(before, retainedCreateSnapshot(t, f.state.dir)) {
+				t.Fatal("recovery device rejection changed retained state")
+			}
+		})
+	}
+}
 
 // seedTestHarnessConfig creates a minimal harness-config directory for testing.
 // Creates <scionDir>/harness-configs/<name>/config.yaml with the given harness type.
