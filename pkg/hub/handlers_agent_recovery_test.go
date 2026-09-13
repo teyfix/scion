@@ -5,6 +5,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,56 @@ func writeSuccessfulRecovery(t *testing.T, w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json")
 	require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{ID: "new-container", Name: "retained", Phase: "running", Image: "new:latest", Template: "current", ContainerStatus: "Up"}}))
 	return req.RuntimeRecovery
+}
+
+func TestRetainedRuntimeRecoveryHubRequestedTemplateDefaultsAndExplicitOverrides(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
+			domain, model := "current.test", "current-model"
+			if explicit {
+				domain, model = "explicit.test", "explicit-model"
+			}
+			var original *store.Agent
+			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					ResolvedEnv  map[string]string `json:"resolvedEnv"`
+					InlineConfig *api.ScionConfig  `json:"inlineConfig"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.Equal(t, domain, req.ResolvedEnv["APP_DOMAIN"])
+				require.Equal(t, model, req.ResolvedEnv["SCION_MODEL"])
+				require.Equal(t, original.ID, req.ResolvedEnv["SCION_AGENT_ID"])
+				require.Equal(t, domain, req.InlineConfig.Env["APP_DOMAIN"])
+				require.Equal(t, model, req.InlineConfig.Model)
+				require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{Phase: "running", Image: "new:latest", Template: "current", ContainerStatus: "Up"}}))
+			})
+			original = agent
+			require.NoError(t, db.CreateTemplate(context.Background(), &store.Template{
+				ID: tid("retained-current-template"), Name: "current", Slug: "current", Scope: store.TemplateScopeGlobal,
+				Harness: "claude", Status: store.TemplateStatusActive, ContentHash: "current-hash",
+				Config: &store.TemplateConfig{Env: map[string]string{"APP_DOMAIN": "current.test"}, Model: "current-model"},
+			}))
+			agent.AppliedConfig.Env = map[string]string{"APP_DOMAIN": "old.test"}
+			agent.AppliedConfig.Model = "old-model"
+			agent.AppliedConfig.InlineConfig.Env["APP_DOMAIN"] = "old.test"
+			agent.AppliedConfig.InlineConfig.Model = "old-model"
+			require.NoError(t, db.UpdateAgent(context.Background(), agent))
+			version := agent.StateVersion
+			update.StateVersion = &version
+			update.Config.Env = nil
+			if explicit {
+				update.Config.Env = map[string]string{"APP_DOMAIN": domain}
+				update.Config.Model = model
+			}
+			response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			saved, err := db.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.Equal(t, domain, saved.AppliedConfig.Env["APP_DOMAIN"])
+			require.Equal(t, model, saved.AppliedConfig.Model)
+			require.Equal(t, domain, saved.AppliedConfig.InlineConfig.Env["APP_DOMAIN"])
+		})
+	}
 }
 
 func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {

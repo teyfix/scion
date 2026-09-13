@@ -149,6 +149,26 @@ func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *s
 	working := *agent
 	applied := *agent.AppliedConfig
 	working.AppliedConfig = &applied
+	// Creation flattens previous template defaults into AppliedConfig.Env.
+	// Apply the requested template before current explicit overrides, matching
+	// the broker's retained-config -> requested-template -> inline precedence.
+	if recovery.TemplateID != "" {
+		template, err := d.store.GetTemplate(ctx, recovery.TemplateID)
+		if err != nil {
+			return err
+		}
+		if template.ContentHash != recovery.TemplateHash {
+			return fmt.Errorf("requested recovery template changed after admission")
+		}
+		if template.Config != nil {
+			requested := &api.ScionConfig{Env: template.Config.Env, Model: template.Config.Model}
+			applied.Env = config.MergeScionConfig(&api.ScionConfig{Env: applied.Env}, requested).Env
+			applied.InlineConfig = config.MergeScionConfig(applied.InlineConfig, requested)
+			if template.Config.Model != "" {
+				applied.Model = template.Config.Model
+			}
+		}
+	}
 	applied.InlineConfig = config.MergeScionConfig(applied.InlineConfig, recovery.Update.Config)
 	applied.Image = recovery.Update.Image
 	if recovery.Update.Config != nil {

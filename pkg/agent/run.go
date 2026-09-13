@@ -243,6 +243,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	if err != nil {
 		return nil, err
 	}
+	if recoveryState != nil {
+		opts.Env = recoveryDispatchEnv(opts.Env, recoveryState.requested)
+	}
 	if finalScionCfg != nil {
 		util.Debugf("Start: GetAgent returned config: harness=%q harnessConfig=%q defaultHarnessConfig=%q image=%q",
 			finalScionCfg.Harness, finalScionCfg.HarnessConfig, finalScionCfg.DefaultHarnessConfig, finalScionCfg.Image)

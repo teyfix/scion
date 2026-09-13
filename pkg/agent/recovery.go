@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -22,6 +23,7 @@ const runtimeConfigHashLabel = "scion.runtime_config_hash"
 type retainedRuntimeState struct {
 	dir, home, workspace string
 	config               *api.ScionConfig
+	requested            *api.ScionConfig
 }
 
 // loadRuntimeRecovery reads retained state without GetAgent's fresh provisioning
@@ -70,7 +72,34 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	info.Image = recovery.Update.Image
 	effective.Info = info
 	state.config = effective
+	state.requested = requested
 	return state, nil
+}
+
+// recoveryDispatchEnv keeps Hub identity/bootstrap credentials while giving
+// the validated requested template and explicit config precedence over the
+// previous template defaults flattened into the Hub's resolved environment.
+// Empty config values remain passthrough markers for Hub-resolved credentials.
+func recoveryDispatchEnv(env map[string]string, requested *api.ScionConfig) map[string]string {
+	result := make(map[string]string, len(env)+len(requested.Env))
+	for key, value := range env {
+		result[key] = value
+	}
+	for key, value := range requested.Env {
+		if value != "" && !strings.HasPrefix(key, "SCION_") {
+			// Let buildAgentEnv apply the existing config expansion rules.
+			delete(result, key)
+		} else if value != "" && (key == "SCION_MODEL" || key == "SCION_THINKING_LEVEL") {
+			result[key], _ = util.ExpandEnv(value)
+		}
+	}
+	if requested.Model != "" && requested.Env["SCION_MODEL"] == "" {
+		result["SCION_MODEL"] = requested.Model
+	}
+	if requested.ThinkingLevel != nil && requested.Env["SCION_THINKING_LEVEL"] == "" {
+		result["SCION_THINKING_LEVEL"] = strconv.Itoa(*requested.ThinkingLevel)
+	}
+	return result
 }
 func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containers []api.AgentInfo) (*retainedRuntimeState, error) {
 	recovery := opts.RuntimeRecovery

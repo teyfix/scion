@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -309,6 +310,52 @@ func (f *recoveryFixture) assertPreserved(t *testing.T) {
 	require.Equal(t, f.gitStatus, fixtureGit(t, f.state.workspace, "status", "--porcelain=v1", "--untracked-files=all"))
 	require.Equal(t, f.gitHead, fixtureGit(t, f.state.workspace, "rev-parse", "HEAD"))
 	require.Equal(t, "retained-branch\n", fixtureGit(t, f.state.workspace, "branch", "--show-current"))
+}
+
+func TestRetainedRuntimeRecoveryRequestedTemplateEnvAndExplicitOverrides(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			f.state.config.Env["APP_DOMAIN"] = "old.test"
+			f.state.config.Model = "old-model"
+			oldThinking := 1
+			f.state.config.ThinkingLevel = &oldThinking
+			require.NoError(t, writeRuntimeRecoveryState(f.state))
+			f.opts.Env["APP_DOMAIN"] = "old.test"
+			f.opts.Env["SCION_MODEL"] = "old-model"
+			f.opts.Env["SCION_THINKING_LEVEL"] = "1"
+			f.opts.Env["EXPANDED_ENTRY"] = "old-value"
+			t.Setenv("RECOVERY_TEMPLATE_VALUE", "expanded-current")
+			f.opts.Env["PASSTHROUGH_CREDENTIAL"] = "hub-resolved-secret"
+			f.opts.Env["SCION_HUB_ENDPOINT"] = "http://authoritative-hub"
+			f.opts.RuntimeRecovery.Update.Config.Env = nil
+			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
+			require.NoError(t, os.WriteFile(template, []byte(`{"harness":"codex","harness_config":"test-harness","model":"current-model","thinking_level":6,"env":{"APP_DOMAIN":"current.test","EXPANDED_ENTRY":"${RECOVERY_TEMPLATE_VALUE}","PASSTHROUGH_CREDENTIAL":""}}`), 0644))
+			domain, model, thinking := "current.test", "current-model", "6"
+			if explicit {
+				level := 8
+				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"APP_DOMAIN": "explicit.test"}
+				f.opts.RuntimeRecovery.Update.Config.Model = "explicit-model"
+				f.opts.RuntimeRecovery.Update.Config.ThinkingLevel = &level
+				domain, model, thinking = "explicit.test", "explicit-model", "8"
+			}
+			_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+			require.NoError(t, err)
+			require.Equal(t, "Host(`"+domain+"`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
+			require.Contains(t, f.runConfig.Env, "APP_DOMAIN="+domain)
+			require.Contains(t, f.runConfig.Env, "SCION_MODEL="+model)
+			require.Contains(t, f.runConfig.Env, "SCION_THINKING_LEVEL="+thinking)
+			require.Contains(t, f.runConfig.Env, "EXPANDED_ENTRY=expanded-current")
+			require.Contains(t, f.runConfig.Env, "PASSTHROUGH_CREDENTIAL=hub-resolved-secret")
+			require.Contains(t, f.runConfig.Env, "SCION_HUB_ENDPOINT=http://authoritative-hub")
+			require.Equal(t, "old.test", f.opts.Env["APP_DOMAIN"], "caller environment must not be mutated")
+			saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+			require.NoError(t, err)
+			require.Equal(t, domain, saved.Env["APP_DOMAIN"])
+			require.Equal(t, model, saved.Model)
+			f.assertPreserved(t)
+		})
+	}
 }
 
 func TestRetainedRuntimeRecoveryPreservesGitHomeDockerAndSession(t *testing.T) {
