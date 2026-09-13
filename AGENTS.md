@@ -38,6 +38,20 @@ repository's `.agents/rules/coordinator.md`. Its SCION checkout is `../scion`.
 Prioritize stable agent registration, issue flow, cleanup, broker registration,
 and GPU-enabled agents so product feature work can proceed.
 
+For the current Animatrix #375 workstream, the operator approves all in-scope
+actions for unattended coordination and delegated delivery; do not prompt
+additional approvals. This includes issue/PR creation and reports, non-force
+source publication, delegated code writing and review, fork image
+publication/builds, host recovery/cleanup, deployment, worker lifecycle actions,
+and merging when acceptance and repository policy permit. Coordinator/operator
+agents remain coordination-only; implementation/review agents own code work.
+Preserve active work, uninspected recoverable artifacts, source/configuration,
+model caches, and audit evidence. This approval is scoped to that workstream.
+
+For this SCION fork work, base branches on refreshed `origin/teyfix/onprem` and
+target pull requests and merges to `teyfix/onprem`. Never merge this work to
+SCION `main`. Animatrix retains its own default-branch delivery target.
+
 Exactly one Animatrix coordinator may be active. While it runs on the host,
 delegate SCION recreation through Animatrix's `task scions`; the serial owner
 must stop and remove the SCION `animatrix-coordinator` container afterward and
