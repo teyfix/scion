@@ -48,6 +48,39 @@ func newTestAgentStore(t *testing.T) (*AgentStore, string) {
 	return NewAgentStore(client), agentTestProjectUID.String()
 }
 
+func TestUpdateAgentRuntimeRecoveryPreservesStatusAndFences(t *testing.T) {
+	s, projectID := newTestAgentStore(t)
+	ctx := context.Background()
+	a := makeAgent(projectID, "recover-status")
+	a.Phase = "starting"
+	a.AppliedConfig = &store.AgentAppliedConfig{Image: "old", RuntimeUpdateVersion: 1}
+	require.NoError(t, s.CreateAgent(ctx, a))
+	result, err := s.GetAgent(ctx, a.ID)
+	require.NoError(t, err)
+	result.Phase, result.Image, result.ContainerStatus = "running", "new", "Up"
+	result.AppliedConfig = &store.AgentAppliedConfig{Image: "new", RuntimeUpdateVersion: 1}
+	turns := 13
+	require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+		Activity: "executing", ToolName: "fresh-tool", CurrentTurns: &turns,
+		Phase: "stopped", ContainerStatus: "Exited", RuntimeState: "stopped", Message: "user stopped",
+	}))
+	stale := *result
+	require.NoError(t, s.UpdateAgentRuntimeRecovery(ctx, result, 1, false))
+	require.Equal(t, "new", result.AppliedConfig.Image)
+	require.Equal(t, "executing", result.Activity)
+	require.Equal(t, "fresh-tool", result.ToolName)
+	require.Equal(t, 13, result.CurrentTurns)
+	require.Equal(t, "stopped", result.Phase)
+	require.Equal(t, "Exited", result.ContainerStatus)
+	require.Equal(t, "stopped", result.RuntimeState)
+	require.Equal(t, "user stopped", result.Message)
+	require.ErrorIs(t, s.UpdateAgentRuntimeRecovery(ctx, &stale, 1, false), store.ErrVersionConflict)
+	require.ErrorIs(t, s.UpdateAgentRuntimeRecovery(ctx, result, 2, false), store.ErrVersionConflict)
+	saved, err := s.GetAgent(ctx, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, result.StateVersion, saved.StateVersion)
+}
+
 // makeAgent builds a minimal valid agent for the seeded project.
 func makeAgent(projectID, slug string) *store.Agent {
 	return &store.Agent{

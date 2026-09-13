@@ -447,22 +447,24 @@ type TelemetrySamplingConfig struct {
 }
 
 type ScionConfig struct {
-	Harness          string            `json:"harness,omitempty" yaml:"harness,omitempty"`
-	HarnessConfig    string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
-	ConfigDir        string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
-	Env              map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Volumes          []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
-	Detached         *bool             `json:"detached" yaml:"detached"`
-	CommandArgs      []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
-	TaskFlag         string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
-	Model            string            `json:"model,omitempty" yaml:"model,omitempty"`
-	ThinkingLevel    *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
-	Kubernetes       *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
-	Docker           *DockerConfig     `json:"docker,omitempty" yaml:"docker,omitempty"`
-	AuthSelectedType string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
-	Resources        *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
-	Image            string            `json:"image,omitempty" yaml:"image,omitempty"`
-	Services         []ServiceSpec     `json:"services,omitempty" yaml:"services,omitempty"`
+	// RuntimeUpdateVersion fences admitted retained-runtime replacements.
+	RuntimeUpdateVersion int64             `json:"runtime_update_version,omitempty" yaml:"runtime_update_version,omitempty"`
+	Harness              string            `json:"harness,omitempty" yaml:"harness,omitempty"`
+	HarnessConfig        string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
+	ConfigDir            string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
+	Env                  map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Volumes              []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Detached             *bool             `json:"detached" yaml:"detached"`
+	CommandArgs          []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
+	TaskFlag             string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
+	Model                string            `json:"model,omitempty" yaml:"model,omitempty"`
+	ThinkingLevel        *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
+	Kubernetes           *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
+	Docker               *DockerConfig     `json:"docker,omitempty" yaml:"docker,omitempty"`
+	AuthSelectedType     string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
+	Resources            *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
+	Image                string            `json:"image,omitempty" yaml:"image,omitempty"`
+	Services             []ServiceSpec     `json:"services,omitempty" yaml:"services,omitempty"`
 	// MCPServers is the universal MCP server map. Keys are server names; values
 	// are the transport-agnostic config translated by each harness's
 	// container-side provisioner into native format.
@@ -995,6 +997,7 @@ type StartOptions struct {
 	BrokerMode        bool // When true, auth gathering skips local sources (broker env + filesystem)
 	Detached          *bool
 	Resume            bool
+	RuntimeRecovery   *RuntimeRecovery // Explicit retained runtime update; ordinary resume is unchanged.
 	NoAuth            bool
 	Branch            string
 	Workspace         string

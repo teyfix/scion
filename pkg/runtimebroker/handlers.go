@@ -220,15 +220,6 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			privileged = profileCfg.Docker.Privileged
 		}
 
-		var envKeys []string
-		if len(profileCfg.Env) > 0 {
-			envKeys = make([]string, 0, len(profileCfg.Env))
-			for k := range profileCfg.Env {
-				envKeys = append(envKeys, k)
-			}
-			sort.Strings(envKeys)
-		}
-
 		profiles = append(profiles, BrokerProfile{
 			Name:       name,
 			Type:       rtType,
@@ -236,7 +227,6 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			Context:    ctx,
 			Namespace:  ns,
 			Privileged: privileged,
-			EnvKeys:    envKeys,
 		})
 	}
 
@@ -405,6 +395,17 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, "name is required", nil)
 		return
 	}
+	unlock, locked := s.lockAgentLifecycle(w, r, req.Name, req.ProjectID)
+	if !locked {
+		return
+	}
+	defer unlock()
+
+	aliasUnlock, aliasLocked := s.bindLifecycleAlias(w, req.Name, req.ID, req.ProjectID)
+	if !aliasLocked {
+		return
+	}
+	defer aliasUnlock()
 
 	agentKey := req.ID
 	if agentKey == "" {
@@ -1191,6 +1192,11 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id, projectID 
 }
 
 func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlock()
 	ctx := r.Context()
 
 	ctx, span := tracer.Start(ctx, "broker.agent.delete")
@@ -1313,6 +1319,11 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 }
 
 func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlock()
 	ctx := r.Context()
 
 	ctx, span := tracer.Start(ctx, "broker.agent.start")
@@ -1344,11 +1355,24 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		// Resume requests harness session continuation (e.g. Claude
 		// --continue). The hub is the source of truth and sets this from the
 		// agent's stored phase; when unset we fall back to GetSavedPhase below.
-		Resume bool `json:"resume,omitempty"`
+		Resume              bool            `json:"resume,omitempty"`
+		RuntimeRecoveryJSON json.RawMessage `json:"runtimeRecovery,omitempty"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.NewDecoder(r.Body).Decode(&startReq); err != nil {
-			s.agentLifecycleLog.Debug("No task in start request body (ignoring decode error)", "agent_id", id, "error", err)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&startReq); err != nil {
+			BadRequest(w, "Invalid start request: "+err.Error())
+			return
+		}
+	}
+	var runtimeRecovery *api.RuntimeRecovery
+	if len(startReq.RuntimeRecoveryJSON) != 0 {
+		decoder := json.NewDecoder(strings.NewReader(string(startReq.RuntimeRecoveryJSON)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&runtimeRecovery); err != nil || runtimeRecovery == nil {
+			BadRequest(w, "runtimeRecovery must contain an admitted supported recovery request")
+			return
 		}
 	}
 	if startReq.ProjectPath == "" && startReq.GrovePath != "" {
@@ -1356,6 +1380,21 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	}
 	if startReq.ProjectSlug == "" && startReq.GroveSlug != "" {
 		startReq.ProjectSlug = startReq.GroveSlug
+	}
+	if recovery := runtimeRecovery; recovery != nil {
+		if err := recovery.Update.Validate(); err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		if recovery.ProjectID != projectID || recovery.AgentID == "" || recovery.RuntimeBrokerID != s.config.BrokerID || recovery.AdmissionVersion != *recovery.Update.StateVersion+1 {
+			BadRequest(w, "Runtime recovery identity or admission does not match this broker")
+			return
+		}
+		aliasUnlock, aliasLocked := s.bindLifecycleAlias(w, id, recovery.AgentID, projectID)
+		if !aliasLocked {
+			return
+		}
+		defer aliasUnlock()
 	}
 
 	s.agentLifecycleLog.Debug("startAgent called", "agent_id", id, "task", startReq.Task, "projectPath", startReq.ProjectPath, "projectSlug", startReq.ProjectSlug, "harnessConfig", startReq.HarnessConfig, "resolvedEnvCount", len(startReq.ResolvedEnv))
@@ -1371,6 +1410,13 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 			SharedDirs:        startReq.SharedDirs,
 			SharedWorkspace:   startReq.SharedWorkspace,
 		}
+	}
+	if recovery := runtimeRecovery; recovery != nil {
+		if cfg == nil {
+			cfg = &CreateAgentConfig{}
+		}
+		cfg.Template, cfg.Image = recovery.Update.Template, recovery.Update.Image
+		cfg.TemplateID, cfg.TemplateHash = recovery.TemplateID, recovery.TemplateHash
 	}
 
 	// Parity with the create path: populate the dedicated AgentToken field from
@@ -1392,6 +1438,8 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		SharedDirs:         startReq.SharedDirs,
 		AgentToken:         startContextAgentToken,
 		HTTPRequest:        r,
+		ProjectID:          projectID,
+		RuntimeRecovery:    runtimeRecovery,
 	})
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
@@ -1399,6 +1447,10 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		return
 	}
 	opts := sc.Opts
+	opts.RuntimeRecovery = runtimeRecovery
+	if runtimeRecovery != nil {
+		opts.Resume = true
+	}
 
 	// If project path wasn't in the request, fall back to looking up from an existing container
 	if startReq.ProjectPath == "" && startReq.ProjectSlug == "" && opts.ProjectPath == "" {
@@ -1419,7 +1471,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	}
 
 	// Apply updated InlineConfig to scion-agent.json before starting.
-	if startReq.InlineConfig != nil && opts.ProjectPath != "" {
+	if runtimeRecovery == nil && startReq.InlineConfig != nil && opts.ProjectPath != "" {
 		s.applyInlineConfigUpdate(id, opts.ProjectPath, startReq.InlineConfig, startReq.SharedWorkspace)
 	}
 
@@ -1571,6 +1623,11 @@ func (s *Server) projectScopedTarget(ctx context.Context, id, projectID string) 
 }
 
 func (s *Server) stopAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlock()
 	ctx := r.Context()
 
 	ctx, span := tracer.Start(ctx, "broker.agent.stop")
@@ -1625,6 +1682,11 @@ func (s *Server) stopAgent(w http.ResponseWriter, r *http.Request, id, projectID
 }
 
 func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlock()
 	ctx := r.Context()
 
 	// Read optional harnessConfig and resolvedEnv from request body (hub sends fresh auth token and harness config)
@@ -2369,15 +2431,9 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 
 	// Phase 2: Settings-based empty-value env key extraction
 	if settings != nil {
-		// Get profile env keys
+		// Get profile harness override env keys
 		if profileName != "" && settings.Profiles != nil {
 			if profile, ok := settings.Profiles[profileName]; ok {
-				for k, v := range profile.Env {
-					if v == "" {
-						required[k] = struct{}{}
-					}
-				}
-				// Check harness overrides within the profile
 				for _, override := range profile.HarnessOverrides {
 					for k, v := range override.Env {
 						if v == "" {

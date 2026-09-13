@@ -145,6 +145,14 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "handlers_agent_lifecycle.go", function: "handleAgentLifecycle", symbol: "DispatchAgentStart",
 		class: "guarded", reason: "authorizeAgentLifecycle at handlers_agent_lifecycle.go"},
 
+	// Explicit recovery reuses the authenticated lifecycle start dispatch.
+	{file: "handlers_agent_recovery.go", function: "DispatchAgentRecover", symbol: "DispatchAgentStart",
+		class: "guarded", reason: "authorized agent lifecycle routes; CAS admission in recoverAgentRuntime"},
+	{file: "handlers_agent_recovery.go", function: "recoverAgentRuntime", symbol: "DispatchAgentRecover",
+		class: "guarded", reason: "authorized agent lifecycle routes; CAS admission before broker mutation"},
+	{file: "reconcile.go", function: "execDispatchStart", symbol: "DispatchAgentRecover",
+		class: "exempt", reason: "durable-intent replay of admitted recovery with identity and generation fence"},
+
 	// handlers_agents_core.go: DispatchAgentCreateWithGather in createAgentInProject.
 	{file: "handlers_agents_core.go", function: "createAgentInProject", symbol: "DispatchAgentCreateWithGather",
 		class: "guarded", reason: "authorizeAgentCreate at handlers_agents_core.go"},
@@ -161,6 +169,7 @@ var targetSymbols = map[string]bool{
 	"DispatchAgentMessage":          true,
 	"DispatchAgentCreate":           true,
 	"DispatchAgentStart":            true,
+	"DispatchAgentRecover":          true,
 	"DispatchAgentCreateWithGather": true,
 }
 

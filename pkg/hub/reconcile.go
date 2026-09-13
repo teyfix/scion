@@ -160,6 +160,16 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 		}
 		task = args.Task
 		resume = args.Resume
+		if args.RuntimeRecovery != nil {
+			recoveryDispatcher, ok := dispatcher.(runtimeRecoveryDispatcher)
+			if !ok {
+				return "", fmt.Errorf("runtime dispatcher does not support retained recovery")
+			}
+			if err := recoveryDispatcher.DispatchAgentRecover(ctx, agent, args.RuntimeRecovery); err != nil {
+				return "", fmt.Errorf("dispatch runtime recovery: %w", err)
+			}
+			return "", s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery)
+		}
 	}
 	if err := dispatcher.DispatchAgentStart(ctx, agent, task, resume); err != nil {
 		return "", fmt.Errorf("dispatch start: %w", err)

@@ -205,6 +205,9 @@ func (t *brokerHTTPTransport) StartAgent(ctx context.Context, brokerID, brokerEn
 	if resume {
 		payload["resume"] = true
 	}
+	if recovery := api.RuntimeRecoveryFromContext(ctx); recovery != nil {
+		payload["runtimeRecovery"] = recovery
+	}
 
 	var body []byte
 	if len(payload) > 0 {

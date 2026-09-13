@@ -21,6 +21,16 @@ type ImageChecker interface {
 	Check(ctx context.Context, image string) CheckResult
 }
 
+// ValidateReference validates an explicitly requested image using the same
+// reference parser as the image availability checker.
+func ValidateReference(image string) error {
+	if image == "" || strings.ContainsAny(image, " \t\r\n") || strings.Contains(image, "://") {
+		return fmt.Errorf("image reference is empty or contains whitespace")
+	}
+	_, err := parseImageRef(image)
+	return err
+}
+
 type Checker struct {
 	local  LocalImageExister
 	client HTTPClient

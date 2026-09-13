@@ -2212,8 +2212,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	}
 	if errors.Is(err, ErrLifecycleDeferred) {
 		return d.deferredStart(ctx, agent, &StartDispatchArgs{
-			Task:   task,
-			Resume: resume,
+			Task:            task,
+			Resume:          resume,
+			RuntimeRecovery: api.RuntimeRecoveryFromContext(ctx),
 		})
 	}
 	if err != nil {
@@ -2672,6 +2673,23 @@ func isStopTerminal(phase string) bool { return phase == "stopped" || phase == "
 // signal → wait for the terminal phase. Called when client.StartAgent returns
 // ErrLifecycleDeferred (broker not locally connected).
 func (d *HTTPAgentDispatcher) deferredStart(ctx context.Context, agent *store.Agent, args *StartDispatchArgs) error {
+	if args.RuntimeRecovery != nil {
+		// A phase event can arrive before the owner has committed the effective
+		// configuration. Wait for the existing durable intent's completion and
+		// adopt its authoritative agent result before returning to the requester.
+		if err := d.deferredDataOp(ctx, agent, "start", args); err != nil {
+			return err
+		}
+		latest, err := d.store.GetAgent(ctx, agent.ID)
+		if err != nil {
+			return err
+		}
+		if latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != args.RuntimeRecovery.AdmissionVersion {
+			return store.ErrVersionConflict
+		}
+		*agent = *latest
+		return nil
+	}
 	return d.deferredLifecycle(ctx, agent, "start", args, isStartTerminal)
 }
 

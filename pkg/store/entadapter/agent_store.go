@@ -471,6 +471,65 @@ func (s *AgentStore) UpdateAgent(ctx context.Context, a *store.Agent) error {
 	return nil
 }
 
+// UpdateAgentRuntimeRecovery shares the status path's row lock and only writes
+// recovery-owned fields. Status reports deliberately do not bump StateVersion,
+// so a whole-record optimistic update cannot safely commit a recovery result.
+func (s *AgentStore) UpdateAgentRuntimeRecovery(ctx context.Context, a *store.Agent, admissionVersion int64, replaceLabels bool) error {
+	uid, err := parseUUID(a.ID)
+	if err != nil {
+		return err
+	}
+	useLock := s.usesRowLocks(ctx)
+	tx, err := s.client.Tx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := tx.Agent.Query().Where(agent.IDEQ(uid))
+	if useLock {
+		q = q.ForUpdate()
+	}
+	current, err := q.Only(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	latest := entAgentToStore(current)
+	if latest.StateVersion != a.StateVersion || latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != admissionVersion {
+		return store.ErrVersionConflict
+	}
+	upd := tx.Agent.Update().Where(agent.IDEQ(uid), agent.StateVersionEQ(a.StateVersion)).
+		SetUpdated(time.Now()).SetStateVersion(a.StateVersion + 1)
+	if current.Phase == "starting" {
+		upd.SetPhase(a.Phase).SetMessage(a.Message)
+		if a.Phase != "error" {
+			upd.SetContainerStatus(a.ContainerStatus).SetRuntimeState(a.RuntimeState)
+		}
+	}
+	if a.Phase != "error" {
+		upd.SetAppliedConfig(marshalAppliedConfig(a.AppliedConfig)).
+			SetTemplate(a.Template).SetImage(a.Image).SetDetached(a.Detached)
+		if replaceLabels {
+			upd.SetLabels(a.Labels)
+		}
+	}
+	affected, err := upd.Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if affected == 0 {
+		return store.ErrVersionConflict
+	}
+	committed, err := tx.Agent.Get(ctx, uid)
+	if err != nil {
+		return mapError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	*a = *entAgentToStore(committed)
+	return nil
+}
+
 // DeleteAgent permanently removes an agent by ID (hard delete).
 func (s *AgentStore) DeleteAgent(ctx context.Context, id string) error {
 	uid, err := parseUUID(id)

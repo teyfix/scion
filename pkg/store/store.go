@@ -236,6 +236,11 @@ type AgentStore interface {
 	// Returns ErrVersionConflict if the version doesn't match.
 	UpdateAgent(ctx context.Context, agent *Agent) error
 
+	// UpdateAgentRuntimeRecovery commits the admitted runtime result without
+	// overwriting concurrent status reports. It uses StateVersion and the saved
+	// runtime-update generation, and hydrates agent with the committed row.
+	UpdateAgentRuntimeRecovery(ctx context.Context, agent *Agent, admissionVersion int64, replaceLabels bool) error
+
 	// DeleteAgent removes an agent by ID.
 	// Returns ErrNotFound if the agent doesn't exist.
 	DeleteAgent(ctx context.Context, id string) error

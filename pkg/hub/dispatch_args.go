@@ -17,6 +17,8 @@ package hub
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
 
 // StartDispatchArgs carries the parameters for a cross-node agent start.
@@ -25,8 +27,9 @@ import (
 // DispatchAgentStart (all hub instances share the same store + secret
 // backend), so resolved env/secrets are NOT serialized here.
 type StartDispatchArgs struct {
-	Task   string `json:"task,omitempty"`
-	Resume bool   `json:"resume,omitempty"`
+	Task            string               `json:"task,omitempty"`
+	Resume          bool                 `json:"resume,omitempty"`
+	RuntimeRecovery *api.RuntimeRecovery `json:"runtimeRecovery,omitempty"`
 }
 
 // RestartDispatchArgs is intentionally empty — the owner's

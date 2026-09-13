@@ -22,7 +22,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -344,7 +343,7 @@ profiles:
 	}
 }
 
-func TestBuildInfoProfiles_EnvKeys(t *testing.T) {
+func TestBuildInfoProfiles_RetiredProfileEnvKeysOmitted(t *testing.T) {
 	tmpDir := t.TempDir()
 	origHome := os.Getenv("HOME")
 	_ = os.Setenv("HOME", tmpDir)
@@ -382,9 +381,8 @@ profiles:
 	if !ok {
 		t.Fatalf("expected profile 'with-env'")
 	}
-	expectedKeys := []string{"ALPHA", "APP_DOMAIN", "ZEBRA"}
-	if !slices.Equal(withEnv.EnvKeys, expectedKeys) {
-		t.Errorf("expected EnvKeys %v, got %v", expectedKeys, withEnv.EnvKeys)
+	if len(withEnv.EnvKeys) != 0 {
+		t.Errorf("retired profile env must not advertise EnvKeys, got %v", withEnv.EnvKeys)
 	}
 
 	noEnv, ok := byName["no-env"]

@@ -111,11 +111,24 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			projectID = opts.Env["SCION_GROVE_ID"]
 		}
 	}
+	if recovery := opts.RuntimeRecovery; recovery != nil {
+		if m.Runtime.Name() != "docker" && m.Runtime.Name() != "podman" && m.Runtime.Name() != "mock" {
+			return nil, fmt.Errorf("retained runtime updates require a Docker-compatible runtime")
+		}
+		if (agentID != opts.Name && agentID != recovery.AgentID) || (projectID != "" && projectID != recovery.ProjectID) {
+			return nil, fmt.Errorf("runtime recovery dispatch identity does not match")
+		}
+		agentID, projectID = recovery.AgentID, recovery.ProjectID
+		opts.Resume = true
+	}
 
 	// 0. Check if container already exists (scoped to this project)
 	slug := api.Slugify(opts.Name)
 	agents, err := m.Runtime.List(ctx, map[string]string{"scion.name": slug})
-	if err == nil {
+	if err != nil && opts.RuntimeRecovery != nil {
+		return nil, fmt.Errorf("read retained containers: %w", err)
+	}
+	if err == nil && opts.RuntimeRecovery == nil {
 		for _, a := range agents {
 			// Skip agents from a different project
 			if !matchAgentProject(a, projectName, projectID) {
@@ -181,9 +194,60 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 
 	util.Debugf("Start: calling GetAgent name=%s template=%q image=%q harnessConfig=%q projectPath=%q profile=%q",
 		opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile)
-	agentDir, agentHome, agentWorkspace, finalScionCfg, err := GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "", opts.Branch, opts.Workspace, startInlineConfig)
+	var agentDir, agentHome, agentWorkspace string
+	var finalScionCfg *api.ScionConfig
+	var recoveryState *retainedRuntimeState
+	if opts.RuntimeRecovery != nil {
+		recoveryState, err = loadRuntimeRecovery(opts, projectDir, agents)
+		if err == nil {
+			agentDir, agentHome, agentWorkspace, finalScionCfg = recoveryState.dir, recoveryState.home, recoveryState.workspace, recoveryState.config
+			hash, hashErr := runtimeConfigHash(finalScionCfg)
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			for _, a := range agents {
+				if !matchAgentProject(a, projectName, projectID) {
+					continue
+				}
+				if a.Labels["agent_id"] != agentID {
+					return nil, fmt.Errorf("retained container identity does not match")
+				}
+				if a.Phase == string(state.PhaseRunning) {
+					if a.Image == opts.RuntimeRecovery.Update.Image && a.Template == opts.RuntimeRecovery.Update.Template && a.Labels[runtimeConfigHashLabel] == hash {
+						// A fresh admission may finish an acknowledged-loss retry.
+						// Fence older requests even when the actual matching container
+						// needs no replacement, and preserve its template binding.
+						recoveryState.config.Info.Phase = string(state.PhaseRunning)
+						if err := writeRuntimeRecoveryState(recoveryState); err != nil {
+							return nil, fmt.Errorf("record verified runtime recovery: %w", err)
+						}
+						return &a, nil
+					}
+					return nil, fmt.Errorf("runtime recovery cannot replace a running container; suspend it first")
+				}
+			}
+			// Verify/pull the explicit image before any retained-home writes.
+			exists, imageErr := m.Runtime.ImageExists(ctx, opts.RuntimeRecovery.Update.Image)
+			if imageErr != nil {
+				return nil, imageErr
+			}
+			if !exists {
+				if err := m.Runtime.PullImage(ctx, opts.RuntimeRecovery.Update.Image); err != nil {
+					return nil, fmt.Errorf("prepare recovery image: %w", err)
+				}
+			}
+		}
+	} else {
+		agentDir, agentHome, agentWorkspace, finalScionCfg, err = GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "", opts.Branch, opts.Workspace, startInlineConfig)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if recoveryState != nil {
+		opts.Env, err = recoveryDispatchEnv(opts.Env, recoveryState.requested)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if finalScionCfg != nil {
 		util.Debugf("Start: GetAgent returned config: harness=%q harnessConfig=%q defaultHarnessConfig=%q image=%q",
@@ -461,6 +525,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// Reconcile the harness bundle for existing agents. Provision() is
 	// idempotent and stages any missing files.
 	if err := h.Provision(ctx, opts.Name, agentDir, agentHome, agentWorkspace); err != nil {
+		if opts.RuntimeRecovery != nil {
+			return nil, fmt.Errorf("reconcile recovery harness: %w", err)
+		}
 		util.Debugf("Start: harness reconciliation failed: %v", err)
 	}
 
@@ -471,8 +538,10 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// will not fire, so the hook would silently not run — worse than aborting.
 	// Called unconditionally: with an empty script the helper clears any file
 	// staged by an earlier occupant of this agent home.
-	if err := harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript); err != nil {
-		return nil, fmt.Errorf("re-stage project pre-start hook: %w", err)
+	if opts.RuntimeRecovery == nil || opts.ProjectPreStartHookScript != "" {
+		if err := harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript); err != nil {
+			return nil, fmt.Errorf("re-stage project pre-start hook: %w", err)
+		}
 	}
 
 	// Resolve auth metadata for the config-driven env var pipeline.
@@ -636,6 +705,14 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		warnings = append(warnings, fmt.Sprintf("Auth: resolved as %s", authDetail))
 	}
 authDone:
+	if opts.NoAuth {
+		// Clean up stale auth-candidates from a prior run so the
+		// provisioner sees no candidates and runs in no-auth mode.
+		authCandidatesPath := filepath.Join(agentHome, ".scion", "harness", "inputs", "auth-candidates.json")
+		if err := os.Remove(authCandidatesPath); err != nil && !os.IsNotExist(err) {
+			util.Debugf("Start: failed to remove stale auth-candidates: %v", err)
+		}
+	}
 
 	// Unconditionally clear corrupted opts.HarnessAuth. This runs even when
 	// NoAuth is true (the auth block is skipped) to prevent re-persisting
@@ -655,10 +732,12 @@ authDone:
 		detached = *opts.Detached
 	}
 
-	exists, err := m.Runtime.ImageExists(ctx, resolvedImage)
-	if err != nil || !exists {
-		if err := m.Runtime.PullImage(ctx, resolvedImage); err != nil {
-			return nil, fmt.Errorf("failed to pull image '%s': %w", resolvedImage, err)
+	if opts.RuntimeRecovery == nil {
+		exists, err := m.Runtime.ImageExists(ctx, resolvedImage)
+		if err != nil || !exists {
+			if err := m.Runtime.PullImage(ctx, resolvedImage); err != nil {
+				return nil, fmt.Errorf("failed to pull image '%s': %w", resolvedImage, err)
+			}
 		}
 	}
 
@@ -854,7 +933,7 @@ authDone:
 			return nil, fmt.Errorf("failed to marshal agent config: %w", marshalErr)
 		}
 		configPath := filepath.Join(agentDir, "scion-agent.json")
-		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+		if writeErr := writeStartConfig(configPath, cfgData, opts.RuntimeRecovery != nil); writeErr != nil {
 			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
 		}
 	} else if finalScionCfg != nil && harness.IsHarnessImplementationName(finalScionCfg.AuthSelectedType) {
@@ -865,7 +944,7 @@ authDone:
 			return nil, fmt.Errorf("failed to marshal repaired agent config: %w", marshalErr)
 		}
 		configPath := filepath.Join(agentDir, "scion-agent.json")
-		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+		if writeErr := writeStartConfig(configPath, cfgData, opts.RuntimeRecovery != nil); writeErr != nil {
 			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
 		}
 	}
@@ -1174,23 +1253,42 @@ authDone:
 		}(),
 		Annotations: projectcompat.ProjectPathLabels(projectDir, true),
 	}
+	if recoveryState != nil {
+		recoveryState.config = finalScionCfg
+		hash, err := runtimeConfigHash(finalScionCfg)
+		if err != nil {
+			return nil, err
+		}
+		runCfg.Labels[runtimeConfigHashLabel] = hash
+		if err := writeRuntimeRecoveryState(recoveryState); err != nil {
+			return nil, fmt.Errorf("install recovery configuration: %w", err)
+		}
+		for _, a := range agents {
+			if !matchAgentProject(a, projectName, projectID) {
+				continue
+			}
+			if err := m.Runtime.Delete(ctx, a.ContainerID); err != nil {
+				return nil, fmt.Errorf("replace retained container: %w", err)
+			}
+		}
+	}
 	id, err := m.Runtime.Run(ctx, runCfg)
 	if err != nil {
 		// Provisioning writes agent-info.json in "created" state before the
 		// runtime launch. If the launch itself fails, keep the provisioned
 		// workspace but flip the local state to "error" so list/status do not
 		// report a phantom created agent forever.
-		if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, "error", m.Runtime.Name(), profileName); updateErr != nil {
+		if updateErr := updateStartStatus(opts, recoveryState, "error", m.Runtime.Name(), profileName); updateErr != nil {
 			util.Debugf("Start: failed to mark agent error in local config: %v", updateErr)
 		}
 		return nil, classifyLaunchRuntimeError(err, resolvedImage)
 	}
 
 	status := "running"
-	if opts.Resume {
+	if opts.Resume && opts.RuntimeRecovery == nil {
 		status = "resumed"
 	}
-	if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, status, m.Runtime.Name(), profileName); updateErr != nil {
+	if updateErr := updateStartStatus(opts, recoveryState, status, m.Runtime.Name(), profileName); updateErr != nil {
 		util.Debugf("Start: failed to update local agent status to %q: %v", status, updateErr)
 	}
 
@@ -1198,6 +1296,9 @@ authDone:
 	allAgents, err := m.Runtime.List(ctx, map[string]string{"scion.name": slug})
 	if err == nil {
 		for _, a := range allAgents {
+			if opts.RuntimeRecovery != nil && (a.ContainerID != id || a.Labels["agent_id"] != agentID || !matchAgentProject(a, projectName, projectID)) {
+				continue
+			}
 			if a.ContainerID == id || strings.EqualFold(a.Name, opts.Name) {
 				// Check if the container has already exited
 				if a.Phase == string(state.PhaseStopped) || a.Phase == string(state.PhaseError) {
@@ -1219,6 +1320,9 @@ authDone:
 	}
 
 	// Container ID returned but not found in listing — it may have exited and been removed
+	if opts.RuntimeRecovery != nil {
+		return nil, fmt.Errorf("recovered container could not be verified as running")
+	}
 	warnings = append(warnings, "Container started but could not be verified as running")
 	return &api.AgentInfo{
 		ID:                    id,
@@ -1416,10 +1520,9 @@ func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSet
 	// finalScionCfg.Env (provision.go:1098-1115, ungated). The gate therefore
 	// bought no isolation, it only blinded auth resolution. See design §0.2.
 	//
-	// Profile env is no longer a source here — this reads the harness config
-	// only. Note this does NOT retire profile env: ResolveHarnessConfig still
-	// merges profile.Env into its result (settings_v1.go:54-55), and
-	// provision.go:1098 feeds it to the container regardless. See design §0.3.
+	// Profile env is fully retired — profiles.<p>.env was removed from both
+	// the struct and the JSON schema (G3-full). This reads the harness config
+	// only. See design §0.3.
 	if settings != nil && harnessConfigName != "" {
 		if hcEntry, err := settings.ResolveHarnessConfig(profileName, harnessConfigName); err == nil && len(hcEntry.Env) > 0 {
 			if opts.Env == nil {
