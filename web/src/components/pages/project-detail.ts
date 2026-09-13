@@ -2207,7 +2207,7 @@ export class ScionPageProjectDetail extends LitElement {
         <td>
           <span class="name-cell">
             <sl-icon name="cpu"></sl-icon>
-            <a href="/agents/${agent.id}">${agent.name}</a>
+            <a href="/agents/${agent.id}" title="${agent.name}">${agent.name}</a>
             ${isAgentPrivileged(agent) || agentUsesNvidiaGPU(agent)
               ? html`<span class="agent-capabilities">
                   ${isAgentPrivileged(agent)

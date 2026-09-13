@@ -582,7 +582,7 @@ export class ScionPageSkills extends LitElement {
         <td>
           <span class="name-cell">
             <sl-icon name="lightning-charge"></sl-icon>
-            <a href="/skills/${skill.id}">${skill.name}</a>
+            <a href="/skills/${skill.id}" title="${skill.name}">${skill.name}</a>
           </span>
         </td>
         <td><span class="scope-badge">${skill.scope}</span></td>

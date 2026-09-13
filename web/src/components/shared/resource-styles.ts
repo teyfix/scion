@@ -638,6 +638,8 @@ export const listPageStyles = css`
 
   .resource-table-container .name-cell {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: start;
     align-items: center;
     gap: 0.5rem;
     font-weight: 500;
@@ -651,6 +653,10 @@ export const listPageStyles = css`
   .resource-table-container .name-cell a {
     color: inherit;
     text-decoration: none;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .resource-table-container .name-cell a:hover {
