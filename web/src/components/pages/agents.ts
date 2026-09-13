@@ -45,7 +45,7 @@ type SortDir = 'asc' | 'desc';
 import type { StatusType } from '../shared/status-badge.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { stateManager } from '../../client/state.js';
-import { listPageStyles } from '../shared/resource-styles.js';
+import { agentTableStyles, listPageStyles } from '../shared/resource-styles.js';
 import type { ViewMode } from '../shared/view-toggle.js';
 import '../shared/status-badge.js';
 import '../shared/message-mode-badge.js';
@@ -338,6 +338,7 @@ export class ScionPageAgents extends LitElement {
         opacity: 1;
       }
     `,
+    agentTableStyles,
   ];
 
   private boundOnAgentsUpdated = this.onAgentsUpdated.bind(this);
@@ -1426,14 +1427,18 @@ export class ScionPageAgents extends LitElement {
           <span class="name-cell">
             <sl-icon name="cpu"></sl-icon>
             <a href="/agents/${agent.id}">${agent.name}</a>
-            ${isAgentPrivileged(agent)
-              ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
-              : ''}
-            ${agentUsesNvidiaGPU(agent)
-              ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                  >GPU</scion-status-badge
-                >`
-              : ''}
+            ${isAgentPrivileged(agent) || agentUsesNvidiaGPU(agent)
+              ? html`<span class="agent-capabilities">
+                  ${isAgentPrivileged(agent)
+                    ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                    : ''}
+                  ${agentUsesNvidiaGPU(agent)
+                    ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                        >GPU</scion-status-badge
+                      >`
+                    : ''}
+                </span>`
+              : nothing}
           </span>
         </td>
         <td>

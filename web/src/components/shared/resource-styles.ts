@@ -764,3 +764,50 @@ export const listPageStyles = css`
     }
   }
 `;
+
+/** Agent tables keep capability badges below the full agent name. */
+export const agentTableStyles = css`
+  .resource-table-container,
+  .agent-table-container {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .resource-table-container th,
+  .resource-table-container td,
+  .agent-table-container th,
+  .agent-table-container td {
+    padding-inline: 0.75rem;
+  }
+
+  .resource-table-container .name-cell,
+  .agent-table-container .name-cell {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 0.5rem;
+    row-gap: 0.375rem;
+  }
+
+  .resource-table-container .name-cell a,
+  .agent-table-container .name-cell a {
+    white-space: nowrap;
+  }
+
+  .agent-capabilities {
+    grid-column: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem;
+  }
+
+  .agent-capabilities > * {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .resource-table-container .status-col,
+  .agent-table-container .status-col {
+    min-width: 8rem;
+  }
+`;

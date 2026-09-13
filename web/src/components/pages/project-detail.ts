@@ -21,6 +21,7 @@
  */
 
 import { LitElement, html, css, nothing } from 'lit';
+import { agentTableStyles } from '../shared/resource-styles.js';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type {
@@ -793,6 +794,7 @@ export class ScionPageProjectDetail extends LitElement {
         display: none;
       }
     }
+    ${agentTableStyles}
   `;
 
   private boundOnAgentsUpdated = this.onAgentsUpdated.bind(this);
@@ -2206,13 +2208,17 @@ export class ScionPageProjectDetail extends LitElement {
           <span class="name-cell">
             <sl-icon name="cpu"></sl-icon>
             <a href="/agents/${agent.id}">${agent.name}</a>
-            ${isAgentPrivileged(agent)
-              ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
-              : nothing}
-            ${agentUsesNvidiaGPU(agent)
-              ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                  >GPU</scion-status-badge
-                >`
+            ${isAgentPrivileged(agent) || agentUsesNvidiaGPU(agent)
+              ? html`<span class="agent-capabilities">
+                  ${isAgentPrivileged(agent)
+                    ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                    : nothing}
+                  ${agentUsesNvidiaGPU(agent)
+                    ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                        >GPU</scion-status-badge
+                      >`
+                    : nothing}
+                </span>`
               : nothing}
           </span>
         </td>
