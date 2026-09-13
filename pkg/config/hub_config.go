@@ -197,6 +197,8 @@ type RuntimeBrokerConfig struct {
 
 	// BrokerID is a unique identifier for this runtime broker (auto-generated if empty)
 	BrokerID string `json:"brokerId" yaml:"brokerId" koanf:"brokerId"`
+	// InstanceAuthorityPath is a trusted launcher-owned broker-only authority file.
+	InstanceAuthorityPath string `json:"instanceAuthorityPath" yaml:"instanceAuthorityPath" koanf:"instanceAuthorityPath"`
 	// BrokerName is a human-readable name for this runtime broker
 	BrokerName string `json:"brokerName" yaml:"brokerName" koanf:"brokerName"`
 
@@ -891,6 +893,7 @@ func parseCommaSeparatedList(s string) []string {
 // Go struct unmarshaling (adminEmails), snakeCaseFields produces keys that
 // match the opsettings keyspace (admin_emails).
 var snakeCaseFields = map[string]string{
+	"instanceauthoritypath": "instance_authority_path",
 	// Layer-1 compound segments (from opsettings registry)
 	"adminemails":           "admin_emails",
 	"apibaseurl":            "api_base_url",
@@ -945,6 +948,7 @@ var snakeCaseFields = map[string]string{
 // camelCaseFields maps lowercased environment variable key segments to their
 // camelCase config equivalents. Package-level to avoid re-allocation per call.
 var camelCaseFields = map[string]string{
+	"instanceauthoritypath":         "instanceAuthorityPath",
 	"adminemails":                   "adminEmails",
 	"adminmode":                     "adminMode",
 	"allowcontainerscriptharnesses": "allowContainerScriptHarnesses",
@@ -1003,6 +1007,10 @@ var camelCaseFields = map[string]string{
 // Handles camelCase conversion for known fields like clientId, clientSecret.
 // Example: OAUTH_CLI_GOOGLE_CLIENTID -> oauth.cli.google.clientId
 func envKeyToConfigKey(envKey string) string {
+	// Broker-only v1 input maps to the legacy GlobalConfig broker section.
+	if strings.EqualFold(envKey, "BROKER_INSTANCEAUTHORITYPATH") {
+		return "runtimeBroker.instanceAuthorityPath"
+	}
 	// Split by underscore, convert each part
 	parts := strings.Split(strings.ToLower(envKey), "_")
 	for i, part := range parts {

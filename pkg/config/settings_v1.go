@@ -562,6 +562,9 @@ type V1BrokerConfig struct {
 	// dispatch agents whose harness-config declares container-script
 	// provisioning. Defaults to true; set false to block container-script dispatches.
 	AllowContainerScriptHarnesses *bool `json:"allow_container_script_harnesses,omitempty" yaml:"allow_container_script_harnesses,omitempty" koanf:"allow_container_script_harnesses"`
+
+	// InstanceAuthorityPath is broker-only; never accept instance IDs from agent configuration.
+	InstanceAuthorityPath string `json:"instance_authority_path,omitempty" yaml:"instance_authority_path,omitempty" koanf:"instance_authority_path"`
 }
 
 // V1DatabaseConfig holds database settings.
@@ -1526,6 +1529,7 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 				gc.RuntimeBroker.CORSMaxAge = v1.Broker.CORS.MaxAge
 			}
 		}
+		gc.RuntimeBroker.InstanceAuthorityPath = v1.Broker.InstanceAuthorityPath
 		if v1.Broker.AllowContainerScriptHarnesses != nil {
 			gc.RuntimeBroker.AllowContainerScriptHarnesses = *v1.Broker.AllowContainerScriptHarnesses
 		} else {
@@ -1783,6 +1787,7 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 
 	// Broker config
 	v1.Broker = &V1BrokerConfig{
+		InstanceAuthorityPath:         gc.RuntimeBroker.InstanceAuthorityPath,
 		Enabled:                       gc.RuntimeBroker.Enabled,
 		Port:                          gc.RuntimeBroker.Port,
 		Host:                          gc.RuntimeBroker.Host,

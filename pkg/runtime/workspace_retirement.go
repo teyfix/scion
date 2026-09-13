@@ -34,14 +34,18 @@ type WorkspaceRetirementGuard interface {
 }
 
 func (r *DockerRuntime) AssertWorkspaceUnused(ctx context.Context, target string) error {
-	return assertContainerWorkspaceUnused(ctx, r.Command, r, target)
+	owner, err := r.currentBrokerInstance(ctx)
+	if err != nil {
+		return err
+	}
+	return assertContainerWorkspaceUnused(ctx, r.Command, r, target, owner)
 }
 
 func (r *PodmanRuntime) AssertWorkspaceUnused(ctx context.Context, target string) error {
-	return assertContainerWorkspaceUnused(ctx, r.Command, r, target)
+	return assertContainerWorkspaceUnused(ctx, r.Command, r, target, "")
 }
 
-func assertContainerWorkspaceUnused(ctx context.Context, command string, rt Runtime, target string) error {
+func assertContainerWorkspaceUnused(ctx context.Context, command string, rt Runtime, target, owner string) error {
 	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
 		return fmt.Errorf("invalid worktree mount target")
 	}
@@ -51,7 +55,19 @@ func assertContainerWorkspaceUnused(ctx context.Context, command string, rt Runt
 	}
 	ids := strings.Fields(string(out))
 	if len(ids) == 0 {
+		if owner != "" {
+			return fmt.Errorf("trusted broker instance disappeared during retirement")
+		}
 		return nil
+	}
+	if owner != "" {
+		found := false
+		for _, id := range ids {
+			found = found || id == owner
+		}
+		if !found {
+			return fmt.Errorf("trusted broker instance disappeared during retirement")
+		}
 	}
 	canonicalTarget, err := retirementMountTarget(target)
 	if err != nil {
@@ -138,10 +154,9 @@ func assertContainerWorkspaceUnused(ctx context.Context, command string, rt Runt
 			if mountedIdentity != sourceIdentity {
 				return fmt.Errorf("container %s mounted-object ownership unverifiable: established object differs from current source", facts.ID)
 			}
-			if retirementMountWithin(canonicalSource, canonicalTarget) {
-				// No trusted immutable self-container ID is wired to the authenticated
-				// broker. Labels/hostname are cross-checks, not ownership authority;
-				// inventing a broad-mount exemption would endanger foreign workspaces.
+			if retirementMountWithin(canonicalSource, canonicalTarget) && facts.ID != owner {
+				// Only the authenticated launcher-attested current broker instance
+				// may own an ancestor, after actual mounted-object verification.
 				return fmt.Errorf("container %s ancestor mount ownership unverifiable: trusted owning-broker identity is unavailable", facts.ID)
 			}
 		}
