@@ -213,7 +213,14 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 					return nil, fmt.Errorf("retained container identity does not match")
 				}
 				if a.Phase == string(state.PhaseRunning) {
-					if a.Image == opts.RuntimeRecovery.Update.Image && a.Labels[runtimeConfigHashLabel] == hash {
+					if a.Image == opts.RuntimeRecovery.Update.Image && a.Template == opts.RuntimeRecovery.Update.Template && a.Labels[runtimeConfigHashLabel] == hash {
+						// A fresh admission may finish an acknowledged-loss retry.
+						// Fence older requests even when the actual matching container
+						// needs no replacement, and preserve its template binding.
+						recoveryState.config.Info.Phase = string(state.PhaseRunning)
+						if err := writeRuntimeRecoveryState(recoveryState); err != nil {
+							return nil, fmt.Errorf("record verified runtime recovery: %w", err)
+						}
 						return &a, nil
 					}
 					return nil, fmt.Errorf("runtime recovery cannot replace a running container; suspend it first")

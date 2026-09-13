@@ -61,7 +61,8 @@ func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {
 	var original *store.Agent
 	srv, storage, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
 		// Ordinary status reports can advance StateVersion after admission.
-		require.NoError(t, db.UpdateAgentStatus(context.Background(), original.ID, store.AgentStatusUpdate{Activity: "thinking"}))
+		turns := 7
+		require.NoError(t, db.UpdateAgentStatus(context.Background(), original.ID, store.AgentStatusUpdate{Activity: "thinking", ToolName: "retained-tool", CurrentTurns: &turns}))
 		recovery := writeSuccessfulRecovery(t, w, r)
 		require.Equal(t, original.ID, recovery.AgentID)
 		require.Equal(t, original.ProjectID, recovery.ProjectID)
@@ -76,6 +77,9 @@ func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {
 	require.Equal(t, agent.ProjectID, saved.ProjectID)
 	require.Equal(t, agent.RuntimeBrokerID, saved.RuntimeBrokerID)
 	require.Equal(t, "running", saved.Phase)
+	require.Equal(t, "thinking", saved.Activity)
+	require.Equal(t, "retained-tool", saved.ToolName)
+	require.Equal(t, 7, saved.CurrentTurns)
 	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
 	require.Equal(t, "current", saved.Template)
 	require.Equal(t, "retained-branch", saved.AppliedConfig.Branch)
@@ -83,6 +87,63 @@ func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {
 	require.Equal(t, "original-creator", saved.AppliedConfig.CreatorName)
 	require.Equal(t, "baseline", saved.AppliedConfig.AgentRole)
 	require.Equal(t, *update.StateVersion+1, saved.AppliedConfig.RuntimeUpdateVersion)
+}
+
+type recoverySignalBus struct {
+	NoopCommandBus
+	signal func(context.Context, string) error
+}
+
+func (b recoverySignalBus) SignalBrokerCmd(ctx context.Context, brokerID string) error {
+	return b.signal(ctx, brokerID)
+}
+
+func TestRetainedRuntimeRecoveryDeferredOwnerResultAndConcurrentStatusPreserved(t *testing.T) {
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSuccessfulRecovery(t, w, r)
+	})
+	owner := srv.GetDispatcher()
+	events := NewChannelEventPublisher()
+	t.Cleanup(events.Close)
+	srv.events = events
+	requester := NewHTTPAgentDispatcherWithClient(db, &deferredTestClient{localBroker: "elsewhere"}, false, slog.Default())
+	var completedVersion int64
+	requester.SetCrossNodeDeps(events, recoverySignalBus{signal: func(ctx context.Context, brokerID string) error {
+		pending, err := db.ListPendingDispatch(ctx, brokerID)
+		require.NoError(t, err)
+		require.Len(t, pending, 1)
+		// Exercise actual owner CAS claim, execution, result commit and done
+		// notification, rather than manually dispatching a phase event.
+		srv.SetDispatcher(owner)
+		srv.ReconcileBroker(ctx, brokerID)
+		srv.SetDispatcher(requester)
+		intent, err := db.GetBrokerDispatch(ctx, pending[0].ID)
+		require.NoError(t, err)
+		require.Equal(t, store.DispatchStateDone, intent.State, intent.Error)
+		native, err := db.GetAgent(ctx, agent.ID)
+		require.NoError(t, err)
+		require.Equal(t, "running", native.Phase)
+		turns := 9
+		require.NoError(t, db.UpdateAgentStatus(ctx, agent.ID, store.AgentStatusUpdate{Activity: "executing", ToolName: "after-owner", CurrentTurns: &turns, Heartbeat: true}))
+		native, err = db.GetAgent(ctx, agent.ID)
+		require.NoError(t, err)
+		completedVersion = native.StateVersion
+		return nil
+	}})
+	srv.SetDispatcher(requester)
+	response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	saved, err := db.GetAgent(context.Background(), agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, "running", saved.Phase)
+	require.Equal(t, "Up", saved.ContainerStatus)
+	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
+	require.Equal(t, "current", saved.Template)
+	require.Equal(t, "executing", saved.Activity)
+	require.Equal(t, "after-owner", saved.ToolName)
+	require.Equal(t, 9, saved.CurrentTurns)
+	require.False(t, saved.LastSeen.IsZero())
+	require.Equal(t, completedVersion, saved.StateVersion, "requester must not rewrite the owner's result")
 }
 
 func TestRetainedRuntimeRecoveryConcurrentDifferentTargetsConflictBeforeDispatch(t *testing.T) {
@@ -151,10 +212,97 @@ func TestRetainedRuntimeRecoveryLateCompletionAndIntentFenced(t *testing.T) {
 	require.NoError(t, db.UpdateAgent(context.Background(), agent))
 	old := *agent
 	old.AppliedConfig = &store.AgentAppliedConfig{RuntimeUpdateVersion: 10, Image: "obsolete:latest"}
-	require.ErrorIs(t, srv.completeRuntimeRecovery(context.Background(), &old, 10), store.ErrVersionConflict)
+	require.ErrorIs(t, srv.completeRuntimeRecovery(context.Background(), &old, &api.RuntimeRecovery{AdmissionVersion: 10}), store.ErrVersionConflict)
 	version := int64(9)
 	args, err := MarshalDispatchArgs(&StartDispatchArgs{Resume: true, RuntimeRecovery: &api.RuntimeRecovery{Update: api.RuntimeUpdateRequest{StateVersion: &version, Template: "current", Image: "obsolete:latest"}, AdmissionVersion: 10, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID}})
 	require.NoError(t, err)
 	_, err = srv.executeDispatch(context.Background(), store.BrokerDispatch{AgentID: agent.ID, ProjectID: agent.ProjectID, BrokerID: agent.RuntimeBrokerID, Op: "start", Args: args})
 	require.ErrorContains(t, err, "stale")
+}
+
+func TestRetainedRuntimeRecoveryRequesterFailureCannotUndoOwnerResult(t *testing.T) {
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("no dispatch needed") })
+	admission := agent.StateVersion + 1
+	agent.AppliedConfig.RuntimeUpdateVersion = admission
+	agent.Phase = "starting"
+	require.NoError(t, db.UpdateAgent(context.Background(), agent))
+	requester := *agent
+	requesterConfig := *agent.AppliedConfig
+	requester.AppliedConfig = &requesterConfig
+	// The owner commits the successful configuration before a cancelled
+	// requester tries to persist its unchanged admission snapshot as an error.
+	agent.Template, agent.Image, agent.Phase = "current", "new:latest", "running"
+	agent.AppliedConfig.Image = "new:latest"
+	agent.Activity, agent.ToolName = "executing", "owner-tool"
+	require.NoError(t, db.UpdateAgent(context.Background(), agent))
+	version := agent.StateVersion
+	requester.Phase, requester.Message = "error", "request cancelled"
+	require.NoError(t, srv.completeRuntimeRecovery(context.Background(), &requester, &api.RuntimeRecovery{Update: *update, AdmissionVersion: admission}))
+	saved, err := db.GetAgent(context.Background(), agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, "running", saved.Phase)
+	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
+	require.Equal(t, "executing", saved.Activity)
+	require.Equal(t, "owner-tool", saved.ToolName)
+	require.Equal(t, version, saved.StateVersion)
+}
+
+type recoveryStatusInterleavingStore struct {
+	store.Store
+	interleave func(context.Context, *store.Agent) error
+}
+
+func (s *recoveryStatusInterleavingStore) UpdateAgentRuntimeRecovery(ctx context.Context, agent *store.Agent, admissionVersion int64, replaceLabels bool) error {
+	if s.interleave != nil && agent.AppliedConfig != nil && agent.AppliedConfig.Image == "new:latest" {
+		interleave := s.interleave
+		s.interleave = nil
+		if err := interleave(ctx, agent); err != nil {
+			return err
+		}
+	}
+	return s.Store.UpdateAgentRuntimeRecovery(ctx, agent, admissionVersion, replaceLabels)
+}
+
+func TestRetainedRuntimeRecoveryCommitPreservesInterleavedStatusWithoutRepeatingDispatch(t *testing.T) {
+	var starts atomic.Int32
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+		starts.Add(1)
+		writeSuccessfulRecovery(t, w, r)
+	})
+	srv.store = &recoveryStatusInterleavingStore{Store: db, interleave: func(ctx context.Context, result *store.Agent) error {
+		turns := 13
+		return db.UpdateAgentStatus(ctx, result.ID, store.AgentStatusUpdate{Activity: "thinking", ToolName: "during-cas", CurrentTurns: &turns})
+	}}
+	response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	saved, err := db.GetAgent(context.Background(), agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, "running", saved.Phase)
+	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
+	require.Equal(t, "thinking", saved.Activity)
+	require.Equal(t, "during-cas", saved.ToolName)
+	require.Equal(t, 13, saved.CurrentTurns)
+	require.Equal(t, int32(1), starts.Load())
+}
+
+func TestRetainedRuntimeRecoveryConfigCommitPreservesNewerStopStatus(t *testing.T) {
+	var db store.Store
+	var id string
+	srv, storage, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+		// Native creation succeeded; a later stop reports its state before the
+		// earlier requester commits the recovered effective configuration.
+		writeSuccessfulRecovery(t, w, r)
+		require.NoError(t, db.UpdateAgentStatus(r.Context(), id, store.AgentStatusUpdate{Phase: "stopped", ContainerStatus: "Exited", RuntimeState: "stopped", Message: "Stopped by user"}))
+	})
+	db, id = storage, agent.ID
+	response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	saved, err := db.GetAgent(context.Background(), agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, "stopped", saved.Phase)
+	require.Equal(t, "Exited", saved.ContainerStatus)
+	require.Equal(t, "stopped", saved.RuntimeState)
+	require.Equal(t, "Stopped by user", saved.Message)
+	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
+	require.Equal(t, "current", saved.Template)
 }

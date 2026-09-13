@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
 const runtimeConfigHashLabel = "scion.runtime_config_hash"
@@ -44,11 +46,18 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	if err := resolveRecoveryLabels(opts, projectDir, old, requested); err != nil {
 		return nil, err
 	}
-	effective := config.MergeScionConfig(old, requested)
+	// MergeScionConfig updates the base Hub pointer in place. Keep the retained
+	// value independent so effective-identity validation cannot compare aliases.
+	base := *old
+	if old.Hub != nil {
+		hub := *old.Hub
+		base.Hub = &hub
+	}
+	effective := config.MergeScionConfig(&base, requested)
 	if err := validateRetainedRuntimeConfig(old, effective); err != nil {
 		return nil, err
 	}
-	effective.Volumes, err = preservedVolumes(old.Volumes, requested.Volumes)
+	effective.Volumes, err = state.preservedVolumes(old.Volumes, requested.Volumes, projectDir)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +167,7 @@ func requestedRuntimeConfig(opts api.StartOptions) (*api.ScionConfig, error) {
 func resolveRecoveryLabels(opts api.StartOptions, projectDir string, old, requested *api.ScionConfig) error {
 	recovery := opts.RuntimeRecovery
 	// Expand layers before merging so a retry overrides an expanded key.
-	labelEnv := config.MergeScionConfig(old, requested).Env
+	labelEnv := config.MergeScionConfig(&api.ScionConfig{Env: old.Env}, &api.ScionConfig{Env: requested.Env}).Env
 	vars := BuildScopedLabelVars(opts.Name, recovery.AgentID, config.GetProjectName(projectDir), recovery.ProjectID, labelEnv)
 	for _, layer := range []*api.ScionConfig{old, requested} {
 		if layer.Docker == nil {
@@ -174,6 +183,14 @@ func resolveRecoveryLabels(opts api.StartOptions, projectDir string, old, reques
 }
 
 func validateRetainedRuntimeConfig(old, effective *api.ScionConfig) error {
+	if old.Branch != effective.Branch || old.ExplicitWorkspace != effective.ExplicitWorkspace || !reflect.DeepEqual(old.Hub, effective.Hub) {
+		return fmt.Errorf("runtime recovery cannot change retained branch, workspace layout, or Hub connection")
+	}
+	for key, value := range effective.Env {
+		if strings.HasPrefix(key, "SCION_") && key != "SCION_MODEL" && key != "SCION_THINKING_LEVEL" && old.Env[key] != value {
+			return fmt.Errorf("runtime recovery cannot change reserved environment key %q", key)
+		}
+	}
 	if old.User != effective.User || old.Harness != effective.Harness || old.HarnessConfig != effective.HarnessConfig || old.DefaultHarnessConfig != effective.DefaultHarnessConfig || old.ConfigDir != effective.ConfigDir {
 		return fmt.Errorf("runtime recovery cannot change container user, harness, or provider configuration identity")
 	}
@@ -196,19 +213,27 @@ func validateRetainedRuntimeConfig(old, effective *api.ScionConfig) error {
 	return nil
 }
 
-func preservedVolumes(old, requested []api.VolumeMount) ([]api.VolumeMount, error) {
+func (state *retainedRuntimeState) preservedVolumes(old, requested []api.VolumeMount, projectDir string) ([]api.VolumeMount, error) {
 	result := append([]api.VolumeMount(nil), old...)
 	byTarget := make(map[string]api.VolumeMount)
 	for _, volume := range old {
 		if err := volume.Validate(); err != nil {
 			return nil, err
 		}
-		if previous, ok := byTarget[volume.Target]; ok && previous != volume {
+		target, err := retainedVolumePath(volume.Target, state.config.User, true)
+		if err != nil {
+			return nil, err
+		}
+		if previous, ok := byTarget[target]; ok && previous != volume {
 			return nil, fmt.Errorf("retained volume binding is ambiguous: %s", volume.Target)
 		}
-		byTarget[volume.Target] = volume
+		byTarget[target] = volume
 		if volume.Type == "" || volume.Type == "local" {
-			if _, err := os.Stat(volume.Source); err != nil {
+			source, err := retainedVolumePath(volume.Source, state.config.User, false)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := os.Stat(source); err != nil {
 				return nil, fmt.Errorf("retained volume source is missing: %s", volume.Source)
 			}
 		}
@@ -217,42 +242,143 @@ func preservedVolumes(old, requested []api.VolumeMount) ([]api.VolumeMount, erro
 		if err := volume.Validate(); err != nil {
 			return nil, err
 		}
-		target := filepath.Clean(volume.Target)
-		if target != volume.Target {
-			return nil, fmt.Errorf("runtime recovery requires canonical volume targets: %s", volume.Target)
+		target, err := retainedVolumePath(volume.Target, state.config.User, true)
+		if err != nil {
+			return nil, err
 		}
 		if previous, exists := byTarget[target]; exists {
-			if previous != volume {
+			matches, err := sameRetainedVolumeBinding(previous, volume, target, state.config.User)
+			if err != nil {
+				return nil, err
+			}
+			if !matches {
 				return nil, fmt.Errorf("runtime recovery cannot change retained volume binding: %s", volume.Target)
 			}
 			continue
 		}
-		if recoveryMountOverlapsIdentity(target) {
+		if !filepath.IsAbs(volume.Target) || target != volume.Target || strings.ContainsAny(volume.Target, "$~") {
+			return nil, fmt.Errorf("runtime recovery requires canonical absolute added bind targets: %s", volume.Target)
+		}
+		if recoveryMountOverlapsIdentity(target, byTarget, state.config.User) {
 			return nil, fmt.Errorf("runtime recovery cannot introduce a replacement home, workspace, or Docker identity")
 		}
 		if volume.Type != "" && volume.Type != "local" {
 			return nil, fmt.Errorf("runtime recovery only supports existing storage and added local binds")
 		}
-		sourceInfo, err := os.Stat(volume.Source)
+		if !volume.ReadOnly {
+			return nil, fmt.Errorf("runtime recovery only permits read-only added binds")
+		}
+		source, err := state.validateAddedBindSource(volume.Source, projectDir)
 		if err != nil {
-			return nil, fmt.Errorf("requested volume source is missing: %s", volume.Source)
+			return nil, err
 		}
-		if sourceInfo.Mode()&os.ModeSocket != 0 {
-			return nil, fmt.Errorf("runtime recovery cannot introduce a daemon socket bind")
-		}
+		volume.Source = source
 		byTarget[volume.Target] = volume
 		result = append(result, volume)
 	}
 	return result, nil
 }
 
-func recoveryMountOverlapsIdentity(target string) bool {
-	for _, retained := range []string{"/workspace", "/home", "/var/lib/docker", "/var/run/docker.sock"} {
-		if target == "/" || target == retained || strings.HasPrefix(target, retained+"/") || strings.HasPrefix(retained, target+"/") {
+func sameRetainedVolumeBinding(old, requested api.VolumeMount, target, user string) (bool, error) {
+	if old == requested {
+		return true, nil
+	}
+	old.Target, requested.Target = target, target
+	for _, volume := range []*api.VolumeMount{&old, &requested} {
+		if volume.Type == "" || volume.Type == "local" {
+			source, err := retainedVolumePath(volume.Source, user, false)
+			if err != nil {
+				return false, err
+			}
+			volume.Source, err = filepath.EvalSymlinks(source)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	return old == requested, nil
+}
+
+func retainedVolumePath(path, user string, target bool) (string, error) {
+	expanded, warned := util.ExpandEnv(path)
+	if warned {
+		return "", fmt.Errorf("retained binding contains an unresolved environment variable")
+	}
+	if expanded == "~" || strings.HasPrefix(expanded, "~/") {
+		home := util.GetHomeDir(user)
+		if !target {
+			var err error
+			home, err = os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+		}
+		expanded = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(expanded, "~"), "/"))
+	}
+	return filepath.Clean(expanded), nil
+}
+
+func recoveryMountOverlapsIdentity(target string, bindings map[string]api.VolumeMount, user string) bool {
+	for _, retained := range []string{"/workspace", "/repo-root", "/root", "/home", util.GetHomeDir(user), "/var/lib/docker", "/var/run/docker.sock"} {
+		if recoveryPathsOverlap(target, retained) {
+			return true
+		}
+	}
+	for retained := range bindings {
+		if recoveryPathsOverlap(target, retained) {
 			return true
 		}
 	}
 	return false
+}
+
+func recoveryPathsOverlap(a, b string) bool {
+	return a == "/" || b == "/" || a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// Added mounts restore tool bindings; they cannot widen access to broker state
+// or daemon authority. Existing approved mounts are preserved without changing
+// their permissions. Persist resolved sources and disallow indirect directory
+// entries so retries cannot acquire a different source via an alias.
+func (state *retainedRuntimeState) validateAddedBindSource(source, projectDir string) (string, error) {
+	if !filepath.IsAbs(source) || source != filepath.Clean(source) || strings.ContainsAny(source, "$~") {
+		return "", fmt.Errorf("runtime recovery requires canonical absolute added bind sources")
+	}
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", fmt.Errorf("resolve added bind source: %w", err)
+	}
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	protected := []string{state.dir, state.home, state.workspace, projectDir,
+		detectRepoRoot(state.config.ExplicitWorkspace, state.workspace, projectDir),
+		filepath.Join(hostHome, ".scion"), filepath.Join(hostHome, ".scion.projects"), filepath.Join(hostHome, ".docker"),
+		"/run", "/var/run", "/var/lib/docker", "/dev", "/proc", "/sys"}
+	for _, path := range protected {
+		if path == "" {
+			continue
+		}
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			path = real
+		}
+		if recoveryPathsOverlap(resolved, filepath.Clean(path)) {
+			return "", fmt.Errorf("added bind source overlaps retained state or daemon authority: %s", source)
+		}
+	}
+	if err := filepath.WalkDir(resolved, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return fmt.Errorf("added bind source contains a socket, device, or symlink")
+		}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("invalid added bind source: %w", err)
+	}
+	return resolved, nil
 }
 
 func runtimeConfigHash(cfg *api.ScionConfig) (string, error) {

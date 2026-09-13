@@ -2,8 +2,10 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -79,13 +81,13 @@ func (s *Server) recoverAgentRuntime(w http.ResponseWriter, r *http.Request, age
 		agent.Message = "Runtime recovery failed: " + err.Error()
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dispatchRollingTimeout)
 		defer cancel()
-		if persistErr := s.completeRuntimeRecovery(persistCtx, agent, recovery.AdmissionVersion); persistErr != nil {
+		if persistErr := s.completeRuntimeRecovery(persistCtx, agent, recovery); persistErr != nil {
 			s.agentLifecycleLog.Error("Failed to record runtime recovery error", "agent_id", agent.ID, "error", persistErr)
 		}
 		RuntimeError(w, agent.Message)
 		return
 	}
-	if err := s.completeRuntimeRecovery(ctx, agent, recovery.AdmissionVersion); err != nil {
+	if err := s.completeRuntimeRecovery(ctx, agent, recovery); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -93,18 +95,49 @@ func (s *Server) recoverAgentRuntime(w http.ResponseWriter, r *http.Request, age
 }
 
 // completeRuntimeRecovery fences late results against a newer admitted retry.
-func (s *Server) completeRuntimeRecovery(ctx context.Context, agent *store.Agent, admissionVersion int64) error {
+func (s *Server) completeRuntimeRecovery(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		err := s.completeRuntimeRecoveryAttempt(ctx, agent, recovery)
+		if !errors.Is(err, store.ErrVersionConflict) {
+			return err
+		}
+	}
+	return store.ErrVersionConflict
+}
+
+func (s *Server) completeRuntimeRecoveryAttempt(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery) error {
 	latest, err := s.store.GetAgent(ctx, agent.ID)
 	if err != nil {
 		return err
 	}
-	if latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != admissionVersion {
+	if latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != recovery.AdmissionVersion {
 		return store.ErrVersionConflict
 	}
-	agent.StateVersion = latest.StateVersion
-	if err := s.store.UpdateAgent(ctx, agent); err != nil {
+	if agent.Phase == string(state.PhaseError) && (latest.Template != agent.Template || latest.Image != agent.Image || !reflect.DeepEqual(latest.AppliedConfig, agent.AppliedConfig)) {
+		// Cancellation can race the owner's committed result. A failure from
+		// the unchanged admission snapshot cannot undo that effective config.
+		*agent = *latest
+		return nil
+	}
+	// The owner may already have committed this result while the requester
+	// waited for the durable intent. Do not replay its snapshot over newer
+	// status reports or lifecycle actions.
+	labelsMatch := recovery.Update.Labels == nil || reflect.DeepEqual(latest.Labels, recovery.Update.Labels)
+	if agent.Phase != string(state.PhaseError) && latest.Template == agent.Template && latest.Image == agent.Image && reflect.DeepEqual(latest.AppliedConfig, agent.AppliedConfig) && labelsMatch && latest.Phase != string(state.PhaseStarting) {
+		*agent = *latest
+		return nil
+	}
+	// The store merges dispatch-owned fields under the same row lock as status
+	// reports, which deliberately do not increment StateVersion.
+	result := *agent
+	result.StateVersion = latest.StateVersion
+	if recovery.Update.Labels != nil {
+		result.Labels = recovery.Update.Labels
+	}
+	if err := s.store.UpdateAgentRuntimeRecovery(ctx, &result, recovery.AdmissionVersion, recovery.Update.Labels != nil); err != nil {
 		return err
 	}
+	*agent = result
 	s.events.PublishAgentStatus(ctx, agent)
 	return nil
 }

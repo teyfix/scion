@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -25,6 +27,171 @@ type recoveryFixture struct {
 	deletes, runs      int
 	sentinels          map[string][]byte
 	gitStatus, gitHead string
+}
+
+func TestRetainedRuntimeRecoveryRejectsIdentityChangesFromTemplateChain(t *testing.T) {
+	for _, layer := range []string{"requested", "default"} {
+		for _, field := range []string{"branch", "workspace", "hub", "bound-hub", "reserved-agent", "reserved-hub", "provider-dir"} {
+			t.Run(layer+"/"+field, func(t *testing.T) {
+				f := newRecoveryFixture(t)
+				if field == "bound-hub" {
+					f.state.config.Hub = &api.AgentHubConfig{Endpoint: "http://retained-hub"}
+					require.NoError(t, writeRuntimeRecoveryState(f.state))
+				}
+				before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+				require.NoError(t, err)
+				chain, err := config.GetTemplateChainInProject("current", f.opts.ProjectPath)
+				require.NoError(t, err)
+				template := chain[len(chain)-1]
+				if layer == "default" {
+					require.GreaterOrEqual(t, len(chain), 2)
+					template = chain[0]
+				}
+				cfg, err := template.LoadConfig()
+				require.NoError(t, err)
+				switch field {
+				case "branch":
+					cfg.Branch = "different-branch"
+				case "workspace":
+					cfg.ExplicitWorkspace = true
+				case "hub", "bound-hub":
+					cfg.Hub = &api.AgentHubConfig{Endpoint: "http://wrong-hub"}
+				case "reserved-agent", "reserved-hub":
+					if cfg.Env == nil {
+						cfg.Env = map[string]string{}
+					}
+					key := "SCION_AGENT_ID"
+					if field == "reserved-hub" {
+						key = "SCION_HUB_ENDPOINT"
+					}
+					cfg.Env[key] = "wrong-identity"
+				case "provider-dir":
+					cfg.ConfigDir = ".different-provider"
+				}
+				data, err := json.Marshal(cfg)
+				require.NoError(t, err)
+				// JSON is valid YAML too; overwrite the chain's existing file so
+				// the YAML-before-JSON resolution order stays realistic.
+				require.NoError(t, os.WriteFile(config.GetScionAgentConfigPath(template.Path), data, 0644))
+				_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+				require.Error(t, err)
+				require.Zero(t, f.deletes)
+				require.Zero(t, f.runs)
+				after, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+				require.NoError(t, err)
+				require.Equal(t, before, after)
+				f.assertPreserved(t)
+			})
+		}
+	}
+}
+
+func TestRetainedRuntimeRecoveryRejectsAddedAuthorityAndIdentityBinds(t *testing.T) {
+	for _, scenario := range []string{"writable-root", "readonly-root", "daemon-directory", "nested-socket", "symlink-root", "nested-symlink", "retained-source", "root-session-target", "worktree-target", "tilde-session-target"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			source := t.TempDir()
+			volume := api.VolumeMount{Source: source, Target: "/extra", ReadOnly: true}
+			switch scenario {
+			case "writable-root":
+				volume.Source, volume.ReadOnly = "/", false
+			case "readonly-root":
+				volume.Source = "/"
+			case "daemon-directory":
+				volume.Source = "/var/run"
+			case "nested-socket":
+				require.NoError(t, os.MkdirAll(filepath.Join(source, "nested"), 0755))
+				listener, err := net.Listen("unix", filepath.Join(source, "nested", "docker.sock"))
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = listener.Close() })
+			case "symlink-root":
+				volume.Source = filepath.Join(source, "root-link")
+				require.NoError(t, os.Symlink("/", volume.Source))
+			case "nested-symlink":
+				require.NoError(t, os.Symlink(filepath.Join(f.state.home, "docker"), filepath.Join(source, "indirect-private-state")))
+			case "retained-source":
+				volume.Source = f.state.home
+			case "root-session-target":
+				volume.Target = "/root/.codex/sessions"
+			case "worktree-target":
+				volume.Target = "/repo-root/.scion/agents/retained/workspace"
+			case "tilde-session-target":
+				volume.Target = "~/.codex/sessions"
+			}
+			before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+			require.NoError(t, err)
+			f.opts.RuntimeRecovery.Update.Config.Volumes = []api.VolumeMount{volume}
+			_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+			require.Error(t, err)
+			require.Zero(t, f.deletes)
+			require.Zero(t, f.runs)
+			after, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			f.assertPreserved(t)
+		})
+	}
+}
+
+func TestRetainedRuntimeRecoveryNativeArgumentsKeepWorktreeHomeAndApprovedBinds(t *testing.T) {
+	f := newRecoveryFixture(t)
+	// Build a real linked worktree using the host's supported Git syntax;
+	// runtime paths must retain the common .git and nested /repo-root binding.
+	backup := filepath.Join(t.TempDir(), "dirty-workspace")
+	require.NoError(t, os.Rename(f.state.workspace, backup))
+	projectRoot := filepath.Dir(f.opts.ProjectPath)
+	require.NoError(t, os.Rename(filepath.Join(backup, ".git"), filepath.Join(projectRoot, ".git")))
+	fixtureGit(t, projectRoot, "worktree", "add", "--force", f.state.workspace, "retained-branch")
+	require.NoError(t, os.WriteFile(filepath.Join(f.state.workspace, "tracked.txt"), []byte("staged\n"), 0644))
+	fixtureGit(t, f.state.workspace, "add", "tracked.txt")
+	require.NoError(t, os.WriteFile(filepath.Join(f.state.workspace, "tracked.txt"), []byte("unstaged\n"), 0644))
+	for path, data := range f.sentinels {
+		if strings.HasPrefix(path, f.state.workspace+"/") {
+			require.NoError(t, os.WriteFile(path, data, 0644))
+		}
+	}
+	f.assertPreserved(t)
+	tools := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(tools, "scion"), []byte("unique-tool-binary"), 0755))
+	alias := filepath.Join(t.TempDir(), "tool-alias")
+	require.NoError(t, os.Symlink(tools, alias))
+	f.opts.RuntimeRecovery.Update.Config.Volumes = []api.VolumeMount{{Source: alias, Target: "/usr/local/lib/scions", ReadOnly: true}}
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	f.assertPreserved(t)
+	// The same symbolic request remains retryable after its resolved source
+	// was persisted, without changing the approved binding or container.
+	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.runs)
+	f.assertPreserved(t)
+	// Execute only a temporary argv recorder through the actual Docker adapter.
+	// No Docker daemon or container is involved in this argument verification.
+	capture := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("RECOVERY_ARGV_CAPTURE", capture)
+	command := filepath.Join(t.TempDir(), "record-argv")
+	require.NoError(t, os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RECOVERY_ARGV_CAPTURE\"\nprintf '%s\\n' new-container\n"), 0755))
+	_, err = (&runtime.DockerRuntime{Command: command}).Run(context.Background(), f.runConfig)
+	require.NoError(t, err)
+	data, err := os.ReadFile(capture)
+	require.NoError(t, err)
+	args := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var mounts []string
+	for i, arg := range args {
+		if arg == "-v" || arg == "--volume" {
+			require.Less(t, i+1, len(args))
+			mounts = append(mounts, args[i+1])
+		}
+	}
+	require.Contains(t, mounts, f.state.home+":/root")
+	require.Contains(t, mounts, filepath.Join(projectRoot, ".git")+":/repo-root/.git")
+	require.Contains(t, mounts, f.state.workspace+":/repo-root/.scion/agents/retained/workspace")
+	require.Contains(t, mounts, filepath.Join(f.state.home, "docker")+":/var/lib/docker")
+	require.Contains(t, mounts, tools+":/usr/local/lib/scions:ro")
+	for _, mount := range mounts {
+		require.False(t, strings.HasPrefix(mount, alias+":"), "native bind must use the validated resolved source")
+	}
+	f.assertPreserved(t)
 }
 
 func fixtureGit(t *testing.T, dir string, args ...string) string {
@@ -175,6 +342,42 @@ func TestRetainedRuntimeRecoveryPreservesGitHomeDockerAndSession(t *testing.T) {
 	// An acknowledged-loss retry verifies the actual matching running container.
 	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
 	require.NoError(t, err)
+	require.Equal(t, 1, f.deletes)
+	require.Equal(t, 1, f.runs)
+	f.assertPreserved(t)
+}
+
+func TestRetainedRuntimeRecoveryFreshAdmissionRetryFencesOlderNativeRequests(t *testing.T) {
+	f := newRecoveryFixture(t)
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	old := f.opts
+	oldRecovery := *f.opts.RuntimeRecovery
+	old.RuntimeRecovery = &oldRecovery
+	version := int64(9)
+	f.opts.RuntimeRecovery.Update.StateVersion = &version
+	f.opts.RuntimeRecovery.AdmissionVersion = 10
+	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.runs)
+	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, int64(10), saved.RuntimeUpdateVersion)
+	f.containers[0].Phase = "stopped"
+	_, err = NewManager(f.rt).Start(context.Background(), old)
+	require.ErrorContains(t, err, "superseded")
+	require.Equal(t, 1, f.deletes)
+	require.Equal(t, 1, f.runs)
+	f.assertPreserved(t)
+}
+
+func TestRetainedRuntimeRecoveryRunningRetryVerifiesTemplateBinding(t *testing.T) {
+	f := newRecoveryFixture(t)
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	f.containers[0].Template = "different-template"
+	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+	require.ErrorContains(t, err, "running container")
 	require.Equal(t, 1, f.deletes)
 	require.Equal(t, 1, f.runs)
 	f.assertPreserved(t)

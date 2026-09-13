@@ -168,7 +168,7 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 			if err := recoveryDispatcher.DispatchAgentRecover(ctx, agent, args.RuntimeRecovery); err != nil {
 				return "", fmt.Errorf("dispatch runtime recovery: %w", err)
 			}
-			return "", s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery.AdmissionVersion)
+			return "", s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery)
 		}
 	}
 	if err := dispatcher.DispatchAgentStart(ctx, agent, task, resume); err != nil {
