@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"reflect"
 
@@ -149,6 +150,19 @@ func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *s
 	working := *agent
 	applied := *agent.AppliedConfig
 	working.AppliedConfig = &applied
+	// Full native templates own unsupported thinking defaults. Remove all
+	// inherited Hub fallbacks before applying the current request, so a later
+	// ordinary resume cannot reapply an obsolete value over retained config.
+	applied.ThinkingLevel = nil
+	applied.Env = maps.Clone(applied.Env)
+	delete(applied.Env, "SCION_THINKING_LEVEL")
+	if applied.InlineConfig != nil {
+		inline := *applied.InlineConfig
+		inline.ThinkingLevel = nil
+		inline.Env = maps.Clone(inline.Env)
+		delete(inline.Env, "SCION_THINKING_LEVEL")
+		applied.InlineConfig = &inline
+	}
 	// Creation flattens previous template defaults into AppliedConfig.Env.
 	// Apply the requested template before current explicit overrides, matching
 	// the broker's retained-config -> requested-template -> inline precedence.

@@ -9,11 +9,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/require"
 )
@@ -55,6 +61,114 @@ func writeSuccessfulRecovery(t *testing.T, w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json")
 	require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{ID: "new-container", Name: "retained", Phase: "running", Image: "new:latest", Template: "current", ContainerStatus: "Up"}}))
 	return req.RuntimeRecovery
+}
+
+// The thinking fixture executes real broker/manager configuration handling;
+// synthetic container creation is the only external runtime effect. Auth has
+// its separate auth-enabled retained-secret regression in pkg/agent.
+type recoveryThinkingManager struct{ agent.Manager }
+
+func (m recoveryThinkingManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
+	opts.NoAuth = true
+	return m.Manager.Start(ctx, opts)
+}
+
+func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) {
+	for _, mode := range []string{"template", "explicit", "zero", "env"} {
+		t.Run(mode, func(t *testing.T) {
+			srv, db := testServer(t)
+			_, broker, ag := setupOnlineBrokerAgent(t, db, "thinking-recovery")
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("SCION_PROJECT", "")
+			t.Setenv("SCION_GROVE", "")
+			project := filepath.Join(root, "project", ".scion")
+			dir := config.ResolveAgentDir(project, ag.Slug)
+			home, workspace := filepath.Join(dir, "home"), filepath.Join(root, "workspace")
+			harnessDir := filepath.Join(root, ".scion", "harness-configs", "codex")
+			templateDir := filepath.Join(root, ".scion", "templates", "current")
+			for _, path := range []string{home, workspace, harnessDir, templateDir} {
+				require.NoError(t, os.MkdirAll(path, 0755))
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "config.yaml"), []byte("harness: codex\nuser: root\nimage: old:latest\nconfig_dir: .codex\nprovisioner:\n  type: container-script\n  interface_version: 1\n  command: [python3, provision.py]\n  lifecycle_events: [pre-start]\ncommand:\n  base: [codex]\n  resume_flag: resume --last\ncapabilities:\n  resume:\n    support: yes\n"), 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "provision.py"), []byte("# synthetic runtime fixture\n"), 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(templateDir, "scion-agent.json"), []byte(`{"harness":"codex","harness_config":"codex","thinking_level":6}`), 0644))
+			one := 1
+			old := &api.ScionConfig{Harness: "codex", HarnessConfig: "codex", User: "root", Image: "old:latest", ExplicitWorkspace: true, ThinkingLevel: &one,
+				Env:     map[string]string{"SCION_AGENT_ID": ag.ID, "SCION_PROJECT_ID": ag.ProjectID, "SCION_THINKING_LEVEL": "1"},
+				Volumes: []api.VolumeMount{{Source: workspace, Target: "/workspace"}},
+				Info:    &api.AgentInfo{ID: ag.ID, Name: ag.Slug, ProjectID: ag.ProjectID, RuntimeBrokerID: broker.ID, Template: "previous", Phase: "suspended", Image: "old:latest"},
+			}
+			chain, err := config.GetTemplateChainInProject("current", project)
+			require.NoError(t, err)
+			defaults := &api.ScionConfig{}
+			for _, template := range chain {
+				cfg, err := template.LoadConfig()
+				require.NoError(t, err)
+				defaults = config.MergeScionConfig(defaults, cfg)
+			}
+			old = config.MergeScionConfig(defaults, old)
+			data, err := json.Marshal(old)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "scion-agent.json"), data, 0644))
+			data, err = json.Marshal(old.Info)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(home, "agent-info.json"), data, 0644))
+			var containers []api.AgentInfo
+			var runs []runtime.RunConfig
+			rt := &runtime.MockRuntime{ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) { return containers, nil }, RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
+				runs = append(runs, cfg)
+				containers = []api.AgentInfo{{Name: ag.Slug, ContainerID: "synthetic-container", Phase: "running", Image: cfg.Image, Template: cfg.Template, Labels: cfg.Labels}}
+				return "synthetic-container", nil
+			}}
+			bs := runtimebroker.New(runtimebroker.ServerConfig{BrokerID: broker.ID, StateDir: t.TempDir(), ForceRuntime: rt.Name()}, recoveryThinkingManager{agent.NewManager(rt)}, rt)
+			backend := httptest.NewServer(bs.Handler())
+			t.Cleanup(backend.Close)
+			t.Cleanup(func() { _ = bs.Shutdown(context.Background()) })
+			broker.Endpoint = backend.URL
+			require.NoError(t, db.UpdateRuntimeBroker(context.Background(), broker))
+			require.NoError(t, db.AddProjectProvider(context.Background(), &store.ProjectProvider{ProjectID: ag.ProjectID, BrokerID: broker.ID, BrokerName: broker.Name, LocalPath: project, Status: "online"}))
+			ag.Phase, ag.Template = "suspended", "previous"
+			ag.AppliedConfig = &store.AgentAppliedConfig{Image: "old:latest", HarnessConfig: "codex", ThinkingLevel: &one,
+				Env: map[string]string{"SCION_THINKING_LEVEL": "1"}, InlineConfig: &api.ScionConfig{ThinkingLevel: &one, Env: map[string]string{"SCION_THINKING_LEVEL": "1"}}}
+			require.NoError(t, db.UpdateAgent(context.Background(), ag))
+			srv.SetDispatcher(NewHTTPAgentDispatcher(db, false, slog.Default()))
+			version := ag.StateVersion
+			update := &api.RuntimeUpdateRequest{StateVersion: &version, Template: "current", Image: "new:latest"}
+			want := "6"
+			if mode == "explicit" || mode == "zero" {
+				level := 8
+				if mode == "zero" {
+					level = 0
+				}
+				update.Config = &api.ScionConfig{ThinkingLevel: &level}
+				want = fmt.Sprint(level)
+			} else if mode == "env" {
+				update.Config = &api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": "4"}}
+				want = "4"
+			}
+			response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+ag.ID+"/start", recoveryStartBody(update))
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Len(t, runs, 1)
+			require.Contains(t, runs[0].Env, "SCION_THINKING_LEVEL="+want)
+			saved, err := db.GetAgent(context.Background(), ag.ID)
+			require.NoError(t, err)
+			if mode == "template" {
+				require.Nil(t, saved.AppliedConfig.ThinkingLevel)
+				require.Nil(t, saved.AppliedConfig.InlineConfig.ThinkingLevel)
+				require.NotContains(t, saved.AppliedConfig.Env, "SCION_THINKING_LEVEL")
+				require.NotContains(t, saved.AppliedConfig.InlineConfig.Env, "SCION_THINKING_LEVEL")
+			}
+			saved.Phase = "suspended"
+			require.NoError(t, db.UpdateAgent(context.Background(), saved))
+			containers[0].Phase = "suspended"
+			response = doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+ag.ID+"/start", map[string]any{})
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Len(t, runs, 2)
+			require.True(t, runs[1].Resume)
+			require.Contains(t, runs[1].Env, "SCION_THINKING_LEVEL="+want)
+		})
+	}
 }
 
 func TestRetainedRuntimeRecoveryHubRequestedTemplateDefaultsAndExplicitOverrides(t *testing.T) {

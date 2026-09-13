@@ -312,6 +312,65 @@ func (f *recoveryFixture) assertPreserved(t *testing.T) {
 	require.Equal(t, "retained-branch\n", fixtureGit(t, f.state.workspace, "branch", "--show-current"))
 }
 
+func TestRetainedRuntimeRecoveryExpandedEnvCannotReplaceIdentityOrReuseMissingValue(t *testing.T) {
+	for _, identity := range []bool{false, true} {
+		t.Run(fmt.Sprint(identity), func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			t.Setenv("RECOVERY_MISSING_VALUE", "")
+			t.Setenv("OPENAI_API_KEY", "")
+			f.opts.RuntimeRecovery.Update.Config.Env["OPENAI_API_KEY"] = "${RECOVERY_MISSING_VALUE}"
+			if identity {
+				t.Setenv("RECOVERY_EXPANDED_KEY", "SCION_AUTH_TOKEN")
+				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"${RECOVERY_EXPANDED_KEY}": "replacement"}
+			}
+			_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+			require.Error(t, err)
+			require.Zero(t, f.runs)
+			require.Zero(t, f.deletes)
+			f.assertPreserved(t)
+		})
+	}
+}
+
+func TestRetainedRuntimeRecoveryCurrentCredentialReplacesStagedSecret(t *testing.T) {
+	for _, mode := range []string{"explicit", "expanded", "passthrough"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			f.opts.NoAuth = false
+			harnessConfig := filepath.Join(os.Getenv("HOME"), ".scion", "harness-configs", "test-harness", "config.yaml")
+			original, err := os.ReadFile(harnessConfig)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(harnessConfig, append(original, []byte("auth:\n  types:\n    api-key:\n      required_env:\n        - any_of: [OPENAI_API_KEY]\n")...), 0644))
+			secret := filepath.Join(f.state.home, ".scion", "harness", "secrets", "OPENAI_API_KEY")
+			require.NoError(t, os.MkdirAll(filepath.Dir(secret), 0700))
+			require.NoError(t, os.WriteFile(secret, []byte("old-dummy-key"), 0600))
+			value := "current-dummy-key"
+			f.opts.Env["OPENAI_API_KEY"] = "current-dummy-key"
+			if mode == "expanded" {
+				t.Setenv("RECOVERY_DUMMY_KEY", value)
+				value = "${RECOVERY_DUMMY_KEY}"
+				f.opts.Env["OPENAI_API_KEY"] = "old-dummy-key"
+			} else if mode == "passthrough" {
+				value = ""
+			}
+			f.opts.RuntimeRecovery.Update.Config.Env["OPENAI_API_KEY"] = value
+			_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+			require.NoError(t, err)
+			staged, err := os.ReadFile(secret)
+			require.NoError(t, err)
+			require.Equal(t, "current-dummy-key", string(staged))
+			data, err := os.ReadFile(filepath.Join(f.state.home, ".scion", "harness", "inputs", "auth-candidates.json"))
+			require.NoError(t, err)
+			var candidates struct {
+				Files map[string]string `json:"env_secret_files"`
+			}
+			require.NoError(t, json.Unmarshal(data, &candidates))
+			require.True(t, strings.HasSuffix(candidates.Files["OPENAI_API_KEY"], "/secrets/OPENAI_API_KEY"))
+			f.assertPreserved(t)
+		})
+	}
+}
+
 func TestRetainedRuntimeRecoveryRequestedTemplateEnvAndExplicitOverrides(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
 		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {

@@ -80,26 +80,47 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 // the validated requested template and explicit config precedence over the
 // previous template defaults flattened into the Hub's resolved environment.
 // Empty config values remain passthrough markers for Hub-resolved credentials.
-func recoveryDispatchEnv(env map[string]string, requested *api.ScionConfig) map[string]string {
+func recoveryDispatchEnv(env map[string]string, requested *api.ScionConfig) (map[string]string, error) {
 	result := make(map[string]string, len(env)+len(requested.Env))
 	for key, value := range env {
 		result[key] = value
 	}
+	current := &api.ScionConfig{Env: make(map[string]string)}
+	keys := make(map[string]bool)
 	for key, value := range requested.Env {
-		if value != "" && !strings.HasPrefix(key, "SCION_") {
-			// Let buildAgentEnv apply the existing config expansion rules.
-			delete(result, key)
-		} else if value != "" && (key == "SCION_MODEL" || key == "SCION_THINKING_LEVEL") {
-			result[key], _ = util.ExpandEnv(value)
+		if value == "" || (strings.HasPrefix(key, "SCION_") && key != "SCION_MODEL" && key != "SCION_THINKING_LEVEL") {
+			continue
 		}
+		expandedKey, _ := util.ExpandEnv(key)
+		if expandedKey == "" || (strings.HasPrefix(expandedKey, "SCION_") && expandedKey != "SCION_MODEL" && expandedKey != "SCION_THINKING_LEVEL") {
+			return nil, fmt.Errorf("requested environment key expands to missing or reserved identity")
+		}
+		delete(result, key)
+		delete(result, expandedKey)
+		keys[expandedKey] = true
+		current.Env[key] = value
 	}
-	if requested.Model != "" && requested.Env["SCION_MODEL"] == "" {
+	// Auth gathering runs before container env construction. Use that same
+	// expansion primitive now so staging and creation consume the same value.
+	entries, _, _ := buildAgentEnv(current, nil)
+	modelEnv, thinkingEnv := false, false
+	for _, entry := range entries {
+		key, value, _ := strings.Cut(entry, "=")
+		result[key] = value
+		modelEnv = modelEnv || key == "SCION_MODEL"
+		thinkingEnv = thinkingEnv || key == "SCION_THINKING_LEVEL"
+		delete(keys, key)
+	}
+	if len(keys) != 0 {
+		return nil, fmt.Errorf("requested runtime environment has an unresolved value")
+	}
+	if requested.Model != "" && !modelEnv {
 		result["SCION_MODEL"] = requested.Model
 	}
-	if requested.ThinkingLevel != nil && requested.Env["SCION_THINKING_LEVEL"] == "" {
+	if requested.ThinkingLevel != nil && !thinkingEnv {
 		result["SCION_THINKING_LEVEL"] = strconv.Itoa(*requested.ThinkingLevel)
 	}
-	return result
+	return result, nil
 }
 func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containers []api.AgentInfo) (*retainedRuntimeState, error) {
 	recovery := opts.RuntimeRecovery
