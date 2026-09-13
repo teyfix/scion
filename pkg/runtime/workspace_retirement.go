@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,10 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 	ids := strings.Fields(string(out))
 	if len(ids) == 0 {
 		return nil
+	}
+	canonicalTarget, err := retirementMountTarget(target)
+	if err != nil {
+		return fmt.Errorf("resolve worktree mount authority: %w", err)
 	}
 	remaining := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -84,19 +89,48 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 				return fmt.Errorf("runtime returned a nonabsolute mount source")
 			}
 			source := filepath.Clean(mount.Source)
-			// Parent broker mounts provide access to managed storage and are not
-			// another agent's exact worktree. Exact/child mounts retain its bytes.
-			rel, err := filepath.Rel(target, source)
-			if err != nil {
-				return fmt.Errorf("compare runtime mount source: %w", err)
-			}
-			if rel == "." || filepath.IsLocal(rel) {
+			if retirementMountWithin(target, source) {
 				return fmt.Errorf("container %s still mounts the selected worktree", facts.ID)
 			}
+			// Docker inspection preserves lexical bind sources, including aliases.
+			// An invisible/unresolvable daemon-host path is not proof that its
+			// mounted bytes are unrelated. Refuse instead of falling back to Clean.
+			canonicalSource, err := filepath.EvalSymlinks(source)
+			if err != nil {
+				return fmt.Errorf("resolve container %s host mount authority: %w", facts.ID, err)
+			}
+			if retirementMountWithin(canonicalTarget, canonicalSource) {
+				return fmt.Errorf("container %s still mounts the selected worktree through an alias", facts.ID)
+			}
+			// Resolved broad broker parent mounts expose managed storage without
+			// retaining another agent's exact worktree and remain permitted.
 		}
 	}
 	if len(remaining) != 0 {
 		return fmt.Errorf("runtime omitted containers from mount inspection")
 	}
 	return nil
+}
+
+func retirementMountWithin(target, source string) bool {
+	rel, err := filepath.Rel(target, source)
+	return err == nil && (rel == "." || filepath.IsLocal(rel))
+}
+
+func retirementMountTarget(target string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(target)
+	if err == nil {
+		return resolved, nil
+	}
+	// A previous partial retirement may already have removed the worktree while
+	// retaining its marker/ref. Resolve the existing parent for branch-only retry;
+	// an existing dangling symlink or other resolution failure remains refused.
+	if _, statErr := os.Lstat(target); !os.IsNotExist(statErr) || !os.IsNotExist(err) {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(target))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(target)), nil
 }

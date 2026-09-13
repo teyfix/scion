@@ -24,24 +24,56 @@ import (
 )
 
 func TestWorkspaceRetirement_AllContainerMountAuthority(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "workspace", "worktrees", "agent-uuid")
+	root := t.TempDir()
+	target := filepath.Join(root, "workspace", "worktrees", "agent-uuid")
+	other := filepath.Join(filepath.Dir(target), "another-uuid")
+	for _, path := range []string{filepath.Join(target, "nested"), other} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aliases := map[string]string{
+		"alias-target":        target,
+		"alias-child":         filepath.Join(target, "nested"),
+		"alias-parent":        filepath.Dir(target),
+		"alias-broker-parent": filepath.Dir(filepath.Dir(target)),
+		"alias-unresolved":    filepath.Join(root, "absent-source"),
+	}
+	for name, destination := range aliases {
+		if err := os.Symlink(destination, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	id := strings.Repeat("a", 64)
 	for _, tc := range []struct {
 		name, source, list, inspect string
 		fail                        bool
+		removedTarget               bool
 	}{
 		{name: "foreign-exact", source: target, fail: true},
 		{name: "foreign-child", source: filepath.Join(target, "nested"), fail: true},
 		{name: "broad-broker-parent", source: filepath.Dir(filepath.Dir(target))},
-		{name: "other-agent", source: filepath.Join(filepath.Dir(target), "another-uuid")},
+		{name: "other-agent", source: other},
+		{name: "alias-target", source: filepath.Join(root, "alias-target"), fail: true},
+		{name: "alias-child", source: filepath.Join(root, "alias-child"), fail: true},
+		{name: "redirected-parent", source: filepath.Join(root, "alias-parent", "agent-uuid", "nested"), fail: true},
+		{name: "resolved-broad-parent", source: filepath.Join(root, "alias-broker-parent")},
+		{name: "unresolved-source", source: filepath.Join(root, "absent-source"), fail: true},
+		{name: "unresolved-alias", source: filepath.Join(root, "alias-unresolved"), fail: true},
 		{name: "enumeration-error", list: "exit 7", fail: true},
 		{name: "inspection-error", inspect: "exit 8", fail: true},
 		{name: "incomplete-inspection", inspect: "printf '%s\\n' '{}'", fail: true},
 		{name: "missing-host-source", inspect: "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{}]}'", fail: true},
 		{name: "missing-container", inspect: "exit 0", fail: true},
 		{name: "invalid-container-id", list: "printf '%s\\n' 'not-a-container'", fail: true},
+		{name: "already-retired-target", source: filepath.Dir(filepath.Dir(target)), removedTarget: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.removedTarget {
+				if err := os.RemoveAll(target); err != nil {
+					t.Fatal(err)
+				}
+			}
 			mounts, err := json.Marshal(map[string]any{"id": id, "mounts": []map[string]string{{"Source": tc.source}}})
 			if err != nil {
 				t.Fatal(err)

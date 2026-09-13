@@ -466,18 +466,48 @@ func TestNativeRetirement_JoinCannotRegisterDuringLastOwnerRetirement(t *testing
 }
 
 func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
-	for _, tc := range []struct{ name, suffix, inspection, want string }{
+	for _, tc := range []struct {
+		name, suffix, inspection, want string
+		alias, redirected, unresolved  bool
+	}{
 		{name: "exact", want: "still mounts"},
 		{name: "child", suffix: "/nested", want: "still mounts"},
+		{name: "alias-exact", alias: true, want: "through an alias"},
+		{name: "alias-child", suffix: "/nested", alias: true, want: "through an alias"},
+		{name: "redirected-parent", suffix: "/nested", redirected: true, want: "through an alias"},
+		{name: "unresolved-source", unresolved: true, want: "host mount authority"},
 		{name: "inspection-failure", inspection: "exit 8", want: "inspect all runtime mounts"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := setupRetirement(t)
 			id := strings.Repeat("a", 64)
 			command := filepath.Join(t.TempDir(), "docker-fixture")
+			source := f.target + tc.suffix
+			if tc.suffix != "" {
+				if err := os.MkdirAll(source, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.alias || tc.redirected {
+				alias := filepath.Join(t.TempDir(), "foreign-source")
+				destination := source
+				if tc.redirected {
+					destination = filepath.Dir(f.target)
+				}
+				if err := os.Symlink(destination, alias); err != nil {
+					t.Fatal(err)
+				}
+				source = alias
+				if tc.redirected {
+					source = filepath.Join(alias, filepath.Base(f.target), "nested")
+				}
+			}
+			if tc.unresolved {
+				source = filepath.Join(t.TempDir(), "invisible-daemon-source")
+			}
 			inspection := tc.inspection
 			if inspection == "" {
-				inspection = "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{\"Source\":\"" + f.target + tc.suffix + "\"}]}'"
+				inspection = "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{\"Source\":\"" + source + "\"}]}'"
 			}
 			script := "#!/bin/sh\ncase \"$1\" in\nps) if [ \"$5\" = '{{json .}}' ]; then printf '%s\\n' '{\"ID\":\"" + id + "\",\"Names\":\"foreign-helper\",\"Labels\":\"\",\"Status\":\"Up\"}'; else printf '%s\\n' '" + id + "'; fi;;\ninspect) " + inspection + ";;\n*) exit 90;;\nesac\n"
 			if err := os.WriteFile(command, []byte(script), 0755); err != nil {
