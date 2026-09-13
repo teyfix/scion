@@ -22,9 +22,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -43,6 +45,159 @@ type mockManager struct {
 	lastDeleteProjectPath string
 	lastDeleteAgentID     string
 	lastStopAgentID       string
+}
+
+// admissionBoundaryManager keeps actual native admission validation while
+// controlling a late competing write or an inner auth-resolution failure.
+type admissionBoundaryManager struct {
+	agent.Manager
+	beforeStart func(api.StartOptions) error
+	starts      int
+}
+
+func (m *admissionBoundaryManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
+	m.starts++
+	if m.beforeStart != nil {
+		if err := m.beforeStart(opts); err != nil {
+			return nil, err
+		}
+	}
+	return m.Manager.Start(ctx, opts)
+}
+
+func brokerAdmissionSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	files := map[string]string{}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		var data []byte
+		if !entry.IsDir() {
+			data, err = os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+		}
+		files[path] = fmt.Sprintf("%o:%s", info.Mode(), data)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func TestCreateAgentAdmissionPreservesRetainedFiles(t *testing.T) {
+	for _, scenario := range []string{"new-uuid", "explicit-denial", "missing-uuid", "late-conflict", "retained-auth-failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Chdir(root)
+			global := filepath.Join(root, ".scion")
+			for _, dir := range []string{filepath.Join(global, "templates", "default"), filepath.Join(global, "harness-configs", "generic")} {
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(global, "templates", "default", "scion-agent.json"), []byte(`{"default_harness_config":"generic"}`), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(global, "harness-configs", "generic", "config.yaml"), []byte("harness: generic\nimage: test-image:latest\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			project := filepath.Join(root, "project", ".scion")
+			agentDir := filepath.Join(project, "agents", "retained")
+			home := filepath.Join(agentDir, "home")
+			info := api.AgentInfo{Name: "retained", ID: "retained-uuid", ProjectID: "retained-project", RuntimeBrokerID: "trusted-broker", Template: "default"}
+			infoData, err := json.Marshal(info)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, data := range map[string][]byte{
+				filepath.Join(home, "agent-info.json"):         infoData,
+				filepath.Join(agentDir, "scion-agent.json"):    []byte(`{"default_harness_config":"generic","docker":{"nvidia_gpu":true,"devices":["nvidia.com/gpu=0"]}}`),
+				filepath.Join(agentDir, "workspace", "source"): []byte("retained source"),
+				filepath.Join(home, "provider", "credential"):  []byte("synthetic retained credential"),
+				filepath.Join(home, "private-docker", "state"): []byte("retained docker state"),
+			} {
+				if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := brokerAdmissionSnapshot(t, agentDir)
+			nativeCalls := 0
+			rt := &runtime.MockRuntime{ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) { nativeCalls++; return nil, nil }, RunFunc: func(context.Context, runtime.RunConfig) (string, error) { nativeCalls++; return "unexpected", nil }}
+			mgr := &admissionBoundaryManager{Manager: agent.NewManager(rt)}
+			switch scenario {
+			case "late-conflict":
+				mgr.beforeStart = func(api.StartOptions) error {
+					info.ID = "competing-uuid"
+					data, err := json.Marshal(info)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(home, "agent-info.json"), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+					before = brokerAdmissionSnapshot(t, agentDir)
+					return nil
+				}
+			case "retained-auth-failure":
+				mgr.beforeStart = func(api.StartOptions) error { return fmt.Errorf("synthetic auth resolution failure") }
+			}
+			cfg := DefaultServerConfig()
+			cfg.BrokerID, cfg.ForceRuntime = info.RuntimeBrokerID, "mock"
+			srv := New(cfg, mgr, rt)
+			gpu := scenario != "explicit-denial"
+			id := "retained-uuid"
+			if scenario == "new-uuid" {
+				id = "new-uuid"
+			}
+			if scenario == "missing-uuid" {
+				id = ""
+			}
+			request := CreateAgentRequest{Name: "retained", ID: id, ProjectID: info.ProjectID, ProjectPath: project, NoAuth: true, Config: &CreateAgentConfig{Template: "default"}, InlineConfig: &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &gpu}}}
+			if scenario == "new-uuid" || scenario == "explicit-denial" || scenario == "missing-uuid" {
+				request.GatherEnv, request.NoAuth = true, false
+				request.Config.Template = "must-not-resolve"
+				request.WorkspaceStoragePath = "must-not-bootstrap"
+			}
+			body, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+			response := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(response, req)
+			want := http.StatusConflict
+			if scenario == "retained-auth-failure" {
+				want = http.StatusInternalServerError
+			}
+			if response.Code != want {
+				t.Fatalf("status %d, want %d: %s", response.Code, want, response.Body.String())
+			}
+			if nativeCalls != 0 {
+				t.Fatalf("rejected/failed admission reached native runtime %d times", nativeCalls)
+			}
+			if !reflect.DeepEqual(before, brokerAdmissionSnapshot(t, agentDir)) {
+				t.Fatal("handler deleted or changed retained source, identity, credential or private Docker")
+			}
+			wantStarts := 0
+			if scenario == "late-conflict" || scenario == "retained-auth-failure" {
+				wantStarts = 1
+			}
+			if mgr.starts != wantStarts {
+				t.Fatalf("manager starts %d, want %d", mgr.starts, wantStarts)
+			}
+		})
+	}
 }
 
 func (m *mockManager) Provision(ctx context.Context, opts api.StartOptions) (*api.ScionConfig, error) {
@@ -3355,20 +3510,21 @@ func TestCreateAgentStartFailure_CleansUpFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	projectPath := filepath.Join(tmpDir, ".scion")
 	agentDir := filepath.Join(projectPath, "agents", "fail-agent")
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
-		t.Fatalf("failed to create agent dir: %v", err)
-	}
-	// Write a scion-agent.yaml so the agent is discoverable
-	if err := os.WriteFile(filepath.Join(agentDir, "scion-agent.yaml"), []byte("harness: gemini\n"), 0644); err != nil {
-		t.Fatalf("failed to write scion-agent.yaml: %v", err)
-	}
 
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
-	mgr := &provisionCapturingManager{}
-	mgr.startErr = fmt.Errorf("auth resolution failed: gemini: auth type \"api-key\" selected but no API key found")
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	mgr := &admissionBoundaryManager{Manager: agent.NewManager(rt), beforeStart: func(api.StartOptions) error {
+		// These files belong to this fresh Start, not a retained collision.
+		if err := os.MkdirAll(agentDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(agentDir, "scion-agent.yaml"), []byte("harness: gemini\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("auth resolution failed: gemini: auth type \"api-key\" selected but no API key found")
+	}}
 	srv := New(cfg, mgr, rt)
 
 	body := fmt.Sprintf(`{

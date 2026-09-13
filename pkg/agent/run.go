@@ -91,6 +91,12 @@ func validateDockerDeviceRuntime(runtimeName string, devices []string) error {
 }
 
 func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
+	if _, err := ValidateCreateAdmission(opts); err != nil {
+		return nil, err
+	}
+	if completeCreateAdmission(opts.CreateAdmission) {
+		ctx = context.WithValue(ctx, createAdmissionContextKey{}, opts.CreateAdmission)
+	}
 	// Resolve project name early so we can scope the container lookup below.
 	projectDir, err := config.GetResolvedProjectDir(opts.ProjectPath)
 	if err != nil {
@@ -120,6 +126,8 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 		agentID, projectID = recovery.AgentID, recovery.ProjectID
 		opts.Resume = true
+	} else if admission := opts.CreateAdmission; completeCreateAdmission(admission) {
+		agentID, projectID = admission.AgentID, admission.ProjectID
 	}
 
 	// 0. Check if container already exists (scoped to this project)
