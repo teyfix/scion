@@ -223,19 +223,22 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	// Stop existing services
 	hc.Stop()
 
-	// Update credentials
+	// Decode before publishing the complete credential/identity/key tuple.
+	secretKey, err := base64.StdEncoding.DecodeString(creds.SecretKey)
+	if err != nil {
+		secretKey = nil // A partially decoded or previous key grants no authority.
+	}
+	hc.mu.Lock()
 	hc.Credentials = creds
 	hc.BrokerID = creds.BrokerID
 	hc.HubEndpoint = creds.HubEndpoint
 	hc.AuthMode = creds.AuthMode
-
-	// Decode secret key
-	secretKey, err := base64.StdEncoding.DecodeString(creds.SecretKey)
+	hc.SecretKey = secretKey
+	hc.mu.Unlock()
 	if err != nil {
 		hc.setStatus(ConnectionStatusError)
 		return fmt.Errorf("failed to decode secret key: %w", err)
 	}
-	hc.SecretKey = secretKey
 
 	// Create new Hub client, resolving transport auth once for both REST and WebSocket
 	opts := buildHubClientOpts(creds, secretKey)

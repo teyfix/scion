@@ -15,11 +15,89 @@
 package runtimebroker
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
+
+func TestBrokerInstanceAuthority_ConcurrentCredentialReinitialize(t *testing.T) {
+	const brokerID = "broker-current"
+	creds := func(id, key string) *brokercredentials.BrokerCredentials {
+		return &brokercredentials.BrokerCredentials{BrokerID: id, SecretKey: base64.StdEncoding.EncodeToString([]byte(key)), HubEndpoint: "http://127.0.0.1:1"}
+	}
+	initial := creds(brokerID, "initial-fixture-key")
+	conn := &HubConnection{Name: "credential-race-fixture", Credentials: initial, BrokerID: brokerID, SecretKey: []byte("initial-fixture-key")}
+	s := &Server{config: ServerConfig{BrokerID: brokerID, BrokerAuthEnabled: true, BrokerAuthStrictMode: true}, hubConnections: map[string]*HubConnection{"current": conn}}
+	// Heartbeat/control channel remain disabled: this exercises the ACTUAL
+	// tuple writer and authority reader without any network or live services.
+	start := make(chan struct{})
+	errors := make(chan error, 3)
+	var workers sync.WaitGroup
+	workers.Add(3)
+	go func() {
+		defer workers.Done()
+		<-start
+		for i := 0; i < 128; i++ {
+			id := brokerID
+			if i%2 != 0 {
+				id = "other-broker"
+			}
+			if err := conn.Reinitialize(context.Background(), s, creds(id, fmt.Sprintf("fixture-key-%d", i))); err != nil {
+				errors <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer workers.Done()
+			<-start
+			for j := 0; j < 512; j++ {
+				id, err := s.authenticatedInstanceBrokerID()
+				if err == nil && id != brokerID {
+					errors <- fmt.Errorf("authority accepted mismatched broker")
+					return
+				}
+				conn.mu.RLock()
+				expected, decodeErr := base64.StdEncoding.DecodeString(conn.Credentials.SecretKey)
+				coherent := decodeErr == nil && conn.BrokerID == conn.Credentials.BrokerID && bytes.Equal(expected, conn.SecretKey)
+				conn.mu.RUnlock()
+				if !coherent {
+					errors <- fmt.Errorf("authority credential tuple was partial")
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestBrokerInstanceAuthority_InvalidRotatedKeyRefuses(t *testing.T) {
+	conn := &HubConnection{Name: "invalid-key-fixture", BrokerID: "broker-current", SecretKey: []byte("previous-key"), Credentials: &brokercredentials.BrokerCredentials{BrokerID: "broker-current"}}
+	s := &Server{config: ServerConfig{BrokerID: "broker-current", BrokerAuthEnabled: true, BrokerAuthStrictMode: true}, hubConnections: map[string]*HubConnection{"current": conn}}
+	// A valid prefix followed by bad base64 must not retain partial/old key bytes.
+	err := conn.Reinitialize(context.Background(), s, &brokercredentials.BrokerCredentials{BrokerID: "broker-current", SecretKey: "Zm9v!!!!", HubEndpoint: "http://127.0.0.1:1"})
+	if err == nil {
+		t.Fatal("invalid rotated key unexpectedly accepted")
+	}
+	if _, err := s.authenticatedInstanceBrokerID(); err == nil {
+		t.Fatal("invalid rotated key retained owning authority")
+	}
+	if conn.GetStatus() != ConnectionStatusError {
+		t.Fatal("failed rotation did not report error")
+	}
+}
 
 func TestBrokerInstanceAuthority_AuthenticatedCredentialBinding(t *testing.T) {
 	for _, name := range []string{"authenticated", "configured-only", "no-key", "mismatch", "ambiguous", "non-strict", "auth-disabled"} {
