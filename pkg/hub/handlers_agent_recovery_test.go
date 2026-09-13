@@ -73,8 +73,8 @@ func (m recoveryThinkingManager) Start(ctx context.Context, opts api.StartOption
 	return m.Manager.Start(ctx, opts)
 }
 
-func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) {
-	for _, mode := range []string{"template", "explicit", "zero", "env"} {
+func TestRetainedRuntimeRecoveryThinkingAndModelSurviveOrdinaryHubResume(t *testing.T) {
+	for _, mode := range []string{"template", "explicit", "zero", "env", "retained"} {
 		t.Run(mode, func(t *testing.T) {
 			srv, db := testServer(t)
 			_, broker, ag := setupOnlineBrokerAgent(t, db, "thinking-recovery")
@@ -92,10 +92,14 @@ func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) 
 			}
 			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "config.yaml"), []byte("harness: codex\nuser: root\nimage: old:latest\nconfig_dir: .codex\nprovisioner:\n  type: container-script\n  interface_version: 1\n  command: [python3, provision.py]\n  lifecycle_events: [pre-start]\ncommand:\n  base: [codex]\n  resume_flag: resume --last\ncapabilities:\n  resume:\n    support: yes\n"), 0644))
 			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "provision.py"), []byte("# synthetic runtime fixture\n"), 0644))
-			require.NoError(t, os.WriteFile(filepath.Join(templateDir, "scion-agent.json"), []byte(`{"harness":"codex","harness_config":"codex","thinking_level":6}`), 0644))
+			templateConfig := `{"harness":"codex","harness_config":"codex","thinking_level":6,"model":"template-model"}`
+			if mode == "retained" {
+				templateConfig = `{"harness":"codex","harness_config":"codex","thinking_level":6}`
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(templateDir, "scion-agent.json"), []byte(templateConfig), 0644))
 			one := 1
-			old := &api.ScionConfig{Harness: "codex", HarnessConfig: "codex", User: "root", Image: "old:latest", ExplicitWorkspace: true, ThinkingLevel: &one,
-				Env:     map[string]string{"SCION_AGENT_ID": ag.ID, "SCION_PROJECT_ID": ag.ProjectID, "SCION_THINKING_LEVEL": "1"},
+			old := &api.ScionConfig{Harness: "codex", HarnessConfig: "codex", User: "root", Image: "old:latest", ExplicitWorkspace: true, ThinkingLevel: &one, Model: "different-old-scalar",
+				Env:     map[string]string{"SCION_AGENT_ID": ag.ID, "SCION_PROJECT_ID": ag.ProjectID, "SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"},
 				Volumes: []api.VolumeMount{{Source: workspace, Target: "/workspace"}},
 				Info:    &api.AgentInfo{ID: ag.ID, Name: ag.Slug, ProjectID: ag.ProjectID, RuntimeBrokerID: broker.ID, Template: "previous", Phase: "suspended", Image: "old:latest"},
 			}
@@ -129,28 +133,35 @@ func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) 
 			require.NoError(t, db.UpdateRuntimeBroker(context.Background(), broker))
 			require.NoError(t, db.AddProjectProvider(context.Background(), &store.ProjectProvider{ProjectID: ag.ProjectID, BrokerID: broker.ID, BrokerName: broker.Name, LocalPath: project, Status: "online"}))
 			ag.Phase, ag.Template = "suspended", "previous"
-			ag.AppliedConfig = &store.AgentAppliedConfig{Image: "old:latest", HarnessConfig: "codex", ThinkingLevel: &one,
-				Env: map[string]string{"SCION_THINKING_LEVEL": "1"}, InlineConfig: &api.ScionConfig{ThinkingLevel: &one, Env: map[string]string{"SCION_THINKING_LEVEL": "1"}}}
+			ag.AppliedConfig = &store.AgentAppliedConfig{Image: "old:latest", HarnessConfig: "codex", ThinkingLevel: &one, Model: "old-model",
+				Env: map[string]string{"SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"}, InlineConfig: &api.ScionConfig{ThinkingLevel: &one, Model: "old-model", Env: map[string]string{"SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"}}}
 			require.NoError(t, db.UpdateAgent(context.Background(), ag))
 			srv.SetDispatcher(NewHTTPAgentDispatcher(db, false, slog.Default()))
 			version := ag.StateVersion
 			update := &api.RuntimeUpdateRequest{StateVersion: &version, Template: "current", Image: "new:latest"}
 			want := "6"
+			wantModel := "template-model"
+			if mode == "retained" {
+				wantModel = "old-model"
+			}
 			if mode == "explicit" || mode == "zero" {
 				level := 8
 				if mode == "zero" {
 					level = 0
 				}
-				update.Config = &api.ScionConfig{ThinkingLevel: &level}
+				update.Config = &api.ScionConfig{ThinkingLevel: &level, Model: "current-model"}
 				want = fmt.Sprint(level)
+				wantModel = "current-model"
 			} else if mode == "env" {
-				update.Config = &api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": "4"}}
+				update.Config = &api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": "4", "SCION_MODEL": "current-env-model"}}
 				want = "4"
+				wantModel = "current-env-model"
 			}
 			response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+ag.ID+"/start", recoveryStartBody(update))
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 			require.Len(t, runs, 1)
 			require.Contains(t, runs[0].Env, "SCION_THINKING_LEVEL="+want)
+			require.Contains(t, runs[0].Env, "SCION_MODEL="+wantModel)
 			saved, err := db.GetAgent(context.Background(), ag.ID)
 			require.NoError(t, err)
 			if mode == "template" {
@@ -158,6 +169,10 @@ func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) 
 				require.Nil(t, saved.AppliedConfig.InlineConfig.ThinkingLevel)
 				require.NotContains(t, saved.AppliedConfig.Env, "SCION_THINKING_LEVEL")
 				require.NotContains(t, saved.AppliedConfig.InlineConfig.Env, "SCION_THINKING_LEVEL")
+				require.Empty(t, saved.AppliedConfig.Model)
+				require.Empty(t, saved.AppliedConfig.InlineConfig.Model)
+				require.NotContains(t, saved.AppliedConfig.Env, "SCION_MODEL")
+				require.NotContains(t, saved.AppliedConfig.InlineConfig.Env, "SCION_MODEL")
 			}
 			saved.Phase = "suspended"
 			require.NoError(t, db.UpdateAgent(context.Background(), saved))
@@ -167,6 +182,7 @@ func TestRetainedRuntimeRecoveryThinkingSurvivesOrdinaryHubResume(t *testing.T) 
 			require.Len(t, runs, 2)
 			require.True(t, runs[1].Resume)
 			require.Contains(t, runs[1].Env, "SCION_THINKING_LEVEL="+want)
+			require.Contains(t, runs[1].Env, "SCION_MODEL="+wantModel)
 		})
 	}
 }

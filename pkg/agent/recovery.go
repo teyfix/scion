@@ -56,6 +56,19 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 		base.Hub = &hub
 	}
 	effective := config.MergeScionConfig(&base, requested)
+	// A newly requested scalar must not leave a prior env fallback in saved
+	// config, where ordinary resume would give it precedence again. Current
+	// explicit environment overrides continue to win over scalar defaults.
+	if requested.Model != "" && requested.Env["SCION_MODEL"] == "" {
+		delete(effective.Env, "SCION_MODEL")
+	} else if model := effective.Env["SCION_MODEL"]; model != "" {
+		// Retain the selected environment model when no new scalar replaces
+		// it, including when old scalar and environment defaults differed.
+		effective.Model = model
+	}
+	if requested.ThinkingLevel != nil && requested.Env["SCION_THINKING_LEVEL"] == "" {
+		delete(effective.Env, "SCION_THINKING_LEVEL")
+	}
 	if err := validateRetainedRuntimeConfig(old, effective); err != nil {
 		return nil, err
 	}

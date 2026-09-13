@@ -150,17 +150,21 @@ func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *s
 	working := *agent
 	applied := *agent.AppliedConfig
 	working.AppliedConfig = &applied
-	// Full native templates own unsupported thinking defaults. Remove all
+	// Full native templates own model/thinking defaults. Remove all
 	// inherited Hub fallbacks before applying the current request, so a later
 	// ordinary resume cannot reapply an obsolete value over retained config.
 	applied.ThinkingLevel = nil
+	applied.Model = ""
 	applied.Env = maps.Clone(applied.Env)
 	delete(applied.Env, "SCION_THINKING_LEVEL")
+	delete(applied.Env, "SCION_MODEL")
 	if applied.InlineConfig != nil {
 		inline := *applied.InlineConfig
 		inline.ThinkingLevel = nil
+		inline.Model = ""
 		inline.Env = maps.Clone(inline.Env)
 		delete(inline.Env, "SCION_THINKING_LEVEL")
+		delete(inline.Env, "SCION_MODEL")
 		applied.InlineConfig = &inline
 	}
 	// Creation flattens previous template defaults into AppliedConfig.Env.
