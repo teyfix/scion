@@ -313,6 +313,8 @@ func ValidateVolumes(volumes []VolumeMount) error {
 
 // DockerConfig holds Docker runtime-specific configuration.
 type DockerConfig struct {
+	// NvidiaGPU overrides inherited NVIDIA device grants. Nil preserves configured devices.
+	NvidiaGPU  *bool             `json:"nvidia_gpu,omitempty" yaml:"nvidia_gpu,omitempty"`
 	Privileged *bool             `json:"privileged,omitempty" yaml:"privileged,omitempty"`
 	Networks   []string          `json:"networks,omitempty" yaml:"networks,omitempty"`
 	Devices    []string          `json:"devices,omitempty" yaml:"devices,omitempty"`

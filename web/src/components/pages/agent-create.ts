@@ -831,7 +831,7 @@ export class ScionPageAgentCreate extends LitElement {
           ? { privileged: false }
           : undefined;
     const dockerConfig = buildDockerRuntimeConfig(
-      dockerBase,
+      { ...dockerBase, nvidia_gpu: this.requireGpu },
       this.dockerNetworks,
       this.dockerLabelEntries
     );
@@ -1554,10 +1554,10 @@ export class ScionPageAgentCreate extends LitElement {
             }
           }}
         >
-          Require GPU
+          Enable NVIDIA GPU
         </sl-checkbox>
         <sl-tooltip
-          content="Require an NVIDIA GPU for this agent. Only GPU-capable brokers will be selectable."
+          content="Attach NVIDIA GPU devices to this agent. Only GPU-capable brokers will be selectable. Uncheck to disable inherited NVIDIA device grants."
           hoist
         >
           <span class="help-badge">?</span>

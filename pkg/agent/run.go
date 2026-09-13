@@ -191,8 +191,10 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	} else {
 		util.Debugf("Start: GetAgent returned nil config")
 	}
+	var dockerDevices []string
 	if finalScionCfg != nil && finalScionCfg.Docker != nil {
-		if err := validateDockerDeviceRuntime(m.Runtime.Name(), finalScionCfg.Docker.Devices); err != nil {
+		dockerDevices = config.ResolveDockerDevices(finalScionCfg.Docker)
+		if err := validateDockerDeviceRuntime(m.Runtime.Name(), dockerDevices); err != nil {
 			return nil, err
 		}
 	}
@@ -1070,12 +1072,7 @@ authDone:
 			}
 			return nil
 		}(),
-		Devices: func() []string {
-			if finalScionCfg != nil && finalScionCfg.Docker != nil {
-				return finalScionCfg.Docker.Devices
-			}
-			return nil
-		}(),
+		Devices: dockerDevices,
 		DockerLabels: func() map[string]string {
 			if finalScionCfg != nil && finalScionCfg.Docker != nil {
 				return finalScionCfg.Docker.Labels

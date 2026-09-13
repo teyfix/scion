@@ -406,6 +406,7 @@ export interface AgentInlineConfig {
 }
 
 export interface DockerRuntimeConfig {
+  nvidia_gpu?: boolean;
   privileged?: boolean;
   networks?: string[];
   devices?: string[];
