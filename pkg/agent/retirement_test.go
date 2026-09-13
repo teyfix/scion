@@ -394,6 +394,34 @@ func deleteAgentFilesForTest(name, project string, removeBranch bool) (bool, err
 	return deleteAgentFiles(context.Background(), name, project, removeBranch, &retirementTestRuntime{MockRuntime: &runtime.MockRuntime{}})
 }
 
+func TestNativeRetirement_BrokerInstanceAuthorityFailureRetainsRetry(t *testing.T) {
+	f := setupRetirement(t)
+	rt := &runtime.DockerRuntime{Command: "must-not-run-before-authority"}
+	rt.ConfigureBrokerInstanceAuthority(filepath.Join(t.TempDir(), "missing-instance.json"), func() (string, error) { return "authenticated-broker", nil })
+	if _, err := deleteAgentFiles(context.Background(), "display-slug", f.project, true, rt); err == nil {
+		t.Fatal("missing trusted instance authority allowed retirement")
+	}
+	for _, path := range []string{f.target, filepath.Join(f.agentDir, "scion-agent.json")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("retry identity/workspace lost: %v", err)
+		}
+	}
+	owners, path, err := provision.ListSharers(f.base, f.branch)
+	if err != nil || len(owners) != 1 || owners[0] != f.uuid || path != f.target {
+		t.Fatal("instance authority refusal lost ownership")
+	}
+	assertRetirementSurvivors(t, f)
+	// With complete empty runtime authority in this disposable fixture, the
+	// persisted UUID/private identity remains usable for supported retry.
+	if _, err := deleteAgentFilesForTest("display-slug", f.project, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(f.target); !os.IsNotExist(err) {
+		t.Fatal("retry left selected worktree")
+	}
+	assertRetirementSurvivors(t, f)
+}
+
 func TestNativeRetirement_JoinCannotRegisterDuringLastOwnerRetirement(t *testing.T) {
 	f := setupRetirement(t)
 	// Native ProvisionShared sanitizes branch requests before registering them.

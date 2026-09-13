@@ -2484,6 +2484,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 
 	// Create Runtime Broker server configuration
 	rhCfg := runtimebroker.ServerConfig{
+		InstanceAuthorityPath:         cfg.RuntimeBroker.InstanceAuthorityPath,
 		Port:                          cfg.RuntimeBroker.Port,
 		Host:                          cfg.RuntimeBroker.Host,
 		ReadTimeout:                   cfg.RuntimeBroker.ReadTimeout,

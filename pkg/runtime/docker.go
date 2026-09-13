@@ -30,8 +30,10 @@ import (
 )
 
 type DockerRuntime struct {
-	Command string
-	Host    string
+	Command               string
+	Host                  string
+	instanceAuthorityPath string
+	authenticatedBrokerID func() (string, error)
 }
 
 func NewDockerRuntime() *DockerRuntime {

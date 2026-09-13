@@ -71,6 +71,9 @@ type ServerConfig struct {
 	// hub listen port is not known (remote broker, non-colocated mode).
 	HubListenPort int
 
+	// InstanceAuthorityPath is trusted launcher input, never agent configuration.
+	InstanceAuthorityPath string
+
 	// BrokerID is a unique identifier for this runtime broker.
 	BrokerID string
 	// BrokerName is a human-readable name for this runtime broker.
@@ -344,6 +347,7 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 		}
 	}
 
+	srv.configureInstanceAuthority(rt)
 	srv.registerRoutes()
 
 	return srv
@@ -365,6 +369,7 @@ func (s *Server) RuntimeName() string {
 func (s *Server) SwapRuntime(rt scionrt.Runtime) {
 	s.mu.Lock()
 	old := s.runtime.Name()
+	s.configureInstanceAuthority(rt)
 	s.runtime = rt
 	newMgr := agent.NewManager(rt)
 	s.manager = newMgr
