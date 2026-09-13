@@ -22,6 +22,45 @@ Subdirectories contain domain-specific agent instructions for their respective a
 - If you are working on the **documentation site**, review `docs-site/AGENTS.md` before making changes.
 - Check the project root [`claude.md`](claude.md) for build commands, architecture notes, and coding conventions.
 
+## Coordinator and operator role
+
+Coordinator/operator agents only coordinate, regardless of environment: host,
+WSL2, or SCION container. They never write or review code, implement corrections,
+or make orchestration hot-fixes. Delegate implementation, code inspection/review,
+verification, documentation changes, host repairs, and SCION project work to
+agents with explicit ownership. Inspect GitHub acceptance, published evidence,
+and agent/broker state to route work; a failed dispatcher does not change the
+role. Delegate difficult diagnosis to an Astra agent with high reasoning.
+
+For Animatrix, the canonical ongoing coordination issue is
+[teyfix/animatrix#375](https://github.com/teyfix/animatrix/issues/375); follow that
+repository's `.agents/rules/coordinator.md`. Its SCION checkout is `../scion`.
+Prioritize stable agent registration, issue flow, cleanup, broker registration,
+and GPU-enabled agents so product feature work can proceed.
+
+Exactly one Animatrix coordinator may be active. While it runs on the host,
+delegate SCION recreation through Animatrix's `task scions`; the serial owner
+must stop and remove the SCION `animatrix-coordinator` container afterward and
+verify that only the host coordinator remains. Establish and retain exactly one
+five-minute trigger targeting the active coordinator session, without launching
+a competing container to obtain a timer. Until jcode and shared Basic Memory
+are implemented and live, the ceiling is four SCION agents, excluding the host
+coordinator; count launches and reserved slots, monitor resources, lower
+concurrency under pressure, and reassess after those features are live.
+
+Routine reading, writing, recovery, and cleanup of agent leftovers requires no
+human interaction. Delegate filesystem work, recover unpublished deliverables,
+and retire verified disposable leftovers autonomously. Preserve active work,
+uninspected stopped-worker artifacts, checked-in source/configuration, model
+caches, and audit evidence. Operational authorization is separate from testing
+this tool: do not mutate unrelated active agents while testing.
+
+The general implementation, code-review, and full-CI instructions below apply
+to implementation/review agents. Coordinator/operator agents delegate those
+activities; their durable state belongs in GitHub, not checkout progress files.
+Documentation workers changing only guidance run focused Markdown/whitespace
+checks instead of unrelated build and test suites.
+
 ## System Goals
 - **Parallelism**: Run multiple agents concurrently as independent processes.
 - **Isolation**: Ensure strict separation of identities, credentials, and configuration.
