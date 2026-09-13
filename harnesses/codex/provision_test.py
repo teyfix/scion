@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import json
 import tempfile
+import tomllib
 import unittest
 from contextlib import contextmanager
+from unittest.mock import patch
 
 PROVISION_PATH = os.path.join(os.path.dirname(__file__), "provision.py")
 SPEC = importlib.util.spec_from_file_location("codex_provision", PROVISION_PATH)
@@ -51,6 +54,93 @@ def temporary_home(path: str):
 
 
 class CodexProvisionTest(unittest.TestCase):
+    def test_mcp_bearer_reference_remains_deferred_through_real_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            bundle = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(bundle, "inputs"))
+            os.makedirs(os.path.join(home, ".codex"))
+            config_path = os.path.join(home, ".codex", "config.toml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('model = "selected-model"\n[model_providers.personal]\nbase_url = "https://provider.example.test"\n')
+            with open(os.path.join(bundle, "inputs", "mcp-servers.json"), "w", encoding="utf-8") as f:
+                json.dump({"mcp_servers": {
+                    "github": {"transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/", "headers": {
+                        "Authorization": "Bearer ${GITHUB_PAT_TOKEN}", "X-MCP-Tools": "issue_read",
+                    }},
+                    "basic-memory": {"transport": "streamable-http", "url": "https://memory.example.test/mcp"},
+                    "browser": {"transport": "stdio", "command": "chrome-devtools-mcp", "args": ["--headless"]},
+                }}, f)
+            marker = "synthetic-token-must-not-be-persisted"
+            with temporary_home(home), patch.dict(os.environ, {"GITHUB_PAT_TOKEN": marker}):
+                ctx = scion_harness.ProvisionContext("codex", {"harness_bundle_dir": bundle})
+                for _ in range(2):
+                    self.assertEqual(scion_harness.apply_mcp_translated(
+                        ctx, provision._build_mcp_section, provision._write_mcp_to_config,
+                    ), 3)
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            parsed = tomllib.loads(content)
+            self.assertNotIn(marker, content)
+            self.assertNotIn("Bearer ${GITHUB_PAT_TOKEN}", content)
+            self.assertEqual(parsed["mcp_servers"]["github"], {
+                "url": "https://api.githubcopilot.com/mcp/", "bearer_token_env_var": "GITHUB_PAT_TOKEN",
+                "http_headers": {"X-MCP-Tools": "issue_read"},
+            })
+            self.assertEqual(parsed["mcp_servers"]["basic-memory"], {"url": "https://memory.example.test/mcp"})
+            self.assertEqual(parsed["mcp_servers"]["browser"], {"command": "chrome-devtools-mcp", "args": ["--headless"]})
+            self.assertEqual(parsed["model"], "selected-model")
+            self.assertEqual(parsed["model_providers"]["personal"]["base_url"], "https://provider.example.test")
+
+    def test_mcp_bearer_reference_does_not_require_token_during_provisioning(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            section = provision._build_mcp_section("github", {
+                "transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/",
+                "headers": {"authorization": "Bearer ${GITHUB_PAT_TOKEN}"},
+            })
+        self.assertEqual(tomllib.loads(section)["mcp_servers"]["github"], {
+            "url": "https://api.githubcopilot.com/mcp/", "bearer_token_env_var": "GITHUB_PAT_TOKEN",
+        })
+
+    def test_mcp_static_headers_are_preserved_without_token_translation(self) -> None:
+        headers = {"Authorization": "Basic literal-field", "X-Region": "test-region"}
+        section = provision._build_mcp_section("static", {
+            "transport": "sse", "url": "https://static.example.test/mcp", "headers": headers,
+        })
+        self.assertEqual(tomllib.loads(section)["mcp_servers"]["static"], {
+            "url": "https://static.example.test/mcp", "http_headers": headers,
+        })
+
+    def test_mcp_unsupported_bearer_references_fail_without_disclosing_values(self) -> None:
+        for value in [
+            "Bearer $GITHUB_PAT_TOKEN", "bearer ${GITHUB_PAT_TOKEN}", "Bearer ${}",
+            "Bearer ${1INVALID}", "Bearer ${GITHUB_PAT_TOKEN", "Bearer ${GITHUB_PAT_TOKEN} trailing",
+            "Bearer ${FIRST}${SECOND}", "Bearer {env:GITHUB_PAT_TOKEN}",
+        ]:
+            with self.subTest(value=value):
+                with self.assertRaises(scion_harness.ProvisionError) as caught:
+                    provision._build_mcp_section("github", {
+                        "transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/",
+                        "headers": {"Authorization": value},
+                    })
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_mcp_ambiguous_authorization_fails_before_real_helper_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(bundle, "inputs"))
+            with open(os.path.join(bundle, "inputs", "mcp-servers.json"), "w", encoding="utf-8") as f:
+                json.dump({"mcp_servers": {"github": {
+                    "transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/",
+                    "headers": {"Authorization": "Bearer ${FIRST}", "authorization": "Bearer ${SECOND}"},
+                }}}, f)
+            ctx = scion_harness.ProvisionContext("codex", {"harness_bundle_dir": bundle})
+            with patch.object(provision, "_write_mcp_to_config") as writer:
+                with self.assertRaises(scion_harness.ProvisionError) as caught:
+                    scion_harness.apply_mcp_translated(ctx, provision._build_mcp_section, writer)
+            writer.assert_not_called()
+            self.assertEqual(str(caught.exception), "ambiguous MCP Authorization headers")
+
     def test_instruction_projection_composes_prompts_without_skills_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
