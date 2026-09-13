@@ -112,8 +112,8 @@ type ProvisionInput struct {
 	// this uses pg_try_advisory_lock(classid, objid) for cross-node mutual
 	// exclusion; on SQLite it's a no-op (single-writer serializes already).
 	//
-	// May be nil — ProvisionShared degrades to sentinel-only guarding
-	// (correct for single-node but NOT safe for multi-node).
+	// May be nil — native local provisioning uses LockWorkspace; NFS then
+	// degrades to sentinel-only guarding (NOT safe for multi-node).
 	Locker store.AdvisoryLocker
 
 	// NFSUID and NFSGID are the stable NFS ownership values (default 1000:1000).
@@ -177,6 +177,17 @@ func ProvisionShared(in ProvisionInput) error {
 	ctx := in.Ctx
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if in.Resolved.Backend == "local" {
+		workspaceRelease, err := LockWorkspace(ctx, in.Resolved.HostPath)
+		if err != nil {
+			return fmt.Errorf("ProvisionShared: acquire native workspace lock: %w", err)
+		}
+		defer func() {
+			if err := workspaceRelease(); err != nil {
+				slog.Warn("ProvisionShared: failed to release native workspace lock", "error", err)
+			}
+		}()
 	}
 
 	// --- Step 1: Acquire per-project advisory lock ---
@@ -260,6 +271,9 @@ func ProvisionShared(in ProvisionInput) error {
 // blocked for up to provisionLockRetries × provisionLockRetryDelay.
 func acquireProvisionLock(ctx context.Context, in ProvisionInput) (func() error, error) {
 	if in.Locker == nil {
+		if in.Resolved.Backend == "local" {
+			return func() error { return nil }, nil // Native workspace lock is already held.
+		}
 		// No locker available — degrade to unguarded (correct for single-node,
 		// unsafe for multi-node). Log a warning.
 		slog.Warn("ProvisionShared: no advisory locker available — provisioning is unguarded",

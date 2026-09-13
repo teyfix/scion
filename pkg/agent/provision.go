@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -34,14 +35,23 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/resources"
 )
 
 func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (bool, error) {
+	return deleteAgentFiles(context.Background(), agentName, projectPath, removeBranch, runtime.GetRuntime(projectPath, ""))
+}
+
+func deleteAgentFiles(ctx context.Context, agentName string, projectPath string, removeBranch bool, rt runtime.Runtime) (deleted bool, retErr error) {
+	if !validRetirementID(agentName) {
+		return false, fmt.Errorf("delete: invalid agent name %q", agentName)
+	}
 	var agentsDirs []string
 	branchDeleted := false
 	var repoRoot string
+	managedBase := false
 	var externalAgentDir string
 	var worktreeDir string // worktree-per-agent: agent's worktree path
 	if projectDir, err := config.GetResolvedProjectDir(projectPath); err == nil {
@@ -63,6 +73,7 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 		// existence is enough to identify a valid repo root. (upstream #351 review)
 		if _, statErr := os.Stat(filepath.Join(sharedBase, ".git")); statErr == nil {
 			repoRoot = sharedBase
+			managedBase = true
 			wtPath := filepath.Join(sharedBase, "worktrees", agentName)
 			if _, statErr := os.Stat(wtPath); statErr == nil {
 				worktreeDir = wtPath
@@ -85,9 +96,38 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 			externalAgentDir = filepath.Join(extDir, agentName)
 		}
 	}
-	// Also check global just in case
-	if globalDir, err := config.GetGlobalAgentsDir(); err == nil {
-		agentsDirs = append(agentsDirs, globalDir)
+	// Only unscoped local deletion may inspect the global agents directory.
+	// A project-scoped slug is not ownership of the same slug in another project.
+	if projectPath == "" {
+		if globalDir, err := config.GetGlobalAgentsDir(); err == nil {
+			agentsDirs = append(agentsDirs, globalDir)
+		}
+	}
+	if repoRoot != "" {
+		release, err := provision.LockWorkspace(ctx, repoRoot)
+		if err != nil {
+			return false, fmt.Errorf("delete: acquire workspace provisioning lock: %w", err)
+		}
+		defer func() {
+			if err := release(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("delete: release workspace lock: %w", err))
+			}
+		}()
+	}
+
+	identityDirs := make([]string, 0, len(agentsDirs)+1)
+	for _, dir := range agentsDirs {
+		identityDirs = append(identityDirs, filepath.Join(dir, agentName))
+	}
+	if externalAgentDir != "" {
+		identityDirs = append(identityDirs, externalAgentDir)
+	}
+	agentUUID, err := retirementIdentity(agentName, identityDirs)
+	if err != nil {
+		return false, err
+	}
+	if repoRoot != "" && agentUUID != agentName {
+		worktreeDir = "" // UUID worktrees are removed only through their ownership registry.
 	}
 
 	// Phase 1: synchronous git operations (worktree removal, pruning, branch cleanup).
@@ -95,56 +135,61 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 	// in a goroutine that could block git subprocess I/O system-wide.
 	var dirsToDelete []string
 
-	// --- Refcount path: shared-worktree teardown (#168 I3) ---
-	//
-	// Before the legacy worktree-removal blocks, check the sharer registry.
-	// If this agent is registered as a sharer, unregister it and decide
-	// whether to remove the shared worktree based on remaining sharers.
-	//
-	// NOTE: teardown does not hold the per-project advisory lock. The
-	// provisioning path (ensureWorktree / ProvisionShared) holds the lock
-	// during registration. A concurrent provision+delete race on the same
-	// branch is unlikely in practice (the hub serialises agent lifecycle)
-	// but not structurally excluded. Acceptable for single-node local mode
-	// which has no advisory locker.
+	// Keep the last sharer's ownership marker until all selected Git operations
+	// succeed. A failed retirement can then be retried after the runtime is gone.
 	refcountHandled := false
 	if repoRoot != "" {
-		// Do NOT silently swallow registry errors and fall through to the legacy
-		// path — that path could delete the shared worktree out from under live
-		// joiners. On a real registry I/O error, fail loudly instead.
-		branch, _, found, findErr := provision.FindBranchForAgent(repoRoot, agentName)
+		registryID := agentUUID
+		branch, wtPath, found, findErr := provision.FindBranchForAgent(repoRoot, registryID)
+		if findErr == nil && !found && !managedBase && agentUUID != agentName {
+			// Older local provisioning registered the slug even when the broker
+			// persisted a UUID. Managed-base provisioning always registers UUIDs.
+			registryID = agentName
+			branch, wtPath, found, findErr = provision.FindBranchForAgent(repoRoot, registryID)
+		}
 		if findErr != nil {
-			return branchDeleted, fmt.Errorf("delete: FindBranchForAgent for %s: %w", agentName, findErr)
+			return branchDeleted, fmt.Errorf("delete: find ownership for %s: %w", agentUUID, findErr)
 		}
 		if found {
-			remaining, wtPath, unregErr := provision.UnregisterSharer(repoRoot, branch, agentName)
-			if unregErr != nil {
-				return branchDeleted, fmt.Errorf("delete: UnregisterSharer for branch %s agent %s: %w", branch, agentName, unregErr)
+			sharers, _, err := provision.ListSharers(repoRoot, branch)
+			if err != nil {
+				return false, err
 			}
-			if len(remaining) == 0 {
-				util.Debugf("delete: last sharer for branch %s, removing worktree at %s", branch, wtPath)
-				worktreeStart := time.Now()
-				if deleted, err := util.RemoveWorktree(wtPath, removeBranch); err == nil {
-					if deleted {
-						branchDeleted = true
-					}
-					util.Debugf("delete: shared worktree removal completed in %v (branch deleted: %v)", time.Since(worktreeStart), deleted)
-				} else {
-					util.Debugf("delete: shared worktree removal failed in %v: %v", time.Since(worktreeStart), err)
-					_ = util.RemoveAllSafe(wtPath)
-					// Worktree removal failed, so the branch wasn't deleted by it —
-					// fall back to deleting the branch by name (like the legacy path).
-					if removeBranch && !branchDeleted {
-						if util.DeleteBranchIn(repoRoot, branch) {
-							branchDeleted = true
-							util.Debugf("delete: deleted branch %s via fallback after worktree removal failure", branch)
-						}
+			if len(sharers) > 1 {
+				for _, dir := range identityDirs {
+					if wtPath == filepath.Join(dir, "workspace") {
+						return false, fmt.Errorf("delete: private directory contains another sharer's active workspace")
 					}
 				}
-			} else {
-				util.Debugf("delete: %d sharers remain for branch %s, detaching agent %s", len(remaining), branch, agentName)
+			}
+			if len(sharers) == 1 {
+				branchDeleted, err = retireRegisteredWorktree(ctx, rt, repoRoot, wtPath, branch, removeBranch, identityDirs)
+				if err != nil {
+					return branchDeleted, err
+				}
+			}
+			if _, _, err := provision.UnregisterSharer(repoRoot, branch, registryID); err != nil {
+				return branchDeleted, fmt.Errorf("delete: unregister %s: %w", agentUUID, err)
 			}
 			refcountHandled = true
+		} else if managedBase || agentUUID != agentName {
+			// Missing ownership must never fall back to deleting the slug's branch
+			// or pruning somebody else's stale registration.
+			refcountHandled = true
+			candidate := provision.WorktreePath(repoRoot, agentUUID)
+			if _, err := os.Lstat(candidate); err == nil {
+				// A previous detach may have succeeded before private directory
+				// cleanup failed. Other sharers retain the creator UUID's path.
+				owned, err := retirementWorktreeHasOwners(repoRoot, candidate, identityDirs)
+				if err != nil {
+					return false, err
+				}
+				if !owned {
+					return false, fmt.Errorf("delete: UUID worktree has no ownership marker: %s", agentUUID)
+				}
+			} else if !os.IsNotExist(err) {
+				return false, err
+			}
 		}
 	}
 
@@ -202,7 +247,7 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 	// Prune stale worktree records from the repo. This handles cases where the
 	// workspace directory was removed (e.g. by os.RemoveAll above, or a previous
 	// incomplete cleanup) but the git worktree record was not properly unregistered.
-	if repoRoot != "" {
+	if repoRoot != "" && !refcountHandled {
 		util.Debugf("delete: pruning stale worktrees in %s", repoRoot)
 		pruneStart := time.Now()
 		_ = util.PruneWorktreesIn(repoRoot)
@@ -505,6 +550,21 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		// because --relative-paths are computed against the container mount
 		// layout, not the host filesystem.
 		isGit = false
+	}
+	if isGit {
+		root, err := util.RepoRootDir(projectDir)
+		if err != nil {
+			return "", "", nil, err
+		}
+		release, err := provision.LockWorkspace(ctx, root)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("acquire workspace provisioning lock: %w", err)
+		}
+		defer func() {
+			if err := release(); err != nil {
+				slog.Warn("failed to release workspace provisioning lock", "error", err)
+			}
+		}()
 	}
 
 	// Verify .gitignore if in a repo
