@@ -18,10 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // WorkspaceRetirementGuard is optional runtime authority for destructive native
@@ -31,14 +34,14 @@ type WorkspaceRetirementGuard interface {
 }
 
 func (r *DockerRuntime) AssertWorkspaceUnused(ctx context.Context, target string) error {
-	return assertContainerWorkspaceUnused(ctx, r.Command, target)
+	return assertContainerWorkspaceUnused(ctx, r.Command, r, target)
 }
 
 func (r *PodmanRuntime) AssertWorkspaceUnused(ctx context.Context, target string) error {
-	return assertContainerWorkspaceUnused(ctx, r.Command, target)
+	return assertContainerWorkspaceUnused(ctx, r.Command, r, target)
 }
 
-func assertContainerWorkspaceUnused(ctx context.Context, command, target string) error {
+func assertContainerWorkspaceUnused(ctx context.Context, command string, rt Runtime, target string) error {
 	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
 		return fmt.Errorf("invalid worktree mount target")
 	}
@@ -53,6 +56,10 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 	canonicalTarget, err := retirementMountTarget(target)
 	if err != nil {
 		return fmt.Errorf("resolve worktree mount authority: %w", err)
+	}
+	identities, err := retirementObjectIdentities(target)
+	if err != nil {
+		return fmt.Errorf("read worktree object authority: %w", err)
 	}
 	remaining := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -70,8 +77,9 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 		var facts struct {
 			ID     string `json:"id"`
 			Mounts *[]struct {
-				Source string `json:"Source"`
-				Type   string `json:"Type"`
+				Source      string `json:"Source"`
+				Destination string `json:"Destination"`
+				Type        string `json:"Type"`
 			} `json:"mounts"`
 		}
 		if err := json.Unmarshal([]byte(line), &facts); err != nil || !remaining[facts.ID] || facts.Mounts == nil {
@@ -88,6 +96,9 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 			if !filepath.IsAbs(mount.Source) {
 				return fmt.Errorf("runtime returned a nonabsolute mount source")
 			}
+			if (mount.Type != "bind" && mount.Type != "volume") || !filepath.IsAbs(mount.Destination) || filepath.Clean(mount.Destination) != mount.Destination {
+				return fmt.Errorf("runtime mount destination/type authority is unavailable")
+			}
 			source := filepath.Clean(mount.Source)
 			if retirementMountWithin(target, source) {
 				return fmt.Errorf("container %s still mounts the selected worktree", facts.ID)
@@ -102,14 +113,96 @@ func assertContainerWorkspaceUnused(ctx context.Context, command, target string)
 			if retirementMountWithin(canonicalTarget, canonicalSource) {
 				return fmt.Errorf("container %s still mounts the selected worktree through an alias", facts.ID)
 			}
-			// Resolved broad broker parent mounts expose managed storage without
-			// retaining another agent's exact worktree and remain permitted.
+			sourceInfo, err := os.Stat(canonicalSource)
+			if err != nil {
+				return fmt.Errorf("read current mount source identity: %w", err)
+			}
+			sourceIdentity, err := retirementObjectIdentity(sourceInfo)
+			if err != nil {
+				return err
+			}
+			// Observe the established mounted object, not just the current Source
+			// pathname. Retarget/rename/replacement can change that pathname while
+			// a foreign bind mount keeps the original worktree inode alive.
+			mounted, err := rt.Exec(ctx, facts.ID, []string{"stat", "-L", "-c", "%d:%i", "--", mount.Destination})
+			if err != nil {
+				return fmt.Errorf("container %s mounted-object ownership unverifiable (runtime exec/stat user, tool or permission capability): %w", facts.ID, err)
+			}
+			mountedIdentity, err := retirementObservedIdentity(mounted)
+			if err != nil {
+				return fmt.Errorf("container %s mounted-object ownership unverifiable: %w", facts.ID, err)
+			}
+			if identities[mountedIdentity] {
+				return fmt.Errorf("container %s still mounts an actual worktree object", facts.ID)
+			}
+			if mountedIdentity != sourceIdentity {
+				return fmt.Errorf("container %s mounted-object ownership unverifiable: established object differs from current source", facts.ID)
+			}
+			if retirementMountWithin(canonicalSource, canonicalTarget) {
+				// No trusted immutable self-container ID is wired to the authenticated
+				// broker. Labels/hostname are cross-checks, not ownership authority;
+				// inventing a broad-mount exemption would endanger foreign workspaces.
+				return fmt.Errorf("container %s ancestor mount ownership unverifiable: trusted owning-broker identity is unavailable", facts.ID)
+			}
 		}
 	}
 	if len(remaining) != 0 {
 		return fmt.Errorf("runtime omitted containers from mount inspection")
 	}
 	return nil
+}
+
+type retirementIdentityKey struct {
+	device, inode uint64
+}
+
+func retirementObjectIdentity(info os.FileInfo) (retirementIdentityKey, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return retirementIdentityKey{}, fmt.Errorf("filesystem object identity capability unavailable")
+	}
+	return retirementIdentityKey{uint64(stat.Dev), uint64(stat.Ino)}, nil
+}
+
+func retirementObservedIdentity(out string) (retirementIdentityKey, error) {
+	fields := strings.Split(strings.TrimSpace(out), ":")
+	if len(fields) != 2 {
+		return retirementIdentityKey{}, fmt.Errorf("invalid mounted stat identity")
+	}
+	device, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return retirementIdentityKey{}, fmt.Errorf("invalid mounted stat device: %w", err)
+	}
+	inode, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return retirementIdentityKey{}, fmt.Errorf("invalid mounted stat inode: %w", err)
+	}
+	return retirementIdentityKey{device, inode}, nil
+}
+
+func retirementObjectIdentities(target string) (map[retirementIdentityKey]bool, error) {
+	identities := make(map[retirementIdentityKey]bool)
+	if _, err := os.Lstat(target); os.IsNotExist(err) {
+		return identities, nil // Prior partial Git retirement, with retained marker/ref.
+	} else if err != nil {
+		return nil, err
+	}
+	err := filepath.WalkDir(target, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info() // Lstat semantics: never follow shared-cache symlinks.
+		if err != nil {
+			return err
+		}
+		key, err := retirementObjectIdentity(info)
+		if err != nil {
+			return err
+		}
+		identities[key] = true
+		return nil
+	})
+	return identities, err
 }
 
 func retirementMountWithin(target, source string) bool {

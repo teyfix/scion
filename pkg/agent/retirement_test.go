@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -467,13 +468,17 @@ func TestNativeRetirement_JoinCannotRegisterDuringLastOwnerRetirement(t *testing
 
 func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
 	for _, tc := range []struct {
-		name, suffix, inspection, want string
-		alias, redirected, unresolved  bool
+		name, suffix, inspection, want                              string
+		alias, redirected, unresolved, retarget, broad, unsupported bool
 	}{
 		{name: "exact", want: "still mounts"},
 		{name: "child", suffix: "/nested", want: "still mounts"},
 		{name: "alias-exact", alias: true, want: "through an alias"},
 		{name: "alias-child", suffix: "/nested", alias: true, want: "through an alias"},
+		{name: "retarget-root", alias: true, retarget: true, want: "actual worktree object"},
+		{name: "retarget-child", suffix: "/nested", alias: true, retarget: true, want: "actual worktree object"},
+		{name: "unverifiable-broker-ancestor", broad: true, want: "trusted owning-broker identity is unavailable"},
+		{name: "unsupported-mounted-stat", unsupported: true, want: "exec/stat user, tool or permission capability"},
 		{name: "redirected-parent", suffix: "/nested", redirected: true, want: "through an alias"},
 		{name: "unresolved-source", unresolved: true, want: "host mount authority"},
 		{name: "inspection-failure", inspection: "exit 8", want: "inspect all runtime mounts"},
@@ -483,6 +488,7 @@ func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
 			id := strings.Repeat("a", 64)
 			command := filepath.Join(t.TempDir(), "docker-fixture")
 			source := f.target + tc.suffix
+			observation := "0:0"
 			if tc.suffix != "" {
 				if err := os.MkdirAll(source, 0755); err != nil {
 					t.Fatal(err)
@@ -497,6 +503,25 @@ func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
 				if err := os.Symlink(destination, alias); err != nil {
 					t.Fatal(err)
 				}
+				if tc.retarget {
+					held, err := os.Open(destination)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer held.Close()
+					info, err := held.Stat()
+					if err != nil {
+						t.Fatal(err)
+					}
+					stat := info.Sys().(*syscall.Stat_t)
+					observation = fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+					if err := os.Remove(alias); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(t.TempDir(), alias); err != nil {
+						t.Fatal(err)
+					}
+				}
 				source = alias
 				if tc.redirected {
 					source = filepath.Join(alias, filepath.Base(f.target), "nested")
@@ -505,11 +530,27 @@ func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
 			if tc.unresolved {
 				source = filepath.Join(t.TempDir(), "invisible-daemon-source")
 			}
+			if tc.broad {
+				source = f.base
+				info, err := os.Stat(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stat := info.Sys().(*syscall.Stat_t)
+				observation = fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+			}
+			if tc.unsupported {
+				source = t.TempDir()
+			}
 			inspection := tc.inspection
 			if inspection == "" {
-				inspection = "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{\"Source\":\"" + source + "\"}]}'"
+				inspection = "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{\"Source\":\"" + source + "\",\"Destination\":\"/held-workspace\",\"Type\":\"bind\"}]}'"
 			}
-			script := "#!/bin/sh\ncase \"$1\" in\nps) if [ \"$5\" = '{{json .}}' ]; then printf '%s\\n' '{\"ID\":\"" + id + "\",\"Names\":\"foreign-helper\",\"Labels\":\"\",\"Status\":\"Up\"}'; else printf '%s\\n' '" + id + "'; fi;;\ninspect) " + inspection + ";;\n*) exit 90;;\nesac\n"
+			execObservation := "printf '%s\\n' '" + observation + "'"
+			if tc.unsupported {
+				execObservation = "exit 126"
+			}
+			script := "#!/bin/sh\ncase \"$1\" in\nps) if [ \"$5\" = '{{json .}}' ]; then printf '%s\\n' '{\"ID\":\"" + id + "\",\"Names\":\"foreign-helper\",\"Labels\":\"\",\"Status\":\"Up\"}'; else printf '%s\\n' '" + id + "'; fi;;\ninspect) " + inspection + ";;\nexec) [ \"$2\" = '--user' ] && [ \"$3\" = 'scion' ] && [ \"$4\" = '" + id + "' ] && [ \"$5\" = 'stat' ] && [ \"${10}\" = '/held-workspace' ] || exit 91\n" + execObservation + ";;\n*) exit 90;;\nesac\n"
 			if err := os.WriteFile(command, []byte(script), 0755); err != nil {
 				t.Fatal(err)
 			}
