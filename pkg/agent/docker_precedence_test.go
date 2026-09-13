@@ -445,7 +445,7 @@ func TestDockerConfig_ReservedLabelCollisionFailsProvisioning(t *testing.T) {
 	}
 }
 
-func TestDockerConfig_ProfileEnvPassthrough(t *testing.T) {
+func TestDockerConfig_TemplateEnvPassthrough(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	oldWd, _ := os.Getwd()
@@ -465,7 +465,8 @@ func TestDockerConfig_ProfileEnvPassthrough(t *testing.T) {
 	tplDir := filepath.Join(globalTemplatesDir, "base-tpl")
 	_ = os.MkdirAll(tplDir, 0755)
 	tplConfig := `{
-		"default_harness_config": "test-harness"
+		"default_harness_config": "test-harness",
+		"env": {"APP_DOMAIN": ""}
 	}`
 	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
 
@@ -481,8 +482,6 @@ profiles:
       labels:
         "traefik.enable": "true"
         "traefik.http.routers.${SCION_AGENT_SLUG}.rule": "Host(${SCION_AGENT_SLUG}.${APP_DOMAIN})"
-    env:
-      APP_DOMAIN: ""
 harness_configs:
   test-harness:
     harness: test-harness
@@ -522,9 +521,9 @@ harness_configs:
 		}
 	}
 
-	// G3-full guard: profile env must NOT be merged into container env
-	if cfg.Env != nil && cfg.Env["APP_DOMAIN"] != "" {
-		t.Errorf("APP_DOMAIN should NOT be present in container cfg.Env, got %q", cfg.Env["APP_DOMAIN"])
+	// Native empty passthrough remains declared in generated config.
+	if value, declared := cfg.Env["APP_DOMAIN"]; !declared || value != "" {
+		t.Errorf("APP_DOMAIN passthrough should remain empty in container cfg.Env, got %q", cfg.Env["APP_DOMAIN"])
 	}
 
 	// Verify on-disk persistence in scion-agent.json
@@ -545,12 +544,12 @@ harness_configs:
 			t.Errorf("persisted label[%q] = %q, want %q", k, diskCfg.Docker.Labels[k], wantVal)
 		}
 	}
-	if diskCfg.Env != nil && diskCfg.Env["APP_DOMAIN"] != "" {
-		t.Errorf("APP_DOMAIN should NOT be present in persisted diskCfg.Env, got %q", diskCfg.Env["APP_DOMAIN"])
+	if value, declared := diskCfg.Env["APP_DOMAIN"]; !declared || value != "" {
+		t.Errorf("APP_DOMAIN passthrough should remain empty in persisted diskCfg.Env, got %q", diskCfg.Env["APP_DOMAIN"])
 	}
 }
 
-func TestDockerConfig_ProfileEnvPassthroughUnsetFailsProvisioning(t *testing.T) {
+func TestDockerConfig_TemplateEnvPassthroughUnsetFailsProvisioning(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	oldWd, _ := os.Getwd()
@@ -570,7 +569,8 @@ func TestDockerConfig_ProfileEnvPassthroughUnsetFailsProvisioning(t *testing.T) 
 	tplDir := filepath.Join(globalTemplatesDir, "base-tpl")
 	_ = os.MkdirAll(tplDir, 0755)
 	tplConfig := `{
-		"default_harness_config": "test-harness"
+		"default_harness_config": "test-harness",
+		"env": {"APP_DOMAIN": ""}
 	}`
 	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
 
@@ -585,8 +585,6 @@ profiles:
     docker:
       labels:
         "traefik.http.routers.${SCION_AGENT_SLUG}.rule": "Host(${SCION_AGENT_SLUG}.${APP_DOMAIN})"
-    env:
-      APP_DOMAIN: ""
 harness_configs:
   test-harness:
     harness: test-harness

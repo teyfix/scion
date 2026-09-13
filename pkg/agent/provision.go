@@ -473,22 +473,6 @@ func resolveProjectRoot(settings *config.VersionedSettings, projectDir string) s
 	return projectDir
 }
 
-// effectiveProfileEnv retrieves the environment map defined in the active or specified
-// profile, if present.
-func effectiveProfileEnv(settings *config.VersionedSettings, profileName string) map[string]string {
-	if settings == nil {
-		return nil
-	}
-	name := profileName
-	if name == "" {
-		name = settings.ActiveProfile
-	}
-	if p, ok := settings.Profiles[name]; ok {
-		return p.Env
-	}
-	return nil
-}
-
 // resolveWorkspaceSubdir resolves a relative workspace subdirectory path
 // against a project root, with containment checks to prevent directory
 // traversal and symlink escapes.
@@ -1405,22 +1389,9 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// Resolve and validate Docker runtime configuration (networks, devices, and labels).
 	if finalScionCfg.Docker != nil {
 		if len(finalScionCfg.Docker.Labels) > 0 {
-			// Merge finalScionCfg.Env with profile.Env for label variable resolution.
-			// Profile env is allowed for passthrough (empty values = os.LookupEnv).
-			// This does NOT inject profile env into the container — that path was
-			// intentionally removed in G3-full. This is label-expansion scope only.
-			labelEnv := finalScionCfg.Env
-			if profileEnv := effectiveProfileEnv(settings, profileName); len(profileEnv) > 0 {
-				merged := make(map[string]string, len(labelEnv)+len(profileEnv))
-				for k, v := range profileEnv {
-					merged[k] = v
-				}
-				for k, v := range labelEnv { // finalScionCfg wins over profile
-					merged[k] = v
-				}
-				labelEnv = merged
-			}
-			scopedVars := BuildScopedLabelVars(agentName, agentID, projectName, projectID, labelEnv)
+			// Native template/agent env is the explicit label-variable allowlist.
+			// Empty values retain scoped host passthrough after profile env retirement.
+			scopedVars := BuildScopedLabelVars(agentName, agentID, projectName, projectID, finalScionCfg.Env)
 			resolvedLabels, err := ExpandAndValidateDockerLabels(finalScionCfg.Docker.Labels, scopedVars)
 			if err != nil {
 				return "", "", nil, fmt.Errorf("resolve docker labels: %w", err)

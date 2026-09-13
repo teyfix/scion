@@ -220,15 +220,6 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			privileged = profileCfg.Docker.Privileged
 		}
 
-		var envKeys []string
-		if len(profileCfg.Env) > 0 {
-			envKeys = make([]string, 0, len(profileCfg.Env))
-			for k := range profileCfg.Env {
-				envKeys = append(envKeys, k)
-			}
-			sort.Strings(envKeys)
-		}
-
 		profiles = append(profiles, BrokerProfile{
 			Name:       name,
 			Type:       rtType,
@@ -236,7 +227,6 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			Context:    ctx,
 			Namespace:  ns,
 			Privileged: privileged,
-			EnvKeys:    envKeys,
 		})
 	}
 
@@ -2441,15 +2431,9 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 
 	// Phase 2: Settings-based empty-value env key extraction
 	if settings != nil {
-		// Get profile env keys
+		// Get profile harness override env keys
 		if profileName != "" && settings.Profiles != nil {
 			if profile, ok := settings.Profiles[profileName]; ok {
-				for k, v := range profile.Env {
-					if v == "" {
-						required[k] = struct{}{}
-					}
-				}
-				// Check harness overrides within the profile
 				for _, override := range profile.HarnessOverrides {
 					for k, v := range override.Env {
 						if v == "" {

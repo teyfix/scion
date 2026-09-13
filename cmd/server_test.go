@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -266,22 +267,10 @@ func TestBuildStoreBrokerProfiles_StarterHubKeepsDockerProfiles(t *testing.T) {
 	assert.True(t, types["kubernetes"], "kubernetes profile should be present")
 }
 
-func TestBuildStoreBrokerProfiles_ExtractsEnvKeys(t *testing.T) {
-	settings := &config.Settings{
-		Profiles: map[string]config.ProfileConfig{
-			"with-env": {
-				Runtime: "docker",
-				Env: map[string]string{
-					"ZEBRA":      "val",
-					"APP_DOMAIN": "",
-					"ALPHA":      "1",
-				},
-			},
-			"no-env": {
-				Runtime: "docker",
-			},
-		},
-	}
+func TestBuildStoreBrokerProfiles_RetiredProfileEnvKeysOmitted(t *testing.T) {
+	settings := &config.Settings{}
+	// Legacy input can be decoded, but retired profile env has no native effect.
+	assert.NoError(t, json.Unmarshal([]byte(`{"profiles":{"with-env":{"runtime":"docker","env":{"APP_DOMAIN":"","ALPHA":"1"}},"no-env":{"runtime":"docker"}}}`), settings))
 
 	profiles := buildStoreBrokerProfiles(settings, "docker")
 	byName := make(map[string]store.BrokerProfile, len(profiles))
@@ -290,7 +279,7 @@ func TestBuildStoreBrokerProfiles_ExtractsEnvKeys(t *testing.T) {
 	}
 
 	withEnv := byName["with-env"]
-	assert.Equal(t, []string{"ALPHA", "APP_DOMAIN", "ZEBRA"}, withEnv.EnvKeys)
+	assert.Empty(t, withEnv.EnvKeys, "retired legacy profile env must not advertise keys")
 
 	noEnv := byName["no-env"]
 	assert.Empty(t, noEnv.EnvKeys)

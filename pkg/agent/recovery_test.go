@@ -312,6 +312,41 @@ func (f *recoveryFixture) assertPreserved(t *testing.T) {
 	require.Equal(t, "retained-branch\n", fixtureGit(t, f.state.workspace, "branch", "--show-current"))
 }
 
+func TestRetainedRuntimeRecoveryTemplateDomainPassthroughAndMissingHost(t *testing.T) {
+	for _, mode := range []string{"host", "explicit", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			t.Setenv("APP_DOMAIN", "host.test")
+			f.opts.RuntimeRecovery.Update.Config.Env = nil
+			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
+			require.NoError(t, os.WriteFile(template, []byte(`{"harness":"codex","harness_config":"test-harness","env":{"APP_DOMAIN":""}}`), 0644))
+			want := "host.test"
+			if mode == "explicit" {
+				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"APP_DOMAIN": "explicit.test"}
+				want = "explicit.test"
+			} else if mode == "missing" {
+				t.Setenv("APP_DOMAIN", "")
+			}
+			before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+			require.NoError(t, err)
+			_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+			if mode == "missing" {
+				require.Error(t, err)
+				require.Zero(t, f.runs)
+				require.Zero(t, f.deletes)
+				after, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+				require.NoError(t, err)
+				require.Equal(t, before, after)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "Host(`"+want+"`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
+				require.Contains(t, f.runConfig.Env, "APP_DOMAIN="+want)
+			}
+			f.assertPreserved(t)
+		})
+	}
+}
+
 func TestRetainedRuntimeRecoveryExpandedEnvCannotReplaceIdentityOrReuseMissingValue(t *testing.T) {
 	for _, identity := range []bool{false, true} {
 		t.Run(fmt.Sprint(identity), func(t *testing.T) {
