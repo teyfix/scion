@@ -332,7 +332,7 @@ def _build_mcp_section(name: str, spec: dict[str, Any]) -> str | None:
                 if reference:
                     body.append(f'bearer_token_env_var = "{reference.group(1)}"')
                     del static_headers[key]
-                elif "$" in value or "{env:" in value:
+                elif re.search(r"\$\{|\{env:|^Bearer\s+\$", value, re.IGNORECASE):
                     raise scion_harness.ProvisionError("unsupported MCP Authorization environment reference")
             if static_headers:
                 body.append(f"http_headers = {scion_harness.toml_inline_table(static_headers)}")

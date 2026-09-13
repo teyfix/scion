@@ -63,6 +63,7 @@ class CodexProvisionTest(unittest.TestCase):
             config_path = os.path.join(home, ".codex", "config.toml")
             with open(config_path, "w", encoding="utf-8") as f:
                 f.write('model = "selected-model"\n[model_providers.personal]\nbase_url = "https://provider.example.test"\n')
+            static_authorization = 'Digest username="synthetic$user", realm="fixture", nonce="literal"'
             with open(os.path.join(bundle, "inputs", "mcp-servers.json"), "w", encoding="utf-8") as f:
                 json.dump({"mcp_servers": {
                     "github": {"transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/", "headers": {
@@ -70,6 +71,9 @@ class CodexProvisionTest(unittest.TestCase):
                     }},
                     "basic-memory": {"transport": "streamable-http", "url": "https://memory.example.test/mcp"},
                     "browser": {"transport": "stdio", "command": "chrome-devtools-mcp", "args": ["--headless"]},
+                    "static-auth": {"transport": "streamable-http", "url": "https://static.example.test/mcp", "headers": {
+                        "Authorization": static_authorization,
+                    }},
                 }}, f)
             marker = "synthetic-token-must-not-be-persisted"
             with temporary_home(home), patch.dict(os.environ, {"GITHUB_PAT_TOKEN": marker}):
@@ -77,7 +81,7 @@ class CodexProvisionTest(unittest.TestCase):
                 for _ in range(2):
                     self.assertEqual(scion_harness.apply_mcp_translated(
                         ctx, provision._build_mcp_section, provision._write_mcp_to_config,
-                    ), 3)
+                    ), 4)
             with open(config_path, "r", encoding="utf-8") as f:
                 content = f.read()
             parsed = tomllib.loads(content)
@@ -89,6 +93,9 @@ class CodexProvisionTest(unittest.TestCase):
             })
             self.assertEqual(parsed["mcp_servers"]["basic-memory"], {"url": "https://memory.example.test/mcp"})
             self.assertEqual(parsed["mcp_servers"]["browser"], {"command": "chrome-devtools-mcp", "args": ["--headless"]})
+            self.assertEqual(parsed["mcp_servers"]["static-auth"], {
+                "url": "https://static.example.test/mcp", "http_headers": {"Authorization": static_authorization},
+            })
             self.assertEqual(parsed["model"], "selected-model")
             self.assertEqual(parsed["model_providers"]["personal"]["base_url"], "https://provider.example.test")
 
