@@ -321,10 +321,11 @@ func TestRetainedRuntimeRecoveryTemplateDomainPassthroughAndMissingHost(t *testi
 			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
 			require.NoError(t, os.WriteFile(template, []byte(`{"harness":"codex","harness_config":"test-harness","env":{"APP_DOMAIN":""}}`), 0644))
 			want := "host.test"
-			if mode == "explicit" {
+			switch mode {
+			case "explicit":
 				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"APP_DOMAIN": "explicit.test"}
 				want = "explicit.test"
-			} else if mode == "missing" {
+			case "missing":
 				t.Setenv("APP_DOMAIN", "")
 			}
 			before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
@@ -381,11 +382,12 @@ func TestRetainedRuntimeRecoveryCurrentCredentialReplacesStagedSecret(t *testing
 			require.NoError(t, os.WriteFile(secret, []byte("old-dummy-key"), 0600))
 			value := "current-dummy-key"
 			f.opts.Env["OPENAI_API_KEY"] = "current-dummy-key"
-			if mode == "expanded" {
+			switch mode {
+			case "expanded":
 				t.Setenv("RECOVERY_DUMMY_KEY", value)
 				value = "${RECOVERY_DUMMY_KEY}"
 				f.opts.Env["OPENAI_API_KEY"] = "old-dummy-key"
-			} else if mode == "passthrough" {
+			case "passthrough":
 				value = ""
 			}
 			f.opts.RuntimeRecovery.Update.Config.Env["OPENAI_API_KEY"] = value

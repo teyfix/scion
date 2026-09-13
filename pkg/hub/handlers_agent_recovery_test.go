@@ -148,7 +148,8 @@ func TestRetainedRuntimeRecoveryThinkingAndModelSurviveOrdinaryHubResume(t *test
 			if mode == "retained" {
 				wantModel = "old-model"
 			}
-			if mode == "explicit" || mode == "zero" {
+			switch mode {
+			case "explicit", "zero":
 				level := 8
 				if mode == "zero" {
 					level = 0
@@ -156,7 +157,7 @@ func TestRetainedRuntimeRecoveryThinkingAndModelSurviveOrdinaryHubResume(t *test
 				update.Config = &api.ScionConfig{ThinkingLevel: &level, Model: "current-model"}
 				want = fmt.Sprint(level)
 				wantModel = "current-model"
-			} else if mode == "env" {
+			case "env":
 				update.Config = &api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": "4", "SCION_MODEL": "current-env-model"}}
 				want = "4"
 				wantModel = "current-env-model"

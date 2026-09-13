@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -476,18 +477,16 @@ func atomicRecoveryJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(file.Name())
+	// Cleanup is best effort; rename consumes this path on success.
+	defer func() { _ = os.Remove(file.Name()) }()
 	if err := file.Chmod(0644); err != nil {
-		file.Close()
-		return err
+		return errors.Join(err, file.Close())
 	}
 	if _, err := file.Write(data); err != nil {
-		file.Close()
-		return err
+		return errors.Join(err, file.Close())
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
+		return errors.Join(err, file.Close())
 	}
 	if err := file.Close(); err != nil {
 		return err
@@ -499,7 +498,8 @@ func atomicRecoveryJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	// Sync reports durability below; closing the read-only handle is cleanup.
+	defer func() { _ = directory.Close() }()
 	return directory.Sync()
 }
 

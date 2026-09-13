@@ -123,6 +123,9 @@ jobs:
       - name: Run Tests
         run: make test-fast
 
+      - name: Run SQLite Harness Hydration Test
+        run: go test -count=1 -timeout=2m ./pkg/runtimebroker -run '^TestBrokerHarnessConfigHydration_RealHTTP$'
+
       - name: Build Binary
         run: make build
 
@@ -174,7 +177,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          args: '--new-from-merge-base=origin/main'
+          # Compare new findings with this PR's target; push runs target main.
+          args: "--new-from-merge-base=origin/${{ github.base_ref || 'main' }}"
 
   shellcheck:
     name: shellcheck
