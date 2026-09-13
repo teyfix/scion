@@ -103,6 +103,10 @@ func TestRetainedRuntimeRecoveryThinkingAndModelSurviveOrdinaryHubResume(t *test
 				Volumes: []api.VolumeMount{{Source: workspace, Target: "/workspace"}},
 				Info:    &api.AgentInfo{ID: ag.ID, Name: ag.Slug, ProjectID: ag.ProjectID, RuntimeBrokerID: broker.ID, Template: "previous", Phase: "suspended", Image: "old:latest"},
 			}
+			if mode == "retained" {
+				t.Setenv("RECOVERY_RETAINED_MODEL", "old-model")
+				old.Env["SCION_MODEL"] = "${RECOVERY_RETAINED_MODEL}"
+			}
 			chain, err := config.GetTemplateChainInProject("current", project)
 			require.NoError(t, err)
 			defaults := &api.ScionConfig{}

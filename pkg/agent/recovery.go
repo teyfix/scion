@@ -64,7 +64,11 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	} else if model := effective.Env["SCION_MODEL"]; model != "" {
 		// Retain the selected environment model when no new scalar replaces
 		// it, including when old scalar and environment defaults differed.
-		effective.Model = model
+		entries, _, _ := buildAgentEnv(&api.ScionConfig{Env: map[string]string{"SCION_MODEL": model}}, nil)
+		if len(entries) != 1 {
+			return nil, fmt.Errorf("retained model environment has an unresolved value")
+		}
+		_, effective.Model, _ = strings.Cut(entries[0], "=")
 	}
 	if requested.ThinkingLevel != nil && requested.Env["SCION_THINKING_LEVEL"] == "" {
 		delete(effective.Env, "SCION_THINKING_LEVEL")
