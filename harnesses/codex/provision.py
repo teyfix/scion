@@ -284,7 +284,9 @@ def _reconcile_codex_toml(
 
     if reasoning_effort:
         re_line = f'reasoning_effort = "{scion_harness.toml_escape(reasoning_effort)}"'
-        content = content.rstrip("\n\t ") + "\n" + re_line + "\n"
+        # Root assignments must precede table headers; appending scopes the key
+        # to the final table in an existing config.
+        content = re_line + "\n" + content
 
     if _telemetry_enabled(telemetry):
         section = _build_otel_section(telemetry or {}, env)
