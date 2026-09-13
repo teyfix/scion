@@ -130,6 +130,9 @@ func (m *AgentManager) Delete(ctx context.Context, agentID string, deleteFiles b
 	slug := api.Slugify(agentID)
 	agents, err := m.Runtime.List(ctx, map[string]string{"scion.name": slug})
 	util.Debugf("delete: mgr.Delete container list completed in %v", time.Since(listStart))
+	if err != nil {
+		return false, fmt.Errorf("failed to verify runtime before deletion: %w", err)
+	}
 	containerExists := false
 	var targetID string
 	// Resolve project name from projectPath (if provided) to scope the container lookup
@@ -139,17 +142,15 @@ func (m *AgentManager) Delete(ctx context.Context, agentID string, deleteFiles b
 			deletionProjectName = config.GetProjectName(resolvedDir)
 		}
 	}
-	if err == nil {
-		for _, a := range agents {
-			if a.Name == agentID || a.ContainerID == agentID || strings.TrimPrefix(a.Name, "/") == agentID || strings.EqualFold(a.Name, agentID) {
-				// If project info is available, skip containers from a different project
-				if deletionProjectName != "" && !matchAgentProject(a, deletionProjectName, "") {
-					continue
-				}
-				containerExists = true
-				targetID = a.ContainerID
-				break
+	for _, a := range agents {
+		if a.Name == agentID || a.ContainerID == agentID || strings.TrimPrefix(a.Name, "/") == agentID || strings.EqualFold(a.Name, agentID) {
+			// If project info is available, skip containers from a different project
+			if deletionProjectName != "" && !matchAgentProject(a, deletionProjectName, "") {
+				continue
 			}
+			containerExists = true
+			targetID = a.ContainerID
+			break
 		}
 	}
 

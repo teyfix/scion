@@ -16,6 +16,7 @@ package provision
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -82,7 +83,10 @@ func TestUnregisterSharer_OneRemaining(t *testing.T) {
 	}
 
 	// Marker file should still exist.
-	p := sharerPath(base, branch)
+	p, err := sharerPath(base, branch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(p); err != nil {
 		t.Errorf("marker file should still exist: %v", err)
 	}
@@ -109,7 +113,10 @@ func TestUnregisterSharer_LastRemoves(t *testing.T) {
 	}
 
 	// Marker file should be deleted.
-	p := sharerPath(base, branch)
+	p, err := sharerPath(base, branch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Errorf("marker file should be removed, got err = %v", err)
 	}
@@ -230,5 +237,60 @@ func TestFindBranchForAgent_NoDir(t *testing.T) {
 	}
 	if found {
 		t.Error("expected found=false when scion-sharers dir does not exist")
+	}
+}
+
+func TestSharerRegistry_LinkedBaseUsesCommonGitDirectory(t *testing.T) {
+	base := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test"}, {"commit", "--allow-empty", "-m", "initial"}} {
+		if out, err := exec.Command("git", append([]string{"-C", base}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	linked := filepath.Join(t.TempDir(), "linked-base")
+	if out, err := exec.Command("git", "-C", base, "worktree", "add", "-b", "linked", linked).CombinedOutput(); err != nil {
+		t.Fatalf("linked base: %v %s", err, out)
+	}
+	if err := RegisterSharer(linked, "agent-branch", "/registered/worktree", "uuid"); err != nil {
+		t.Fatal(err)
+	}
+	branch, path, found, err := FindBranchForAgent(base, "uuid")
+	if err != nil || !found || branch != "agent-branch" || path != "/registered/worktree" {
+		t.Fatalf("common registry: %q %q %v %v", branch, path, found, err)
+	}
+	if _, _, err := UnregisterSharer(linked, "agent-branch", "uuid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, found, err := FindBranchForAgent(base, "uuid"); err != nil || found {
+		t.Fatalf("common registry unregister: %v %v", found, err)
+	}
+}
+
+func TestFindBranchForAgent_CorruptOwnershipFailsClosed(t *testing.T) {
+	base := setupBase(t)
+	path, err := sharerPath(base, "corrupt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("not-json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := FindBranchForAgent(base, "uuid"); err == nil {
+		t.Fatal("corrupt ownership was silently skipped")
+	}
+}
+
+func TestFindBranchForAgent_ConflictingOwnershipFailsClosed(t *testing.T) {
+	base := setupBase(t)
+	for _, branch := range []string{"first", "second"} {
+		if err := RegisterSharer(base, branch, "/worktrees/"+branch, "uuid"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, err := FindBranchForAgent(base, "uuid"); err == nil {
+		t.Fatal("conflicting UUID ownership was accepted")
 	}
 }

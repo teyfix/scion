@@ -17,11 +17,13 @@ package provision
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
-	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 )
 
 // sharerMarker is the on-disk JSON shape stored per shared branch.
@@ -34,8 +36,28 @@ type sharerMarker struct {
 const sharerDir = "scion-sharers"
 
 // sharerPath returns the marker file path for a branch under the base repo.
-func sharerPath(base, branch string) string {
-	return filepath.Join(base, ".git", sharerDir, sanitizeBranchName(branch)+".json")
+func sharerDirectory(base string) (string, error) {
+	gitDir := filepath.Join(base, ".git")
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		out, err := exec.Command("git", "-C", base, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+		if err != nil {
+			return "", fmt.Errorf("resolve sharer registry: %w", err)
+		}
+		gitDir = strings.TrimSpace(string(out))
+	}
+	return filepath.Join(gitDir, sharerDir), nil
+}
+
+func sharerPath(base, branch string) (string, error) {
+	dir, err := sharerDirectory(base)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, sanitizeBranchName(branch)+".json"), nil
 }
 
 // readMarker loads the marker file for a branch. Returns nil (no error) when
@@ -90,13 +112,18 @@ func writeMarkerAtomic(path string, m *sharerMarker) error {
 //
 // Callers MUST hold the per-project advisory lock / provision mutex.
 func RegisterSharer(base, branch, worktreePath, agentID string) error {
-	p := sharerPath(base, branch)
+	p, err := sharerPath(base, branch)
+	if err != nil {
+		return err
+	}
 	m, err := readMarker(p)
 	if err != nil {
 		return err
 	}
 	if m == nil {
 		m = &sharerMarker{Branch: branch, WorktreePath: worktreePath}
+	} else if m.Branch != branch {
+		return fmt.Errorf("sharer marker branch mismatch: %s", branch)
 	}
 	if worktreePath != "" {
 		m.WorktreePath = worktreePath
@@ -117,13 +144,19 @@ func RegisterSharer(base, branch, worktreePath, agentID string) error {
 //
 // Callers MUST hold the per-project advisory lock / provision mutex.
 func UnregisterSharer(base, branch, agentID string) (remaining []string, worktreePath string, err error) {
-	p := sharerPath(base, branch)
+	p, err := sharerPath(base, branch)
+	if err != nil {
+		return nil, "", err
+	}
 	m, err := readMarker(p)
 	if err != nil {
 		return nil, "", err
 	}
 	if m == nil {
 		return nil, "", nil
+	}
+	if m.Branch != branch {
+		return nil, "", fmt.Errorf("sharer marker branch mismatch: %s", branch)
 	}
 	m.Sharers = slices.DeleteFunc(m.Sharers, func(s string) bool { return s == agentID })
 	if len(m.Sharers) == 0 {
@@ -141,13 +174,19 @@ func UnregisterSharer(base, branch, agentID string) (remaining []string, worktre
 // ListSharers returns the current sharer agent IDs and worktreePath for a
 // branch. If no marker exists, sharers is nil and worktreePath is "".
 func ListSharers(base, branch string) ([]string, string, error) {
-	p := sharerPath(base, branch)
+	p, err := sharerPath(base, branch)
+	if err != nil {
+		return nil, "", err
+	}
 	m, err := readMarker(p)
 	if err != nil {
 		return nil, "", err
 	}
 	if m == nil {
 		return nil, "", nil
+	}
+	if m.Branch != branch {
+		return nil, "", fmt.Errorf("sharer marker branch mismatch: %s", branch)
 	}
 	return m.Sharers, m.WorktreePath, nil
 }
@@ -156,7 +195,10 @@ func ListSharers(base, branch string) ([]string, string, error) {
 // (and worktree path) agentID is sharing. Returns found=false when the agent
 // is not present in any marker.
 func FindBranchForAgent(base, agentID string) (branch, worktreePath string, found bool, err error) {
-	dir := filepath.Join(base, ".git", sharerDir)
+	dir, err := sharerDirectory(base)
+	if err != nil {
+		return "", "", false, err
+	}
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", "", false, nil
@@ -170,16 +212,17 @@ func FindBranchForAgent(base, agentID string) (branch, worktreePath string, foun
 		}
 		m, err := readMarker(filepath.Join(dir, e.Name()))
 		if err != nil {
-			// A single corrupted/unreadable marker must not block the whole
-			// scan (and thus all agent deletions). Skip it and keep looking;
-			// dir-level failures are still returned above.
-			slog.Warn("FindBranchForAgent: skipping unreadable sharer marker",
-				"file", e.Name(), "error", err)
-			continue
+			return "", "", false, fmt.Errorf("read sharer marker %s: %w", e.Name(), err)
+		}
+		if m != nil && (m.Branch == "" || sanitizeBranchName(m.Branch)+".json" != e.Name()) {
+			return "", "", false, fmt.Errorf("sharer marker filename/branch mismatch: %s", e.Name())
 		}
 		if m != nil && slices.Contains(m.Sharers, agentID) {
-			return m.Branch, m.WorktreePath, true, nil
+			if found {
+				return "", "", false, fmt.Errorf("agent %s has conflicting sharer ownership", agentID)
+			}
+			branch, worktreePath, found = m.Branch, m.WorktreePath, true
 		}
 	}
-	return "", "", false, nil
+	return branch, worktreePath, found, nil
 }
