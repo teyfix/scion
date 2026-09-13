@@ -959,6 +959,10 @@ func CloneDockerConfig(d *api.DockerConfig) *api.DockerConfig {
 		return nil
 	}
 	res := &api.DockerConfig{}
+	if d.NvidiaGPU != nil {
+		v := *d.NvidiaGPU
+		res.NvidiaGPU = &v
+	}
 	if d.Privileged != nil {
 		v := *d.Privileged
 		res.Privileged = &v
@@ -988,6 +992,11 @@ func mergeDockerConfig(base, override *api.DockerConfig) *api.DockerConfig {
 	}
 
 	result := *base
+
+	if override.NvidiaGPU != nil {
+		v := *override.NvidiaGPU
+		result.NvidiaGPU = &v
+	}
 
 	if override.Privileged != nil {
 		v := *override.Privileged

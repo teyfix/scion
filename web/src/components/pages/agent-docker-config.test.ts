@@ -27,6 +27,7 @@ interface TestableCreatePage {
   dockerLabelEntries: Array<{ key: string; value: string }>;
   dockerNetworks: string[];
   dockerPrivileged: 'inherit' | 'enabled' | 'disabled';
+  requireGpu: boolean;
   buildLabels(): Record<string, string> | undefined;
   buildConfig(): Record<string, unknown>;
 }
@@ -52,9 +53,19 @@ describe('agent Docker configuration forms', () => {
 
     expect(page.buildLabels()).toEqual({ team: 'platform' });
     expect(page.buildConfig().docker).toEqual({
+      nvidia_gpu: false,
       networks: ['traefik_proxy'],
       labels: { 'traefik.enable': 'true' },
     });
+  });
+
+  it('sends an explicit NVIDIA attachment choice, including unchecked', () => {
+    const page = new ScionPageAgentCreate() as unknown as TestableCreatePage;
+    expect(page.buildConfig().docker).toEqual({ nvidia_gpu: false });
+    page.requireGpu = true;
+    expect(page.buildConfig().docker).toEqual({ nvidia_gpu: true });
+    page.requireGpu = false;
+    expect(page.buildConfig().docker).toEqual({ nvidia_gpu: false });
   });
 
   it('preserves unrelated Docker fields when a provisioned agent config is edited', () => {

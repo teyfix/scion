@@ -15,8 +15,11 @@
 package config
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,6 +58,7 @@ profiles:
   onprem:
     runtime: docker
     docker:
+      nvidia_gpu: false
       devices:
         - nvidia.com/gpu=all
 `,
@@ -251,5 +255,49 @@ profiles:
 	}
 	if adaptedOnprem.Docker.Devices[0] != "nvidia.com/gpu=all" {
 		t.Errorf("mutating legacy Docker devices mutated adapted Docker: expected deep copy")
+	}
+}
+
+func TestNvidiaGPUConfig(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		validationErrors, err := ValidateAgentConfig([]byte(`{"docker":{"nvidia_gpu":`+value+`}}`), "1")
+		if err != nil || len(validationErrors) > 0 {
+			t.Fatalf("GPU setting rejected by schema: %v %v", err, validationErrors)
+		}
+	}
+	enabled, disabled := true, false
+	for _, tc := range []struct {
+		name    string
+		policy  *bool
+		devices []string
+		want    []string
+	}{
+		{"inherit", nil, []string{"nvidia.com/gpu=all", "/dev/fuse"}, []string{"nvidia.com/gpu=all", "/dev/fuse"}},
+		{"disabled", &disabled, []string{" nvidia.com/gpu=all ", "nvidia.com/gpu=GPU-123", "/dev/nvidia0:/dev/nvidia0:rwm", "/dev/nvidiactl", "/dev/nvidia-caps", "/dev/fuse", "/dev/dri"}, []string{"/dev/fuse", "/dev/dri"}},
+		{"enabled default", &enabled, []string{"/dev/fuse"}, []string{"/dev/fuse", "nvidia.com/gpu=all"}},
+		{"enabled selection", &enabled, []string{"nvidia.com/gpu=GPU-123"}, []string{"nvidia.com/gpu=GPU-123"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &api.DockerConfig{NvidiaGPU: tc.policy, Devices: tc.devices}
+			if got := ResolveDockerDevices(d); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("devices = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// An explicit false must survive merging, cloning and JSON transport/storage.
+	merged := MergeScionConfig(&api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &enabled}}, &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &disabled}})
+	clone := CloneDockerConfig(merged.Docker)
+	*merged.Docker.NvidiaGPU = true
+	data, err := json.Marshal(clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded api.DockerConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.NvidiaGPU == nil || *decoded.NvidiaGPU {
+		t.Fatalf("lost explicit false: %s", data)
 	}
 }

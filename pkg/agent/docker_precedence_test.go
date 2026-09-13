@@ -25,6 +25,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDockerConfig_PrecedenceAndResolution(t *testing.T) {
@@ -234,65 +235,107 @@ func TestValidateDockerDeviceRuntime(t *testing.T) {
 }
 
 func TestStartPassesDockerDevicesToRuntime(t *testing.T) {
-	tmpDir := t.TempDir()
+	enabled, disabled := true, false
+	for _, tc := range []struct {
+		name   string
+		policy *bool
+		want   []string
+	}{
+		{"inherit", nil, []string{"nvidia.com/gpu=all", "/dev/dri"}},
+		{"enabled", &enabled, []string{"nvidia.com/gpu=all", "/dev/dri"}},
+		{"disabled", &disabled, []string{"/dev/dri"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
 
-	oldWd, _ := os.Getwd()
-	_ = os.Chdir(tmpDir)
-	defer func() { _ = os.Chdir(oldWd) }()
+			oldWd, _ := os.Getwd()
+			_ = os.Chdir(tmpDir)
+			defer func() { _ = os.Chdir(oldWd) }()
 
-	originalHome := os.Getenv("HOME")
-	defer func() { _ = os.Setenv("HOME", originalHome) }()
-	_ = os.Setenv("HOME", tmpDir)
+			originalHome := os.Getenv("HOME")
+			defer func() { _ = os.Setenv("HOME", originalHome) }()
+			_ = os.Setenv("HOME", tmpDir)
 
-	globalScionDir := filepath.Join(tmpDir, ".scion")
-	seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
+			globalScionDir := filepath.Join(tmpDir, ".scion")
+			seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
 
-	tplDir := filepath.Join(globalScionDir, "templates", "device-tpl")
-	_ = os.MkdirAll(tplDir, 0755)
-	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(`{
+			tplDir := filepath.Join(globalScionDir, "templates", "device-tpl")
+			_ = os.MkdirAll(tplDir, 0755)
+			_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(`{
 		"default_harness_config": "generic",
-		"docker": {"devices": ["nvidia.com/gpu=all", "/dev/dri"]}
+		"docker": {"devices": ["/dev/dri"]}
 	}`), 0644)
-	_ = os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
+			_ = os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
 active_profile: local
 profiles:
   local:
     runtime: docker
+    docker:
+      devices: ["nvidia.com/gpu=all"]
 `), 0644)
 
-	projectScionDir := filepath.Join(tmpDir, "project", ".scion")
-	_ = os.MkdirAll(projectScionDir, 0755)
+			projectScionDir := filepath.Join(tmpDir, "project", ".scion")
+			_ = os.MkdirAll(projectScionDir, 0755)
 
-	var captured runtime.RunConfig
-	mockRuntime := &runtime.MockRuntime{
-		ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) {
-			return nil, nil
-		},
-		RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
-			captured = cfg
-			return "mock-id", nil
-		},
-	}
+			var captured runtime.RunConfig
+			mockRuntime := &runtime.MockRuntime{
+				ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) {
+					return nil, nil
+				},
+				RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
+					captured = cfg
+					return "mock-id", nil
+				},
+			}
 
-	mgr := NewManager(mockRuntime)
-	_, err := mgr.Start(context.Background(), api.StartOptions{
-		Name:        "device-agent",
-		Template:    "device-tpl",
-		ProjectPath: projectScionDir,
-		NoAuth:      true,
-	})
-	if err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+			mgr := NewManager(mockRuntime)
+			_, err := mgr.Start(context.Background(), api.StartOptions{
+				Name:         "device-agent",
+				Template:     "device-tpl",
+				ProjectPath:  projectScionDir,
+				NoAuth:       true,
+				InlineConfig: &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: tc.policy}},
+			})
+			if err != nil {
+				t.Fatalf("Start failed: %v", err)
+			}
 
-	want := []string{"nvidia.com/gpu=all", "/dev/dri"}
-	if len(captured.Devices) != len(want) {
-		t.Fatalf("RunConfig.Devices = %v, want %v", captured.Devices, want)
-	}
-	for i := range want {
-		if captured.Devices[i] != want[i] {
-			t.Errorf("RunConfig.Devices[%d] = %q, want %q", i, captured.Devices[i], want[i])
-		}
+			want := tc.want
+			if len(captured.Devices) != len(want) {
+				t.Fatalf("RunConfig.Devices = %v, want %v", captured.Devices, want)
+			}
+			for i := range want {
+				if captured.Devices[i] != want[i] {
+					t.Errorf("RunConfig.Devices[%d] = %q, want %q", i, captured.Devices[i], want[i])
+				}
+			}
+
+			// Provisioning persists the explicit policy for a later start.
+			saved, err := os.ReadFile(filepath.Join(config.GetAgentDir(projectScionDir, "device-agent", false), "scion-agent.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted api.ScionConfig
+			if err := json.Unmarshal(saved, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Docker == nil {
+				t.Fatal("missing persisted Docker config")
+			}
+			if tc.policy != nil && (persisted.Docker.NvidiaGPU == nil || *persisted.Docker.NvidiaGPU != *tc.policy) {
+				t.Fatal("NVIDIA attachment choice was not persisted")
+			}
+
+			// Starting the saved agent without resending inline config keeps the choice.
+			captured = runtime.RunConfig{}
+			_, err = mgr.Start(context.Background(), api.StartOptions{
+				Name: "device-agent", ProjectPath: projectScionDir, NoAuth: true,
+			})
+			if err != nil {
+				t.Fatalf("start saved agent: %v", err)
+			}
+			assert.ElementsMatch(t, tc.want, captured.Devices, "saved agent device grants")
+		})
 	}
 }
 
