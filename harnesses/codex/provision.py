@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -320,7 +321,21 @@ def _build_mcp_section(name: str, spec: dict[str, Any]) -> str | None:
         body.append(f'url = "{scion_harness.toml_escape(url)}"')
         headers = spec.get("headers")
         if isinstance(headers, dict) and headers:
-            body.append(f"http_headers = {scion_harness.toml_inline_table({str(k): str(v) for k, v in headers.items()})}")
+            static_headers = {str(k): str(v) for k, v in headers.items()}
+            authorization = [key for key in static_headers if key.lower() == "authorization"]
+            if len(authorization) > 1:
+                raise scion_harness.ProvisionError("ambiguous MCP Authorization headers")
+            if authorization:
+                key = authorization[0]
+                value = static_headers[key]
+                reference = re.fullmatch(r"Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+                if reference:
+                    body.append(f'bearer_token_env_var = "{reference.group(1)}"')
+                    del static_headers[key]
+                elif re.search(r"\$\{|\{env:|^Bearer\s+\$", value, re.IGNORECASE):
+                    raise scion_harness.ProvisionError("unsupported MCP Authorization environment reference")
+            if static_headers:
+                body.append(f"http_headers = {scion_harness.toml_inline_table(static_headers)}")
     else:
         print(f"codex provision: mcp server {name!r}: unsupported transport {transport!r}", file=sys.stderr)
         return None
