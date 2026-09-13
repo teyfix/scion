@@ -176,7 +176,7 @@ func (m *AgentManager) Delete(ctx context.Context, agentID string, deleteFiles b
 
 	if deleteFiles {
 		util.Debugf("delete: starting filesystem cleanup for agent %s", agentID)
-		branchDeleted, err := DeleteAgentFiles(agentID, projectPath, removeBranch)
+		branchDeleted, err := deleteAgentFiles(ctx, agentID, projectPath, removeBranch, m.Runtime)
 		util.Debugf("delete: filesystem cleanup completed for agent %s", agentID)
 		return branchDeleted, err
 	}

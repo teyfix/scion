@@ -109,7 +109,7 @@ func TestDeleteAgentFiles_CleansStaleWorktree(t *testing.T) {
 	}
 
 	// Call DeleteAgentFiles — it should clean up the stale worktree record
-	branchDeleted, err := DeleteAgentFiles(agentName, scionDir, true)
+	branchDeleted, err := deleteAgentFilesForTest(agentName, scionDir, true)
 	if err != nil {
 		t.Fatalf("DeleteAgentFiles failed: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestDeleteAgentFiles_CleansSharedWorkspaceExternalState(t *testing.T) {
 	}
 
 	// DeleteAgentFiles takes projectPath; pass scionDir like real callers do.
-	if _, err := DeleteAgentFiles(agentName, scionDir, false); err != nil {
+	if _, err := deleteAgentFilesForTest(agentName, scionDir, false); err != nil {
 		t.Fatalf("DeleteAgentFiles failed: %v", err)
 	}
 
@@ -239,7 +239,7 @@ func TestDeleteAgentFiles_CleansWorktreeWithGitFile(t *testing.T) {
 	}
 
 	// DeleteAgentFiles should properly clean up via RemoveWorktree
-	branchDeleted, err := DeleteAgentFiles(agentName, scionDir, true)
+	branchDeleted, err := deleteAgentFilesForTest(agentName, scionDir, true)
 	if err != nil {
 		t.Fatalf("DeleteAgentFiles failed: %v", err)
 	}
@@ -361,9 +361,9 @@ func TestDeleteAgentFiles_WorktreePerAgent_DeletesOnlyTargetWorktree(t *testing.
 
 	// Delete agent-b via DeleteAgentFiles (pass projectPath, not scionDir,
 	// to match the hub-managed broker flow).
-	branchDeleted, err := DeleteAgentFiles("agent-b", projectPath, true)
+	branchDeleted, err := deleteAgentFilesForTest("agent-b", projectPath, true)
 	if err != nil {
-		t.Fatalf("DeleteAgentFiles(agent-b): %v", err)
+		t.Fatalf("deleteAgentFilesForTest(agent-b): %v", err)
 	}
 
 	// --- Assertions ---
@@ -476,9 +476,9 @@ func TestDeleteAgentFiles_SharedWorktree_DeleteCreatorWhileJoinerRemains(t *test
 	}
 
 	// Delete agent-a (the creator) while agent-b (joiner) remains.
-	branchDeleted, err := DeleteAgentFiles("agent-a", projectPath, true)
+	branchDeleted, err := deleteAgentFilesForTest("agent-a", projectPath, true)
 	if err != nil {
-		t.Fatalf("DeleteAgentFiles(agent-a): %v", err)
+		t.Fatalf("deleteAgentFilesForTest(agent-a): %v", err)
 	}
 
 	// 1. Shared worktree PERSISTS (dir + .git still present).
@@ -560,8 +560,8 @@ func TestDeleteAgentFiles_SharedWorktree_DeleteLastSharer_RemovesWorktree(t *tes
 	wtA := provision.WorktreePath(base, "agent-a")
 
 	// Delete agent-a first (not last → detach only).
-	if _, err := DeleteAgentFiles("agent-a", projectPath, true); err != nil {
-		t.Fatalf("DeleteAgentFiles(agent-a): %v", err)
+	if _, err := deleteAgentFilesForTest("agent-a", projectPath, true); err != nil {
+		t.Fatalf("deleteAgentFilesForTest(agent-a): %v", err)
 	}
 
 	// Worktree should still exist.
@@ -570,9 +570,9 @@ func TestDeleteAgentFiles_SharedWorktree_DeleteLastSharer_RemovesWorktree(t *tes
 	}
 
 	// Now delete agent-b (last sharer) with removeBranch=true.
-	branchDeleted, err := DeleteAgentFiles("agent-b", projectPath, true)
+	branchDeleted, err := deleteAgentFilesForTest("agent-b", projectPath, true)
 	if err != nil {
-		t.Fatalf("DeleteAgentFiles(agent-b): %v", err)
+		t.Fatalf("deleteAgentFilesForTest(agent-b): %v", err)
 	}
 
 	// 1. Shared worktree is removed.
@@ -646,9 +646,9 @@ func TestDeleteAgentFiles_SharedWorktree_SoleSharer_DeleteRemoves(t *testing.T) 
 	}
 
 	// Delete the sole sharer.
-	branchDeleted, err := DeleteAgentFiles("solo-agent", projectPath, true)
+	branchDeleted, err := deleteAgentFilesForTest("solo-agent", projectPath, true)
 	if err != nil {
-		t.Fatalf("DeleteAgentFiles(solo-agent): %v", err)
+		t.Fatalf("deleteAgentFilesForTest(solo-agent): %v", err)
 	}
 
 	// Worktree is removed.

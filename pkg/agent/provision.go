@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -34,11 +35,16 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/resources"
 )
 
 func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (bool, error) {
+	return deleteAgentFiles(context.Background(), agentName, projectPath, removeBranch, runtime.GetRuntime(projectPath, ""))
+}
+
+func deleteAgentFiles(ctx context.Context, agentName string, projectPath string, removeBranch bool, rt runtime.Runtime) (deleted bool, retErr error) {
 	if !validRetirementID(agentName) {
 		return false, fmt.Errorf("delete: invalid agent name %q", agentName)
 	}
@@ -97,6 +103,17 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 			agentsDirs = append(agentsDirs, globalDir)
 		}
 	}
+	if repoRoot != "" {
+		release, err := provision.LockWorkspace(ctx, repoRoot)
+		if err != nil {
+			return false, fmt.Errorf("delete: acquire workspace provisioning lock: %w", err)
+		}
+		defer func() {
+			if err := release(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("delete: release workspace lock: %w", err))
+			}
+		}()
+	}
 
 	identityDirs := make([]string, 0, len(agentsDirs)+1)
 	for _, dir := range agentsDirs {
@@ -146,7 +163,7 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 				}
 			}
 			if len(sharers) == 1 {
-				branchDeleted, err = retireRegisteredWorktree(repoRoot, wtPath, branch, removeBranch, identityDirs)
+				branchDeleted, err = retireRegisteredWorktree(ctx, rt, repoRoot, wtPath, branch, removeBranch, identityDirs)
 				if err != nil {
 					return branchDeleted, err
 				}
@@ -533,6 +550,21 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		// because --relative-paths are computed against the container mount
 		// layout, not the host filesystem.
 		isGit = false
+	}
+	if isGit {
+		root, err := util.RepoRootDir(projectDir)
+		if err != nil {
+			return "", "", nil, err
+		}
+		release, err := provision.LockWorkspace(ctx, root)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("acquire workspace provisioning lock: %w", err)
+		}
+		defer func() {
+			if err := release(); err != nil {
+				slog.Warn("failed to release workspace provisioning lock", "error", err)
+			}
+		}()
 	}
 
 	// Verify .gitignore if in a repo

@@ -16,16 +16,19 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 type retirementFixture struct {
@@ -124,7 +127,7 @@ func TestNativeRetirement_UUIDSymlinkAndFlags(t *testing.T) {
 			if err := os.Symlink(modelTarget, filepath.Join(f.target, ".volumes", "transcription", "models")); err != nil {
 				t.Fatal(err)
 			}
-			deleted, err := DeleteAgentFiles("display-slug", f.project, removeBranch)
+			deleted, err := deleteAgentFilesForTest("display-slug", f.project, removeBranch)
 			if err != nil || deleted != removeBranch {
 				t.Fatalf("delete: branchDeleted=%v err=%v", deleted, err)
 			}
@@ -146,7 +149,7 @@ func TestNativeRetirement_UUIDSymlinkAndFlags(t *testing.T) {
 			if data, err := os.ReadFile(model); err != nil || string(data) != "shared immutable model" {
 				t.Errorf("shared model changed: %q %v", data, err)
 			}
-			if _, err := DeleteAgentFiles("display-slug", f.project, removeBranch); err != nil {
+			if _, err := deleteAgentFilesForTest("display-slug", f.project, removeBranch); err != nil {
 				t.Fatalf("repeat delete: %v", err)
 			}
 			assertRetirementSurvivors(t, f)
@@ -191,7 +194,7 @@ func TestNativeRetirement_RefusesRecoverableOrMismatchedArtifacts(t *testing.T) 
 					t.Fatal(err)
 				}
 			}
-			if _, err := DeleteAgentFiles("display-slug", f.project, true); err == nil {
+			if _, err := deleteAgentFilesForTest("display-slug", f.project, true); err == nil {
 				t.Fatal("unsafe retirement succeeded")
 			}
 			for _, path := range []string{f.target, f.agentDir} {
@@ -214,7 +217,7 @@ func TestNativeRetirement_PartialBranchFailureRetainsIdentityForRetry(t *testing
 	if err := os.WriteFile(lock, []byte("injected branch lock"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DeleteAgentFiles("display-slug", f.project, true); err == nil {
+	if _, err := deleteAgentFilesForTest("display-slug", f.project, true); err == nil {
 		t.Fatal("injected partial failure was swallowed")
 	}
 	if _, err := os.Stat(f.target); !os.IsNotExist(err) {
@@ -229,7 +232,7 @@ func TestNativeRetirement_PartialBranchFailureRetainsIdentityForRetry(t *testing
 	if err := os.Remove(lock); err != nil {
 		t.Fatal(err)
 	}
-	deleted, err := DeleteAgentFiles("display-slug", f.project, true)
+	deleted, err := deleteAgentFilesForTest("display-slug", f.project, true)
 	if err != nil || !deleted {
 		t.Fatalf("retry did not finish: %v %v", deleted, err)
 	}
@@ -249,7 +252,7 @@ func TestNativeRetirement_UUIDJoinerPreservesSharedWorktreeUntilLastRetirement(t
 	if err := provision.RegisterSharer(f.base, f.branch, f.target, joinerUUID); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := DeleteAgentFiles("display-slug", f.project, true); err != nil || deleted {
+	if deleted, err := deleteAgentFilesForTest("display-slug", f.project, true); err != nil || deleted {
 		t.Fatalf("creator deletion: %v %v", deleted, err)
 	}
 	if _, err := os.Stat(f.target); err != nil {
@@ -267,10 +270,10 @@ func TestNativeRetirement_UUIDJoinerPreservesSharedWorktreeUntilLastRetirement(t
 	if err := os.WriteFile(filepath.Join(f.agentDir, "scion-agent.json"), []byte(`{"env":{"SCION_AGENT_ID":"`+f.uuid+`"}}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := DeleteAgentFiles("display-slug", f.project, true); err != nil || deleted {
+	if deleted, err := deleteAgentFilesForTest("display-slug", f.project, true); err != nil || deleted {
 		t.Fatalf("creator detach retry: %v %v", deleted, err)
 	}
-	if deleted, err := DeleteAgentFiles("joiner-slug", f.project, true); err != nil || !deleted {
+	if deleted, err := deleteAgentFilesForTest("joiner-slug", f.project, true); err != nil || !deleted {
 		t.Fatalf("last UUID joiner deletion: %v %v", deleted, err)
 	}
 	if _, err := os.Stat(f.target); !os.IsNotExist(err) {
@@ -315,7 +318,7 @@ func TestNativeRetirement_RuntimeEnumerationFailurePreservesArtifacts(t *testing
 
 func TestNativeRetirement_LinkedBaseRetiresOnlySelectedArtifacts(t *testing.T) {
 	f := setupRetirement(t, true)
-	if deleted, err := DeleteAgentFiles("display-slug", f.project, true); err != nil || !deleted {
+	if deleted, err := deleteAgentFilesForTest("display-slug", f.project, true); err != nil || !deleted {
 		t.Fatalf("linked base retirement: %v %v", deleted, err)
 	}
 	if _, err := os.Stat(f.target); !os.IsNotExist(err) {
@@ -350,7 +353,7 @@ func TestNativeRetirement_LegacyLocalSlugRegistrationWithPersistedUUID(t *testin
 	if err := provision.RegisterSharer(project, "local-slug", workspace, "joiner-slug"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DeleteAgentFiles("local-slug", project, true); err == nil {
+	if _, err := deleteAgentFilesForTest("local-slug", project, true); err == nil {
 		t.Fatal("private directory retirement would delete active joiner's workspace")
 	}
 	if _, err := os.Stat(workspace); err != nil {
@@ -362,7 +365,7 @@ func TestNativeRetirement_LegacyLocalSlugRegistrationWithPersistedUUID(t *testin
 	if _, _, err := provision.UnregisterSharer(project, "local-slug", "joiner-slug"); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := DeleteAgentFiles("local-slug", project, true); err != nil || !deleted {
+	if deleted, err := deleteAgentFilesForTest("local-slug", project, true); err != nil || !deleted {
 		t.Fatalf("legacy slug registration retirement: %v %v", deleted, err)
 	}
 	if _, err := os.Stat(agentDir); !os.IsNotExist(err) {
@@ -370,5 +373,151 @@ func TestNativeRetirement_LegacyLocalSlugRegistrationWithPersistedUUID(t *testin
 	}
 	if strings.Contains(listWorktrees(t, project), workspace) {
 		t.Error("legacy UUID configuration left Git registration")
+	}
+}
+
+// Existing file-retirement fixtures supply explicit empty runtime authority.
+// Dedicated adapter fixtures below prove inspection failures and foreign mounts.
+type retirementTestRuntime struct {
+	*runtime.MockRuntime
+	guard func(context.Context, string) error
+}
+
+func (r *retirementTestRuntime) AssertWorkspaceUnused(ctx context.Context, path string) error {
+	if r.guard != nil {
+		return r.guard(ctx, path)
+	}
+	return nil
+}
+func deleteAgentFilesForTest(name, project string, removeBranch bool) (bool, error) {
+	return deleteAgentFiles(context.Background(), name, project, removeBranch, &retirementTestRuntime{MockRuntime: &runtime.MockRuntime{}})
+}
+
+func TestNativeRetirement_JoinCannotRegisterDuringLastOwnerRetirement(t *testing.T) {
+	f := setupRetirement(t)
+	// Native ProvisionShared sanitizes branch requests before registering them.
+	// Use its actual branch identity for this join/delete concurrency fixture.
+	retirementTestGit(t, f.target, "branch", "-m", "native-retirement")
+	if _, _, err := provision.UnregisterSharer(f.base, f.branch, f.uuid); err != nil {
+		t.Fatal(err)
+	}
+	f.branch = "native-retirement"
+	if err := provision.RegisterSharer(f.base, f.branch, f.target, f.uuid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.project, provision.ProvisionSentinelFile), []byte("ready"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	entered, resume := make(chan struct{}), make(chan struct{})
+	rt := &retirementTestRuntime{MockRuntime: &runtime.MockRuntime{}, guard: func(context.Context, string) error {
+		close(entered)
+		<-resume
+		return nil
+	}}
+	deleted := make(chan error, 1)
+	go func() {
+		_, err := deleteAgentFiles(context.Background(), "display-slug", f.project, true, rt)
+		deleted <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retirement did not reach guarded last-owner phase")
+	}
+	defer func() {
+		select {
+		case <-resume:
+		default:
+			close(resume)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	in := provision.ProvisionInput{Ctx: ctx, Resolved: provision.ResolvedWorkspace{HostPath: f.base, Backend: "local"}, ProjectID: "project-native", AgentID: "new-joiner", AgentName: f.branch, Mode: store.SharingModeWorktreePerAgent}
+	err := provision.ProvisionShared(in)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "workspace lock") {
+		t.Fatalf("join must wait on retirement's SAME provisioning lock, got %v", err)
+	}
+	owners, path, err := provision.ListSharers(f.base, f.branch)
+	if err != nil || len(owners) != 1 || owners[0] != f.uuid || path != f.target {
+		t.Fatalf("blocked join changed ownership: %v %s %v", owners, path, err)
+	}
+	close(resume)
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("retirement failed to complete")
+	}
+	in.Ctx = context.Background()
+	if err := provision.ProvisionShared(in); err != nil {
+		t.Fatal(err)
+	}
+	owners, path, err = provision.ListSharers(f.base, f.branch)
+	if err != nil || len(owners) != 1 || owners[0] != "new-joiner" || path != provision.WorktreePath(f.base, "new-joiner") {
+		t.Fatalf("retry join ownership: %v %s %v", owners, path, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("joiner's provisioned workspace lost: %v", err)
+	}
+	assertRetirementSurvivors(t, f)
+}
+
+func TestNativeRetirement_ForeignRuntimeMountRefusedAndRetryable(t *testing.T) {
+	for _, tc := range []struct{ name, suffix, inspection, want string }{
+		{name: "exact", want: "still mounts"},
+		{name: "child", suffix: "/nested", want: "still mounts"},
+		{name: "inspection-failure", inspection: "exit 8", want: "inspect all runtime mounts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setupRetirement(t)
+			id := strings.Repeat("a", 64)
+			command := filepath.Join(t.TempDir(), "docker-fixture")
+			inspection := tc.inspection
+			if inspection == "" {
+				inspection = "printf '%s\\n' '{\"id\":\"" + id + "\",\"mounts\":[{\"Source\":\"" + f.target + tc.suffix + "\"}]}'"
+			}
+			script := "#!/bin/sh\ncase \"$1\" in\nps) if [ \"$5\" = '{{json .}}' ]; then printf '%s\\n' '{\"ID\":\"" + id + "\",\"Names\":\"foreign-helper\",\"Labels\":\"\",\"Status\":\"Up\"}'; else printf '%s\\n' '" + id + "'; fi;;\ninspect) " + inspection + ";;\n*) exit 90;;\nesac\n"
+			if err := os.WriteFile(command, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			mgr := &AgentManager{Runtime: &runtime.DockerRuntime{Command: command}}
+			if _, err := mgr.Delete(context.Background(), "display-slug", true, f.project, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("foreign mount retirement: %v", err)
+			}
+			for _, path := range []string{f.target, f.agentDir} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("mount refusal lost %s: %v", path, err)
+				}
+			}
+			if _, _, found, err := provision.FindBranchForAgent(f.base, f.uuid); err != nil || !found {
+				t.Fatalf("mount refusal lost retry identity: %v %v", found, err)
+			}
+			if err := os.WriteFile(command, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if deleted, err := mgr.Delete(context.Background(), "display-slug", true, f.project, true); err != nil || !deleted {
+				t.Fatalf("retry after foreign mount retired: %v %v", deleted, err)
+			}
+			assertRetirementSurvivors(t, f)
+		})
+	}
+}
+
+func TestNativeRetirement_UnsupportedMountAuthorityRefused(t *testing.T) {
+	f := setupRetirement(t)
+	mgr := &AgentManager{Runtime: &runtime.MockRuntime{}}
+	if _, err := mgr.Delete(context.Background(), "display-slug", true, f.project, true); err == nil || !strings.Contains(err.Error(), "mount authority") {
+		t.Fatalf("missing mount authority: %v", err)
+	}
+	for _, path := range []string{f.target, f.agentDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, found, err := provision.FindBranchForAgent(f.base, f.uuid); err != nil || !found {
+		t.Fatalf("missing authority lost marker: %v %v", found, err)
 	}
 }

@@ -15,6 +15,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
 func validRetirementID(id string) bool {
@@ -161,7 +163,7 @@ func validateRetirementContents(target string) error {
 	return nil
 }
 
-func retireRegisteredWorktree(base, target, branch string, removeBranch bool, agentDirs []string) (bool, error) {
+func retireRegisteredWorktree(ctx context.Context, rt runtime.Runtime, base, target, branch string, removeBranch bool, agentDirs []string) (bool, error) {
 	if err := validateRetirementPath(base, target, agentDirs); err != nil {
 		return false, err
 	}
@@ -192,6 +194,13 @@ func retireRegisteredWorktree(base, target, branch string, removeBranch bool, ag
 		}
 	} else if !errors.Is(statErr, fs.ErrNotExist) {
 		return false, statErr
+	}
+	guard, ok := rt.(runtime.WorkspaceRetirementGuard)
+	if !ok {
+		return false, fmt.Errorf("delete: runtime cannot establish worktree mount authority")
+	}
+	if err := guard.AssertWorkspaceUnused(ctx, target); err != nil {
+		return false, fmt.Errorf("delete: worktree runtime inspection: %w", err)
 	}
 	if registered {
 		// One force permits ignored symlink removal but does not override locks.
