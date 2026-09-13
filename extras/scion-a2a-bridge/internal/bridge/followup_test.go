@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 )
@@ -98,6 +99,9 @@ func (m *mockAgentService) Suspend(ctx context.Context, agentID string) error {
 }
 func (m *mockAgentService) Restart(ctx context.Context, agentID string) error {
 	return fmt.Errorf("not implemented")
+}
+func (m *mockAgentService) RecoverRuntime(ctx context.Context, agentID string, update *api.RuntimeUpdateRequest) (*hubclient.Agent, error) {
+	return nil, fmt.Errorf("not implemented")
 }
 func (m *mockAgentService) StopAll(ctx context.Context) (*hubclient.StopAllResponse, error) {
 	return nil, fmt.Errorf("not implemented")
