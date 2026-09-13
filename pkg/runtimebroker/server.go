@@ -249,6 +249,11 @@ type Server struct {
 	// Key: ProjectID (or ProjectPath if ID is empty).
 	projectProvisionMu sync.Map
 
+	// agentLifecycleMu excludes overlapping create/start/stop/restart/delete
+	// mutations of one project-scoped retained agent.
+	agentLifecycleMu      sync.Map
+	agentLifecycleAliases sync.Map
+
 	// NFS mount reconciler (nil when backend != "nfs")
 	nfsMountReconciler *NFSMountReconciler
 

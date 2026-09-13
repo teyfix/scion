@@ -142,21 +142,24 @@ func (a *Agent) UnmarshalJSON(data []byte) error {
 
 // AgentAppliedConfig stores the effective configuration of an agent.
 type AgentAppliedConfig struct {
-	Image         string              `json:"image,omitempty"`
-	HarnessConfig string              `json:"harnessConfig,omitempty"`
-	HarnessAuth   string              `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
-	Env           map[string]string   `json:"env,omitempty"`
-	Model         string              `json:"model,omitempty"`
-	ThinkingLevel *int                `json:"thinkingLevel,omitempty"`
-	Profile       string              `json:"profile,omitempty"`   // Settings profile for the runtime broker
-	Task          string              `json:"task,omitempty"`      // Initial task/prompt for the agent
-	Attach        bool                `json:"attach,omitempty"`    // If true, signals interactive attach mode to the broker/harness
-	Branch        string              `json:"branch,omitempty"`    // Git branch name (defaults to agent slug if empty)
-	Workspace     string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
-	GitClone      *api.GitCloneConfig `json:"gitClone,omitempty"`
-	RequireGPU    bool                `json:"requireGpu,omitempty"`
-	Docker        *api.DockerConfig   `json:"docker,omitempty"`    // Effective runtime Docker settings reported by the broker
-	NvidiaGPU     *bool               `json:"nvidiaGpu,omitempty"` // Effective NVIDIA GPU attachment reported by the broker
+	// RuntimeUpdateVersion identifies the currently admitted runtime update.
+	// Async status updates do not change this lifecycle fence.
+	RuntimeUpdateVersion int64               `json:"runtimeUpdateVersion,omitempty"`
+	Image                string              `json:"image,omitempty"`
+	HarnessConfig        string              `json:"harnessConfig,omitempty"`
+	HarnessAuth          string              `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
+	Env                  map[string]string   `json:"env,omitempty"`
+	Model                string              `json:"model,omitempty"`
+	ThinkingLevel        *int                `json:"thinkingLevel,omitempty"`
+	Profile              string              `json:"profile,omitempty"`   // Settings profile for the runtime broker
+	Task                 string              `json:"task,omitempty"`      // Initial task/prompt for the agent
+	Attach               bool                `json:"attach,omitempty"`    // If true, signals interactive attach mode to the broker/harness
+	Branch               string              `json:"branch,omitempty"`    // Git branch name (defaults to agent slug if empty)
+	Workspace            string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
+	GitClone             *api.GitCloneConfig `json:"gitClone,omitempty"`
+	RequireGPU           bool                `json:"requireGpu,omitempty"`
+	Docker               *api.DockerConfig   `json:"docker,omitempty"`    // Effective runtime Docker settings reported by the broker
+	NvidiaGPU            *bool               `json:"nvidiaGpu,omitempty"` // Effective NVIDIA GPU attachment reported by the broker
 
 	// Template info for Runtime Broker hydration
 	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching

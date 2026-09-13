@@ -15,7 +15,9 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -216,6 +218,28 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+	if action == api.AgentActionStart && r.Body != nil && r.ContentLength != 0 {
+		var req struct {
+			RuntimeUpdate json.RawMessage `json:"runtimeUpdate"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			BadRequest(w, "Invalid start request: "+err.Error())
+			return
+		}
+		if len(req.RuntimeUpdate) != 0 {
+			var update *api.RuntimeUpdateRequest
+			updateDecoder := json.NewDecoder(bytes.NewReader(req.RuntimeUpdate))
+			updateDecoder.DisallowUnknownFields()
+			if err := updateDecoder.Decode(&update); err != nil || update == nil {
+				BadRequest(w, "runtimeUpdate must contain an explicit supported recovery request")
+				return
+			}
+			s.recoverAgentRuntime(w, r, agent, update)
+			return
+		}
 	}
 
 	// Managed agent lifecycle: handle directly without broker dispatch.

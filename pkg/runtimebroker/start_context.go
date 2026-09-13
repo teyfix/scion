@@ -72,7 +72,8 @@ type startContextInputs struct {
 	Config *CreateAgentConfig
 
 	// InlineConfig for provisioning
-	InlineConfig *api.ScionConfig
+	InlineConfig    *api.ScionConfig
+	RuntimeRecovery *api.RuntimeRecovery
 
 	// SharedDirs from project
 	SharedDirs []api.SharedDir
@@ -153,7 +154,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// This block also handles the case where the createAgent handler already
 	// resolved ProjectPath (for env-gather) before calling buildStartContext,
 	// which would skip the resolution block above.
-	if in.ProjectSlug != "" && in.ProjectPath != "" {
+	if in.RuntimeRecovery == nil && in.ProjectSlug != "" && in.ProjectPath != "" {
 		scionPath := filepath.Join(in.ProjectPath, config.DotScion)
 
 		if config.IsProjectMarkerFile(scionPath) {

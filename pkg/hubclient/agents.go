@@ -50,6 +50,9 @@ type AgentService interface {
 	// Start starts a stopped agent.
 	Start(ctx context.Context, agentID string) error
 
+	// RecoverRuntime updates a retained container and continues its provider session.
+	RecoverRuntime(ctx context.Context, agentID string, update *api.RuntimeUpdateRequest) (*Agent, error)
+
 	// Stop stops a running agent.
 	Stop(ctx context.Context, agentID string) error
 
@@ -434,6 +437,19 @@ func (s *agentService) Start(ctx context.Context, agentID string) error {
 		return err
 	}
 	return apiclient.CheckResponse(resp)
+}
+
+func (s *agentService) RecoverRuntime(ctx context.Context, agentID string, update *api.RuntimeUpdateRequest) (*Agent, error) {
+	if err := update.Validate(); err != nil {
+		return nil, err
+	}
+	resp, err := s.c.post(ctx, s.agentPath(agentID)+"/start", struct {
+		RuntimeUpdate *api.RuntimeUpdateRequest `json:"runtimeUpdate"`
+	}{RuntimeUpdate: update}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeResponse[Agent](resp)
 }
 
 // Stop stops a running agent.

@@ -2212,8 +2212,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	}
 	if errors.Is(err, ErrLifecycleDeferred) {
 		return d.deferredStart(ctx, agent, &StartDispatchArgs{
-			Task:   task,
-			Resume: resume,
+			Task:            task,
+			Resume:          resume,
+			RuntimeRecovery: api.RuntimeRecoveryFromContext(ctx),
 		})
 	}
 	if err != nil {
