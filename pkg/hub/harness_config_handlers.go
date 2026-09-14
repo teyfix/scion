@@ -1133,7 +1133,7 @@ func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	case store.HarnessConfigScopeProject:
-		if !s.authorizeProjectImport(ctx, w, hc.ScopeID, "harness-configs") {
+		if !s.authorizeProjectImport(ctx, w, hc.ScopeID, "harness-configs", "harness_config") {
 			return
 		}
 	case store.HarnessConfigScopeUser:
