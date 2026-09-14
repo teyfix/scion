@@ -249,6 +249,7 @@ func (s *Server) listEnvVars(w http.ResponseWriter, r *http.Request) {
 			Scope:   scope,
 			ScopeID: scopeID,
 			Type:    "environment",
+			Name:    filter.Key,
 		})
 		if err != nil {
 			s.envSecretLog.Warn("failed to list environment secrets for env var merge", "error", err)
@@ -1560,10 +1561,11 @@ func (s *Server) handleProjectEnvVars(w http.ResponseWriter, r *http.Request, pr
 
 	switch r.Method {
 	case http.MethodGet:
-		envVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{
+		filter := store.EnvVarFilter{
 			Scope:   store.ScopeProject,
 			ScopeID: projectID,
-		})
+		}
+		envVars, err := s.store.ListEnvVars(ctx, filter)
 		if err != nil {
 			writeErrorFromErr(w, err, "")
 			return
@@ -2257,10 +2259,11 @@ func (s *Server) handleBrokerEnvVars(w http.ResponseWriter, r *http.Request, bro
 
 	switch r.Method {
 	case http.MethodGet:
-		envVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{
+		filter := store.EnvVarFilter{
 			Scope:   store.ScopeRuntimeBroker,
 			ScopeID: brokerID,
-		})
+		}
+		envVars, err := s.store.ListEnvVars(ctx, filter)
 		if err != nil {
 			writeErrorFromErr(w, err, "")
 			return
