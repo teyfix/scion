@@ -272,7 +272,9 @@ jobs:
       SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
       VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
       BUILD_SCOPE: ${{ needs.prepare.outputs.build_scope }}
-      PUBLISH_LATEST: ${{ inputs.publish_latest || false }}
+      # Branch pushes advance latest after the full build succeeds. Manual
+      # dispatches keep their explicit publish_latest choice.
+      PUBLISH_LATEST: ${{ github.event_name == 'push' || inputs.publish_latest == true }}
     steps:
       - uses: actions/checkout@v7
         with:
