@@ -246,10 +246,10 @@ def _resolve_reasoning_effort(level: int) -> str:
 def _is_toml_key_line(line: str, key: str) -> bool:
     """True if line is a top-level TOML assignment for exactly `key`."""
     s = line.strip()
-    if not s.startswith(key):
-        return False
-    rest = s[len(key):]
-    return len(rest) > 0 and rest[0] in (" ", "=", "\t")
+    for spelling in (key, f'"{key}"', f"'{key}'"):
+        if s.startswith(spelling) and s[len(spelling):].lstrip().startswith("="):
+            return True
+    return False
 
 
 def _strip_toml_top_level_key(content: str, key: str) -> str:

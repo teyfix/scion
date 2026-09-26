@@ -413,6 +413,25 @@ class CodexProvisionTest(unittest.TestCase):
                         "profiles": {"custom": {"model_reasoning_effort": "low"}},
                     })
 
+    def test_reconcile_replaces_quoted_managed_root_keys(self) -> None:
+        for quote in ('"', "'"):
+            with self.subTest(quote=quote), tempfile.TemporaryDirectory() as tmp:
+                with temporary_home(tmp):
+                    os.makedirs(os.path.join(tmp, ".codex"))
+                    config_path = os.path.join(tmp, ".codex", "config.toml")
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        f.write(
+                            f'{quote}reasoning_effort{quote} = "low"\n'
+                            f'{quote}model_reasoning_effort{quote} = "medium"\n'
+                            '[profiles.custom]\nmodel_reasoning_effort = "low"\n'
+                        )
+                    provision._reconcile_codex_toml(None, None, reasoning_effort="high")
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        self.assertEqual(tomllib.loads(f.read()), {
+                            "model_reasoning_effort": "high",
+                            "profiles": {"custom": {"model_reasoning_effort": "low"}},
+                        })
+
     def test_strip_toml_top_level_key_section_safety(self) -> None:
         content = '[otel]\nreasoning_effort = "low"\n[other]\nkey = "val"\n'
         result = provision._strip_toml_top_level_key(content, "reasoning_effort")
