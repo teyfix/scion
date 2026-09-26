@@ -371,6 +371,30 @@ class CodexProvisionTest(unittest.TestCase):
                 self.assertNotIn('"low"', content)
                 self.assertIn('other_key = "value"', content)
 
+    def test_reasoning_effort_stays_at_root_with_existing_tables(self) -> None:
+        original = (
+            'reasoning_effort = "low"\nmodel = "selected-model"\n'
+            '[mcp_servers.memory]\nurl = "https://memory.example.test/mcp"\n'
+            '[tui.model_availability_nux]\n"selected-model" = 1\n'
+        )
+        expected = tomllib.loads(original)
+        expected["reasoning_effort"] = "high"
+        with tempfile.TemporaryDirectory() as tmp:
+            with temporary_home(tmp):
+                os.makedirs(os.path.join(tmp, ".codex"))
+                config_path = os.path.join(tmp, ".codex", "config.toml")
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(original)
+                previous = None
+                for _ in range(2):
+                    provision._reconcile_codex_toml(None, None, reasoning_effort="high")
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    self.assertEqual(tomllib.loads(content), expected)
+                    if previous is not None:
+                        self.assertEqual(content, previous)
+                    previous = content
+
     def test_strip_toml_top_level_key_section_safety(self) -> None:
         content = '[otel]\nreasoning_effort = "low"\n[other]\nkey = "val"\n'
         result = provision._strip_toml_top_level_key(content, "reasoning_effort")
