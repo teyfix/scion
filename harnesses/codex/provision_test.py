@@ -345,7 +345,7 @@ class CodexProvisionTest(unittest.TestCase):
                 config_path = os.path.join(tmp, ".codex", "config.toml")
                 with open(config_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                self.assertIn('reasoning_effort = "medium"', content)
+                self.assertEqual(tomllib.loads(content), {"model_reasoning_effort": "medium"})
 
     def test_reconcile_codex_toml_omits_reasoning_effort_when_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,18 +367,19 @@ class CodexProvisionTest(unittest.TestCase):
                 provision._reconcile_codex_toml(None, None, reasoning_effort="high")
                 with open(config_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                self.assertIn('reasoning_effort = "high"', content)
+                self.assertEqual(tomllib.loads(content), {"model_reasoning_effort": "high", "other_key": "value"})
                 self.assertNotIn('"low"', content)
                 self.assertIn('other_key = "value"', content)
 
     def test_reasoning_effort_stays_at_root_with_existing_tables(self) -> None:
         original = (
-            'reasoning_effort = "low"\nmodel = "selected-model"\n'
+            'reasoning_effort = "low"\nmodel_reasoning_effort = "medium"\nmodel = "selected-model"\n'
             '[mcp_servers.memory]\nurl = "https://memory.example.test/mcp"\n'
             '[tui.model_availability_nux]\n"selected-model" = 1\n'
         )
         expected = tomllib.loads(original)
-        expected["reasoning_effort"] = "high"
+        del expected["reasoning_effort"]
+        expected["model_reasoning_effort"] = "high"
         with tempfile.TemporaryDirectory() as tmp:
             with temporary_home(tmp):
                 os.makedirs(os.path.join(tmp, ".codex"))
@@ -394,6 +395,42 @@ class CodexProvisionTest(unittest.TestCase):
                     if previous is not None:
                         self.assertEqual(content, previous)
                     previous = content
+
+    def test_no_reasoning_override_removes_both_managed_root_keys(self) -> None:
+        original = (
+            'reasoning_effort = "low"\nmodel_reasoning_effort = "medium"\n'
+            '[profiles.custom]\nmodel_reasoning_effort = "low"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with temporary_home(tmp):
+                os.makedirs(os.path.join(tmp, ".codex"))
+                config_path = os.path.join(tmp, ".codex", "config.toml")
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(original)
+                provision._reconcile_codex_toml(None, None)
+                with open(config_path, "r", encoding="utf-8") as f:
+                    self.assertEqual(tomllib.loads(f.read()), {
+                        "profiles": {"custom": {"model_reasoning_effort": "low"}},
+                    })
+
+    def test_reconcile_replaces_quoted_managed_root_keys(self) -> None:
+        for quote in ('"', "'"):
+            with self.subTest(quote=quote), tempfile.TemporaryDirectory() as tmp:
+                with temporary_home(tmp):
+                    os.makedirs(os.path.join(tmp, ".codex"))
+                    config_path = os.path.join(tmp, ".codex", "config.toml")
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        f.write(
+                            f'{quote}reasoning_effort{quote} = "low"\n'
+                            f'{quote}model_reasoning_effort{quote} = "medium"\n'
+                            '[profiles.custom]\nmodel_reasoning_effort = "low"\n'
+                        )
+                    provision._reconcile_codex_toml(None, None, reasoning_effort="high")
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        self.assertEqual(tomllib.loads(f.read()), {
+                            "model_reasoning_effort": "high",
+                            "profiles": {"custom": {"model_reasoning_effort": "low"}},
+                        })
 
     def test_strip_toml_top_level_key_section_safety(self) -> None:
         content = '[otel]\nreasoning_effort = "low"\n[other]\nkey = "val"\n'

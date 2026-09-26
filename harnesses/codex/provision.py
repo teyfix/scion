@@ -246,10 +246,10 @@ def _resolve_reasoning_effort(level: int) -> str:
 def _is_toml_key_line(line: str, key: str) -> bool:
     """True if line is a top-level TOML assignment for exactly `key`."""
     s = line.strip()
-    if not s.startswith(key):
-        return False
-    rest = s[len(key):]
-    return len(rest) > 0 and rest[0] in (" ", "=", "\t")
+    for spelling in (key, f'"{key}"', f"'{key}'"):
+        if s.startswith(spelling) and s[len(spelling):].lstrip().startswith("="):
+            return True
+    return False
 
 
 def _strip_toml_top_level_key(content: str, key: str) -> str:
@@ -280,10 +280,11 @@ def _reconcile_codex_toml(
         with open(config_path, "r", encoding="utf-8") as f:
             content = f.read()
     content = _strip_toml_top_level_key(content, "reasoning_effort")
+    content = _strip_toml_top_level_key(content, "model_reasoning_effort")
     content = scion_harness.strip_toml_sections(content, lambda h: h == "[otel]")
 
     if reasoning_effort:
-        re_line = f'reasoning_effort = "{scion_harness.toml_escape(reasoning_effort)}"'
+        re_line = f'model_reasoning_effort = "{scion_harness.toml_escape(reasoning_effort)}"'
         # Root assignments must precede table headers; appending scopes the key
         # to the final table in an existing config.
         content = re_line + "\n" + content
