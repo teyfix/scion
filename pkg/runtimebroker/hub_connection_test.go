@@ -351,14 +351,14 @@ func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
 		AuthMode:    brokercredentials.AuthModeHMAC,
 	}
 	conn := &HubConnection{
-		Name:           oldCreds.Name,
-		HubEndpoint:    oldCreds.HubEndpoint,
-		BrokerID:       oldCreds.BrokerID,
-		AuthMode:       oldCreds.AuthMode,
-		Credentials:    oldCreds,
-		SecretKey:      oldKey,
-		authorityReady: true,
+		Name:        oldCreds.Name,
+		HubEndpoint: oldCreds.HubEndpoint,
+		BrokerID:    oldCreds.BrokerID,
+		AuthMode:    oldCreds.AuthMode,
+		Credentials: oldCreds,
+		SecretKey:   oldKey,
 	}
+	conn.authorityReady.Store(true)
 	srv := &Server{
 		config: ServerConfig{
 			BrokerAuthEnabled:    true,
@@ -1333,6 +1333,178 @@ func TestCredentialWatcher_RemoveConnection(t *testing.T) {
 
 	if count != 1 {
 		t.Errorf("expected 1 connection after removal, got %d", count)
+	}
+}
+
+func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.T) {
+	const (
+		connectionName = "hub-remove"
+		brokerID       = "registered-broker"
+		hubEndpoint    = "https://hub.remove.example"
+		projectID      = "removal-project"
+	)
+	key := []byte("credential-removal-secret-key")
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hubEndpoint, brokerID, key)
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+
+	managerEntered := make(chan struct{})
+	releaseManager := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseManager:
+		default:
+			close(releaseManager)
+		}
+	}()
+	manager := &admissionBoundaryManager{
+		Manager: srv.manager,
+		beforeStart: func(api.StartOptions) error {
+			close(managerEntered)
+			<-releaseManager
+			return nil
+		},
+	}
+	srv.manager = manager
+
+	hubLocked := make(chan struct{})
+	allowHubUnlock := make(chan struct{})
+	authorityRevoked := make(chan struct{})
+	defer func() {
+		select {
+		case <-allowHubUnlock:
+		default:
+			close(allowHubUnlock)
+		}
+	}()
+	srv.credentialReloadHook = func(stage string) {
+		switch stage {
+		case "hub-locked":
+			close(hubLocked)
+			<-allowHubUnlock
+		case "authority-revoked":
+			close(authorityRevoked)
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+	sign := func(req *http.Request, nonce string) {
+		timestamp := fmt.Sprintf("%d", time.Now().Unix())
+		req.Header.Set(apiclient.HeaderBrokerID, brokerID)
+		req.Header.Set(apiclient.HeaderTimestamp, timestamp)
+		req.Header.Set(apiclient.HeaderNonce, nonce)
+		canonical := apiclient.BuildCanonicalString(req, timestamp, nonce)
+		signature := apiclient.ComputeHMAC(key, canonical)
+		req.Header.Set(apiclient.HeaderSignature, base64.StdEncoding.EncodeToString(signature))
+	}
+	newCreateRequest := func(name, nonce string) *http.Request {
+		body, err := json.Marshal(CreateAgentRequest{
+			ID:          name + "-id",
+			Name:        name,
+			ProjectID:   projectID,
+			HubEndpoint: hubEndpoint,
+			NoAuth:      true,
+			Config:      &CreateAgentConfig{Template: "claude"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		// Control-channel dispatch injects this connection selector before the
+		// request enters the same Server.Handler path exercised here.
+		req.Header.Set("X-Scion-Hub-Connection", connectionName)
+		sign(req, nonce)
+		return req
+	}
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(context.Background())
+	}()
+	waitFor(hubLocked, "credential reload to hold hubMu")
+
+	firstResponse := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		srv.Handler().ServeHTTP(firstResponse, newCreateRequest("already-admitted", "before-removal"))
+	}()
+
+	// The request must hold the connection's read lease while waiting for
+	// hubMu. This is the lock ordering that deadlocked when removal called Stop
+	// while still holding hubMu.
+	leaseDeadline := time.NewTimer(2 * time.Second)
+	leasePoll := time.NewTicker(time.Millisecond)
+	leaseObserved := false
+	for !leaseObserved {
+		if !conn.mu.TryLock() {
+			leaseObserved = true
+			break
+		}
+		conn.mu.Unlock()
+		select {
+		case <-leaseDeadline.C:
+			t.Fatal("signed CREATE did not acquire the Hub authority lease")
+		case <-leasePoll.C:
+		}
+	}
+	leaseDeadline.Stop()
+	leasePoll.Stop()
+
+	close(allowHubUnlock)
+	waitFor(authorityRevoked, "removed authority to be revoked")
+
+	// A new request signed by the removed key must fail before Manager.Start,
+	// even while removal is waiting for the already-admitted request's lease.
+	secondResponse := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(secondResponse, newCreateRequest("after-revocation", "after-removal"))
+	if secondResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("post-revocation CREATE status %d, want %d: %s", secondResponse.Code, http.StatusUnauthorized, secondResponse.Body.String())
+	}
+	waitFor(managerEntered, "already-admitted CREATE to reach manager")
+	if manager.starts != 1 {
+		t.Fatalf("manager starts %d, want only the already-admitted request", manager.starts)
+	}
+	select {
+	case err := <-reloadDone:
+		t.Fatalf("credential removal returned before the admitted authority lease: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseManager)
+	waitFor(firstDone, "already-admitted CREATE to complete")
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("already-admitted CREATE status %d, want %d: %s", firstResponse.Code, http.StatusCreated, firstResponse.Body.String())
+	}
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal deadlocked after the authority lease was released")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority remained ready")
+	}
+	if conn.authorityGeneration.Load() == 0 {
+		t.Fatal("removed connection authority generation was not invalidated")
+	}
+	srv.hubMu.RLock()
+	_, retained := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if retained {
+		t.Fatal("removed connection remained published")
 	}
 }
 

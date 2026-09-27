@@ -229,6 +229,10 @@ type Server struct {
 	credLastScan    time.Time
 	credWatcherStop chan struct{}
 
+	// credentialReloadHook is a test-only synchronization point for credential
+	// removal. Production servers leave it nil.
+	credentialReloadHook func(stage string)
+
 	// dispatchAttempts tracks request-id based create-attempt state for
 	// idempotency and auditability.
 	dispatchAttempts   map[string]*dispatchAttempt
@@ -623,8 +627,8 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		Hydrator:        hydrator,
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
-		authorityReady:  true,
 	}
+	conn.authorityReady.Store(true)
 
 	return conn, nil
 }
@@ -675,8 +679,8 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		Hydrator:        hydrator,
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
-		authorityReady:  true,
 	}
+	conn.authorityReady.Store(true)
 
 	return conn, nil
 }
@@ -755,12 +759,12 @@ func (s *Server) buildAuthMiddleware() {
 	var keys []secretKeyEntry
 	for _, conn := range s.hubConnections {
 		conn.mu.RLock()
-		if conn.authorityReady && len(conn.SecretKey) > 0 {
+		if conn.authorityReady.Load() && len(conn.SecretKey) > 0 {
 			keys = append(keys, secretKeyEntry{
 				hubName:     conn.Name,
 				brokerID:    conn.BrokerID,
 				hubEndpoint: conn.HubEndpoint,
-				generation:  conn.authorityGeneration,
+				generation:  conn.authorityGeneration.Load(),
 				secretKey:   append([]byte(nil), conn.SecretKey...),
 				connection:  conn,
 			})
@@ -805,7 +809,7 @@ func (s *Server) authKeyCount() int {
 	count := 0
 	for _, conn := range s.hubConnections {
 		conn.mu.RLock()
-		ready := conn.authorityReady && len(conn.SecretKey) > 0
+		ready := conn.authorityReady.Load() && len(conn.SecretKey) > 0
 		conn.mu.RUnlock()
 		if ready {
 			count++
@@ -1418,62 +1422,109 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		newCreds[creds[i].Name] = &creds[i]
 	}
 
-	s.hubMu.Lock()
+	type credentialUpdate struct {
+		name        string
+		connection  *HubConnection
+		credentials *brokercredentials.BrokerCredentials
+	}
 
-	// Detect removals: connections that exist but are not in newCreds
-	// (skip "local" connection which comes from InMemoryCredentials)
+	var removed []*HubConnection
+	var additions []*brokercredentials.BrokerCredentials
+	var existing []credentialUpdate
+
+	// Only detach connections and snapshot work while holding hubMu. In
+	// particular, never wait for a connection lease here: authenticated
+	// handlers retain that lease and may need hubMu while dispatching.
+	s.hubMu.Lock()
+	if s.credentialReloadHook != nil {
+		s.credentialReloadHook("hub-locked")
+	}
 	for name, conn := range s.hubConnections {
 		if name == "local" && s.config.InMemoryCredentials != nil {
 			continue
 		}
 		if _, exists := newCreds[name]; !exists {
 			slog.Info("Removing hub connection", "name", name)
-			conn.Stop()
 			delete(s.hubConnections, name)
+			removed = append(removed, conn)
 		}
 	}
-
-	// Detect additions and modifications
-	for name, c := range newCreds {
-		existingConn, exists := s.hubConnections[name]
-		if !exists {
-			// New connection
-			conn, err := s.createHubConnection(name, c)
-			if err != nil {
-				slog.Warn("Failed to create new hub connection", "name", name, "error", err)
-				continue
-			}
-			s.hubConnections[name] = conn
-			slog.Info("Added new hub connection", "name", name, "brokerID", c.BrokerID)
-
-			// Start services for the new connection
-			go func(conn *HubConnection) {
-				if err := conn.Start(ctx, s); err != nil {
-					slog.Error("Failed to start new hub connection", "name", conn.Name, "error", err)
-				}
-			}(conn)
+	for name, credentials := range newCreds {
+		if conn, ok := s.hubConnections[name]; ok {
+			existing = append(existing, credentialUpdate{
+				name:        name,
+				connection:  conn,
+				credentials: credentials,
+			})
 		} else {
-			// Check if credentials changed
-			existingConn.mu.RLock()
-			existingCredentials := existingConn.Credentials
-			credentialsChanged := existingCredentials == nil ||
-				existingCredentials.BrokerID != c.BrokerID ||
-				existingCredentials.SecretKey != c.SecretKey ||
-				existingCredentials.HubEndpoint != c.HubEndpoint
-			existingConn.mu.RUnlock()
-			if credentialsChanged {
-
-				slog.Info("Reinitializing hub connection", "name", name)
-				go func(conn *HubConnection, creds *brokercredentials.BrokerCredentials) {
-					if err := conn.Reinitialize(ctx, s, creds); err != nil {
-						slog.Error("Failed to reinitialize hub connection", "name", conn.Name, "error", err)
-					}
-				}(existingConn, c)
-			}
+			additions = append(additions, credentials)
 		}
 	}
-
 	s.hubMu.Unlock()
+
+	// Serialize with Reinitialize, close every removed authority immediately,
+	// and publish the reduced key set before waiting for existing request
+	// leases or stopping outbound services.
+	for _, conn := range removed {
+		conn.reinitializeMu.Lock()
+		conn.authorityReady.Store(false)
+		conn.authorityGeneration.Add(1)
+	}
+	if len(removed) > 0 {
+		s.buildAuthMiddleware()
+		if s.credentialReloadHook != nil {
+			s.credentialReloadHook("authority-revoked")
+		}
+	}
+	for _, conn := range removed {
+		conn.Stop()
+		conn.reinitializeMu.Unlock()
+	}
+
+	for _, credentials := range additions {
+		conn, err := s.createHubConnection(credentials.Name, credentials)
+		if err != nil {
+			slog.Warn("Failed to create new hub connection", "name", credentials.Name, "error", err)
+			continue
+		}
+
+		s.hubMu.Lock()
+		_, alreadyAdded := s.hubConnections[credentials.Name]
+		if !alreadyAdded {
+			s.hubConnections[credentials.Name] = conn
+		}
+		s.hubMu.Unlock()
+		if alreadyAdded {
+			continue
+		}
+
+		slog.Info("Added new hub connection", "name", credentials.Name, "brokerID", credentials.BrokerID)
+		go func(conn *HubConnection) {
+			if err := conn.Start(ctx, s); err != nil {
+				slog.Error("Failed to start new hub connection", "name", conn.Name, "error", err)
+			}
+		}(conn)
+	}
+
+	for _, update := range existing {
+		update.connection.mu.RLock()
+		existingCredentials := update.connection.Credentials
+		credentialsChanged := existingCredentials == nil ||
+			existingCredentials.BrokerID != update.credentials.BrokerID ||
+			existingCredentials.SecretKey != update.credentials.SecretKey ||
+			existingCredentials.HubEndpoint != update.credentials.HubEndpoint
+		update.connection.mu.RUnlock()
+		if !credentialsChanged {
+			continue
+		}
+
+		slog.Info("Reinitializing hub connection", "name", update.name)
+		go func(conn *HubConnection, credentials *brokercredentials.BrokerCredentials) {
+			if err := conn.Reinitialize(ctx, s, credentials); err != nil {
+				slog.Error("Failed to reinitialize hub connection", "name", conn.Name, "error", err)
+			}
+		}(update.connection, update.credentials)
+	}
 
 	// Rebuild auth middleware with updated keys
 	s.buildAuthMiddleware()

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
@@ -88,8 +89,8 @@ type HubConnection struct {
 	// and per-Hub clients above one admission capability. A request holds mu's
 	// read lock for its full handler lifetime, so Reinitialize cannot rebind an
 	// authenticated request between admission and mutation.
-	authorityGeneration uint64
-	authorityReady      bool
+	authorityGeneration atomic.Uint64
+	authorityReady      atomic.Bool
 
 	// ccWg tracks the control-channel Connect goroutine spawned in Start so
 	// that Stop / Reinitialize can wait for it to exit before replacing or
@@ -258,12 +259,10 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	defer hc.reinitializeMu.Unlock()
 
 	// Close admission immediately. Existing admitted requests retain the read
-	// lease until their handler returns; this write waits for them before the
+	// lease until their handler returns; Stop waits for them before the
 	// connection can be rebound.
-	hc.mu.Lock()
-	hc.authorityReady = false
-	hc.authorityGeneration++
-	hc.mu.Unlock()
+	hc.authorityReady.Store(false)
+	hc.authorityGeneration.Add(1)
 	server.buildAuthMiddleware()
 
 	capabilities, err := prepareHubConnectionCapabilities(server, creds)
@@ -300,8 +299,8 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	hc.HubClient = capabilities.hubClient
 	hc.Hydrator = capabilities.hydrator
 	hc.HCResolver = capabilities.hcResolver
-	hc.authorityReady = true
-	hc.authorityGeneration++
+	hc.authorityGeneration.Add(1)
+	hc.authorityReady.Store(true)
 	hc.mu.Unlock()
 	server.buildAuthMiddleware()
 

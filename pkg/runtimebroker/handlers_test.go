@@ -96,12 +96,12 @@ func configureAuthenticatedHubFixture(t *testing.T, srv *Server, name, endpoint,
 	srv.config.BrokerAuthEnabled = true
 	srv.config.BrokerAuthStrictMode = true
 	conn := &HubConnection{
-		Name:           name,
-		HubEndpoint:    endpoint,
-		BrokerID:       brokerID,
-		SecretKey:      append([]byte(nil), key...),
-		authorityReady: true,
+		Name:        name,
+		HubEndpoint: endpoint,
+		BrokerID:    brokerID,
+		SecretKey:   append([]byte(nil), key...),
 	}
+	conn.authorityReady.Store(true)
 	srv.hubMu.Lock()
 	srv.hubConnections[name] = conn
 	srv.hubMu.Unlock()
@@ -254,7 +254,7 @@ func TestAuthenticatedHubAuthorityScopesCreateAndRecovery(t *testing.T) {
 		{name: "wrong generation", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 9, wantStatus: http.StatusBadRequest},
 		{name: "stale authority", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized, mutate: func(_ *Server, conn *HubConnection) {
 			conn.mu.Lock()
-			conn.authorityGeneration++
+			conn.authorityGeneration.Add(1)
 			conn.mu.Unlock()
 		}},
 		{name: "rebound authority", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized, mutate: func(_ *Server, conn *HubConnection) {

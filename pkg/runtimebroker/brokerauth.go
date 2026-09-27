@@ -330,8 +330,8 @@ func (m *MultiKeyBrokerAuthMiddleware) Middleware(next http.Handler) http.Handle
 		// an admitted request into a request for a different Hub identity.
 		if entry.connection != nil {
 			entry.connection.mu.RLock()
-			if !entry.connection.authorityReady ||
-				entry.connection.authorityGeneration != entry.generation ||
+			if !entry.connection.authorityReady.Load() ||
+				entry.connection.authorityGeneration.Load() != entry.generation ||
 				entry.connection.Name != entry.hubName ||
 				entry.connection.BrokerID != entry.brokerID ||
 				entry.connection.HubEndpoint != entry.hubEndpoint ||
