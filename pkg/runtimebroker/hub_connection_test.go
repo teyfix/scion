@@ -179,8 +179,8 @@ func TestMultiKeyBrokerAuth_MatchesAnyKey(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret1},
-		{hubName: "hub-2", secretKey: secret2},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret1},
+		{hubName: "hub-2", brokerID: "broker-1", secretKey: secret2},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +239,7 @@ func TestMultiKeyBrokerAuth_AllowUnauthenticated(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, true)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +262,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: oldSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: oldSecret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +280,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	// Update keys to new secret only
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: newSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: newSecret},
 	})
 
 	// Request with old key should now fail
@@ -306,7 +306,7 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -330,6 +330,117 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("Expected 401 for expired timestamp, got %d", rr.Code)
+	}
+}
+
+func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
+	oldKey := []byte("old-connection-secret")
+	newKey := []byte("new-connection-secret")
+	oldCreds := &brokercredentials.BrokerCredentials{
+		Name:        "hub-a",
+		BrokerID:    "broker-a",
+		HubEndpoint: "https://hub-a.example",
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	newCreds := &brokercredentials.BrokerCredentials{
+		Name:        "hub-a",
+		BrokerID:    "broker-b",
+		HubEndpoint: "https://hub-b.example",
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn := &HubConnection{
+		Name:           oldCreds.Name,
+		HubEndpoint:    oldCreds.HubEndpoint,
+		BrokerID:       oldCreds.BrokerID,
+		AuthMode:       oldCreds.AuthMode,
+		Credentials:    oldCreds,
+		SecretKey:      oldKey,
+		authorityReady: true,
+	}
+	srv := &Server{
+		config: ServerConfig{
+			BrokerAuthEnabled:    true,
+			BrokerAuthStrictMode: true,
+		},
+		hubConnections: map[string]*HubConnection{"hub-a": conn},
+	}
+	srv.buildAuthMiddleware()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	observed := make(chan brokerRequestAuthority, 1)
+	handler := srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok {
+			t.Error("authenticated request had no bound authority")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		observed <- *authority
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	oldResponse := httptest.NewRecorder()
+	oldRequest := httptest.NewRequest(http.MethodPost, "/api/v1/agents/retained/start", strings.NewReader(`{"runtimeRecovery":{}}`))
+	oldRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(oldRequest, oldCreds.BrokerID, oldKey)
+	requestDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(oldResponse, oldRequest)
+		close(requestDone)
+	}()
+	<-entered
+
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(context.Background(), srv, newCreds)
+	}()
+	select {
+	case err := <-reinitializeDone:
+		t.Fatalf("Reinitialize published while an admitted request held its authority lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-requestDone
+	if oldResponse.Code != http.StatusOK {
+		t.Fatalf("in-flight old authority status %d, want %d", oldResponse.Code, http.StatusOK)
+	}
+	oldAuthority := <-observed
+	if oldAuthority.brokerID != oldCreds.BrokerID || oldAuthority.hubEndpoint != oldCreds.HubEndpoint {
+		t.Fatalf("in-flight authority changed: broker=%q endpoint=%q", oldAuthority.brokerID, oldAuthority.hubEndpoint)
+	}
+	if err := <-reinitializeDone; err != nil {
+		t.Fatalf("Reinitialize: %v", err)
+	}
+
+	// The stale signature/identity cannot cross the publication boundary.
+	staleRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+	staleRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(staleRequest, oldCreds.BrokerID, oldKey)
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, staleRequest)
+	if staleResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("stale authority status %d, want %d", staleResponse.Code, http.StatusUnauthorized)
+	}
+
+	newRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+	newRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(newRequest, newCreds.BrokerID, newKey)
+	newResponse := httptest.NewRecorder()
+	srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok || authority.brokerID != newCreds.BrokerID || authority.hubEndpoint != newCreds.HubEndpoint {
+			t.Fatalf("new request observed incoherent authority: %#v", authority)
+		}
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(newResponse, newRequest)
+	if newResponse.Code != http.StatusOK {
+		t.Fatalf("new authority status %d, want %d: %s", newResponse.Code, http.StatusOK, newResponse.Body.String())
 	}
 }
 

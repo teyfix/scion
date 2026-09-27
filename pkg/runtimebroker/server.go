@@ -623,6 +623,7 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		Hydrator:        hydrator,
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
+		authorityReady:  true,
 	}
 
 	return conn, nil
@@ -674,6 +675,7 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		Hydrator:        hydrator,
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
+		authorityReady:  true,
 	}
 
 	return conn, nil
@@ -752,16 +754,22 @@ func (s *Server) buildAuthMiddleware() {
 	s.hubMu.RLock()
 	var keys []secretKeyEntry
 	for _, conn := range s.hubConnections {
-		if len(conn.SecretKey) > 0 {
+		conn.mu.RLock()
+		if conn.authorityReady && len(conn.SecretKey) > 0 {
 			keys = append(keys, secretKeyEntry{
-				hubName:   conn.Name,
-				secretKey: conn.SecretKey,
+				hubName:     conn.Name,
+				brokerID:    conn.BrokerID,
+				hubEndpoint: conn.HubEndpoint,
+				generation:  conn.authorityGeneration,
+				secretKey:   append([]byte(nil), conn.SecretKey...),
+				connection:  conn,
 			})
 		}
+		conn.mu.RUnlock()
 	}
 	s.hubMu.RUnlock()
 
-	if !s.config.BrokerAuthEnabled || len(keys) == 0 {
+	if !s.config.BrokerAuthEnabled {
 		s.brokerAuthMiddleware = nil
 		return
 	}
@@ -796,7 +804,10 @@ func (s *Server) authKeyCount() int {
 	defer s.hubMu.RUnlock()
 	count := 0
 	for _, conn := range s.hubConnections {
-		if len(conn.SecretKey) > 0 {
+		conn.mu.RLock()
+		ready := conn.authorityReady && len(conn.SecretKey) > 0
+		conn.mu.RUnlock()
+		if ready {
 			count++
 		}
 	}
@@ -1443,10 +1454,14 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 			}(conn)
 		} else {
 			// Check if credentials changed
-			if existingConn.Credentials == nil ||
-				existingConn.Credentials.BrokerID != c.BrokerID ||
-				existingConn.Credentials.SecretKey != c.SecretKey ||
-				existingConn.Credentials.HubEndpoint != c.HubEndpoint {
+			existingConn.mu.RLock()
+			existingCredentials := existingConn.Credentials
+			credentialsChanged := existingCredentials == nil ||
+				existingCredentials.BrokerID != c.BrokerID ||
+				existingCredentials.SecretKey != c.SecretKey ||
+				existingCredentials.HubEndpoint != c.HubEndpoint
+			existingConn.mu.RUnlock()
+			if credentialsChanged {
 
 				slog.Info("Reinitializing hub connection", "name", name)
 				go func(conn *HubConnection, creds *brokercredentials.BrokerCredentials) {
@@ -1531,6 +1546,26 @@ func (s *Server) isMultiHubMode() bool {
 	return len(s.hubConnections) > 1
 }
 
+// hasRegisteredHubAuthority distinguishes Hub credential-backed ingress from
+// ordinary standalone CLI/Manager use. It remains true while a credential is
+// rebuilding or invalid so a scoped request cannot fall back to local config.
+func (s *Server) hasRegisteredHubAuthority() bool {
+	if !s.config.BrokerAuthEnabled {
+		return false
+	}
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	for _, conn := range s.hubConnections {
+		conn.mu.RLock()
+		registered := conn.Credentials != nil || len(conn.SecretKey) > 0
+		conn.mu.RUnlock()
+		if registered {
+			return true
+		}
+	}
+	return false
+}
+
 // isGlobalProject returns true if this is the global project.
 // A request with a specific (non-empty, non-"global") ProjectID is never the
 // global project, even when projectPath is empty (e.g. git-based projects where the
@@ -1552,6 +1587,9 @@ func (s *Server) resolveHydrator(r *http.Request) *templatecache.Hydrator {
 // resolveHubConnection resolves the hub connection for a request, routing to
 // the correct connection based on the X-Scion-Hub-Connection header.
 func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
+	if authority, ok := authenticatedBrokerAuthority(r); ok {
+		return authority.connection
+	}
 	connName := r.Header.Get("X-Scion-Hub-Connection")
 	if connName != "" {
 		s.hubMu.RLock()
@@ -1578,6 +1616,9 @@ func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
 // use the correct hub endpoint when dispatched by a remote hub, rather than
 // falling back to its own config.HubEndpoint (which may point to a different hub).
 func (s *Server) resolveHubEndpointFromRequest(r *http.Request) string {
+	if authority, ok := authenticatedBrokerAuthority(r); ok {
+		return authority.hubEndpoint
+	}
 	connName := r.Header.Get("X-Scion-Hub-Connection")
 	if connName == "" {
 		return ""

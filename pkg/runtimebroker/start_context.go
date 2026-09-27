@@ -99,6 +99,10 @@ type startContextInputs struct {
 
 	// HTTP request (for hub connection resolution)
 	HTTPRequest *http.Request
+
+	// ScopedBrokerAuthority requires endpoint, broker identity, and per-Hub
+	// resources to come only from the authenticated registered connection.
+	ScopedBrokerAuthority bool
 }
 
 // buildStartContext unifies the common startup logic shared by createAgent,
@@ -301,14 +305,39 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	}
 
 	// Resolve hub connection early — needed for colocated detection and
-	// template hydration below.
+	// template hydration below. Scoped create/recovery requests may only use
+	// the immutable authority installed by broker authentication.
 	var hubConn *HubConnection
+	var authority *brokerRequestAuthority
 	if in.HTTPRequest != nil {
+		authority, _ = authenticatedBrokerAuthority(in.HTTPRequest)
+	}
+	if in.ScopedBrokerAuthority {
+		if authority == nil || authority.connection == nil || authority.hubEndpoint == "" || authority.brokerID == "" {
+			return nil, &startContextError{
+				Status:  http.StatusUnauthorized,
+				Message: "scoped request has no authenticated registered Hub connection",
+			}
+		}
+		hubConn = authority.connection
+	} else if in.HTTPRequest != nil {
 		hubConn = s.resolveHubConnection(in.HTTPRequest)
 	}
 
 	var hubEndpoint string
-	if in.HTTPRequest != nil {
+	if in.ScopedBrokerAuthority {
+		// Use only the registered endpoint. Container reachability rewriting is
+		// still applied, but request/config/env/settings cannot replace it.
+		hubEndpoint = resolveHubEndpointForCreate(
+			authority.hubEndpoint,
+			authority.hubEndpoint,
+			"",
+			nil,
+			"",
+			s.config.ContainerHubEndpoint,
+			runtimeName,
+		)
+	} else if in.HTTPRequest != nil {
 		// Full create path: request-level, connection-level, and broker-level fallbacks
 		hubEndpoint = resolveHubEndpointForCreate(
 			in.HubEndpoint,
@@ -405,8 +434,12 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		env["SCION_BROKER_NAME"] = s.config.BrokerName
 		classifyBrokerEnv("SCION_BROKER_NAME", api.EnvKindPlain)
 	}
-	if s.config.BrokerID != "" {
-		env["SCION_BROKER_ID"] = s.config.BrokerID
+	brokerID := s.config.BrokerID
+	if in.ScopedBrokerAuthority {
+		brokerID = authority.brokerID
+	}
+	if brokerID != "" {
+		env["SCION_BROKER_ID"] = brokerID
 		classifyBrokerEnv("SCION_BROKER_ID", api.EnvKindPlain)
 	}
 	if in.CreatorName != "" {
