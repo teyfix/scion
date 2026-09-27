@@ -1444,12 +1444,7 @@ func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.
 	// while still holding hubMu.
 	leaseDeadline := time.NewTimer(2 * time.Second)
 	leasePoll := time.NewTicker(time.Millisecond)
-	leaseObserved := false
-	for !leaseObserved {
-		if !conn.mu.TryLock() {
-			leaseObserved = true
-			break
-		}
+	for conn.mu.TryLock() {
 		conn.mu.Unlock()
 		select {
 		case <-leaseDeadline.C:
