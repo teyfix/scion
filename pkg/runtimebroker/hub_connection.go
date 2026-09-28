@@ -199,6 +199,14 @@ func (hc *HubConnection) Start(ctx context.Context, server *Server) error {
 			}
 
 			cc := NewControlChannelClient(ccConfig, server.Handler(), server, name, logging.Subsystem("broker.control-channel"))
+			// Publish cancellation before exposing the client through the
+			// connection. Stop may run as soon as Start returns, including when
+			// credential removal follows a completed Reinitialize. Initializing
+			// the client context in the goroutine would let that Stop miss the
+			// cancellation and wait indefinitely for a newly started connector.
+			cc.mu.Lock()
+			cc.ctx, cc.cancel = context.WithCancel(ctx)
+			cc.mu.Unlock()
 			hc.mu.Lock()
 			hc.ControlChannel = cc
 			hc.mu.Unlock()
@@ -207,7 +215,7 @@ func (hc *HubConnection) Start(ctx context.Context, server *Server) error {
 			hc.ccWg.Add(1)
 			go func() {
 				defer hc.ccWg.Done()
-				if err := cc.Connect(ctx); err != nil {
+				if err := cc.connectWithBackoff(); err != nil {
 					if ctx.Err() != nil {
 						slog.Info("Control channel stopped", "name", name)
 					} else {
@@ -265,6 +273,9 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	}
 	if !server.hasPublishedHubConnection(hc) {
 		return fmt.Errorf("hub connection %q is no longer registered", hc.Name)
+	}
+	if server.hubConnectionLifecycleHook != nil {
+		server.hubConnectionLifecycleHook("reinitialize-active")
 	}
 
 	// Close admission immediately. Existing admitted requests retain the read

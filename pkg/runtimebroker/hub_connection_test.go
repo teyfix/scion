@@ -1545,8 +1545,8 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 		AuthMode:    brokercredentials.AuthModeHMAC,
 	}
 
+	removalLocked := make(chan struct{})
 	reinitializeWaiting := make(chan struct{})
-	connectionDetached := make(chan struct{})
 	allowRemoval := make(chan struct{})
 	defer func() {
 		select {
@@ -1557,11 +1557,11 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 	}()
 	srv.hubConnectionLifecycleHook = func(stage string) {
 		switch stage {
+		case "removal-locked":
+			close(removalLocked)
+			<-allowRemoval
 		case "reinitialize-waiting":
 			close(reinitializeWaiting)
-		case "connections-detached":
-			close(connectionDetached)
-			<-allowRemoval
 		}
 	}
 
@@ -1576,50 +1576,21 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn.reinitializeMu.Lock()
-	lifecycleHeld := true
-	defer func() {
-		if lifecycleHeld {
-			conn.reinitializeMu.Unlock()
-		}
-	}()
-	reinitializeDone := make(chan error, 1)
-	go func() {
-		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
-	}()
-	waitFor(reinitializeWaiting, "Reinitialize to queue on lifecycle serialization")
-
 	reloadDone := make(chan error, 1)
 	go func() {
 		reloadDone <- srv.checkAndReloadCredentials(ctx)
 	}()
-	waitFor(connectionDetached, "credential removal to detach the connection")
+	waitFor(removalLocked, "credential removal to acquire lifecycle serialization")
 
-	// Reinitialize was queued first, but removal has already made its exact
-	// connection object unreachable. Once released, it must refuse to publish
-	// replacement capabilities or restart outbound services.
-	conn.reinitializeMu.Unlock()
-	lifecycleHeld = false
-	select {
-	case err := <-reinitializeDone:
-		if err == nil {
-			t.Fatal("queued Reinitialize succeeded after exact connection removal")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued Reinitialize did not return after connection removal")
-	}
-	conn.mu.RLock()
-	heartbeat := conn.Heartbeat
-	controlChannel := conn.ControlChannel
-	gotSecret := append([]byte(nil), conn.SecretKey...)
-	conn.mu.RUnlock()
-	if heartbeat != nil || controlChannel != nil {
-		t.Fatalf("detached connection restarted services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
-	}
-	if !bytes.Equal(gotSecret, oldKey) {
-		t.Fatal("queued Reinitialize published replacement credentials after removal")
-	}
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
+	}()
+	waitFor(reinitializeWaiting, "Reinitialize to queue behind credential removal")
 
+	// Removal owns lifecycle serialization before detaching the exact pointer.
+	// The queued Reinitialize must observe the completed removal and refuse to
+	// publish replacement capabilities or restart outbound services.
 	close(allowRemoval)
 	select {
 	case err := <-reloadDone:
@@ -1627,7 +1598,15 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 			t.Fatalf("credential removal failed: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("credential removal did not finish after queued Reinitialize returned")
+		t.Fatal("credential removal did not finish while owning lifecycle serialization")
+	}
+	select {
+	case err := <-reinitializeDone:
+		if err == nil {
+			t.Fatal("queued Reinitialize succeeded after exact connection removal")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Reinitialize did not return after connection removal")
 	}
 
 	if conn.authorityReady.Load() {
@@ -1637,11 +1616,15 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 		t.Fatalf("removed authority generation %d, want only the removal invalidation", generation)
 	}
 	conn.mu.RLock()
-	heartbeat = conn.Heartbeat
-	controlChannel = conn.ControlChannel
+	heartbeat := conn.Heartbeat
+	controlChannel := conn.ControlChannel
+	gotSecret := append([]byte(nil), conn.SecretKey...)
 	conn.mu.RUnlock()
 	if heartbeat != nil || controlChannel != nil {
 		t.Fatalf("removed connection retained services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+	if !bytes.Equal(gotSecret, oldKey) {
+		t.Fatal("queued Reinitialize published replacement credentials after removal")
 	}
 
 	body, err := json.Marshal(CreateAgentRequest{
@@ -1666,6 +1649,199 @@ func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
 	}
 	if manager.startCalls != 0 {
 		t.Fatalf("removed authority reached manager %d times", manager.startCalls)
+	}
+}
+
+func TestCredentialWatcher_ActiveReinitializeCompletesBeforeRemovalDetaches(t *testing.T) {
+	const (
+		connectionName = "hub-active-reinitialize"
+		brokerID       = "registered-broker"
+		projectID      = "active-reinitialize-project"
+	)
+	oldKey := []byte("active-reinitialize-old-secret")
+	newKey := []byte("active-reinitialize-new-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
+	oldCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn.mu.Lock()
+	conn.Credentials = oldCredentials
+	conn.AuthMode = oldCredentials.AuthMode
+	conn.mu.Unlock()
+	srv.config.HeartbeatEnabled = true
+	srv.config.HeartbeatInterval = time.Hour
+	srv.config.ControlChannelEnabled = true
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+	manager := srv.manager.(*mockManager)
+
+	newCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+
+	reinitializeActive := make(chan struct{})
+	allowReinitialize := make(chan struct{})
+	removalWaiting := make(chan struct{})
+	connectionDetached := make(chan struct{})
+	allowRemoval := make(chan struct{})
+	defer func() {
+		for _, ch := range []chan struct{}{allowReinitialize, allowRemoval} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	}()
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		switch stage {
+		case "reinitialize-active":
+			close(reinitializeActive)
+			<-allowReinitialize
+		case "removal-waiting":
+			close(removalWaiting)
+		case "connections-detached":
+			close(connectionDetached)
+			<-allowRemoval
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
+	}()
+	waitFor(reinitializeActive, "Reinitialize to own lifecycle serialization")
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(ctx)
+	}()
+	waitFor(removalWaiting, "credential removal to reach lifecycle serialization")
+
+	// Removal has snapshotted the candidate but cannot detach it while the
+	// active Reinitialize owns lifecycle serialization.
+	srv.hubMu.RLock()
+	published := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if published != conn {
+		t.Fatal("credential removal detached an active Reinitialize candidate before lifecycle serialization")
+	}
+	select {
+	case <-connectionDetached:
+		t.Fatal("connection detached while Reinitialize still owned lifecycle serialization")
+	default:
+	}
+
+	close(allowReinitialize)
+	waitFor(connectionDetached, "credential removal to detach after Reinitialize")
+	select {
+	case err := <-reinitializeDone:
+		if err != nil {
+			t.Fatalf("active Reinitialize failed before serialized removal: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal detached before active Reinitialize returned")
+	}
+
+	// At detachment, all Reinitialize publication and service-start work has
+	// completed. No writer can run again while removal owns reinitializeMu.
+	if generation := conn.authorityGeneration.Load(); generation != 2 {
+		t.Fatalf("authority generation at detachment %d, want completed Reinitialize generation 2", generation)
+	}
+	conn.mu.RLock()
+	detachedSecret := append([]byte(nil), conn.SecretKey...)
+	heartbeatStarted := conn.Heartbeat != nil
+	controlChannelStarted := conn.ControlChannel != nil
+	conn.mu.RUnlock()
+	if !bytes.Equal(detachedSecret, newKey) {
+		t.Fatal("Reinitialize replacement was not published before serialized detachment")
+	}
+	if !heartbeatStarted || !controlChannelStarted {
+		t.Fatalf("Reinitialize services did not start before detachment: heartbeat=%v controlChannel=%v", heartbeatStarted, controlChannelStarted)
+	}
+
+	close(allowRemoval)
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal did not complete after serialized detachment")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority was restored after detachment")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 3 {
+		t.Fatalf("final authority generation %d, want Reinitialize publication plus one removal invalidation", generation)
+	}
+	conn.mu.RLock()
+	finalSecret := append([]byte(nil), conn.SecretKey...)
+	heartbeat := conn.Heartbeat
+	controlChannel := conn.ControlChannel
+	conn.mu.RUnlock()
+	if !bytes.Equal(finalSecret, detachedSecret) {
+		t.Fatal("connection capabilities changed after detachment")
+	}
+	if heartbeat != nil || controlChannel != nil {
+		t.Fatalf("removed connection revived services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+	srv.hubMu.RLock()
+	_, retained := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if retained {
+		t.Fatal("serialized removal left the connection published")
+	}
+
+	body, err := json.Marshal(CreateAgentRequest{
+		ID:          "after-active-remove-id",
+		Name:        "after-active-remove",
+		ProjectID:   projectID,
+		HubEndpoint: hub.URL,
+		NoAuth:      true,
+		Config:      &CreateAgentConfig{Template: "claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Scion-Hub-Connection", connectionName)
+	signRequest(request, brokerID, newKey)
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("removed replacement authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+	if manager.startCalls != 0 {
+		t.Fatalf("removed replacement authority reached manager %d times", manager.startCalls)
 	}
 }
 

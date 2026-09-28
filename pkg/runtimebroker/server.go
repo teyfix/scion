@@ -1427,14 +1427,18 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		connection  *HubConnection
 		credentials *brokercredentials.BrokerCredentials
 	}
+	type credentialRemoval struct {
+		name       string
+		connection *HubConnection
+	}
 
-	var removed []*HubConnection
+	var removals []credentialRemoval
 	var additions []*brokercredentials.BrokerCredentials
 	var existing []credentialUpdate
 
-	// Only detach connections and snapshot work while holding hubMu. In
-	// particular, never wait for a connection lease here: authenticated
-	// handlers retain that lease and may need hubMu while dispatching.
+	// Only snapshot work while holding hubMu. In particular, never wait for a
+	// connection lifecycle or authority lease here: authenticated handlers
+	// retain the latter and may need hubMu while dispatching.
 	s.hubMu.Lock()
 	if s.hubConnectionLifecycleHook != nil {
 		s.hubConnectionLifecycleHook("hub-locked")
@@ -1445,8 +1449,7 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		}
 		if _, exists := newCreds[name]; !exists {
 			slog.Info("Removing hub connection", "name", name)
-			delete(s.hubConnections, name)
-			removed = append(removed, conn)
+			removals = append(removals, credentialRemoval{name: name, connection: conn})
 		}
 	}
 	for name, credentials := range newCreds {
@@ -1461,27 +1464,49 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		}
 	}
 	s.hubMu.Unlock()
-	if len(removed) > 0 && s.hubConnectionLifecycleHook != nil {
-		s.hubConnectionLifecycleHook("connections-detached")
+	if len(removals) > 0 && s.hubConnectionLifecycleHook != nil {
+		s.hubConnectionLifecycleHook("removal-candidates-snapshotted")
 	}
 
-	// Serialize with Reinitialize, close every removed authority immediately,
-	// and publish the reduced key set before waiting for existing request
-	// leases or stopping outbound services.
-	for _, conn := range removed {
-		conn.reinitializeMu.Lock()
-		conn.authorityReady.Store(false)
-		conn.authorityGeneration.Add(1)
-	}
-	if len(removed) > 0 {
+	// Serialize detachment with Reinitialize. Lifecycle ownership is acquired
+	// outside hubMu, then the exact snapshotted pointer is revalidated and
+	// detached under hubMu. Revocation, lease draining, and service shutdown
+	// all complete before lifecycle ownership is released.
+	for _, removal := range removals {
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-waiting")
+		}
+		removal.connection.reinitializeMu.Lock()
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-locked")
+		}
+
+		detached := false
+		s.hubMu.Lock()
+		if s.hubConnections[removal.name] == removal.connection {
+			delete(s.hubConnections, removal.name)
+			detached = true
+		}
+		s.hubMu.Unlock()
+		if !detached {
+			removal.connection.reinitializeMu.Unlock()
+			continue
+		}
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("connections-detached")
+		}
+
+		removal.connection.authorityReady.Store(false)
+		removal.connection.authorityGeneration.Add(1)
 		s.buildAuthMiddleware()
 		if s.hubConnectionLifecycleHook != nil {
 			s.hubConnectionLifecycleHook("authority-revoked")
 		}
-	}
-	for _, conn := range removed {
-		conn.Stop()
-		conn.reinitializeMu.Unlock()
+		removal.connection.Stop()
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-complete")
+		}
+		removal.connection.reinitializeMu.Unlock()
 	}
 
 	for _, credentials := range additions {
