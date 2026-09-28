@@ -15,6 +15,7 @@
 package runtimebroker
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1378,7 +1379,7 @@ func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.
 			close(allowHubUnlock)
 		}
 	}()
-	srv.credentialReloadHook = func(stage string) {
+	srv.hubConnectionLifecycleHook = func(stage string) {
 		switch stage {
 		case "hub-locked":
 			close(hubLocked)
@@ -1500,6 +1501,171 @@ func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.
 	srv.hubMu.RUnlock()
 	if retained {
 		t.Fatal("removed connection remained published")
+	}
+}
+
+func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
+	const (
+		connectionName = "hub-remove-wins"
+		brokerID       = "registered-broker"
+		projectID      = "remove-wins-project"
+	)
+	oldKey := []byte("remove-wins-old-secret")
+	newKey := []byte("remove-wins-new-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
+	oldCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn.mu.Lock()
+	conn.Credentials = oldCredentials
+	conn.AuthMode = oldCredentials.AuthMode
+	conn.mu.Unlock()
+	srv.config.HeartbeatEnabled = true
+	srv.config.HeartbeatInterval = time.Hour
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+	manager := srv.manager.(*mockManager)
+
+	newCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+
+	reinitializeWaiting := make(chan struct{})
+	connectionDetached := make(chan struct{})
+	allowRemoval := make(chan struct{})
+	defer func() {
+		select {
+		case <-allowRemoval:
+		default:
+			close(allowRemoval)
+		}
+	}()
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		switch stage {
+		case "reinitialize-waiting":
+			close(reinitializeWaiting)
+		case "connections-detached":
+			close(connectionDetached)
+			<-allowRemoval
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn.reinitializeMu.Lock()
+	lifecycleHeld := true
+	defer func() {
+		if lifecycleHeld {
+			conn.reinitializeMu.Unlock()
+		}
+	}()
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
+	}()
+	waitFor(reinitializeWaiting, "Reinitialize to queue on lifecycle serialization")
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(ctx)
+	}()
+	waitFor(connectionDetached, "credential removal to detach the connection")
+
+	// Reinitialize was queued first, but removal has already made its exact
+	// connection object unreachable. Once released, it must refuse to publish
+	// replacement capabilities or restart outbound services.
+	conn.reinitializeMu.Unlock()
+	lifecycleHeld = false
+	select {
+	case err := <-reinitializeDone:
+		if err == nil {
+			t.Fatal("queued Reinitialize succeeded after exact connection removal")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Reinitialize did not return after connection removal")
+	}
+	conn.mu.RLock()
+	heartbeat := conn.Heartbeat
+	controlChannel := conn.ControlChannel
+	gotSecret := append([]byte(nil), conn.SecretKey...)
+	conn.mu.RUnlock()
+	if heartbeat != nil || controlChannel != nil {
+		t.Fatalf("detached connection restarted services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+	if !bytes.Equal(gotSecret, oldKey) {
+		t.Fatal("queued Reinitialize published replacement credentials after removal")
+	}
+
+	close(allowRemoval)
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal did not finish after queued Reinitialize returned")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority was revived")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 1 {
+		t.Fatalf("removed authority generation %d, want only the removal invalidation", generation)
+	}
+	conn.mu.RLock()
+	heartbeat = conn.Heartbeat
+	controlChannel = conn.ControlChannel
+	conn.mu.RUnlock()
+	if heartbeat != nil || controlChannel != nil {
+		t.Fatalf("removed connection retained services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+
+	body, err := json.Marshal(CreateAgentRequest{
+		ID:          "after-remove-wins-id",
+		Name:        "after-remove-wins",
+		ProjectID:   projectID,
+		HubEndpoint: hub.URL,
+		NoAuth:      true,
+		Config:      &CreateAgentConfig{Template: "claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Scion-Hub-Connection", connectionName)
+	signRequest(request, brokerID, oldKey)
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("removed authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+	if manager.startCalls != 0 {
+		t.Fatalf("removed authority reached manager %d times", manager.startCalls)
 	}
 }
 

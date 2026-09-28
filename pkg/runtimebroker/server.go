@@ -229,9 +229,9 @@ type Server struct {
 	credLastScan    time.Time
 	credWatcherStop chan struct{}
 
-	// credentialReloadHook is a test-only synchronization point for credential
-	// removal. Production servers leave it nil.
-	credentialReloadHook func(stage string)
+	// hubConnectionLifecycleHook is a test-only synchronization point for Hub
+	// connection credential transitions. Production servers leave it nil.
+	hubConnectionLifecycleHook func(stage string)
 
 	// dispatchAttempts tracks request-id based create-attempt state for
 	// idempotency and auditability.
@@ -1436,8 +1436,8 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 	// particular, never wait for a connection lease here: authenticated
 	// handlers retain that lease and may need hubMu while dispatching.
 	s.hubMu.Lock()
-	if s.credentialReloadHook != nil {
-		s.credentialReloadHook("hub-locked")
+	if s.hubConnectionLifecycleHook != nil {
+		s.hubConnectionLifecycleHook("hub-locked")
 	}
 	for name, conn := range s.hubConnections {
 		if name == "local" && s.config.InMemoryCredentials != nil {
@@ -1461,6 +1461,9 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		}
 	}
 	s.hubMu.Unlock()
+	if len(removed) > 0 && s.hubConnectionLifecycleHook != nil {
+		s.hubConnectionLifecycleHook("connections-detached")
+	}
 
 	// Serialize with Reinitialize, close every removed authority immediately,
 	// and publish the reduced key set before waiting for existing request
@@ -1472,8 +1475,8 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 	}
 	if len(removed) > 0 {
 		s.buildAuthMiddleware()
-		if s.credentialReloadHook != nil {
-			s.credentialReloadHook("authority-revoked")
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("authority-revoked")
 		}
 	}
 	for _, conn := range removed {
@@ -1530,6 +1533,20 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 	s.buildAuthMiddleware()
 
 	return nil
+}
+
+// hasPublishedHubConnection reports whether the exact connection object is
+// still registered. Pointer identity makes credential removal terminal even
+// when an older asynchronous Reinitialize call was already queued.
+func (s *Server) hasPublishedHubConnection(connection *HubConnection) bool {
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	for _, published := range s.hubConnections {
+		if published == connection {
+			return true
+		}
+	}
+	return false
 }
 
 // buildProjectFilterForHub builds a project filter function for a specific hub endpoint.

@@ -255,8 +255,17 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	if creds == nil {
 		return fmt.Errorf("credentials are required")
 	}
+	if server.hubConnectionLifecycleHook != nil {
+		server.hubConnectionLifecycleHook("reinitialize-waiting")
+	}
 	hc.reinitializeMu.Lock()
 	defer hc.reinitializeMu.Unlock()
+	if server.hubConnectionLifecycleHook != nil {
+		server.hubConnectionLifecycleHook("reinitialize-locked")
+	}
+	if !server.hasPublishedHubConnection(hc) {
+		return fmt.Errorf("hub connection %q is no longer registered", hc.Name)
+	}
 
 	// Close admission immediately. Existing admitted requests retain the read
 	// lease until their handler returns; Stop waits for them before the
