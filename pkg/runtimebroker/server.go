@@ -222,7 +222,9 @@ type Server struct {
 	ghResolutionCache *agent.GitHubResolutionCache
 
 	// Multi-key auth middleware
-	brokerAuthMiddleware *MultiKeyBrokerAuthMiddleware
+	brokerAuthMiddleware          *MultiKeyBrokerAuthMiddleware
+	authMiddlewarePublicationMu   sync.Mutex
+	authMiddlewarePublicationHook func(stage string, keys []secretKeyEntry)
 
 	// Credential watching (watches MultiStore directory)
 	multiCredStore  *brokercredentials.MultiStore
@@ -755,6 +757,15 @@ func (s *Server) tryLegacyCredentials() {
 // buildAuthMiddleware creates or rebuilds the multi-key auth middleware
 // from all hub connections' secret keys.
 func (s *Server) buildAuthMiddleware() {
+	s.authMiddlewarePublicationMu.Lock()
+	defer s.authMiddlewarePublicationMu.Unlock()
+	s.buildAuthMiddlewareLocked()
+}
+
+// buildAuthMiddlewareLocked snapshots and publishes one complete authority
+// view. Callers must hold authMiddlewarePublicationMu so an older snapshot
+// cannot overwrite keys published for a later authority transition.
+func (s *Server) buildAuthMiddlewareLocked() {
 	s.hubMu.RLock()
 	var keys []secretKeyEntry
 	for _, conn := range s.hubConnections {
@@ -772,6 +783,9 @@ func (s *Server) buildAuthMiddleware() {
 		conn.mu.RUnlock()
 	}
 	s.hubMu.RUnlock()
+	if s.authMiddlewarePublicationHook != nil {
+		s.authMiddlewarePublicationHook("snapshot", keys)
+	}
 
 	if !s.config.BrokerAuthEnabled {
 		s.brokerAuthMiddleware = nil
@@ -1482,6 +1496,7 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		}
 
 		detached := false
+		s.authMiddlewarePublicationMu.Lock()
 		s.hubMu.Lock()
 		if s.hubConnections[removal.name] == removal.connection {
 			delete(s.hubConnections, removal.name)
@@ -1494,6 +1509,7 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		}
 		s.hubMu.Unlock()
 		if !detached {
+			s.authMiddlewarePublicationMu.Unlock()
 			removal.connection.reinitializeMu.Unlock()
 			continue
 		}
@@ -1501,7 +1517,8 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 			s.hubConnectionLifecycleHook("connections-detached")
 		}
 
-		s.buildAuthMiddleware()
+		s.buildAuthMiddlewareLocked()
+		s.authMiddlewarePublicationMu.Unlock()
 		if s.hubConnectionLifecycleHook != nil {
 			s.hubConnectionLifecycleHook("authority-revoked")
 		}

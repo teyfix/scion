@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,6 +443,152 @@ func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
 	})).ServeHTTP(newResponse, newRequest)
 	if newResponse.Code != http.StatusOK {
 		t.Fatalf("new authority status %d, want %d: %s", newResponse.Code, http.StatusOK, newResponse.Body.String())
+	}
+}
+
+func TestBuildAuthMiddlewareSerializesSnapshotWithAuthorityTransition(t *testing.T) {
+	const (
+		connectionA = "hub-a"
+		connectionB = "hub-b"
+		brokerA     = "broker-a"
+		oldBrokerB  = "broker-b-old"
+		newBrokerB  = "broker-b-new"
+	)
+	keyA := []byte("connection-a-current-secret")
+	oldKeyB := []byte("connection-b-stale-secret")
+	newKeyB := []byte("connection-b-current-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	connA := configureAuthenticatedHubFixture(t, srv, connectionA, hub.URL, brokerA, keyA)
+	connB := configureAuthenticatedHubFixture(t, srv, connectionB, hub.URL, oldBrokerB, oldKeyB)
+	oldCredsB := &brokercredentials.BrokerCredentials{
+		Name:        connectionB,
+		BrokerID:    oldBrokerB,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKeyB),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	connB.mu.Lock()
+	connB.Credentials = oldCredsB
+	connB.AuthMode = oldCredsB.AuthMode
+	connB.mu.Unlock()
+
+	snapshotBuilt := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseSnapshot:
+		default:
+			close(releaseSnapshot)
+		}
+	}()
+	var paused atomic.Bool
+	srv.authMiddlewarePublicationHook = func(stage string, keys []secretKeyEntry) {
+		if stage != "snapshot" || !paused.CompareAndSwap(false, true) {
+			return
+		}
+		foundOldB := false
+		for _, key := range keys {
+			if key.hubName == connectionB && bytes.Equal(key.secretKey, oldKeyB) {
+				foundOldB = true
+				break
+			}
+		}
+		if !foundOldB {
+			t.Error("paused auth snapshot did not contain the stale connection-B key")
+		}
+		close(snapshotBuilt)
+		<-releaseSnapshot
+	}
+
+	firstBuildDone := make(chan struct{})
+	go func() {
+		srv.buildAuthMiddleware()
+		close(firstBuildDone)
+	}()
+	select {
+	case <-snapshotBuilt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first auth snapshot")
+	}
+	if srv.authMiddlewarePublicationMu.TryLock() {
+		srv.authMiddlewarePublicationMu.Unlock()
+		t.Fatal("auth snapshot was not serialized through UpdateKeys publication")
+	}
+
+	newCredsB := &brokercredentials.BrokerCredentials{
+		Name:        connectionB,
+		BrokerID:    newBrokerB,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKeyB),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	reinitializeActive := make(chan struct{})
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		if stage == "reinitialize-active" {
+			close(reinitializeActive)
+		}
+	}
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- connB.Reinitialize(context.Background(), srv, newCredsB)
+	}()
+	select {
+	case <-reinitializeActive:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for connection B to begin Reinitialize")
+	}
+
+	// The complete older snapshot remains serialized with its publication, so
+	// connection B cannot change authority generation until that publication
+	// finishes. This ties snapshot order to authority-transition order.
+	if !connB.authorityReady.Load() || connB.authorityGeneration.Load() != 0 {
+		t.Fatal("connection B authority changed while an older auth snapshot was unpublished")
+	}
+	close(releaseSnapshot)
+	select {
+	case <-firstBuildDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first auth publication did not finish")
+	}
+	select {
+	case err := <-reinitializeDone:
+		if err != nil {
+			t.Fatalf("Reinitialize connection B: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection B Reinitialize did not finish")
+	}
+
+	authenticate := func(name, brokerID string, key []byte) int {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+		request.Header.Set("X-Scion-Hub-Connection", name)
+		signRequest(request, brokerID, key)
+		response := httptest.NewRecorder()
+		srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})).ServeHTTP(response, request)
+		return response.Code
+	}
+	if status := authenticate(connectionA, brokerA, keyA); status != http.StatusNoContent {
+		t.Fatalf("surviving connection A status %d, want %d", status, http.StatusNoContent)
+	}
+	if status := authenticate(connectionB, newBrokerB, newKeyB); status != http.StatusNoContent {
+		t.Fatalf("current connection B status %d, want %d", status, http.StatusNoContent)
+	}
+	if status := authenticate(connectionB, oldBrokerB, oldKeyB); status != http.StatusUnauthorized {
+		t.Fatalf("stale connection B status %d, want %d", status, http.StatusUnauthorized)
+	}
+
+	if !connA.authorityReady.Load() {
+		t.Fatal("serializing connection B authority disturbed connection A")
 	}
 }
 

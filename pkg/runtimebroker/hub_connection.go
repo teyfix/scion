@@ -281,9 +281,11 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	// Close admission immediately. Existing admitted requests retain the read
 	// lease until their handler returns; Stop waits for them before the
 	// connection can be rebound.
+	server.authMiddlewarePublicationMu.Lock()
 	hc.authorityReady.Store(false)
 	hc.authorityGeneration.Add(1)
-	server.buildAuthMiddleware()
+	server.buildAuthMiddlewareLocked()
+	server.authMiddlewarePublicationMu.Unlock()
 
 	capabilities, err := prepareHubConnectionCapabilities(server, creds)
 	if err != nil {
@@ -308,6 +310,7 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	// capability has been constructed successfully.
 	hc.Stop()
 
+	server.authMiddlewarePublicationMu.Lock()
 	hc.mu.Lock()
 	hc.Credentials = capabilities.credentials
 	hc.BrokerID = capabilities.credentials.BrokerID
@@ -322,7 +325,8 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	hc.authorityGeneration.Add(1)
 	hc.authorityReady.Store(true)
 	hc.mu.Unlock()
-	server.buildAuthMiddleware()
+	server.buildAuthMiddlewareLocked()
+	server.authMiddlewarePublicationMu.Unlock()
 
 	slog.Info("Hub connection reinitialized", "name", hc.Name, "brokerID", creds.BrokerID)
 
