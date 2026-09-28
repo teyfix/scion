@@ -1485,6 +1485,11 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		s.hubMu.Lock()
 		if s.hubConnections[removal.name] == removal.connection {
 			delete(s.hubConnections, removal.name)
+			// Revoke the stale middleware entry as part of detachment. These
+			// atomics do not wait for authority leases, so the hub map lock is
+			// still held only for the exact-pointer state transition.
+			removal.connection.authorityReady.Store(false)
+			removal.connection.authorityGeneration.Add(1)
 			detached = true
 		}
 		s.hubMu.Unlock()
@@ -1496,8 +1501,6 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 			s.hubConnectionLifecycleHook("connections-detached")
 		}
 
-		removal.connection.authorityReady.Store(false)
-		removal.connection.authorityGeneration.Add(1)
 		s.buildAuthMiddleware()
 		if s.hubConnectionLifecycleHook != nil {
 			s.hubConnectionLifecycleHook("authority-revoked")

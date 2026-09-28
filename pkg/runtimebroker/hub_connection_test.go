@@ -1770,9 +1770,13 @@ func TestCredentialWatcher_ActiveReinitializeCompletesBeforeRemovalDetaches(t *t
 	}
 
 	// At detachment, all Reinitialize publication and service-start work has
-	// completed. No writer can run again while removal owns reinitializeMu.
-	if generation := conn.authorityGeneration.Load(); generation != 2 {
-		t.Fatalf("authority generation at detachment %d, want completed Reinitialize generation 2", generation)
+	// completed and removal has atomically revoked the published authority. No
+	// writer can run again while removal owns reinitializeMu.
+	if conn.authorityReady.Load() {
+		t.Fatal("connection authority remained ready after serialized detachment")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 3 {
+		t.Fatalf("authority generation at detachment %d, want Reinitialize publication plus removal invalidation", generation)
 	}
 	conn.mu.RLock()
 	detachedSecret := append([]byte(nil), conn.SecretKey...)
