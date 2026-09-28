@@ -221,9 +221,12 @@ type Server struct {
 	// Caches GitHub API resolution results to avoid redundant API calls.
 	ghResolutionCache *agent.GitHubResolutionCache
 
-	// Multi-key auth middleware
-	brokerAuthMiddleware          *MultiKeyBrokerAuthMiddleware
-	authMiddlewarePublicationMu   sync.Mutex
+	// Multi-key auth middleware. authMiddlewarePublicationMu orders every
+	// published authority transition with its complete key snapshot and
+	// UpdateKeys call, preventing an older snapshot from winning afterward.
+	brokerAuthMiddleware        *MultiKeyBrokerAuthMiddleware
+	authMiddlewarePublicationMu sync.Mutex
+	// authMiddlewarePublicationHook is a test-only synchronization point.
 	authMiddlewarePublicationHook func(stage string, keys []secretKeyEntry)
 
 	// Credential watching (watches MultiStore directory)

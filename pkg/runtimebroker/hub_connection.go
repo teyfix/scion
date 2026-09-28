@@ -280,7 +280,8 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 
 	// Close admission immediately. Existing admitted requests retain the read
 	// lease until their handler returns; Stop waits for them before the
-	// connection can be rebound.
+	// connection can be rebound. Keep the authority transition and its complete
+	// key publication in the same server-level ordering domain.
 	server.authMiddlewarePublicationMu.Lock()
 	hc.authorityReady.Store(false)
 	hc.authorityGeneration.Add(1)
@@ -310,6 +311,8 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	// capability has been constructed successfully.
 	hc.Stop()
 
+	// Publish the replacement tuple under the same ordering lock. Otherwise an
+	// older snapshot from another connection could overwrite this final state.
 	server.authMiddlewarePublicationMu.Lock()
 	hc.mu.Lock()
 	hc.Credentials = capabilities.credentials

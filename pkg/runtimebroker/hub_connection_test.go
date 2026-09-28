@@ -446,7 +446,7 @@ func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
 	}
 }
 
-func TestBuildAuthMiddlewareSerializesSnapshotWithAuthorityTransition(t *testing.T) {
+func TestAuthMiddlewarePublicationOrdersTwoConnectionReinitialize(t *testing.T) {
 	const (
 		connectionA = "hub-a"
 		connectionB = "hub-b"
@@ -550,6 +550,11 @@ func TestBuildAuthMiddlewareSerializesSnapshotWithAuthorityTransition(t *testing
 	// finishes. This ties snapshot order to authority-transition order.
 	if !connB.authorityReady.Load() || connB.authorityGeneration.Load() != 0 {
 		t.Fatal("connection B authority changed while an older auth snapshot was unpublished")
+	}
+	select {
+	case err := <-reinitializeDone:
+		t.Fatalf("connection B Reinitialize completed ahead of the older auth publication: %v", err)
+	default:
 	}
 	close(releaseSnapshot)
 	select {
