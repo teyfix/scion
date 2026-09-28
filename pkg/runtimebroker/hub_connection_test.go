@@ -15,6 +15,7 @@
 package runtimebroker
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -179,8 +181,8 @@ func TestMultiKeyBrokerAuth_MatchesAnyKey(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret1},
-		{hubName: "hub-2", secretKey: secret2},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret1},
+		{hubName: "hub-2", brokerID: "broker-1", secretKey: secret2},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +241,7 @@ func TestMultiKeyBrokerAuth_AllowUnauthenticated(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, true)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +264,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: oldSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: oldSecret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +282,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	// Update keys to new secret only
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: newSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: newSecret},
 	})
 
 	// Request with old key should now fail
@@ -306,7 +308,7 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -330,6 +332,268 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("Expected 401 for expired timestamp, got %d", rr.Code)
+	}
+}
+
+func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
+	oldKey := []byte("old-connection-secret")
+	newKey := []byte("new-connection-secret")
+	oldCreds := &brokercredentials.BrokerCredentials{
+		Name:        "hub-a",
+		BrokerID:    "broker-a",
+		HubEndpoint: "https://hub-a.example",
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	newCreds := &brokercredentials.BrokerCredentials{
+		Name:        "hub-a",
+		BrokerID:    "broker-b",
+		HubEndpoint: "https://hub-b.example",
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn := &HubConnection{
+		Name:        oldCreds.Name,
+		HubEndpoint: oldCreds.HubEndpoint,
+		BrokerID:    oldCreds.BrokerID,
+		AuthMode:    oldCreds.AuthMode,
+		Credentials: oldCreds,
+		SecretKey:   oldKey,
+	}
+	conn.authorityReady.Store(true)
+	srv := &Server{
+		config: ServerConfig{
+			BrokerAuthEnabled:    true,
+			BrokerAuthStrictMode: true,
+		},
+		hubConnections: map[string]*HubConnection{"hub-a": conn},
+	}
+	srv.buildAuthMiddleware()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	observed := make(chan brokerRequestAuthority, 1)
+	handler := srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok {
+			t.Error("authenticated request had no bound authority")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		observed <- *authority
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	oldResponse := httptest.NewRecorder()
+	oldRequest := httptest.NewRequest(http.MethodPost, "/api/v1/agents/retained/start", strings.NewReader(`{"runtimeRecovery":{}}`))
+	oldRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(oldRequest, oldCreds.BrokerID, oldKey)
+	requestDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(oldResponse, oldRequest)
+		close(requestDone)
+	}()
+	<-entered
+
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(context.Background(), srv, newCreds)
+	}()
+	select {
+	case err := <-reinitializeDone:
+		t.Fatalf("Reinitialize published while an admitted request held its authority lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-requestDone
+	if oldResponse.Code != http.StatusOK {
+		t.Fatalf("in-flight old authority status %d, want %d", oldResponse.Code, http.StatusOK)
+	}
+	oldAuthority := <-observed
+	if oldAuthority.brokerID != oldCreds.BrokerID || oldAuthority.hubEndpoint != oldCreds.HubEndpoint {
+		t.Fatalf("in-flight authority changed: broker=%q endpoint=%q", oldAuthority.brokerID, oldAuthority.hubEndpoint)
+	}
+	if err := <-reinitializeDone; err != nil {
+		t.Fatalf("Reinitialize: %v", err)
+	}
+
+	// The stale signature/identity cannot cross the publication boundary.
+	staleRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+	staleRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(staleRequest, oldCreds.BrokerID, oldKey)
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, staleRequest)
+	if staleResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("stale authority status %d, want %d", staleResponse.Code, http.StatusUnauthorized)
+	}
+
+	newRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+	newRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(newRequest, newCreds.BrokerID, newKey)
+	newResponse := httptest.NewRecorder()
+	srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok || authority.brokerID != newCreds.BrokerID || authority.hubEndpoint != newCreds.HubEndpoint {
+			t.Fatalf("new request observed incoherent authority: %#v", authority)
+		}
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(newResponse, newRequest)
+	if newResponse.Code != http.StatusOK {
+		t.Fatalf("new authority status %d, want %d: %s", newResponse.Code, http.StatusOK, newResponse.Body.String())
+	}
+}
+
+func TestAuthMiddlewarePublicationOrdersTwoConnectionReinitialize(t *testing.T) {
+	const (
+		connectionA = "hub-a"
+		connectionB = "hub-b"
+		brokerA     = "broker-a"
+		oldBrokerB  = "broker-b-old"
+		newBrokerB  = "broker-b-new"
+	)
+	keyA := []byte("connection-a-current-secret")
+	oldKeyB := []byte("connection-b-stale-secret")
+	newKeyB := []byte("connection-b-current-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	connA := configureAuthenticatedHubFixture(t, srv, connectionA, hub.URL, brokerA, keyA)
+	connB := configureAuthenticatedHubFixture(t, srv, connectionB, hub.URL, oldBrokerB, oldKeyB)
+	oldCredsB := &brokercredentials.BrokerCredentials{
+		Name:        connectionB,
+		BrokerID:    oldBrokerB,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKeyB),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	connB.mu.Lock()
+	connB.Credentials = oldCredsB
+	connB.AuthMode = oldCredsB.AuthMode
+	connB.mu.Unlock()
+
+	snapshotBuilt := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseSnapshot:
+		default:
+			close(releaseSnapshot)
+		}
+	}()
+	var paused atomic.Bool
+	srv.authMiddlewarePublicationHook = func(stage string, keys []secretKeyEntry) {
+		if stage != "snapshot" || !paused.CompareAndSwap(false, true) {
+			return
+		}
+		foundOldB := false
+		for _, key := range keys {
+			if key.hubName == connectionB && bytes.Equal(key.secretKey, oldKeyB) {
+				foundOldB = true
+				break
+			}
+		}
+		if !foundOldB {
+			t.Error("paused auth snapshot did not contain the stale connection-B key")
+		}
+		close(snapshotBuilt)
+		<-releaseSnapshot
+	}
+
+	firstBuildDone := make(chan struct{})
+	go func() {
+		srv.buildAuthMiddleware()
+		close(firstBuildDone)
+	}()
+	select {
+	case <-snapshotBuilt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first auth snapshot")
+	}
+	if srv.authMiddlewarePublicationMu.TryLock() {
+		srv.authMiddlewarePublicationMu.Unlock()
+		t.Fatal("auth snapshot was not serialized through UpdateKeys publication")
+	}
+
+	newCredsB := &brokercredentials.BrokerCredentials{
+		Name:        connectionB,
+		BrokerID:    newBrokerB,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKeyB),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	reinitializeActive := make(chan struct{})
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		if stage == "reinitialize-active" {
+			close(reinitializeActive)
+		}
+	}
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- connB.Reinitialize(context.Background(), srv, newCredsB)
+	}()
+	select {
+	case <-reinitializeActive:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for connection B to begin Reinitialize")
+	}
+
+	// The complete older snapshot remains serialized with its publication, so
+	// connection B cannot change authority generation until that publication
+	// finishes. This ties snapshot order to authority-transition order.
+	if !connB.authorityReady.Load() || connB.authorityGeneration.Load() != 0 {
+		t.Fatal("connection B authority changed while an older auth snapshot was unpublished")
+	}
+	select {
+	case err := <-reinitializeDone:
+		t.Fatalf("connection B Reinitialize completed ahead of the older auth publication: %v", err)
+	default:
+	}
+	close(releaseSnapshot)
+	select {
+	case <-firstBuildDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first auth publication did not finish")
+	}
+	select {
+	case err := <-reinitializeDone:
+		if err != nil {
+			t.Fatalf("Reinitialize connection B: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection B Reinitialize did not finish")
+	}
+
+	authenticate := func(name, brokerID string, key []byte) int {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+		request.Header.Set("X-Scion-Hub-Connection", name)
+		signRequest(request, brokerID, key)
+		response := httptest.NewRecorder()
+		srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})).ServeHTTP(response, request)
+		return response.Code
+	}
+	if status := authenticate(connectionA, brokerA, keyA); status != http.StatusNoContent {
+		t.Fatalf("surviving connection A status %d, want %d", status, http.StatusNoContent)
+	}
+	if status := authenticate(connectionB, newBrokerB, newKeyB); status != http.StatusNoContent {
+		t.Fatalf("current connection B status %d, want %d", status, http.StatusNoContent)
+	}
+	if status := authenticate(connectionB, oldBrokerB, oldKeyB); status != http.StatusUnauthorized {
+		t.Fatalf("stale connection B status %d, want %d", status, http.StatusUnauthorized)
+	}
+
+	if !connA.authorityReady.Load() {
+		t.Fatal("serializing connection B authority disturbed connection A")
 	}
 }
 
@@ -1222,6 +1486,518 @@ func TestCredentialWatcher_RemoveConnection(t *testing.T) {
 
 	if count != 1 {
 		t.Errorf("expected 1 connection after removal, got %d", count)
+	}
+}
+
+func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.T) {
+	const (
+		connectionName = "hub-remove"
+		brokerID       = "registered-broker"
+		hubEndpoint    = "https://hub.remove.example"
+		projectID      = "removal-project"
+	)
+	key := []byte("credential-removal-secret-key")
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hubEndpoint, brokerID, key)
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+
+	managerEntered := make(chan struct{})
+	releaseManager := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseManager:
+		default:
+			close(releaseManager)
+		}
+	}()
+	manager := &admissionBoundaryManager{
+		Manager: srv.manager,
+		beforeStart: func(api.StartOptions) error {
+			close(managerEntered)
+			<-releaseManager
+			return nil
+		},
+	}
+	srv.manager = manager
+
+	hubLocked := make(chan struct{})
+	allowHubUnlock := make(chan struct{})
+	authorityRevoked := make(chan struct{})
+	defer func() {
+		select {
+		case <-allowHubUnlock:
+		default:
+			close(allowHubUnlock)
+		}
+	}()
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		switch stage {
+		case "hub-locked":
+			close(hubLocked)
+			<-allowHubUnlock
+		case "authority-revoked":
+			close(authorityRevoked)
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+	sign := func(req *http.Request, nonce string) {
+		timestamp := fmt.Sprintf("%d", time.Now().Unix())
+		req.Header.Set(apiclient.HeaderBrokerID, brokerID)
+		req.Header.Set(apiclient.HeaderTimestamp, timestamp)
+		req.Header.Set(apiclient.HeaderNonce, nonce)
+		canonical := apiclient.BuildCanonicalString(req, timestamp, nonce)
+		signature := apiclient.ComputeHMAC(key, canonical)
+		req.Header.Set(apiclient.HeaderSignature, base64.StdEncoding.EncodeToString(signature))
+	}
+	newCreateRequest := func(name, nonce string) *http.Request {
+		body, err := json.Marshal(CreateAgentRequest{
+			ID:          name + "-id",
+			Name:        name,
+			ProjectID:   projectID,
+			HubEndpoint: hubEndpoint,
+			NoAuth:      true,
+			Config:      &CreateAgentConfig{Template: "claude"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		// Control-channel dispatch injects this connection selector before the
+		// request enters the same Server.Handler path exercised here.
+		req.Header.Set("X-Scion-Hub-Connection", connectionName)
+		sign(req, nonce)
+		return req
+	}
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(context.Background())
+	}()
+	waitFor(hubLocked, "credential reload to hold hubMu")
+
+	firstResponse := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		srv.Handler().ServeHTTP(firstResponse, newCreateRequest("already-admitted", "before-removal"))
+	}()
+
+	// The request must hold the connection's read lease while waiting for
+	// hubMu. This is the lock ordering that deadlocked when removal called Stop
+	// while still holding hubMu.
+	leaseDeadline := time.NewTimer(2 * time.Second)
+	leasePoll := time.NewTicker(time.Millisecond)
+	for conn.mu.TryLock() {
+		conn.mu.Unlock()
+		select {
+		case <-leaseDeadline.C:
+			t.Fatal("signed CREATE did not acquire the Hub authority lease")
+		case <-leasePoll.C:
+		}
+	}
+	leaseDeadline.Stop()
+	leasePoll.Stop()
+
+	close(allowHubUnlock)
+	waitFor(authorityRevoked, "removed authority to be revoked")
+
+	// A new request signed by the removed key must fail before Manager.Start,
+	// even while removal is waiting for the already-admitted request's lease.
+	secondResponse := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(secondResponse, newCreateRequest("after-revocation", "after-removal"))
+	if secondResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("post-revocation CREATE status %d, want %d: %s", secondResponse.Code, http.StatusUnauthorized, secondResponse.Body.String())
+	}
+	waitFor(managerEntered, "already-admitted CREATE to reach manager")
+	if manager.starts != 1 {
+		t.Fatalf("manager starts %d, want only the already-admitted request", manager.starts)
+	}
+	select {
+	case err := <-reloadDone:
+		t.Fatalf("credential removal returned before the admitted authority lease: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseManager)
+	waitFor(firstDone, "already-admitted CREATE to complete")
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("already-admitted CREATE status %d, want %d: %s", firstResponse.Code, http.StatusCreated, firstResponse.Body.String())
+	}
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal deadlocked after the authority lease was released")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority remained ready")
+	}
+	if conn.authorityGeneration.Load() == 0 {
+		t.Fatal("removed connection authority generation was not invalidated")
+	}
+	srv.hubMu.RLock()
+	_, retained := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if retained {
+		t.Fatal("removed connection remained published")
+	}
+}
+
+func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
+	const (
+		connectionName = "hub-remove-wins"
+		brokerID       = "registered-broker"
+		projectID      = "remove-wins-project"
+	)
+	oldKey := []byte("remove-wins-old-secret")
+	newKey := []byte("remove-wins-new-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
+	oldCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn.mu.Lock()
+	conn.Credentials = oldCredentials
+	conn.AuthMode = oldCredentials.AuthMode
+	conn.mu.Unlock()
+	srv.config.HeartbeatEnabled = true
+	srv.config.HeartbeatInterval = time.Hour
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+	manager := srv.manager.(*mockManager)
+
+	newCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+
+	removalLocked := make(chan struct{})
+	reinitializeWaiting := make(chan struct{})
+	allowRemoval := make(chan struct{})
+	defer func() {
+		select {
+		case <-allowRemoval:
+		default:
+			close(allowRemoval)
+		}
+	}()
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		switch stage {
+		case "removal-locked":
+			close(removalLocked)
+			<-allowRemoval
+		case "reinitialize-waiting":
+			close(reinitializeWaiting)
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(ctx)
+	}()
+	waitFor(removalLocked, "credential removal to acquire lifecycle serialization")
+
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
+	}()
+	waitFor(reinitializeWaiting, "Reinitialize to queue behind credential removal")
+
+	// Removal owns lifecycle serialization before detaching the exact pointer.
+	// The queued Reinitialize must observe the completed removal and refuse to
+	// publish replacement capabilities or restart outbound services.
+	close(allowRemoval)
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal did not finish while owning lifecycle serialization")
+	}
+	select {
+	case err := <-reinitializeDone:
+		if err == nil {
+			t.Fatal("queued Reinitialize succeeded after exact connection removal")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Reinitialize did not return after connection removal")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority was revived")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 1 {
+		t.Fatalf("removed authority generation %d, want only the removal invalidation", generation)
+	}
+	conn.mu.RLock()
+	heartbeat := conn.Heartbeat
+	controlChannel := conn.ControlChannel
+	gotSecret := append([]byte(nil), conn.SecretKey...)
+	conn.mu.RUnlock()
+	if heartbeat != nil || controlChannel != nil {
+		t.Fatalf("removed connection retained services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+	if !bytes.Equal(gotSecret, oldKey) {
+		t.Fatal("queued Reinitialize published replacement credentials after removal")
+	}
+
+	body, err := json.Marshal(CreateAgentRequest{
+		ID:          "after-remove-wins-id",
+		Name:        "after-remove-wins",
+		ProjectID:   projectID,
+		HubEndpoint: hub.URL,
+		NoAuth:      true,
+		Config:      &CreateAgentConfig{Template: "claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Scion-Hub-Connection", connectionName)
+	signRequest(request, brokerID, oldKey)
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("removed authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+	if manager.startCalls != 0 {
+		t.Fatalf("removed authority reached manager %d times", manager.startCalls)
+	}
+}
+
+func TestCredentialWatcher_ActiveReinitializeCompletesBeforeRemovalDetaches(t *testing.T) {
+	const (
+		connectionName = "hub-active-reinitialize"
+		brokerID       = "registered-broker"
+		projectID      = "active-reinitialize-project"
+	)
+	oldKey := []byte("active-reinitialize-old-secret")
+	newKey := []byte("active-reinitialize-new-secret")
+
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer hub.Close()
+
+	srv := newTestServer(t)
+	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
+	oldCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+	conn.mu.Lock()
+	conn.Credentials = oldCredentials
+	conn.AuthMode = oldCredentials.AuthMode
+	conn.mu.Unlock()
+	srv.config.HeartbeatEnabled = true
+	srv.config.HeartbeatInterval = time.Hour
+	srv.config.ControlChannelEnabled = true
+	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+	manager := srv.manager.(*mockManager)
+
+	newCredentials := &brokercredentials.BrokerCredentials{
+		Name:        connectionName,
+		BrokerID:    brokerID,
+		HubEndpoint: hub.URL,
+		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
+		AuthMode:    brokercredentials.AuthModeHMAC,
+	}
+
+	reinitializeActive := make(chan struct{})
+	allowReinitialize := make(chan struct{})
+	removalWaiting := make(chan struct{})
+	connectionDetached := make(chan struct{})
+	allowRemoval := make(chan struct{})
+	defer func() {
+		for _, ch := range []chan struct{}{allowReinitialize, allowRemoval} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	}()
+	srv.hubConnectionLifecycleHook = func(stage string) {
+		switch stage {
+		case "reinitialize-active":
+			close(reinitializeActive)
+			<-allowReinitialize
+		case "removal-waiting":
+			close(removalWaiting)
+		case "connections-detached":
+			close(connectionDetached)
+			<-allowRemoval
+		}
+	}
+
+	waitFor := func(ch <-chan struct{}, event string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", event)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reinitializeDone := make(chan error, 1)
+	go func() {
+		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
+	}()
+	waitFor(reinitializeActive, "Reinitialize to own lifecycle serialization")
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srv.checkAndReloadCredentials(ctx)
+	}()
+	waitFor(removalWaiting, "credential removal to reach lifecycle serialization")
+
+	// Removal has snapshotted the candidate but cannot detach it while the
+	// active Reinitialize owns lifecycle serialization.
+	srv.hubMu.RLock()
+	published := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if published != conn {
+		t.Fatal("credential removal detached an active Reinitialize candidate before lifecycle serialization")
+	}
+	select {
+	case <-connectionDetached:
+		t.Fatal("connection detached while Reinitialize still owned lifecycle serialization")
+	default:
+	}
+
+	close(allowReinitialize)
+	waitFor(connectionDetached, "credential removal to detach after Reinitialize")
+	select {
+	case err := <-reinitializeDone:
+		if err != nil {
+			t.Fatalf("active Reinitialize failed before serialized removal: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal detached before active Reinitialize returned")
+	}
+
+	// At detachment, all Reinitialize publication and service-start work has
+	// completed and removal has atomically revoked the published authority. No
+	// writer can run again while removal owns reinitializeMu.
+	if conn.authorityReady.Load() {
+		t.Fatal("connection authority remained ready after serialized detachment")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 3 {
+		t.Fatalf("authority generation at detachment %d, want Reinitialize publication plus removal invalidation", generation)
+	}
+	conn.mu.RLock()
+	detachedSecret := append([]byte(nil), conn.SecretKey...)
+	heartbeatStarted := conn.Heartbeat != nil
+	controlChannelStarted := conn.ControlChannel != nil
+	conn.mu.RUnlock()
+	if !bytes.Equal(detachedSecret, newKey) {
+		t.Fatal("Reinitialize replacement was not published before serialized detachment")
+	}
+	if !heartbeatStarted || !controlChannelStarted {
+		t.Fatalf("Reinitialize services did not start before detachment: heartbeat=%v controlChannel=%v", heartbeatStarted, controlChannelStarted)
+	}
+
+	close(allowRemoval)
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatalf("credential removal failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("credential removal did not complete after serialized detachment")
+	}
+
+	if conn.authorityReady.Load() {
+		t.Fatal("removed connection authority was restored after detachment")
+	}
+	if generation := conn.authorityGeneration.Load(); generation != 3 {
+		t.Fatalf("final authority generation %d, want Reinitialize publication plus one removal invalidation", generation)
+	}
+	conn.mu.RLock()
+	finalSecret := append([]byte(nil), conn.SecretKey...)
+	heartbeat := conn.Heartbeat
+	controlChannel := conn.ControlChannel
+	conn.mu.RUnlock()
+	if !bytes.Equal(finalSecret, detachedSecret) {
+		t.Fatal("connection capabilities changed after detachment")
+	}
+	if heartbeat != nil || controlChannel != nil {
+		t.Fatalf("removed connection revived services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
+	}
+	srv.hubMu.RLock()
+	_, retained := srv.hubConnections[connectionName]
+	srv.hubMu.RUnlock()
+	if retained {
+		t.Fatal("serialized removal left the connection published")
+	}
+
+	body, err := json.Marshal(CreateAgentRequest{
+		ID:          "after-active-remove-id",
+		Name:        "after-active-remove",
+		ProjectID:   projectID,
+		HubEndpoint: hub.URL,
+		NoAuth:      true,
+		Config:      &CreateAgentConfig{Template: "claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Scion-Hub-Connection", connectionName)
+	signRequest(request, brokerID, newKey)
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("removed replacement authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+	if manager.startCalls != 0 {
+		t.Fatalf("removed replacement authority reached manager %d times", manager.startCalls)
 	}
 }
 

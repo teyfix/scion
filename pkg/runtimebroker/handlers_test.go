@@ -91,6 +91,225 @@ func brokerAdmissionSnapshot(t *testing.T, root string) map[string]string {
 	return files
 }
 
+func configureAuthenticatedHubFixture(t *testing.T, srv *Server, name, endpoint, brokerID string, key []byte) *HubConnection {
+	t.Helper()
+	srv.config.BrokerAuthEnabled = true
+	srv.config.BrokerAuthStrictMode = true
+	conn := &HubConnection{
+		Name:        name,
+		HubEndpoint: endpoint,
+		BrokerID:    brokerID,
+		SecretKey:   append([]byte(nil), key...),
+	}
+	conn.authorityReady.Store(true)
+	srv.hubMu.Lock()
+	srv.hubConnections[name] = conn
+	srv.hubMu.Unlock()
+	srv.buildAuthMiddleware()
+	return conn
+}
+
+func TestAuthenticatedHubAuthorityScopesCreateAndRecovery(t *testing.T) {
+	const (
+		connectionName = "animatrix-hub"
+		hubEndpoint    = "https://hub.animatrix.example"
+		localBrokerID  = "local-config-broker"
+		hubBrokerID    = "registered-hub-broker"
+		projectID      = "animatrix-project"
+		agentID        = "retained-agent-id"
+	)
+	key := []byte("animatrix-per-hub-fixture-secret")
+	validImage := "us-docker.pkg.dev/animatrix/agents/runtime@sha256:" + strings.Repeat("a", 64)
+
+	t.Run("standalone scoped create remains available", func(t *testing.T) {
+		srv := newTestServer(t)
+		body, err := json.Marshal(CreateAgentRequest{
+			Name:      "standalone-agent",
+			ProjectID: projectID,
+			NoAuth:    true,
+			Config:    &CreateAgentConfig{Template: "claude"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body))))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+	})
+
+	newFixture := func(t *testing.T) (*Server, *mockManager, *HubConnection) {
+		t.Helper()
+		srv := newTestServer(t)
+		srv.config.BrokerID = localBrokerID
+		srv.config.HubEndpoint = "https://local-config.example"
+		conn := configureAuthenticatedHubFixture(t, srv, connectionName, hubEndpoint, hubBrokerID, key)
+		return srv, srv.manager.(*mockManager), conn
+	}
+	serveSigned := func(srv *Server, method, target string, body []byte, brokerID, connection string, signingKey []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		if connection != "" {
+			req.Header.Set("X-Scion-Hub-Connection", connection)
+		}
+		signRequest(req, brokerID, signingKey)
+		response := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(response, req)
+		return response
+	}
+	recoveryBody := func(recoveryProjectID, recoveryBrokerID string, admissionVersion int64) []byte {
+		stateVersion := int64(7)
+		body, err := json.Marshal(map[string]any{
+			"runtimeRecovery": &api.RuntimeRecovery{
+				Update: api.RuntimeUpdateRequest{
+					StateVersion: &stateVersion,
+					Template:     "claude",
+					Image:        validImage,
+				},
+				AgentID:          agentID,
+				ProjectID:        recoveryProjectID,
+				RuntimeBrokerID:  recoveryBrokerID,
+				AdmissionVersion: admissionVersion,
+			},
+			"resolvedEnv": map[string]string{
+				"SCION_HUB_ENDPOINT": "https://untrusted-env.example",
+				"SCION_BROKER_ID":    "untrusted-env-broker",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	t.Run("fresh signed create uses registered tuple", func(t *testing.T) {
+		srv, mgr, _ := newFixture(t)
+		body, err := json.Marshal(CreateAgentRequest{
+			Name:        "fresh-agent",
+			ID:          "fresh-agent-id",
+			ProjectID:   projectID,
+			HubEndpoint: hubEndpoint,
+			NoAuth:      true,
+			Config:      &CreateAgentConfig{Template: "claude"},
+			ResolvedEnv: map[string]string{"SCION_BROKER_ID": "untrusted-env-broker"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Direct HTTP dispatch has no connection header; the signing key must
+		// still select the registered per-Hub tuple unambiguously.
+		response := serveSigned(srv, http.MethodPost, "/api/v1/agents", body, hubBrokerID, "", key)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+		if mgr.startCalls != 1 {
+			t.Fatalf("manager starts %d, want 1", mgr.startCalls)
+		}
+		if got := mgr.lastStartOpts.CreateAdmission.RuntimeBrokerID; got != hubBrokerID {
+			t.Fatalf("create admission broker %q, want %q", got, hubBrokerID)
+		}
+		if got := mgr.lastStartOpts.Env["SCION_BROKER_ID"]; got != hubBrokerID {
+			t.Fatalf("SCION_BROKER_ID %q, want %q", got, hubBrokerID)
+		}
+		if got := mgr.lastStartOpts.Env["SCION_HUB_ENDPOINT"]; got != hubEndpoint {
+			t.Fatalf("SCION_HUB_ENDPOINT %q, want %q", got, hubEndpoint)
+		}
+	})
+
+	t.Run("runtime recovery uses registered tuple", func(t *testing.T) {
+		srv, mgr, _ := newFixture(t)
+		response := serveSigned(srv, http.MethodPost, "/api/v1/agents/retained/start?projectId="+projectID, recoveryBody(projectID, hubBrokerID, 8), hubBrokerID, connectionName, key)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status %d, want %d: %s", response.Code, http.StatusAccepted, response.Body.String())
+		}
+		if mgr.startCalls != 1 {
+			t.Fatalf("manager starts %d, want 1", mgr.startCalls)
+		}
+		if mgr.lastStartOpts.RuntimeRecovery == nil || !mgr.lastStartOpts.Resume {
+			t.Fatal("accepted recovery did not preserve explicit recovery/resume intent")
+		}
+		if got := mgr.lastStartOpts.Env["SCION_BROKER_ID"]; got != hubBrokerID {
+			t.Fatalf("SCION_BROKER_ID %q, want %q", got, hubBrokerID)
+		}
+		if got := mgr.lastStartOpts.Env["SCION_HUB_ENDPOINT"]; got != hubEndpoint {
+			t.Fatalf("SCION_HUB_ENDPOINT %q, want %q", got, hubEndpoint)
+		}
+	})
+
+	for _, tc := range []struct {
+		name            string
+		requestBroker   string
+		connection      string
+		recoveryProject string
+		recoveryBroker  string
+		admission       int64
+		mutate          func(*Server, *HubConnection)
+		wantStatus      int
+	}{
+		{name: "wrong connection", requestBroker: hubBrokerID, connection: "other-hub", recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized},
+		{name: "wrong signed broker", requestBroker: localBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized},
+		{name: "wrong project", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: "other-project", recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusBadRequest},
+		{name: "wrong recovery broker", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: localBrokerID, admission: 8, wantStatus: http.StatusBadRequest},
+		{name: "wrong generation", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 9, wantStatus: http.StatusBadRequest},
+		{name: "stale authority", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized, mutate: func(_ *Server, conn *HubConnection) {
+			conn.mu.Lock()
+			conn.authorityGeneration.Add(1)
+			conn.mu.Unlock()
+		}},
+		{name: "rebound authority", requestBroker: hubBrokerID, connection: connectionName, recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized, mutate: func(_ *Server, conn *HubConnection) {
+			conn.mu.Lock()
+			conn.BrokerID = "rebound-broker"
+			conn.mu.Unlock()
+		}},
+		{name: "ambiguous authority", requestBroker: hubBrokerID, connection: "", recoveryProject: projectID, recoveryBroker: hubBrokerID, admission: 8, wantStatus: http.StatusUnauthorized, mutate: func(srv *Server, _ *HubConnection) {
+			configureAuthenticatedHubFixture(t, srv, "duplicate-hub", "https://duplicate.example", hubBrokerID, key)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, mgr, conn := newFixture(t)
+			if tc.mutate != nil {
+				tc.mutate(srv, conn)
+			}
+			response := serveSigned(srv, http.MethodPost, "/api/v1/agents/retained/start?projectId="+projectID, recoveryBody(tc.recoveryProject, tc.recoveryBroker, tc.admission), tc.requestBroker, tc.connection, key)
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status %d, want %d: %s", response.Code, tc.wantStatus, response.Body.String())
+			}
+			if mgr.startCalls != 0 {
+				t.Fatalf("rejected authority reached retained mutation path %d times", mgr.startCalls)
+			}
+		})
+	}
+
+	t.Run("create rejects endpoint mismatch before manager", func(t *testing.T) {
+		srv, mgr, _ := newFixture(t)
+		body, err := json.Marshal(CreateAgentRequest{Name: "fresh-agent", ID: "fresh-agent-id", ProjectID: projectID, HubEndpoint: "https://wrong.example", Config: &CreateAgentConfig{Template: "claude"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := serveSigned(srv, http.MethodPost, "/api/v1/agents", body, hubBrokerID, connectionName, key)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+		}
+		if mgr.startCalls != 0 {
+			t.Fatalf("endpoint mismatch reached manager %d times", mgr.startCalls)
+		}
+	})
+
+	t.Run("recovery rejects missing authority before manager", func(t *testing.T) {
+		srv, mgr, _ := newFixture(t)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/retained/start?projectId="+projectID, strings.NewReader(string(recoveryBody(projectID, hubBrokerID, 8))))
+		response := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(response, req)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+		}
+		if mgr.startCalls != 0 {
+			t.Fatalf("missing authority reached manager %d times", mgr.startCalls)
+		}
+	})
+}
+
 func TestCreateAgentAdmissionPreservesRetainedFiles(t *testing.T) {
 	for _, scenario := range []string{"new-uuid", "explicit-denial", "missing-uuid", "late-conflict", "retained-auth-failure"} {
 		t.Run(scenario, func(t *testing.T) {

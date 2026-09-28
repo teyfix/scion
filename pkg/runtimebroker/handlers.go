@@ -395,6 +395,18 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, "name is required", nil)
 		return
 	}
+	authority, hasAuthority := authenticatedBrokerAuthority(r)
+	scopedHubRequest := req.ProjectID != "" && (hasAuthority || s.hasRegisteredHubAuthority())
+	if scopedHubRequest {
+		if !hasAuthority || authority.connection == nil || authority.brokerID == "" || authority.hubEndpoint == "" {
+			writeError(w, http.StatusUnauthorized, "BROKER_AUTHORITY_REQUIRED", "Scoped create requires an authenticated registered Hub connection", nil)
+			return
+		}
+		if req.HubEndpoint == "" || strings.TrimRight(req.HubEndpoint, "/") != strings.TrimRight(authority.hubEndpoint, "/") {
+			writeError(w, http.StatusUnauthorized, "BROKER_AUTHORITY_MISMATCH", "Create Hub endpoint does not match the authenticated registered connection", nil)
+			return
+		}
+	}
 	unlock, locked := s.lockAgentLifecycle(w, r, req.Name, req.ProjectID)
 	if !locked {
 		return
@@ -505,7 +517,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Env-gather: if GatherEnv is true, evaluate env completeness before building full context.
-	createAdmission := &api.CreateAdmission{AgentID: req.ID, ProjectID: req.ProjectID, RuntimeBrokerID: s.config.BrokerID}
+	admissionBrokerID := s.config.BrokerID
+	if hasAuthority {
+		admissionBrokerID = authority.brokerID
+	}
+	createAdmission := &api.CreateAdmission{AgentID: req.ID, ProjectID: req.ProjectID, RuntimeBrokerID: admissionBrokerID}
 	retainedCreate, admissionErr := agent.ValidateCreateAdmission(api.StartOptions{Name: req.Name, ProjectPath: req.ProjectPath, SharedWorkspace: req.Config != nil && req.Config.SharedWorkspace, InlineConfig: req.InlineConfig, CreateAdmission: createAdmission})
 	if admissionErr != nil {
 		markAttemptFailed(http.StatusConflict, admissionErr.Error())
@@ -700,25 +716,26 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		"agent_id", req.ID, "name", req.Name, "elapsed", time.Since(createStart).String())
 	buildCtxStart := time.Now()
 	sc, err := s.buildStartContext(ctx, startContextInputs{
-		Name:               req.Name,
-		AgentID:            req.ID,
-		Slug:               req.Slug,
-		ProjectPath:        req.ProjectPath,
-		ProjectSlug:        req.ProjectSlug,
-		ProjectID:          req.ProjectID,
-		Config:             req.Config,
-		InlineConfig:       req.InlineConfig,
-		SharedDirs:         req.SharedDirs,
-		HubEndpoint:        req.HubEndpoint,
-		AgentToken:         req.AgentToken,
-		CreatorName:        req.CreatorName,
-		ResolvedEnv:        req.ResolvedEnv,
-		EnvClassifications: req.EnvClassifications,
-		ResolvedSecrets:    req.ResolvedSecrets,
-		NoAuth:             req.NoAuth,
-		Attach:             req.Attach,
-		WorkspaceMode:      req.WorkspaceMode,
-		HTTPRequest:        r,
+		Name:                  req.Name,
+		AgentID:               req.ID,
+		Slug:                  req.Slug,
+		ProjectPath:           req.ProjectPath,
+		ProjectSlug:           req.ProjectSlug,
+		ProjectID:             req.ProjectID,
+		Config:                req.Config,
+		InlineConfig:          req.InlineConfig,
+		SharedDirs:            req.SharedDirs,
+		HubEndpoint:           req.HubEndpoint,
+		AgentToken:            req.AgentToken,
+		CreatorName:           req.CreatorName,
+		ResolvedEnv:           req.ResolvedEnv,
+		EnvClassifications:    req.EnvClassifications,
+		ResolvedSecrets:       req.ResolvedSecrets,
+		NoAuth:                req.NoAuth,
+		Attach:                req.Attach,
+		WorkspaceMode:         req.WorkspaceMode,
+		HTTPRequest:           r,
+		ScopedBrokerAuthority: scopedHubRequest,
 	})
 	if err != nil {
 		markAttemptFailed(http.StatusInternalServerError, err.Error())
@@ -1339,11 +1356,6 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 }
 
 func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
-	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
-	if !locked {
-		return
-	}
-	defer unlock()
 	ctx := r.Context()
 
 	ctx, span := tracer.Start(ctx, "broker.agent.start")
@@ -1406,10 +1418,24 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 			BadRequest(w, err.Error())
 			return
 		}
-		if recovery.ProjectID != projectID || recovery.AgentID == "" || recovery.RuntimeBrokerID != s.config.BrokerID || recovery.AdmissionVersion != *recovery.Update.StateVersion+1 {
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok || authority.connection == nil || authority.brokerID == "" || authority.hubEndpoint == "" {
+			writeError(w, http.StatusUnauthorized, "BROKER_AUTHORITY_REQUIRED", "Runtime recovery requires an authenticated registered Hub connection", nil)
+			return
+		}
+		if recovery.ProjectID != projectID || recovery.AgentID == "" || recovery.RuntimeBrokerID != authority.brokerID || recovery.AdmissionVersion != *recovery.Update.StateVersion+1 {
 			BadRequest(w, "Runtime recovery identity or admission does not match this broker")
 			return
 		}
+	}
+
+	unlock, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlock()
+
+	if recovery := runtimeRecovery; recovery != nil {
 		aliasUnlock, aliasLocked := s.bindLifecycleAlias(w, id, recovery.AgentID, projectID)
 		if !aliasLocked {
 			return
@@ -1447,19 +1473,20 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	startContextAgentToken := startReq.ResolvedEnv["SCION_AUTH_TOKEN"]
 
 	sc, err := s.buildStartContext(ctx, startContextInputs{
-		Name:               id,
-		ProjectPath:        startReq.ProjectPath,
-		ProjectSlug:        startReq.ProjectSlug,
-		Config:             cfg,
-		InlineConfig:       startReq.InlineConfig,
-		ResolvedEnv:        startReq.ResolvedEnv,
-		EnvClassifications: startReq.EnvClassifications,
-		ResolvedSecrets:    startReq.ResolvedSecrets,
-		SharedDirs:         startReq.SharedDirs,
-		AgentToken:         startContextAgentToken,
-		HTTPRequest:        r,
-		ProjectID:          projectID,
-		RuntimeRecovery:    runtimeRecovery,
+		Name:                  id,
+		ProjectPath:           startReq.ProjectPath,
+		ProjectSlug:           startReq.ProjectSlug,
+		Config:                cfg,
+		InlineConfig:          startReq.InlineConfig,
+		ResolvedEnv:           startReq.ResolvedEnv,
+		EnvClassifications:    startReq.EnvClassifications,
+		ResolvedSecrets:       startReq.ResolvedSecrets,
+		SharedDirs:            startReq.SharedDirs,
+		AgentToken:            startContextAgentToken,
+		HTTPRequest:           r,
+		ProjectID:             projectID,
+		RuntimeRecovery:       runtimeRecovery,
+		ScopedBrokerAuthority: runtimeRecovery != nil,
 	})
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())

@@ -221,13 +221,22 @@ type Server struct {
 	// Caches GitHub API resolution results to avoid redundant API calls.
 	ghResolutionCache *agent.GitHubResolutionCache
 
-	// Multi-key auth middleware
-	brokerAuthMiddleware *MultiKeyBrokerAuthMiddleware
+	// Multi-key auth middleware. authMiddlewarePublicationMu orders every
+	// published authority transition with its complete key snapshot and
+	// UpdateKeys call, preventing an older snapshot from winning afterward.
+	brokerAuthMiddleware        *MultiKeyBrokerAuthMiddleware
+	authMiddlewarePublicationMu sync.Mutex
+	// authMiddlewarePublicationHook is a test-only synchronization point.
+	authMiddlewarePublicationHook func(stage string, keys []secretKeyEntry)
 
 	// Credential watching (watches MultiStore directory)
 	multiCredStore  *brokercredentials.MultiStore
 	credLastScan    time.Time
 	credWatcherStop chan struct{}
+
+	// hubConnectionLifecycleHook is a test-only synchronization point for Hub
+	// connection credential transitions. Production servers leave it nil.
+	hubConnectionLifecycleHook func(stage string)
 
 	// dispatchAttempts tracks request-id based create-attempt state for
 	// idempotency and auditability.
@@ -624,6 +633,7 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
 	}
+	conn.authorityReady.Store(true)
 
 	return conn, nil
 }
@@ -675,6 +685,7 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
 	}
+	conn.authorityReady.Store(true)
 
 	return conn, nil
 }
@@ -749,19 +760,37 @@ func (s *Server) tryLegacyCredentials() {
 // buildAuthMiddleware creates or rebuilds the multi-key auth middleware
 // from all hub connections' secret keys.
 func (s *Server) buildAuthMiddleware() {
+	s.authMiddlewarePublicationMu.Lock()
+	defer s.authMiddlewarePublicationMu.Unlock()
+	s.buildAuthMiddlewareLocked()
+}
+
+// buildAuthMiddlewareLocked snapshots and publishes one complete authority
+// view. Callers must hold authMiddlewarePublicationMu so an older snapshot
+// cannot overwrite keys published for a later authority transition.
+func (s *Server) buildAuthMiddlewareLocked() {
 	s.hubMu.RLock()
 	var keys []secretKeyEntry
 	for _, conn := range s.hubConnections {
-		if len(conn.SecretKey) > 0 {
+		conn.mu.RLock()
+		if conn.authorityReady.Load() && len(conn.SecretKey) > 0 {
 			keys = append(keys, secretKeyEntry{
-				hubName:   conn.Name,
-				secretKey: conn.SecretKey,
+				hubName:     conn.Name,
+				brokerID:    conn.BrokerID,
+				hubEndpoint: conn.HubEndpoint,
+				generation:  conn.authorityGeneration.Load(),
+				secretKey:   append([]byte(nil), conn.SecretKey...),
+				connection:  conn,
 			})
 		}
+		conn.mu.RUnlock()
 	}
 	s.hubMu.RUnlock()
+	if s.authMiddlewarePublicationHook != nil {
+		s.authMiddlewarePublicationHook("snapshot", keys)
+	}
 
-	if !s.config.BrokerAuthEnabled || len(keys) == 0 {
+	if !s.config.BrokerAuthEnabled {
 		s.brokerAuthMiddleware = nil
 		return
 	}
@@ -796,7 +825,10 @@ func (s *Server) authKeyCount() int {
 	defer s.hubMu.RUnlock()
 	count := 0
 	for _, conn := range s.hubConnections {
-		if len(conn.SecretKey) > 0 {
+		conn.mu.RLock()
+		ready := conn.authorityReady.Load() && len(conn.SecretKey) > 0
+		conn.mu.RUnlock()
+		if ready {
 			count++
 		}
 	}
@@ -1407,63 +1439,162 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		newCreds[creds[i].Name] = &creds[i]
 	}
 
-	s.hubMu.Lock()
+	type credentialUpdate struct {
+		name        string
+		connection  *HubConnection
+		credentials *brokercredentials.BrokerCredentials
+	}
+	type credentialRemoval struct {
+		name       string
+		connection *HubConnection
+	}
 
-	// Detect removals: connections that exist but are not in newCreds
-	// (skip "local" connection which comes from InMemoryCredentials)
+	var removals []credentialRemoval
+	var additions []*brokercredentials.BrokerCredentials
+	var existing []credentialUpdate
+
+	// Only snapshot work while holding hubMu. In particular, never wait for a
+	// connection lifecycle or authority lease here: authenticated handlers
+	// retain the latter and may need hubMu while dispatching.
+	s.hubMu.Lock()
+	if s.hubConnectionLifecycleHook != nil {
+		s.hubConnectionLifecycleHook("hub-locked")
+	}
 	for name, conn := range s.hubConnections {
 		if name == "local" && s.config.InMemoryCredentials != nil {
 			continue
 		}
 		if _, exists := newCreds[name]; !exists {
 			slog.Info("Removing hub connection", "name", name)
-			conn.Stop()
-			delete(s.hubConnections, name)
+			removals = append(removals, credentialRemoval{name: name, connection: conn})
 		}
 	}
-
-	// Detect additions and modifications
-	for name, c := range newCreds {
-		existingConn, exists := s.hubConnections[name]
-		if !exists {
-			// New connection
-			conn, err := s.createHubConnection(name, c)
-			if err != nil {
-				slog.Warn("Failed to create new hub connection", "name", name, "error", err)
-				continue
-			}
-			s.hubConnections[name] = conn
-			slog.Info("Added new hub connection", "name", name, "brokerID", c.BrokerID)
-
-			// Start services for the new connection
-			go func(conn *HubConnection) {
-				if err := conn.Start(ctx, s); err != nil {
-					slog.Error("Failed to start new hub connection", "name", conn.Name, "error", err)
-				}
-			}(conn)
+	for name, credentials := range newCreds {
+		if conn, ok := s.hubConnections[name]; ok {
+			existing = append(existing, credentialUpdate{
+				name:        name,
+				connection:  conn,
+				credentials: credentials,
+			})
 		} else {
-			// Check if credentials changed
-			if existingConn.Credentials == nil ||
-				existingConn.Credentials.BrokerID != c.BrokerID ||
-				existingConn.Credentials.SecretKey != c.SecretKey ||
-				existingConn.Credentials.HubEndpoint != c.HubEndpoint {
-
-				slog.Info("Reinitializing hub connection", "name", name)
-				go func(conn *HubConnection, creds *brokercredentials.BrokerCredentials) {
-					if err := conn.Reinitialize(ctx, s, creds); err != nil {
-						slog.Error("Failed to reinitialize hub connection", "name", conn.Name, "error", err)
-					}
-				}(existingConn, c)
-			}
+			additions = append(additions, credentials)
 		}
 	}
-
 	s.hubMu.Unlock()
+	if len(removals) > 0 && s.hubConnectionLifecycleHook != nil {
+		s.hubConnectionLifecycleHook("removal-candidates-snapshotted")
+	}
+
+	// Serialize detachment with Reinitialize. Lifecycle ownership is acquired
+	// outside hubMu, then the exact snapshotted pointer is revalidated and
+	// detached under hubMu. Revocation, lease draining, and service shutdown
+	// all complete before lifecycle ownership is released.
+	for _, removal := range removals {
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-waiting")
+		}
+		removal.connection.reinitializeMu.Lock()
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-locked")
+		}
+
+		detached := false
+		s.authMiddlewarePublicationMu.Lock()
+		s.hubMu.Lock()
+		if s.hubConnections[removal.name] == removal.connection {
+			delete(s.hubConnections, removal.name)
+			// Revoke the stale middleware entry as part of detachment. These
+			// atomics do not wait for authority leases, so the hub map lock is
+			// still held only for the exact-pointer state transition.
+			removal.connection.authorityReady.Store(false)
+			removal.connection.authorityGeneration.Add(1)
+			detached = true
+		}
+		s.hubMu.Unlock()
+		if !detached {
+			s.authMiddlewarePublicationMu.Unlock()
+			removal.connection.reinitializeMu.Unlock()
+			continue
+		}
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("connections-detached")
+		}
+
+		s.buildAuthMiddlewareLocked()
+		s.authMiddlewarePublicationMu.Unlock()
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("authority-revoked")
+		}
+		removal.connection.Stop()
+		if s.hubConnectionLifecycleHook != nil {
+			s.hubConnectionLifecycleHook("removal-complete")
+		}
+		removal.connection.reinitializeMu.Unlock()
+	}
+
+	for _, credentials := range additions {
+		conn, err := s.createHubConnection(credentials.Name, credentials)
+		if err != nil {
+			slog.Warn("Failed to create new hub connection", "name", credentials.Name, "error", err)
+			continue
+		}
+
+		s.hubMu.Lock()
+		_, alreadyAdded := s.hubConnections[credentials.Name]
+		if !alreadyAdded {
+			s.hubConnections[credentials.Name] = conn
+		}
+		s.hubMu.Unlock()
+		if alreadyAdded {
+			continue
+		}
+
+		slog.Info("Added new hub connection", "name", credentials.Name, "brokerID", credentials.BrokerID)
+		go func(conn *HubConnection) {
+			if err := conn.Start(ctx, s); err != nil {
+				slog.Error("Failed to start new hub connection", "name", conn.Name, "error", err)
+			}
+		}(conn)
+	}
+
+	for _, update := range existing {
+		update.connection.mu.RLock()
+		existingCredentials := update.connection.Credentials
+		credentialsChanged := existingCredentials == nil ||
+			existingCredentials.BrokerID != update.credentials.BrokerID ||
+			existingCredentials.SecretKey != update.credentials.SecretKey ||
+			existingCredentials.HubEndpoint != update.credentials.HubEndpoint
+		update.connection.mu.RUnlock()
+		if !credentialsChanged {
+			continue
+		}
+
+		slog.Info("Reinitializing hub connection", "name", update.name)
+		go func(conn *HubConnection, credentials *brokercredentials.BrokerCredentials) {
+			if err := conn.Reinitialize(ctx, s, credentials); err != nil {
+				slog.Error("Failed to reinitialize hub connection", "name", conn.Name, "error", err)
+			}
+		}(update.connection, update.credentials)
+	}
 
 	// Rebuild auth middleware with updated keys
 	s.buildAuthMiddleware()
 
 	return nil
+}
+
+// hasPublishedHubConnection reports whether the exact connection object is
+// still registered. Pointer identity makes credential removal terminal even
+// when an older asynchronous Reinitialize call was already queued.
+func (s *Server) hasPublishedHubConnection(connection *HubConnection) bool {
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	for _, published := range s.hubConnections {
+		if published == connection {
+			return true
+		}
+	}
+	return false
 }
 
 // buildProjectFilterForHub builds a project filter function for a specific hub endpoint.
@@ -1531,6 +1662,26 @@ func (s *Server) isMultiHubMode() bool {
 	return len(s.hubConnections) > 1
 }
 
+// hasRegisteredHubAuthority distinguishes Hub credential-backed ingress from
+// ordinary standalone CLI/Manager use. It remains true while a credential is
+// rebuilding or invalid so a scoped request cannot fall back to local config.
+func (s *Server) hasRegisteredHubAuthority() bool {
+	if !s.config.BrokerAuthEnabled {
+		return false
+	}
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	for _, conn := range s.hubConnections {
+		conn.mu.RLock()
+		registered := conn.Credentials != nil || len(conn.SecretKey) > 0
+		conn.mu.RUnlock()
+		if registered {
+			return true
+		}
+	}
+	return false
+}
+
 // isGlobalProject returns true if this is the global project.
 // A request with a specific (non-empty, non-"global") ProjectID is never the
 // global project, even when projectPath is empty (e.g. git-based projects where the
@@ -1552,6 +1703,9 @@ func (s *Server) resolveHydrator(r *http.Request) *templatecache.Hydrator {
 // resolveHubConnection resolves the hub connection for a request, routing to
 // the correct connection based on the X-Scion-Hub-Connection header.
 func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
+	if authority, ok := authenticatedBrokerAuthority(r); ok {
+		return authority.connection
+	}
 	connName := r.Header.Get("X-Scion-Hub-Connection")
 	if connName != "" {
 		s.hubMu.RLock()
@@ -1578,6 +1732,9 @@ func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
 // use the correct hub endpoint when dispatched by a remote hub, rather than
 // falling back to its own config.HubEndpoint (which may point to a different hub).
 func (s *Server) resolveHubEndpointFromRequest(r *http.Request) string {
+	if authority, ok := authenticatedBrokerAuthority(r); ok {
+		return authority.hubEndpoint
+	}
 	connName := r.Header.Get("X-Scion-Hub-Connection")
 	if connName == "" {
 		return ""

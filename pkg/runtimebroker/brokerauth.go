@@ -16,6 +16,8 @@
 package runtimebroker
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -159,8 +161,30 @@ func (m *BrokerAuthMiddleware) SetEnabled(enabled bool) {
 
 // secretKeyEntry associates a secret key with a hub connection name.
 type secretKeyEntry struct {
-	hubName   string
-	secretKey []byte
+	hubName     string
+	brokerID    string
+	hubEndpoint string
+	generation  uint64
+	secretKey   []byte
+	connection  *HubConnection
+}
+
+type brokerRequestAuthority struct {
+	hubName     string
+	brokerID    string
+	hubEndpoint string
+	generation  uint64
+	connection  *HubConnection
+}
+
+type brokerRequestAuthorityKey struct{}
+
+func authenticatedBrokerAuthority(r *http.Request) (*brokerRequestAuthority, bool) {
+	if r == nil {
+		return nil, false
+	}
+	authority, ok := r.Context().Value(brokerRequestAuthorityKey{}).(*brokerRequestAuthority)
+	return authority, ok && authority != nil
 }
 
 // MultiKeyBrokerAuthMiddleware provides HMAC-based authentication that supports
@@ -184,9 +208,14 @@ func NewMultiKeyBrokerAuthMiddleware(enabled bool, maxClockSkew time.Duration, a
 
 // UpdateKeys replaces the set of secret keys used for verification.
 func (m *MultiKeyBrokerAuthMiddleware) UpdateKeys(keys []secretKeyEntry) {
+	cloned := make([]secretKeyEntry, len(keys))
+	for i := range keys {
+		cloned[i] = keys[i]
+		cloned[i].secretKey = append([]byte(nil), keys[i].secretKey...)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.keys = keys
+	m.keys = cloned
 }
 
 // Middleware returns an HTTP middleware handler that validates HMAC signatures
@@ -196,7 +225,7 @@ func (m *MultiKeyBrokerAuthMiddleware) Middleware(next http.Handler) http.Handle
 		m.mu.RLock()
 		enabled := m.enabled
 		allowUnauth := m.allowUnauthenticated
-		keys := m.keys
+		keys := append([]secretKeyEntry(nil), m.keys...)
 		maxSkew := m.maxClockSkew
 		m.mu.RUnlock()
 
@@ -268,16 +297,61 @@ func (m *MultiKeyBrokerAuthMiddleware) Middleware(next http.Handler) http.Handle
 		// Build canonical string
 		canonical := apiclient.BuildCanonicalString(r, timestamp, nonce)
 
-		// Try each key until one matches
+		// Resolve exactly one signing authority. The broker ID is not part of
+		// the canonical signature, so it must agree with the identity bound to
+		// the matching key rather than being trusted as request metadata.
+		var matches []secretKeyEntry
 		for _, entry := range keys {
 			if apiclient.VerifyHMAC(entry.secretKey, canonical, sigBytes) {
-				next.ServeHTTP(w, r)
-				return
+				matches = append(matches, entry)
 			}
 		}
+		if len(matches) == 0 {
+			m.writeError(w, "invalid signature")
+			return
+		}
+		if len(matches) != 1 {
+			m.writeError(w, "ambiguous signing authority")
+			return
+		}
 
-		// No key matched
-		m.writeError(w, "invalid signature")
+		entry := matches[0]
+		if entry.brokerID == "" || brokerID != entry.brokerID {
+			m.writeError(w, "broker identity does not match signing authority")
+			return
+		}
+		if requestedConnection := r.Header.Get("X-Scion-Hub-Connection"); requestedConnection != "" && requestedConnection != entry.hubName {
+			m.writeError(w, "hub connection does not match signing authority")
+			return
+		}
+
+		// Production key entries retain their connection. Keep its read lease
+		// through the downstream handler so a credential rotation cannot turn
+		// an admitted request into a request for a different Hub identity.
+		if entry.connection != nil {
+			entry.connection.mu.RLock()
+			if !entry.connection.authorityReady.Load() ||
+				entry.connection.authorityGeneration.Load() != entry.generation ||
+				entry.connection.Name != entry.hubName ||
+				entry.connection.BrokerID != entry.brokerID ||
+				entry.connection.HubEndpoint != entry.hubEndpoint ||
+				!bytes.Equal(entry.connection.SecretKey, entry.secretKey) {
+				entry.connection.mu.RUnlock()
+				m.writeError(w, "stale signing authority")
+				return
+			}
+			defer entry.connection.mu.RUnlock()
+		}
+
+		authority := &brokerRequestAuthority{
+			hubName:     entry.hubName,
+			brokerID:    entry.brokerID,
+			hubEndpoint: entry.hubEndpoint,
+			generation:  entry.generation,
+			connection:  entry.connection,
+		}
+		ctx := context.WithValue(r.Context(), brokerRequestAuthorityKey{}, authority)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
