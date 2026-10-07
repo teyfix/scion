@@ -361,7 +361,7 @@ func (s *Server) handleResourcesImport(w http.ResponseWriter, r *http.Request) {
 				"scopeId (project id) is required for project scope", nil)
 			return
 		}
-		if !s.authorizeProjectImport(ctx, w, req.ScopeID, kind.noun) {
+		if !s.authorizeProjectImport(ctx, w, req.ScopeID, kind.noun, authzType) {
 			return
 		}
 		// Verify project exists before fetching.
@@ -473,7 +473,7 @@ func (s *Server) streamImport(w http.ResponseWriter, run func(progress importPro
 // authorizeProjectImport checks that the caller may import resources into the
 // given project, mirroring the per-project import handlers. It writes the error
 // response and returns false when access is denied.
-func (s *Server) authorizeProjectImport(ctx context.Context, w http.ResponseWriter, projectID, noun string) bool {
+func (s *Server) authorizeProjectImport(ctx context.Context, w http.ResponseWriter, projectID, noun, authzResourceType string) bool {
 	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
 		if !agentIdent.HasScope(ScopeAgentCreate) {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope: project:agent:create", nil)
@@ -487,7 +487,7 @@ func (s *Server) authorizeProjectImport(ctx context.Context, w http.ResponseWrit
 	}
 	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
 		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-			Type:       "agent",
+			Type:       authzResourceType,
 			ParentType: "project",
 			ParentID:   projectID,
 		}, ActionCreate)
@@ -752,7 +752,7 @@ func (s *Server) handleResourcesDiscover(w http.ResponseWriter, r *http.Request)
 				"scopeId (project id) is required for project scope", nil)
 			return
 		}
-		if !s.authorizeProjectImport(ctx, w, req.ScopeID, kind.noun) {
+		if !s.authorizeProjectImport(ctx, w, req.ScopeID, kind.noun, authzType) {
 			return
 		}
 		if _, perr := s.store.GetProject(ctx, req.ScopeID); perr != nil {

@@ -1053,6 +1053,10 @@ func (s *Server) hydrateHarnessConfig(ctx context.Context, cfg *CreateAgentConfi
 	// Hydrate only when HarnessConfigID or HarnessConfigHash identifies a Hub-managed resource.
 	// A plain HarnessConfig name without Hub identity must continue to fall back to the broker's local search.
 	if cfg.HarnessConfigID == "" && cfg.HarnessConfigHash == "" {
+		if cfg.HarnessConfig != "" {
+			s.agentLifecycleLog.Warn("Harness-config hydration skipped: dispatch names harness-config but carries no config ID or hash; broker will fall back to on-disk search",
+				"harness_config", cfg.HarnessConfig)
+		}
 		return "", nil
 	}
 	ref := cfg.HarnessConfigID
