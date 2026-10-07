@@ -34,13 +34,6 @@ const redactedSecret = "xxxxx"
 // string, e.g. "postgres://" or "postgresql://".
 var connectionURLPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
 
-// keywordValueCredentialPattern matches a libpq keyword/value credential
-// (password=... or sslpassword=...), including a single- or double-quoted
-// value, so it can be masked without disturbing the rest of the DSN.
-var keywordValueCredentialPattern = regexp.MustCompile(
-	`(?i)\b(password|sslpassword)\s*=\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\S+)`,
-)
-
 // credentialQueryKeys lists query-string parameter names that carry a
 // credential and must be masked wherever they appear, e.g. in the query
 // string of a URL-style connection string.
@@ -83,7 +76,7 @@ func RedactDatabaseURL(driver, dsn string) string {
 	case connectionURLPattern.MatchString(dsn):
 		return redactConnectionURL(dsn)
 	case strings.Contains(dsn, "="):
-		return keywordValueCredentialPattern.ReplaceAllString(dsn, "${1}="+redactedSecret)
+		return redactKeywordValueDSN(dsn)
 	default:
 		// Not a recognizable URL or libpq keyword/value DSN. Since driver
 		// isn't "sqlite" (handled above), we have no basis for trusting this
@@ -91,6 +84,91 @@ func RedactDatabaseURL(driver, dsn string) string {
 		// unrecognized credential format reaching a log line.
 		return redactedPlaceholder
 	}
+}
+
+// redactKeywordValueDSN scans libpq keyword/value tokens before masking
+// credentials. Backslash escapes consume the following byte even when it is
+// whitespace. Malformed tokens fail closed rather than expose a partial value.
+func redactKeywordValueDSN(dsn string) string {
+	var out strings.Builder
+	last := 0
+	for i := 0; i < len(dsn); {
+		for i < len(dsn) && isDSNSpace(dsn[i]) {
+			i++
+		}
+		if i == len(dsn) {
+			break
+		}
+		start := i
+		for i < len(dsn) && !isDSNSpace(dsn[i]) && dsn[i] != '=' {
+			i++
+		}
+		key := dsn[start:i]
+		for i < len(dsn) && isDSNSpace(dsn[i]) {
+			i++
+		}
+		if !isDSNKeyword(key) || i == len(dsn) || dsn[i] != '=' {
+			return redactedPlaceholder
+		}
+		i++
+		for i < len(dsn) && isDSNSpace(dsn[i]) {
+			i++
+		}
+		var quote byte
+		if i < len(dsn) && (dsn[i] == '\'' || dsn[i] == '"') {
+			quote = dsn[i]
+			i++
+		}
+		closed := quote == 0
+		for i < len(dsn) {
+			if dsn[i] == '\\' {
+				if i+1 == len(dsn) {
+					return redactedPlaceholder
+				}
+				i += 2
+				continue
+			}
+			if quote != 0 && dsn[i] == quote {
+				i++
+				closed = true
+				break
+			}
+			if quote == 0 && isDSNSpace(dsn[i]) {
+				break
+			}
+			i++
+		}
+		if !closed || (i < len(dsn) && !isDSNSpace(dsn[i])) {
+			return redactedPlaceholder
+		}
+		if credentialQueryKeys[strings.ToLower(key)] {
+			out.WriteString(dsn[last:start])
+			out.WriteString(key)
+			out.WriteByte('=')
+			out.WriteString(redactedSecret)
+			last = i
+		}
+	}
+	out.WriteString(dsn[last:])
+	return out.String()
+}
+
+func isDSNKeyword(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isDSNSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
 }
 
 // redactConnectionURL masks the password in a URL-style connection string,
