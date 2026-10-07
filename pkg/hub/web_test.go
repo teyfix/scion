@@ -563,11 +563,10 @@ func TestSPACatchAll_EmbeddedDirectoryDoesNotIntercept(t *testing.T) {
 		"assets/main.js":    &fstest.MapFile{Data: []byte("// stub")},
 		"chat/somefile.txt": &fstest.MapFile{Data: []byte("data")},
 	}
-	ws.hasAssets = ws.detectWebAssets()
 
-	// A request to /chat/my-project/thread-id should get the SPA shell,
+	// A request to the existing embedded /chat directory should get the SPA shell,
 	// NOT a static file or 404 from the file server.
-	req := httptest.NewRequest("GET", "/chat/my-project/thread-id", nil)
+	req := httptest.NewRequest("GET", "/chat", nil)
 	rec := httptest.NewRecorder()
 	ws.Handler().ServeHTTP(rec, req)
 
