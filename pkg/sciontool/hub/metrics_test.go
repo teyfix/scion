@@ -52,7 +52,7 @@ func TestClient_ReportMetrics(t *testing.T) {
 	payload := MetricsPayload{
 		Type:    "agent_metrics",
 		AgentID: "agent-123",
-		Session: SessionMetrics{ID: "session-1"},
+		Session: SessionMetrics{ID: "session-1", StartedAt: time.Now().UTC().Format(time.RFC3339)},
 		Tokens:  TokenMetrics{Input: 12, Output: 7},
 	}
 
@@ -72,7 +72,7 @@ func TestClient_ReportMetricsDoesNotRetryClientErrors(t *testing.T) {
 	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
 	client.retryBaseDelay = time.Millisecond
 
-	err := client.ReportMetrics(context.Background(), MetricsPayload{Session: SessionMetrics{ID: "session-1"}})
+	err := client.ReportMetrics(context.Background(), MetricsPayload{Session: SessionMetrics{ID: "session-1", StartedAt: time.Now().UTC().Format(time.RFC3339)}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "hub returned error 400: bad metrics")
 	assert.Equal(t, 1, attempts)
