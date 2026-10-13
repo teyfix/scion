@@ -107,7 +107,9 @@ func TestCreateDispatchAdmission_RegisteredOmittedIdentityRequiresAuthority(t *t
 
 func TestCreateDispatchAdmission_BuildContextBackstopBeforeOwnership(t *testing.T) {
 	fixture := newFlatInstanceTestServer(t, flatInstanceOpts{hubInProcess: true})
+	reached := false
 	handler := fixture.srv.loadBrokerMiddleware().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
 		_, err := fixture.srv.buildStartContext(r.Context(), startContextInputs{
 			Name: "guarded-agent", ProjectID: flatTestProjectID, RunID: "missing-agent-run", Operation: opCreate, HTTPRequest: r,
 		})
@@ -118,7 +120,11 @@ func TestCreateDispatchAdmission_BuildContextBackstopBeforeOwnership(t *testing.
 	}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
 	signRequest(req, fixture.identity.RuntimeBrokerID, []byte("secret"))
-	handler.ServeHTTP(httptest.NewRecorder(), req)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if !reached {
+		t.Fatalf("signed request never reached the build-context backstop: status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	if records, err := fixture.srv.ownership.List(); err != nil || len(records) != 0 {
 		t.Fatalf("incomplete identity changed ownership: %v %v", records, err)
 	}
