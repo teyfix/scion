@@ -18,8 +18,11 @@ import (
 	"context"
 	"log/slog"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
 
 // TestHeartbeatCapabilities_StaticSetPlusTemplateTiers: a heartbeat reports
@@ -27,6 +30,7 @@ import (
 // itself (also written at in-process registration) and the registration
 // capability names carry no TemplateTiers and are unchanged.
 func TestHeartbeatCapabilities_StaticSetPlusTemplateTiers(t *testing.T) {
+	t.Setenv("SCION_NVIDIA_GPU", "")
 	client := &mockRuntimeBrokerService{}
 	svc := NewHeartbeatService(client, "test-host", time.Hour, nil, nil, slog.Default())
 	if err := svc.ForceHeartbeat(context.Background()); err != nil {
@@ -45,8 +49,37 @@ func TestHeartbeatCapabilities_StaticSetPlusTemplateTiers(t *testing.T) {
 	if StaticCapabilities(nil).TemplateTiers {
 		t.Error("the static set (sent at registration) must not carry TemplateTiers")
 	}
-	wantNames := []string{"sync", "attach", "reprovision", "asyncLaunch", "emptyPerAgentWorkspace", "agentMove", "reprovisionEmptyPerAgent"}
+	wantNames := []string{"sync", "attach", "reprovision", "asyncLaunch", "emptyPerAgentWorkspace", "agentMove", "reprovisionEmptyPerAgent", "runtimeRecovery"}
 	if got := StaticCapabilityNames(nil); !reflect.DeepEqual(got, wantNames) {
 		t.Errorf("registration capability names = %v, want %v (unchanged)", got, wantNames)
+	}
+}
+
+func TestStaticCapabilities_ExplicitNvidiaGPU(t *testing.T) {
+	for _, value := range []string{"", "false", "TRUE", "true"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("SCION_NVIDIA_GPU", value)
+			want := value == "true"
+			if got := StaticCapabilities(nil).NvidiaGPU; got != want {
+				t.Fatalf("NvidiaGPU=%v want=%v", got, want)
+			}
+			if got := slices.Contains(StaticCapabilityNames(nil), "nvidiaGpu"); got != want {
+				t.Fatalf("registration nvidiaGpu=%v want=%v", got, want)
+			}
+		})
+	}
+}
+
+func TestHeartbeat_PreservesObservedPrivilegesAndGPU(t *testing.T) {
+	privileged, gpu := false, true
+	mgr := &heartbeatMockManager{agents: []api.AgentInfo{{Name: "agent-a", ProjectID: "project-a", Phase: "running", Privileged: &privileged, NvidiaGPU: &gpu}}}
+	svc := NewHeartbeatService(&mockRuntimeBrokerService{}, "broker-a", time.Hour, mgr, nil, slog.Default())
+	projects, _ := svc.gatherProjectAgents(context.Background(), nil)
+	if len(projects) != 1 || len(projects[0].Agents) != 1 {
+		t.Fatalf("unexpected inventory: %+v", projects)
+	}
+	got := projects[0].Agents[0]
+	if got.Privileged == nil || *got.Privileged || got.NvidiaGPU == nil || !*got.NvidiaGPU {
+		t.Fatalf("observed runtime flags not preserved: %+v", got)
 	}
 }

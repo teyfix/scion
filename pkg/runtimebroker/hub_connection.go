@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
@@ -82,6 +83,14 @@ type HubConnection struct {
 
 	Status ConnectionStatus
 	mu     sync.RWMutex
+
+	// authorityMu protects admitted requests across credential rebinding.
+	// It is distinct from mu so an admitted handler can still take snapshots
+	// while a lifecycle operation waits for its lease. Never wait for this
+	// lock while holding a server lock or mu.
+	authorityMu         sync.RWMutex
+	authorityGeneration atomic.Uint64
+	authorityReady      atomic.Bool
 
 	// lifecycleMu makes Start, Stop, close and Reinitialize on this connection run
 	// one at a time. It is held for the whole operation, including the
@@ -316,6 +325,16 @@ func (hc *HubConnection) Stop() {
 func (hc *HubConnection) close() {
 	hc.lifecycleMu.Lock()
 	defer hc.lifecycleMu.Unlock()
+	hc.authorityReady.Store(false)
+	hc.authorityGeneration.Add(1)
+	hc.closeLocked()
+}
+
+// closeLocked is the final stop without lifecycleMu; the caller holds it
+// and has revoked admission before waiting for existing requests.
+func (hc *HubConnection) closeLocked() {
+	hc.authorityMu.Lock()
+	defer hc.authorityMu.Unlock()
 	hc.mu.Lock()
 	hc.closed = true
 	hc.mu.Unlock()
@@ -549,73 +568,117 @@ func (hc *HubConnection) retryFailedReinitialize() bool {
 
 // reinitialize is Reinitialize without lifecycleMu; the caller holds it.
 func (hc *HubConnection) reinitialize(ctx context.Context, server *Server, creds *brokercredentials.BrokerCredentials) error {
-	// Stop existing services. stop takes hc.mu itself.
+	if hc.isClosed() {
+		return nil
+	}
+	if creds == nil {
+		return fmt.Errorf("credentials are required")
+	}
+	if server.hubConnectionLifecycleHook != nil {
+		server.hubConnectionLifecycleHook("reinitialize-active")
+	}
+
+	// Admission closes before draining leases. Serialize the invalidation
+	// and key snapshot so no earlier rebuild can republish stale authority.
+	server.authMiddlewareMu.Lock()
+	hc.authorityReady.Store(false)
+	hc.authorityGeneration.Add(1)
+	server.buildAuthMiddlewareLocked()
+	server.authMiddlewareMu.Unlock()
+	if server.hubConnectionLifecycleHook != nil {
+		server.hubConnectionLifecycleHook("authority-revoked")
+	}
+
+	capabilities, err := prepareHubConnectionCapabilities(server, creds)
+	hc.authorityMu.Lock()
+	defer hc.authorityMu.Unlock()
 	hc.stop()
+	if err != nil {
+		hc.mu.Lock()
+		hc.Credentials = creds
+		hc.BrokerID = creds.BrokerID
+		hc.HubEndpoint = creds.HubEndpoint
+		hc.AuthMode = creds.AuthMode
+		hc.SecretKey = nil
+		hc.TransportSource = nil
+		hc.TransportMode = 0
+		hc.HubClient = nil
+		hc.Hydrator = nil
+		hc.HCResolver = nil
+		hc.Status = ConnectionStatusError
+		hc.mu.Unlock()
+		return err
+	}
 
-	// Update credentials
+	server.authMiddlewareMu.Lock()
 	hc.mu.Lock()
-	hc.Credentials = creds
-	hc.BrokerID = creds.BrokerID
-	hc.HubEndpoint = creds.HubEndpoint
-	hc.AuthMode = creds.AuthMode
+	hc.Credentials = capabilities.credentials
+	hc.BrokerID = capabilities.credentials.BrokerID
+	hc.HubEndpoint = capabilities.credentials.HubEndpoint
+	hc.AuthMode = capabilities.credentials.AuthMode
+	hc.SecretKey = capabilities.secretKey
+	hc.TransportSource = capabilities.transportSource
+	hc.TransportMode = capabilities.transportMode
+	hc.HubClient = capabilities.hubClient
+	hc.Hydrator = capabilities.hydrator
+	hc.HCResolver = capabilities.hcResolver
+	hc.authorityGeneration.Add(1)
+	hc.authorityReady.Store(true)
 	hc.mu.Unlock()
+	server.buildAuthMiddlewareLocked()
+	server.authMiddlewareMu.Unlock()
 
-	// Decode secret key
+	slog.Info("Hub connection reinitialized", "name", hc.Name, "brokerID", creds.BrokerID)
+	return hc.start(ctx, server)
+}
+
+// hubConnectionCapabilities is prepared before publication so readers see
+// one coherent identity, key, transport and hydration client tuple.
+type hubConnectionCapabilities struct {
+	credentials     *brokercredentials.BrokerCredentials
+	secretKey       []byte
+	transportSource transportauth.TokenSource
+	transportMode   transportauth.HeaderMode
+	hubClient       hubclient.Client
+	hydrator        *templatecache.Hydrator
+	hcResolver      *templatecache.Resolver
+}
+
+func prepareHubConnectionCapabilities(server *Server, creds *brokercredentials.BrokerCredentials) (*hubConnectionCapabilities, error) {
+	// A replacement must not grant ingress authority for a different flat
+	// instance identity merely because its outbound services would refuse it.
+	if fi := server.flatInstance(); fi != nil && creds.BrokerID != fi.Identity.RuntimeBrokerID {
+		return nil, fmt.Errorf("flat Runtime Broker instance: replacement broker %s does not match instance %s", creds.BrokerID, fi.Identity.RuntimeBrokerID)
+	}
 	secretKey, err := base64.StdEncoding.DecodeString(creds.SecretKey)
 	if err != nil {
-		hc.setStatus(ConnectionStatusError)
-		return fmt.Errorf("failed to decode secret key: %w", err)
+		return nil, fmt.Errorf("failed to decode secret key: %w", err)
 	}
-	hc.mu.Lock()
-	hc.SecretKey = secretKey
-	hc.mu.Unlock()
-
-	// Create new Hub client, resolving transport auth once for both REST and WebSocket
 	opts := buildHubClientOpts(creds, secretKey)
 	src, mode, err := transportauth.ResolveBrokerTransport(creds.TransportMode, creds.TransportAudience, adcsource.New)
 	if err != nil {
-		hc.setStatus(ConnectionStatusError)
-		return fmt.Errorf("failed to resolve transport auth: %w", err)
+		return nil, fmt.Errorf("failed to resolve transport auth: %w", err)
 	}
 	if src != nil {
 		opts = append(opts, hubclient.WithTransportAuth(src, mode))
 	} else {
 		mode = 0
 	}
-	hc.mu.Lock()
-	hc.TransportSource = src
-	hc.TransportMode = mode
-	hc.mu.Unlock()
-
 	client, err := hubclient.New(creds.HubEndpoint, opts...)
 	if err != nil {
-		hc.setStatus(ConnectionStatusError)
-		return fmt.Errorf("failed to create Hub client: %w", err)
+		return nil, fmt.Errorf("failed to create Hub client: %w", err)
 	}
-
-	// Rebuild hydrator using shared cache
-	var hydrator *templatecache.Hydrator
+	capabilities := &hubConnectionCapabilities{
+		credentials: creds, secretKey: secretKey, transportSource: src,
+		transportMode: mode, hubClient: client,
+	}
 	if server.cache != nil {
-		hydrator = templatecache.NewHydrator(server.cache, client)
+		capabilities.hydrator = templatecache.NewHydrator(server.cache, client)
 	}
-	var hcResolver *templatecache.Resolver
 	if server.hcCache != nil {
-		hcResolver = templatecache.NewHarnessConfigResolver(server.hcCache, client)
+		capabilities.hcResolver = templatecache.NewHarnessConfigResolver(server.hcCache, client)
 	}
-	hc.mu.Lock()
-	hc.HubClient = client
-	if hydrator != nil {
-		hc.Hydrator = hydrator
-	}
-	if hcResolver != nil {
-		hc.HCResolver = hcResolver
-	}
-	hc.mu.Unlock()
-
-	slog.Info("Hub connection reinitialized", "name", hc.Name, "brokerID", creds.BrokerID)
-
-	// Restart services
-	return hc.start(ctx, server)
+	return capabilities, nil
 }
 
 // buildHubClientOpts creates hub client options from credentials.

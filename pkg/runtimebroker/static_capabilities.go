@@ -15,6 +15,8 @@
 package runtimebroker
 
 import (
+	"os"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
@@ -35,6 +37,8 @@ func StaticCapabilities(rt scionrt.Runtime) *hubclient.BrokerCapabilities {
 		Attach:                 scionrt.HasAttachSupport(rt),
 		Reprovision:            true,
 		AsyncLaunch:            true,
+		RuntimeRecovery:        true,
+		NvidiaGPU:              os.Getenv("SCION_NVIDIA_GPU") == "true",
 		EmptyPerAgentWorkspace: scionrt.HasEmptyPerAgentSupport(rt),
 		// This broker honours localOnly deletes and confirms a moved
 		// agent's NFS workspace before provisioning it (agent move).
@@ -64,5 +68,7 @@ func StaticCapabilityNames(rt scionrt.Runtime) []string {
 	add(c.EmptyPerAgentWorkspace, "emptyPerAgentWorkspace")
 	add(c.AgentMove, "agentMove")
 	add(c.ReprovisionEmptyPerAgent, "reprovisionEmptyPerAgent")
+	add(c.RuntimeRecovery, "runtimeRecovery")
+	add(c.NvidiaGPU, "nvidiaGpu")
 	return names
 }
