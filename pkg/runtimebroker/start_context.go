@@ -240,7 +240,14 @@ type prehydratedBundle struct {
 // The caller may further customize the returned startContext before calling
 // mgr.Start or mgr.Provision.
 func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (*startContext, error) {
-	if (in.RuntimeRecovery != nil || (in.Operation == opCreate && (in.ProjectID != "" || in.AgentID != ""))) && s.hasRegisteredHubAuthority() {
+	var createAdmission *api.CreateAdmission
+	if in.Operation == opCreate {
+		var err error
+		createAdmission, err = s.createDispatchAdmission(in.HTTPRequest, in.AgentID, in.ProjectID)
+		if err != nil {
+			return nil, err
+		}
+	} else if in.RuntimeRecovery != nil && s.hasRegisteredHubAuthority() {
 		if _, ok := authenticatedBrokerAuthority(in.HTTPRequest); !ok {
 			return nil, &startContextError{Status: http.StatusUnauthorized, Message: "Scoped lifecycle dispatch requires its registered Hub authority"}
 		}
@@ -860,15 +867,8 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	}
 
 	opts.RuntimeRecovery = in.RuntimeRecovery
-	if in.Operation == opCreate && !in.Reprovision {
-		brokerID := s.config.BrokerID
-		if authority, ok := authenticatedBrokerAuthority(in.HTTPRequest); ok {
-			brokerID = authority.brokerID
-		}
-		if fi := s.flatInstance(); fi != nil {
-			brokerID = fi.Identity.RuntimeBrokerID
-		}
-		opts.CreateAdmission = &api.CreateAdmission{AgentID: in.AgentID, ProjectID: in.ProjectID, RuntimeBrokerID: brokerID}
+	if in.Operation == opCreate && !in.Reprovision && createAdmission != nil {
+		opts.CreateAdmission = createAdmission
 		if retained, err := agent.ValidateCreateAdmission(opts); err != nil {
 			return nil, &startContextError{Status: http.StatusConflict, Message: err.Error(), OriginalErr: err}
 		} else if retained {
