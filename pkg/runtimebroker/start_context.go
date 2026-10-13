@@ -1004,21 +1004,25 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		s.applyStartTemplateEnvSource(ctx, in, &opts, hubConn, templateSlug)
 	}
 
-	var networkOwner *agent.OwnerScope
-	if s.ownership != nil {
-		networkOwner = &agent.OwnerScope{RuntimeBrokerID: s.ownership.brokerID, RetainedRunOwned: s.retainedRunOwned}
-	}
-	dockerConfig, err := agent.EffectiveStartDockerConfig(ctx, func() api.StartOptions {
+	var networks []string
+	// Only Docker and Podman need live Docker policy to choose their Hub
+	// callback URL. Other runtimes leave template resolution to Start or
+	// Provision. Retained recovery still validates its identity and owner
+	// before dispatch, regardless of runtime.
+	if runtimeName == "docker" || runtimeName == "podman" || opts.RuntimeRecovery != nil {
+		var networkOwner *agent.OwnerScope
+		if s.ownership != nil {
+			networkOwner = &agent.OwnerScope{RuntimeBrokerID: s.ownership.brokerID, RetainedRunOwned: s.retainedRunOwned}
+		}
 		networkOpts := opts
 		networkOpts.Profile = gcpIdentityProfile
-		return networkOpts
-	}(), networkOwner)
-	if err != nil {
-		return nil, &startContextError{Status: http.StatusConflict, Message: "Failed to resolve Docker network policy", OriginalErr: err}
-	}
-	var networks []string
-	if dockerConfig != nil {
-		networks = dockerConfig.Networks
+		dockerConfig, err := agent.EffectiveStartDockerConfig(ctx, networkOpts, networkOwner)
+		if err != nil {
+			return nil, &startContextError{Status: http.StatusConflict, Message: "Failed to resolve Docker network policy", OriginalErr: err}
+		}
+		if dockerConfig != nil {
+			networks = dockerConfig.Networks
+		}
 	}
 
 	endpointInputs.Networks = networks

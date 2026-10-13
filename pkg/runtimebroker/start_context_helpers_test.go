@@ -76,8 +76,9 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	// Create dummy templates to satisfy FindTemplate
-	templatesDir := filepath.Join(dotScion, "templates")
+	// Global fixtures are also resolvable when a dispatch names a project
+	// other than the test's CWD.
+	templatesDir := filepath.Join(os.Getenv("HOME"), ".scion", "templates")
 	if err := os.MkdirAll(templatesDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +140,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	templatesDir := filepath.Join(dotScion, "templates")
+	templatesDir := filepath.Join(os.Getenv("HOME"), ".scion", "templates")
 	if err := os.MkdirAll(templatesDir, 0755); err != nil {
 		t.Fatal(err)
 	}
