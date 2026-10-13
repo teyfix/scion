@@ -28,9 +28,10 @@ import (
 )
 
 // Tests for template environment keys at provisioning (ptone/scion#4524):
-// environment keys and reserved SCION_* env are ignored and reported, and a
+// ignored environment keys and reserved SCION_* env are reported, and a
 // template's env never reaches the agent config or scion-agent.json (it is
-// the separate template env layer; see template_env_fill_test.go).
+// the separate template env layer; see template_env_fill_test.go). The
+// on-prem image exception remains live and is not stored as requester config.
 
 const templateEnvSettingsYAML = `schema_version: "1"
 default_harness_config: test-harness
@@ -65,10 +66,10 @@ const templateEnvTemplateJSON = `{
 var templateEnvKeysInTemplate = []string{"SCION_HUB_URL", "OTEL_EXPORTER_OTLP_ENDPOINT", "TZ", "TEST_HARNESS_API_KEY", "TPL_JOB_FLAG"}
 
 // wantTemplateEnvIgnored is the ignored-key list of templateEnvTemplateJSON:
-// the six environment keys and the reserved SCION_* env key.
+// the five ignored environment keys and the reserved SCION_* env key.
 var wantTemplateEnvIgnored = []string{
 	"env.SCION_HUB_URL",
-	"hub", "image", "kubernetes", "resources", "telemetry", "volumes",
+	"hub", "kubernetes", "resources", "telemetry", "volumes",
 }
 
 func templateEnvFixture(t *testing.T) string {
@@ -77,7 +78,7 @@ func templateEnvFixture(t *testing.T) string {
 }
 
 // assertNoTemplateEnvironment checks that cfg carries none of the template's
-// environment values and none of its env, and keeps its job keys.
+// ignored environment values and none of its env, and keeps its job keys.
 func assertNoTemplateEnvironment(t *testing.T, label string, cfg *api.ScionConfig) {
 	t.Helper()
 	if cfg == nil {
@@ -90,9 +91,6 @@ func assertNoTemplateEnvironment(t *testing.T, label string, cfg *api.ScionConfi
 	}
 	if cfg.Hub != nil && cfg.Hub.Endpoint == "http://template-hub" {
 		t.Errorf("%s: hub from the template survived: %+v", label, cfg.Hub)
-	}
-	if cfg.Image == "template-image:1" {
-		t.Errorf("%s: image from the template survived", label)
 	}
 	if cfg.Resources != nil && cfg.Resources.Requests.CPU == "4" {
 		t.Errorf("%s: resources from the template survived: %+v", label, cfg.Resources)
@@ -132,12 +130,18 @@ func TestProvision_TemplateEnvironmentKeysIgnored(t *testing.T) {
 		t.Fatalf("GetAgent (provision): %v", err)
 	}
 	assertNoTemplateEnvironment(t, "provisioned config", cfg)
+	if cfg.Image != "template-image:1" {
+		t.Errorf("live template image = %q, want template-image:1", cfg.Image)
+	}
 
 	stored, err := (&config.Template{Path: agentDir}).LoadConfig()
 	if err != nil {
 		t.Fatalf("load stored scion-agent.json: %v", err)
 	}
 	assertNoTemplateEnvironment(t, "stored scion-agent.json", stored)
+	if stored.Image != "" {
+		t.Errorf("stored image = %q, want live template default excluded from requester config", stored.Image)
+	}
 	raw, err := os.ReadFile(filepath.Join(agentDir, "scion-agent.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -169,6 +173,9 @@ func TestGetAgent_RestartDoesNotReintroduceTemplateEnvironmentKeys(t *testing.T)
 		t.Fatalf("GetAgent (restart): %v", err)
 	}
 	assertNoTemplateEnvironment(t, "restart config", cfg)
+	if cfg.Image != "template-image:1" {
+		t.Errorf("restart live template image = %q, want template-image:1", cfg.Image)
+	}
 	if got, want := warns.Warnings(), []string{wantTemplateEnvWarning()}; !reflect.DeepEqual(got, want) {
 		t.Errorf("restart warnings = %q,\nwant %q", got, want)
 	}
@@ -190,16 +197,16 @@ func TestPreflightResolve_TemplateEnvironmentKeysQuiet(t *testing.T) {
 func TestTemplateJobConfig_DropsEnvAndDedupesWarnings(t *testing.T) {
 	ctx, warns := withTemplateEnvWarnings(context.Background())
 	tpl := &config.Template{Name: "dup", Path: t.TempDir()}
-	cfg := &api.ScionConfig{Model: "m", Image: "x", Env: map[string]string{"TOOL": "1"}}
+	cfg := &api.ScionConfig{Model: "m", Image: "x", Resources: &api.ResourceSpec{}, Env: map[string]string{"TOOL": "1"}}
 	job := templateJobConfig(ctx, tpl, cfg)
 	_ = templateJobConfig(ctx, tpl, cfg)
-	if job.Env != nil || job.Image != "" || job.Model != "m" {
-		t.Errorf("job config = %+v, want model only (no env, no image)", job)
+	if job.Env != nil || job.Resources != nil || job.Image != "x" || job.Model != "m" {
+		t.Errorf("job config = %+v, want model and on-prem image exception (no env or resources)", job)
 	}
 	if cfg.Env["TOOL"] != "1" || cfg.Image != "x" {
 		t.Errorf("input config was modified: %+v", cfg)
 	}
-	want := []string{"template dup sets environment key(s) image; ignored (environment comes from settings)"}
+	want := []string{"template dup sets environment key(s) resources; ignored (environment comes from settings)"}
 	if got := warns.Warnings(); !reflect.DeepEqual(got, want) {
 		t.Errorf("warnings = %q, want %q", got, want)
 	}
@@ -217,8 +224,8 @@ func TestTemplateJobConfig_ZeroValueCollector(t *testing.T) {
 	c := &templateEnvWarnings{}
 	ctx := context.WithValue(context.Background(), templateEnvWarningsKey{}, c)
 	tpl := &config.Template{Name: "z", Path: t.TempDir()}
-	_ = templateJobConfig(ctx, tpl, &api.ScionConfig{Image: "x"})
-	_ = templateJobConfig(ctx, tpl, &api.ScionConfig{Image: "x"})
+	_ = templateJobConfig(ctx, tpl, &api.ScionConfig{Resources: &api.ResourceSpec{}})
+	_ = templateJobConfig(ctx, tpl, &api.ScionConfig{Resources: &api.ResourceSpec{}})
 	if got := c.Warnings(); len(got) != 1 {
 		t.Errorf("warnings = %q, want exactly one", got)
 	}
