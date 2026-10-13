@@ -70,7 +70,7 @@ func newHubDefaultsWiringServer() (*Server, *hubDefaultsCapturingManager) {
 	cfg.ForceRuntime = "mock"
 
 	mgr := &hubDefaultsCapturingManager{}
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr
 }

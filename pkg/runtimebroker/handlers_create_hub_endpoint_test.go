@@ -236,7 +236,7 @@ func TestCreateAgentHubManagedProjectSettingsEndpoint(t *testing.T) {
 	cfg.ForceRuntime = "mock"
 
 	mgr := &envCapturingManager{}
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 	srv := New(cfg, mgr, rt)
 
 	// Set up a hub-managed project directory at the expected path.

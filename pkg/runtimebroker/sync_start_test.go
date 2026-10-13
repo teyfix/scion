@@ -58,7 +58,8 @@ func newSyncStartTestServer(t *testing.T) (*Server, *startFuncManager, string, s
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	cfg.ForceRuntime = "mock"
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 	return New(cfg, mgr, rt), mgr, projectPath, agentDir
 }
 
