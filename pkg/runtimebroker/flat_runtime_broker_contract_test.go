@@ -16,6 +16,7 @@ package runtimebroker
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -160,8 +161,8 @@ func newFlatInstanceTestServer(t *testing.T, opts flatInstanceOpts) *flatInstanc
 	cfg.BrokerName = instances[0].Name
 	cfg.HubEnabled = true
 	cfg.HubEndpoint = "http://127.0.0.1:1"
-	// The tests drive Handler() directly without HMAC-signed requests.
-	cfg.BrokerAuthStrictMode = false
+	// Contract dispatches carry the registered Hub's signing authority.
+	cfg.BrokerAuthStrictMode = true
 	cfg.FlatInstance = &FlatInstanceConfig{Identity: id, Instance: instances[0], HubInProcess: opts.hubInProcess}
 	if opts.hubInProcess {
 		cfg.InMemoryCredentials = &brokercredentials.BrokerCredentials{
@@ -238,9 +239,37 @@ func serveFlat(srv *Server, method, path, body string) *httptest.ResponseRecorde
 		req = httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// Both flat fixtures register their instance through in-memory Hub
+	// credentials. Legacy standalone fixtures have no signing authority.
+	if creds := srv.config.InMemoryCredentials; srv.isFlat() && creds != nil {
+		key, err := base64.StdEncoding.DecodeString(creds.SecretKey)
+		if err != nil {
+			panic("invalid flat fixture signing key: " + err.Error())
+		}
+		req.Header.Set("X-Scion-Hub-Connection", creds.Name)
+		signRequest(req, creds.BrokerID, key)
+	}
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 	return w
+}
+
+func TestFlatInstanceCreate_UnsignedDispatchRefused(t *testing.T) {
+	f := newFlatInstanceTestServer(t, flatInstanceOpts{hubInProcess: true})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(flatCreateBody("req-unsigned", "flat-agent",
+		map[string]interface{}{"expectedRuntimeTargetId": f.identity.RuntimeTarget.ID})))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned dispatch status = %d, want 401: %s", w.Code, w.Body.String())
+	}
+	if f.mgr.StartCalls() != 0 {
+		t.Fatal("unsigned dispatch started an agent")
+	}
+	if _, ok, err := f.srv.ownership.Get(flatTestProjectID, "agent-id-flat-agent"); err != nil || ok {
+		t.Fatalf("unsigned dispatch created an ownership record: present=%v err=%v", ok, err)
+	}
 }
 
 func decodeFlatError(t *testing.T, w *httptest.ResponseRecorder) APIError {

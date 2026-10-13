@@ -232,7 +232,7 @@ func newPartitionInstanceWithLocks(t *testing.T, d *sharedDaemon, key, stateDir 
 	cfg.StateDir = stateDir
 	cfg.HubEnabled = true
 	cfg.HubEndpoint = "http://127.0.0.1:1"
-	cfg.BrokerAuthStrictMode = false
+	cfg.BrokerAuthStrictMode = true
 	cfg.FlatInstance = &FlatInstanceConfig{Identity: id, HubInProcess: true,
 		Instance: config.V1RuntimeBrokerInstanceConfig{Key: key, Name: key, RuntimeTarget: &config.V1RuntimeTargetConfig{Type: "docker"}}}
 	cfg.InMemoryCredentials = &brokercredentials.BrokerCredentials{BrokerID: id.RuntimeBrokerID, SecretKey: "c2VjcmV0", HubEndpoint: cfg.HubEndpoint}

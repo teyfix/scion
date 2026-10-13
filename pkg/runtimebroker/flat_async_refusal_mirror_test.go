@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,15 +179,8 @@ func TestFlatAsyncCreate_AcceptedLaunchKeepsOwnershipMirror(t *testing.T) {
 		<-release
 		return &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultApplied}, nil
 	}
-	f.srv.hubMu.Lock()
-	f.srv.hubConnections["hub-a"] = &HubConnection{Name: "hub-a", BrokerID: f.identity.RuntimeBrokerID, HubClient: &stubBrokerHubClient{brokers: rtb}}
-	f.srv.hubMu.Unlock()
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(flatAsyncCreateBody(f, "async-ok", nil)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Hub-Connection", "hub-a")
-	w := httptest.NewRecorder()
-	f.srv.Handler().ServeHTTP(w, req)
+	setFlatLaunchReportClient(t, f, rtb)
+	w := serveFlat(f.srv, http.MethodPost, "/api/v1/agents", flatAsyncCreateBody(f, "async-ok", nil))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %s", w.Code, w.Body.String())
 	}
@@ -217,17 +209,26 @@ func TestFlatAsyncCreate_AcceptedLaunchKeepsOwnershipMirror(t *testing.T) {
 func acceptFlatAsyncCreate(t *testing.T, f *flatInstanceFixture, name string, claim func(*hubclient.AgentLaunchReport) (*hubclient.AgentLaunchReportResult, error)) {
 	t.Helper()
 	rtb := &mockRuntimeBrokerService{launchReportFunc: claim}
-	f.srv.hubMu.Lock()
-	f.srv.hubConnections["hub-a"] = &HubConnection{Name: "hub-a", BrokerID: f.identity.RuntimeBrokerID, HubClient: &stubBrokerHubClient{brokers: rtb}}
-	f.srv.hubMu.Unlock()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(flatAsyncCreateBody(f, name, nil)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Hub-Connection", "hub-a")
-	w := httptest.NewRecorder()
-	f.srv.Handler().ServeHTTP(w, req)
+	setFlatLaunchReportClient(t, f, rtb)
+	w := serveFlat(f.srv, http.MethodPost, "/api/v1/agents", flatAsyncCreateBody(f, name, nil))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %s", w.Code, w.Body.String())
 	}
+}
+
+// Substitute launch-report responses while retaining the registered Hub's
+// credentials, hydration services and authority generation.
+func setFlatLaunchReportClient(t *testing.T, f *flatInstanceFixture, rtb *mockRuntimeBrokerService) {
+	t.Helper()
+	f.srv.hubMu.RLock()
+	conn := f.srv.hubConnections[f.srv.config.InMemoryCredentials.Name]
+	f.srv.hubMu.RUnlock()
+	if conn == nil {
+		t.Fatal("flat fixture has no registered Hub connection")
+	}
+	conn.mu.Lock()
+	conn.HubClient = &stubBrokerHubClient{Client: conn.HubClient, brokers: rtb}
+	conn.mu.Unlock()
 }
 
 // launchEnded reports whether no launch is registered any more.
