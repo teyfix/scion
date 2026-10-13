@@ -32,7 +32,7 @@ import (
 
 const envKeysTemplateYAML = "default_harness_config: claude\nmodel: opus\nimage: tpl-image:1\ntelemetry:\n  enabled: true\nvolumes:\n  - source: /a\n    target: /b\nenv:\n  SCION_HUB_URL: http://x\n  MY_FLAG: \"1\"\n"
 
-var wantEnvKeysTemplateKeys = []string{"env.SCION_HUB_URL", "image", "telemetry", "volumes"}
+var wantEnvKeysTemplateKeys = []string{"env.SCION_HUB_URL", "telemetry", "volumes"}
 
 // A committed template that sets environment keys is stored as is (the
 // AgentConfig snapshot stays a faithful parse) and the commit logs a WARN
@@ -83,8 +83,9 @@ func TestAdminValidateResources_ListsTemplateEnvironmentKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	global := seedCommittedTemplate(t, srv, "env-keys-tpl", store.TemplateScopeGlobal, "", map[string]string{"scion-agent.yaml": envKeysTemplateYAML})
-	proj := seedCommittedTemplate(t, srv, "proj-env-tpl", store.TemplateScopeProject, project.ID, map[string]string{"scion-agent.yaml": "image: proj:1\n"})
+	proj := seedCommittedTemplate(t, srv, "proj-env-tpl", store.TemplateScopeProject, project.ID, map[string]string{"scion-agent.yaml": "resources:\n  limits:\n    cpu: \"4\"\n"})
 	seedCommittedTemplate(t, srv, "job-only-tpl", store.TemplateScopeGlobal, "", map[string]string{"scion-agent.yaml": commitCfgBoth})
+	seedCommittedTemplate(t, srv, "onprem-defaults-tpl", store.TemplateScopeProject, project.ID, map[string]string{"scion-agent.yaml": "image: proj:1\ndocker:\n  networks: [preview]\n"})
 
 	w := doTemplateRequest(t, srv, http.MethodGet, "/api/v1/admin/validate-resources", "", nil)
 	mustStatus(t, w, http.StatusOK)
@@ -108,12 +109,12 @@ func TestAdminValidateResources_ListsTemplateEnvironmentKeys(t *testing.T) {
 	if !reflect.DeepEqual(g.Keys, wantEnvKeysTemplateKeys) {
 		t.Errorf("global finding keys = %v, want %v", g.Keys, wantEnvKeysTemplateKeys)
 	}
-	wantMsg := "template env-keys-tpl sets environment key(s) env.SCION_HUB_URL, image, telemetry, volumes; ignored (environment comes from settings)"
+	wantMsg := "template env-keys-tpl sets environment key(s) env.SCION_HUB_URL, telemetry, volumes; ignored (environment comes from settings)"
 	if g.Message != wantMsg {
 		t.Errorf("message = %q, want %q", g.Message, wantMsg)
 	}
 	p := byName["proj-env-tpl"]
-	if p.TemplateID != proj.ID || p.Scope != store.TemplateScopeProject || p.ScopeID != project.ID || !reflect.DeepEqual(p.Keys, []string{"image"}) {
+	if p.TemplateID != proj.ID || p.Scope != store.TemplateScopeProject || p.ScopeID != project.ID || !reflect.DeepEqual(p.Keys, []string{"resources"}) {
 		t.Errorf("project finding = %+v", p)
 	}
 }

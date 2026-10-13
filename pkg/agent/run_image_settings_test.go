@@ -247,9 +247,9 @@ harness_configs:
 	}
 }
 
-// TestStart_TemplateImageAndPullPolicyIgnored: a template's `image:` /
-// `kubernetes.imagePullPolicy` are environment keys, ignored
-// (ptone/scion#4524), so the Hub settings values apply.
+// A live template image remains an on-prem fallback above generic harness
+// defaults. Template kubernetes.imagePullPolicy is still ignored, so the
+// settings pull policy applies independently.
 func TestStart_TemplateImageFallbackWithPullPolicyIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 
