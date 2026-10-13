@@ -177,10 +177,10 @@ func TestTemplateEnvironmentKeysWarning(t *testing.T) {
 // The stripped copy never shares Env with the input, also when only
 // top-level environment keys are dropped and no env key is reserved.
 func TestStripTemplateEnvironmentKeys_CopyDoesNotAliasEnv(t *testing.T) {
-	cfg := &api.ScionConfig{Image: "tpl:1", Env: map[string]string{"MY_FLAG": "1"}}
+	cfg := &api.ScionConfig{Resources: &api.ResourceSpec{}, Env: map[string]string{"MY_FLAG": "1"}}
 	got, ignored := StripTemplateEnvironmentKeys(cfg)
-	if !reflect.DeepEqual(ignored, []string{"image"}) {
-		t.Fatalf("ignored = %v, want [image]", ignored)
+	if !reflect.DeepEqual(ignored, []string{"resources"}) {
+		t.Fatalf("ignored = %v, want [resources]", ignored)
 	}
 	if !reflect.DeepEqual(got.Env, map[string]string{"MY_FLAG": "1"}) {
 		t.Fatalf("Env = %v, want the non-reserved key kept", got.Env)
