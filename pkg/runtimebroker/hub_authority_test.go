@@ -703,6 +703,23 @@ func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
 	srv.config.BrokerAuthStrictMode = true
 	key := []byte("shutdown-lease-key")
 	conn := configureAuthorityTestConnection(t, srv, "hub-a", "https://a.example", "broker-a", key)
+	// Run an actual listener as well as the admitted lease below: a timed
+	// out authority drain must still stop accepting fresh HTTP requests.
+	live := httptest.NewServer(srv.Handler())
+	defer live.Close()
+	srv.mu.Lock()
+	srv.httpServer = live.Config
+	srv.mu.Unlock()
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: time.Second}
+	defer client.CloseIdleConnections()
+	response, err := client.Get(live.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("healthy listener status=%d", response.StatusCode)
+	}
 	entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer func() {
 		select {
@@ -737,6 +754,10 @@ func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Shutdown ignored its deadline")
+	}
+	if response, err := client.Get(live.URL + "/healthz"); err == nil {
+		response.Body.Close()
+		t.Fatal("HTTP listener still accepted a fresh request after the shutdown deadline")
 	}
 	if conn.authorityReady.Load() {
 		t.Fatal("timed-out shutdown left authority ready")

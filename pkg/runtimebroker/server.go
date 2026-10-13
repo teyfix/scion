@@ -1582,21 +1582,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for _, conn := range s.hubConnectionList() {
 		closing = append(closing, conn.closeAsync())
 	}
+	var drainErr error
+waitForConnections:
 	for _, done := range closing {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return ctx.Err()
+			drainErr = ctx.Err()
+			break waitForConnections
 		}
 	}
 
 	if srv == nil {
-		return nil
+		return drainErr
 	}
 
 	slog.Info("Runtime Broker API server shutting down...")
 
-	return srv.Shutdown(ctx)
+	// http.Server.Shutdown closes listeners even when ctx has expired.
+	// A timed-out lease drain must never bypass that listener closure.
+	return errors.Join(drainErr, srv.Shutdown(ctx))
 }
 
 // hubConnectionList returns the current hub connections, read under
