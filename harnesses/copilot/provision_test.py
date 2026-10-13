@@ -27,6 +27,7 @@ import re
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr
+from unittest.mock import patch
 
 PROVISION_PATH = os.path.join(os.path.dirname(__file__), "provision.py")
 SPEC = importlib.util.spec_from_file_location("copilot_provision", PROVISION_PATH)
@@ -397,6 +398,16 @@ class CopilotConfigFileAuthTest(BaseTelemetryTest):
         self.assertTrue(resolved.get("config_file_written"))
         self.assertEqual(self._read_raw(), raw)
 
+    def test_staged_config_too_deep_for_streamed_write_is_untouched(self) -> None:
+        # Decoders differ by Python version, but json.dump cannot rewrite
+        # this host-readable nesting. Preserve staged credential bytes.
+        raw = ('{"copilot_hmac_key":"placeholder-hmac", "theme":'
+               + "[" * 9998 + "]" * 9998 + "}").encode()
+        self._stage_config_secret(raw)
+        resolved = self._provision_staged()
+        self.assertEqual(resolved["method"], "auth-file")
+        self.assertEqual(self._read_raw(), raw)
+
     def test_staged_long_int_config_is_accepted(self) -> None:
         # Copilot and the host read long integers; the file is copied as is.
         raw = ('// note\n{"placeholder_sign_in": {"login": "example-user"}, "n": '
@@ -490,20 +501,23 @@ class CopilotConfigFileAuthTest(BaseTelemetryTest):
         self._assert_replaced()
 
     def test_too_deep_sign_in_file_is_untouched(self) -> None:
-        # Find the first depth Python's decoder rejects; Go's limit is
-        # 10000 levels, so the host may still read sign-in from it.
+        # Find the first depth decoding OR streamed encoding rejects.
+        # Python 3.14 decodes deeper than json.dump can write. Go's limit
+        # is 10000 levels, so the host may still read sign-in from it.
         def doc(n: int) -> str:
             return '{"copilot_hmac_key": "placeholder-hmac", "theme": ' + "[" * n + "]" * n + "}"
 
         def too_deep(n: int) -> bool:
             try:
-                json.loads(doc(n))
+                loaded = json.loads(doc(n))
+                for _ in json.JSONEncoder(indent=2, sort_keys=True).iterencode(loaded):
+                    pass
             except RecursionError:
                 return True
             return False
 
         lo, hi = 1, 9998  # 9998 arrays + the object = 9999 levels, within Go's limit
-        self.assertTrue(too_deep(hi), "Python's decoder accepts 9999 levels; test needs updating")
+        self.assertTrue(too_deep(hi), "Python's JSON decoder and streamed encoder accept 9999 levels; test needs updating")
         while lo < hi:
             mid = (lo + hi) // 2
             if too_deep(mid):
@@ -523,9 +537,12 @@ class CopilotConfigFileAuthTest(BaseTelemetryTest):
                + b', "theme": ' + b"[" * 9998 + b"]" * 9998 + b"}")
         with self.assertRaises(ValueError):
             provision._load_config_strictly(raw)
-        with self.assertRaises(RecursionError,
-                               msg="Python's decoder accepts 9999 levels; test needs updating"):
-            provision._config_holds_sign_in_or_too_deep(raw)
+        try:
+            # Newer decoders can inspect the sign-in; older ones reach their
+            # nesting limit. Both paths must preserve the original bytes.
+            self.assertTrue(provision._config_holds_sign_in_or_too_deep(raw))
+        except RecursionError:
+            pass
         self._write_raw(raw)
         self._provision_must_succeed()
         self.assertEqual(self._read_raw(), raw)
@@ -596,6 +613,24 @@ class CopilotConfigFileAuthTest(BaseTelemetryTest):
         self._write_settings_raw(b'{"theme": ')
         self._provision_must_succeed()
         self._assert_settings_defaults()
+
+    def test_settings_streamed_encode_failure_preserves_bytes(self) -> None:
+        nested = []
+        for _ in range(9998):
+            nested = [nested]
+        raw = b'{"theme":' + b"[" * 9999 + b"]" * 9999 + b"}"
+        self._write_settings_raw(raw)
+        ctx = scion_harness.ProvisionContext("copilot", {
+            "harness_bundle_dir": self.bundle, "agent_workspace": "/workspace",
+        })
+        # Model a decoder that accepts deep content, even on older Python
+        # versions whose decoder refuses before the streamed write.
+        with patch.object(provision.json, "load", return_value={"theme": nested}):
+            provision._ensure_settings(ctx)
+        with open(self._settings_path(), "rb") as handle:
+            self.assertEqual(handle.read(), raw)
+        self.assertCountEqual(os.listdir(os.path.dirname(self._settings_path())),
+                              ["settings.json", "config.json"])
 
     def test_clean_settings_keeps_values(self) -> None:
         self._write_settings_raw(b'{"autoUpdate": true, "theme": "dark"}')

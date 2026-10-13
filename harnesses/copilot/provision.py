@@ -454,7 +454,10 @@ def _write_hooks(home: str) -> None:
 
 
 def _load_config_strictly(raw: bytes) -> Any:
-    """Parse config.json content that is safe to rewrite.
+    """Parse config.json content eligible for settings edits.
+
+    Decoding can accept deeper nesting than streamed json.dump (Python 3.14);
+    callers must also handle RecursionError when writing the edited object.
 
     Lines that start with "//" are dropped, as copilot allows. Raises
     ValueError (UnicodeDecodeError and json.JSONDecodeError included) or
@@ -507,12 +510,21 @@ def _ensure_settings(ctx: scion_harness.ProvisionContext) -> None:
             settings[key] = value
             changed = True
     if changed:
-        scion_harness.atomic_write_json(settings_path, settings)
+        try:
+            scion_harness.atomic_write_json(settings_path, settings)
+        except RecursionError:
+            # Python 3.14's decoder can accept nesting its streamed encoder
+            # cannot write. The atomic writer removes its partial temporary
+            # file, preserving the existing settings bytes.
+            ctx.info(
+                "~/.copilot/settings.json is nested too deeply to rewrite; "
+                "leaving it unchanged (defaults not added)"
+            )
 
     config_path = os.path.join(config_dir, "config.json")
     config: dict[str, Any] = {}
     too_deep_note = (
-        "~/.copilot/config.json is nested too deeply to read; leaving it "
+        "~/.copilot/config.json is nested too deeply to read or rewrite; leaving it "
         "unchanged (workspace not added to trustedFolders)"
     )
     if os.path.isfile(config_path):
@@ -553,12 +565,21 @@ def _ensure_settings(ctx: scion_harness.ProvisionContext) -> None:
                     return
 
     folders = config.get("trustedFolders")
+    changed = False
     if not isinstance(folders, list):
         config["trustedFolders"] = [ctx.workspace]
-        scion_harness.atomic_write_json(config_path, config)
+        changed = True
     elif ctx.workspace not in folders:
         folders.append(ctx.workspace)
-        scion_harness.atomic_write_json(config_path, config)
+        changed = True
+    if changed:
+        try:
+            scion_harness.atomic_write_json(config_path, config)
+        except RecursionError:
+            # Keep sign-in bytes intact when decoding succeeded but streamed
+            # encoding reaches its own nesting limit. atomic_write_json has
+            # already removed the incomplete temporary file.
+            ctx.info(too_deep_note)
 
 
 def provision(ctx: scion_harness.ProvisionContext) -> None:
