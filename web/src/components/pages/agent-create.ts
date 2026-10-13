@@ -1241,10 +1241,7 @@ export class ScionPageAgentCreate extends LitElement {
           }}
         >
           ${this.brokers.map((b) => {
-            const hasGpu = Boolean(
-              b.capabilities?.nvidiaGpu ||
-              (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
-            );
+            const hasGpu = b.capabilities?.nvidiaGpu === true;
             const isGpuDisabled = this.requireGpu && !hasGpu;
             const disabled = b.status === 'offline' || isGpuDisabled;
             return html`<sl-option
