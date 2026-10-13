@@ -466,17 +466,30 @@ echo '{"ID":"abc123","Names":"proj--agent1","Status":"Up 5 minutes","Image":"sci
 func TestDockerRuntime_List_CollapsesConcurrentCalls(t *testing.T) {
 	tmpDir := t.TempDir()
 	mockDocker := filepath.Join(tmpDir, "mock-docker")
-	counterFile := filepath.Join(tmpDir, "counter")
-	if err := os.WriteFile(counterFile, []byte("0"), 0644); err != nil {
-		t.Fatalf("failed to seed counter file: %v", err)
+	psCallsFile := filepath.Join(tmpDir, "ps-calls")
+	if err := os.WriteFile(psCallsFile, nil, 0644); err != nil {
+		t.Fatalf("failed to seed ps call log: %v", err)
 	}
 
-	// Sleep briefly so concurrent List() calls are guaranteed to overlap
-	// and race into the singleflight group together.
+	// Sleep briefly during ps so concurrent List() calls overlap and race
+	// into the singleflight group together. Each caller's inspection returns
+	// runtime facts independently of the ps invocation counter.
 	script := `#!/bin/sh
-n=$(cat "` + counterFile + `")
-n=$((n + 1))
-echo "$n" > "` + counterFile + `"
+case "$1" in
+inspect)
+  echo '{"id":"abc123","privileged":true,"devices":[],"deviceRequests":[{"Driver":"nvidia","Capabilities":[["gpu"]]}]}'
+  exit 0
+  ;;
+ps)
+  ;;
+*)
+  echo "unexpected docker command: $1" >&2
+  exit 1
+  ;;
+esac
+# Append one short record atomically so concurrent ps processes cannot
+# overwrite each other's calls if singleflight stops collapsing them.
+printf 'ps\n' >> "` + psCallsFile + `"
 sleep 0.1
 echo '{"ID":"abc123","Names":"proj--agent1","Status":"Up 5 minutes","Image":"scion-claude:latest","Labels":"scion.name=agent1"}'
 `
@@ -488,23 +501,45 @@ echo '{"ID":"abc123","Names":"proj--agent1","Status":"Up 5 minutes","Image":"sci
 
 	const callers = 10
 	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(callers)
+	start := make(chan struct{})
 	var failures atomic.Int32
+	var factsFailures atomic.Int32
 	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := rt.List(context.Background(), nil); err != nil {
+			ready.Done()
+			<-start
+			agents, err := rt.List(context.Background(), nil)
+			if err != nil {
 				failures.Add(1)
+				return
+			}
+			if len(agents) != 1 || agents[0].Name != "agent1" ||
+				agents[0].Privileged == nil || !*agents[0].Privileged ||
+				agents[0].NvidiaGPU == nil || !*agents[0].NvidiaGPU {
+				factsFailures.Add(1)
 			}
 		}()
 	}
+	ready.Wait()
+	close(start)
 	wg.Wait()
 
 	if n := failures.Load(); n != 0 {
 		t.Fatalf("expected all concurrent List calls to succeed, got %d failures", n)
 	}
-	if got := readCounter(t, counterFile); got != 1 {
-		t.Fatalf("expected singleflight to collapse %d concurrent calls into 1 exec, got %d", callers, got)
+	if n := factsFailures.Load(); n != 0 {
+		t.Fatalf("expected all concurrent List calls to report observed privilege and GPU facts, got %d failures", n)
+	}
+	psCalls, err := os.ReadFile(psCallsFile)
+	if err != nil {
+		t.Fatalf("failed to read ps call log: %v", err)
+	}
+	if got := len(strings.Fields(string(psCalls))); got != 1 {
+		t.Fatalf("expected singleflight to collapse %d concurrent calls into 1 ps invocation, got %d", callers, got)
 	}
 }
 
