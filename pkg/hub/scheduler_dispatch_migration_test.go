@@ -28,17 +28,19 @@ import (
 )
 
 func TestDispatchAgentEventHandler_UserAuthoredChildRoleSurvivesMigration(t *testing.T) {
+	// Not parallel: concurrent ent migrate (store Migrate) writes the
+	// package-level migrate.Tables (concurrent map writes in Atlas.setupTables).
 	srv, s, user, project := setupAgentRoleTest(t)
 	ctx := context.Background()
 
-	err := srv.dispatchAgentEventHandler()(ctx, store.ScheduledEvent{
+	err := srv.dispatchAgentEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
 		ID:        tid("scheduled-dispatch-user-role"),
 		ProjectID: project.ID,
 		EventType: "dispatch_agent",
 		Payload:   `{"agentName":"scheduled-user-child","task":"scheduled work"}`,
 		CreatedBy: user.ID,
 		FireAt:    time.Now(),
-	})
+	}, user.ID))
 	require.NoError(t, err)
 
 	child, err := s.GetAgentBySlug(ctx, project.ID, "scheduled-user-child")
@@ -60,7 +62,7 @@ func TestDispatchAgentEventHandler_UserAuthoredChildRoleSurvivesMigration(t *tes
 	require.Empty(t, req.ResolvedSecrets)
 	require.NotContains(t, req.ResolvedEnv, "API_KEY")
 
-	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, migrateTestStore(ctx, s))
 
 	child, err = s.GetAgent(ctx, child.ID)
 	require.NoError(t, err)

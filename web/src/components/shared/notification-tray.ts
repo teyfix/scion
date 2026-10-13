@@ -26,7 +26,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import { apiFetch } from '../../client/api.js';
 import { stateManager } from '../../client/state.js';
-import { isChatNotificationStatus } from '../../client/chat-notifications.js';
+import { dispatchTrayCount } from '../../client/tray-count-events.js';
 import {
   canShowPushNotification,
   enablePushWithPermission,
@@ -36,6 +36,29 @@ import {
   type PushPermissionState,
 } from '../../client/push-preference.js';
 import type { User, Notification } from '../../shared/types.js';
+import { formatRelative } from '../../utils/time.js';
+import { navigateTo } from '../../client/navigation.js';
+
+/**
+ * A scheduled dispatch blocked by an agent row in phase error. The row's
+ * agentId is the errored agent, so "View agent" leads to the delete that
+ * unblocks the schedule.
+ */
+export const SCHEDULE_BLOCKED_STATUS = 'SCHEDULE_BLOCKED';
+
+/**
+ * Statuses of the chat rows the hub used to write into the bell (mentions
+ * and DMs). It writes none now, but rows made before that can remain.
+ */
+const RETIRED_CHAT_STATUSES: ReadonlySet<string> = new Set(['MENTION', 'DM_RECEIVED']);
+
+/** The nil UUID some older notification rows carry in place of an agent. */
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+/** Whether a notification row names an agent the "View agent" link can open. */
+function hasAgentLink(agentId: string | undefined): boolean {
+  return !!agentId && agentId !== NIL_UUID;
+}
 
 const POLL_INTERVAL_MS = 5 * 60_000; // 5 minutes — fallback only; SSE delivers in real-time
 
@@ -52,6 +75,8 @@ export class ScionNotificationTray extends LitElement {
   @state() private pushPermission: PushPermissionState = 'default';
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /** The user id loading was started for; null when nothing is running. */
+  private activeUserId: string | null = null;
   private boundOnClickOutside = this.onClickOutside.bind(this);
   private boundOnNotification = this.onNotificationEvent.bind(this);
   private boundOnPushPreference = (): void => this.syncPushState();
@@ -61,6 +86,9 @@ export class ScionNotificationTray extends LitElement {
 
   /** Suppresses browser push for the initial fetch so existing notifications don't fire. */
   private initialFetchDone = false;
+
+  /** The user id that the list, seenIds and initialFetchDone belong to. */
+  private stateUserId: string | null = null;
 
   // ---------------------------------------------------------------------------
   // Lifecycle
@@ -72,34 +100,93 @@ export class ScionNotificationTray extends LitElement {
     // Keep in step with the profile settings page, which writes the same
     // preference. Two toggles disagreeing about one setting is worse than one.
     window.addEventListener(PUSH_PREFERENCE_EVENT, this.boundOnPushPreference);
-    if (this.user) {
-      void this.fetchNotifications();
-      this.startPolling();
-      this.listenForNotifications();
-    }
+    this.syncUser();
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.stopPolling();
     this.stopListeningForNotifications();
+    // A reconnect starts afresh, as a first mount does.
+    this.activeUserId = null;
     window.removeEventListener(PUSH_PREFERENCE_EVENT, this.boundOnPushPreference);
     document.removeEventListener('click', this.boundOnClickOutside, true);
   }
 
+  override willUpdate(changed: Map<string, unknown>): void {
+    // Clear the previous user's state before this render, so no render pairs
+    // the new user with the previous user's list.
+    if (changed.has('user')) this.resetOnUserChange();
+    if (changed.has('notifications')) this.announceCount();
+  }
+
   override updated(changed: Map<string, unknown>): void {
-    if (changed.has('user')) {
-      if (this.user) {
-        void this.fetchNotifications();
-        this.startPolling();
-        this.listenForNotifications();
-      } else {
-        this.stopPolling();
-        this.stopListeningForNotifications();
-        this.notifications = [];
-      }
-    }
+    if (changed.has('user')) this.syncUser();
     this.detectTruncation();
+  }
+
+  /**
+   * Starts or stops loading for the signed-in user.
+   *
+   * Keyed on the user id, not the object: connectedCallback and the first
+   * updated() both see the same user on mount, and the header can hand over a
+   * new object for the same user (an auth refresh). Neither is a reason to
+   * fetch again or to restart polling.
+   */
+  private syncUser(): void {
+    const id = this.user?.id ?? null;
+    if (id) {
+      if (id === this.activeUserId) return;
+      // Loading stops on disconnect and restarts in connectedCallback.
+      if (!this.isConnected) return;
+      this.activeUserId = id;
+      void this.fetchNotifications();
+      this.startPolling();
+      this.listenForNotifications();
+    } else {
+      this.activeUserId = null;
+      this.stopPolling();
+      this.stopListeningForNotifications();
+      this.notifications = [];
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-user state
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Resets per-user state when the signed-in user id changes, so the next
+   * user's first fetch behaves like a first load: it shows only that user's
+   * notifications, suppresses push for the ones that already exist, and does
+   * not treat the previous user's notifications as seen.
+   */
+  private resetOnUserChange(): void {
+    const id = this.user?.id ?? null;
+    if (id === this.stateUserId) return;
+    this.stateUserId = id;
+    this.notifications = [];
+    this.seenIds = new Set();
+    this.initialFetchDone = false;
+  }
+
+  /**
+   * Tells the header how many items the list now holds. Called for every
+   * change to the list, including a clear on a user change or sign-out; a
+   * dropped response for a previous user changes nothing, so it announces
+   * nothing.
+   */
+  private announceCount(): void {
+    dispatchTrayCount(this, 'notifications', this.notifications.length);
+  }
+
+  /**
+   * Whether a response to a request started while requestUserId was signed in
+   * may be applied. A response for a previous user, or one that arrives after
+   * sign-out, is dropped.
+   */
+  private isForCurrentUser(requestUserId: string | null): boolean {
+    return requestUserId !== null && requestUserId === (this.user?.id ?? null);
   }
 
   // ---------------------------------------------------------------------------
@@ -110,11 +197,12 @@ export class ScionNotificationTray extends LitElement {
     this.pushPermission = pushPermission();
     // Permission can be revoked in site settings long after the opt-in was
     // stored, so the toggle reflects both halves rather than the flag alone.
-    this.pushEnabled = canShowPushNotification();
+    this.pushEnabled = canShowPushNotification('agent');
   }
 
   /**
-   * Turns desktop notifications on or off.
+   * Turns desktop notifications for agent events on or off. Chat message
+   * alerts have their own toggle in profile settings.
    *
    * This is the only path that asks the browser for permission, and it is
    * reachable from chat because the tray is in the chat header. Permission is
@@ -123,9 +211,9 @@ export class ScionNotificationTray extends LitElement {
    */
   private async handlePushToggle(): Promise<void> {
     if (this.pushEnabled) {
-      setPushOptIn(false);
+      setPushOptIn('agent', false);
     } else {
-      await enablePushWithPermission();
+      await enablePushWithPermission('agent');
     }
     this.syncPushState();
   }
@@ -179,11 +267,15 @@ export class ScionNotificationTray extends LitElement {
   // ---------------------------------------------------------------------------
 
   private async fetchNotifications(): Promise<void> {
+    const requestUserId = this.user?.id ?? null;
     try {
       const res = await apiFetch('/api/v1/notifications?acknowledged=false');
       if (!res.ok) return;
       const data = (await res.json()) as Notification[] | null;
-      const incoming = data ?? [];
+      if (!this.isForCurrentUser(requestUserId)) return;
+      // Older chat rows can still be unacknowledged; chat no longer belongs
+      // in the bell, so they are neither listed, counted nor popped.
+      const incoming = (data ?? []).filter((n) => !RETIRED_CHAT_STATUSES.has(n.status));
 
       // Detect new notifications (IDs not previously seen) and dispatch
       // browser push for them — but only after the first fetch so we don't
@@ -210,14 +302,7 @@ export class ScionNotificationTray extends LitElement {
    * and the browser has granted permission.
    */
   private dispatchBrowserNotification(n: Notification): void {
-    // Chat mentions and DMs are dispatched by chat-notifications.ts straight
-    // off the SSE event, with a conversation tag and a click target this
-    // component cannot build — the notification row has no conversation
-    // column. Firing here too would show every mention twice, because the
-    // same event that produces the popup also triggers the re-fetch below.
-    if (isChatNotificationStatus(n.status)) return;
-
-    if (!canShowPushNotification()) {
+    if (!canShowPushNotification('agent')) {
       return;
     }
 
@@ -234,17 +319,21 @@ export class ScionNotificationTray extends LitElement {
       case 'COMPLETED':
         return 'Agent Completed';
       case 'WAITING_FOR_INPUT':
-        return 'Agent Needs Input';
+        return 'Agent Waiting on Parent';
       case 'LIMITS_EXCEEDED':
         return 'Agent Limits Exceeded';
+      case SCHEDULE_BLOCKED_STATUS:
+        return 'Schedule Blocked';
       default:
         return 'Scion Notification';
     }
   }
 
   private async ackOne(id: string): Promise<void> {
+    const requestUserId = this.user?.id ?? null;
     try {
       await apiFetch(`/api/v1/notifications/${id}/ack`, { method: 'POST' });
+      if (!this.isForCurrentUser(requestUserId)) return;
       this.notifications = this.notifications.filter((n) => n.id !== id);
     } catch {
       // Ignore
@@ -252,8 +341,10 @@ export class ScionNotificationTray extends LitElement {
   }
 
   private async ackAll(): Promise<void> {
+    const requestUserId = this.user?.id ?? null;
     try {
       await apiFetch('/api/v1/notifications/ack-all', { method: 'POST' });
+      if (!this.isForCurrentUser(requestUserId)) return;
       this.notifications = [];
     } catch {
       // Ignore
@@ -298,6 +389,8 @@ export class ScionNotificationTray extends LitElement {
         return 'exclamation-circle-fill';
       case 'LIMITS_EXCEEDED':
         return 'x-circle-fill';
+      case SCHEDULE_BLOCKED_STATUS:
+        return 'calendar-x';
       default:
         return 'info-circle-fill';
     }
@@ -310,6 +403,7 @@ export class ScionNotificationTray extends LitElement {
       case 'WAITING_FOR_INPUT':
         return 'status-warning';
       case 'LIMITS_EXCEEDED':
+      case SCHEDULE_BLOCKED_STATUS:
         return 'status-danger';
       default:
         return 'status-info';
@@ -317,15 +411,11 @@ export class ScionNotificationTray extends LitElement {
   }
 
   private relativeTime(iso: string): string {
-    const diff = Date.now() - new Date(iso).getTime();
-    const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return 'just now';
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    return `${days}d ago`;
+    const ms = new Date(iso).getTime();
+    if (Number.isNaN(ms)) return '—';
+    // A future instant is clock skew between hub and browser.
+    if (ms > Date.now()) return 'just now';
+    return formatRelative(iso, { style: 'narrow' });
   }
 
   // ---------------------------------------------------------------------------
@@ -716,14 +806,13 @@ export class ScionNotificationTray extends LitElement {
         <div class="panel-footer">
           ${this.renderPushToggle()}
           <a
-            href="/projects"
+            href="/profile/settings"
             class="manage-link"
             @click=${(e: Event): void => {
               e.preventDefault();
               this.open = false;
               document.removeEventListener('click', this.boundOnClickOutside, true);
-              window.history.pushState({}, '', '/projects');
-              window.dispatchEvent(new PopStateEvent('popstate'));
+              navigateTo('/profile/settings');
             }}
             >Manage subscriptions</a
           >
@@ -733,9 +822,10 @@ export class ScionNotificationTray extends LitElement {
   }
 
   /**
-   * The master desktop-notification toggle. Lives in the tray because the tray
-   * is the one notification surface present on every page, chat included —
-   * the profile settings page is not reachable without leaving a conversation.
+   * The agent-event desktop-notification toggle. Lives in the tray because
+   * the tray is the one notification surface present on every page, chat
+   * included — the profile settings page is not reachable without leaving a
+   * conversation. It mirrors the profile page's agent event alerts toggle.
    */
   private renderPushToggle() {
     if (this.pushPermission === 'unsupported') return nothing;
@@ -747,10 +837,10 @@ export class ScionNotificationTray extends LitElement {
     // the next render admitted the button was blocked all along.
     const blocked = this.pushPermission === 'denied';
     const label = blocked
-      ? 'Desktop notifications blocked'
+      ? 'Agent alerts blocked'
       : this.pushEnabled
-        ? 'Desktop notifications on'
-        : 'Desktop notifications off';
+        ? 'Agent alerts on'
+        : 'Agent alerts off';
 
     return html`
       <button
@@ -780,10 +870,9 @@ export class ScionNotificationTray extends LitElement {
           </sl-tooltip>
           <div class="notif-meta">
             <span>${this.relativeTime(n.createdAt)}</span>
-            ${isChatNotificationStatus(n.status)
-              ? // Chat rows carry the nil agent UUID, so "View agent" would
-                // link to /agents/00000000-... and 404. Until the row records
-                // its conversation there is nowhere honest to send the click.
+            ${!hasAgentLink(n.agentId)
+              ? // Older rows can carry no agent (the nil UUID); a link would
+                // 404, so offer none.
                 nothing
               : html`<a
                   href="/agents/${n.agentId}"
@@ -813,8 +902,7 @@ export class ScionNotificationTray extends LitElement {
     e.preventDefault();
     this.open = false;
     document.removeEventListener('click', this.boundOnClickOutside, true);
-    window.history.pushState({}, '', `/agents/${agentId}`);
-    window.dispatchEvent(new PopStateEvent('popstate'));
+    navigateTo(`/agents/${agentId}`);
   }
 }
 

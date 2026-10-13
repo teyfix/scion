@@ -42,7 +42,7 @@ func (s *Server) handleProjectInjectedSkills(w http.ResponseWriter, r *http.Requ
 	case http.MethodPut:
 		s.setProjectInjectedSkills(w, r, projectID)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost, http.MethodPut)
 	}
 }
 
@@ -53,7 +53,7 @@ func (s *Server) handleProjectInjectedSkillByID(w http.ResponseWriter, r *http.R
 	case http.MethodDelete:
 		s.removeProjectInjectedSkill(w, r, projectID, entryID)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodDelete)
 	}
 }
 
@@ -397,6 +397,29 @@ func (s *Server) removeProjectInjectedSkill(w http.ResponseWriter, r *http.Reque
 // User-scope injected skills (/users/me/...)
 // =============================================================================
 
+// permUserSkillInjectionUpdate is the self-scoped permission a user access
+// token needs on the user-scope write routes (POST, PUT, DELETE).
+const permUserSkillInjectionUpdate = "user_skill_injection.update"
+
+// authorizeUserSkillInjectionWrite checks a user-scope injected-skills write
+// by the caller with authorizeSelfScoped. An interactive session or a dev
+// credential passes. A user access token needs the
+// user_skill_injection:update scope and a hub boundary, because a user's
+// injected skills belong to no project. Every other identity, including a
+// federated user, is refused, as on the inbox routes. A request whose
+// credential record names a user access token but whose identity is not a
+// token identity is refused too. It writes 403 on denial.
+func (s *Server) authorizeUserSkillInjectionWrite(w http.ResponseWriter, r *http.Request, userIdent UserIdentity) bool {
+	_, isToken := userIdent.(*ScopedUserIdentity)
+	if !isToken && GetCredentialContextFromContext(r.Context()).Kind == CredentialKindUAT {
+		resourceType, action := selfPermissionResourceAction(permUserSkillInjectionUpdate)
+		logAuthzDenial(r, userIdent, Resource{Type: resourceType}, action, selfScopeReasonCredential)
+		writeForbiddenStructured(w, "", resourceType, action)
+		return false
+	}
+	return s.authorizeSelfScoped(w, r, permUserSkillInjectionUpdate, "")
+}
+
 // handleUserMeInjectedSkills routes GET/POST/PUT on
 // /api/v1/users/me/injected-skills.
 func (s *Server) handleUserMeInjectedSkills(w http.ResponseWriter, r *http.Request) {
@@ -408,7 +431,7 @@ func (s *Server) handleUserMeInjectedSkills(w http.ResponseWriter, r *http.Reque
 	case http.MethodPut:
 		s.setUserInjectedSkills(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost, http.MethodPut)
 	}
 }
 
@@ -419,7 +442,7 @@ func (s *Server) handleUserMeInjectedSkillByID(w http.ResponseWriter, r *http.Re
 	case http.MethodDelete:
 		s.removeUserInjectedSkill(w, r, entryID)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodDelete)
 	}
 }
 
@@ -451,6 +474,9 @@ func (s *Server) addUserInjectedSkill(w http.ResponseWriter, r *http.Request) {
 	userIdent := GetUserIdentityFromContext(ctx)
 	if userIdent == nil {
 		Unauthorized(w)
+		return
+	}
+	if !s.authorizeUserSkillInjectionWrite(w, r, userIdent) {
 		return
 	}
 
@@ -513,9 +539,6 @@ func (s *Server) addUserInjectedSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Manage implicit progeny policy lifecycle
-	s.ensureSkillProgenyPolicy(ctx, si)
-
 	writeJSON(w, http.StatusCreated, skillInjectionToEntry(*si))
 }
 
@@ -526,6 +549,9 @@ func (s *Server) setUserInjectedSkills(w http.ResponseWriter, r *http.Request) {
 	userIdent := GetUserIdentityFromContext(ctx)
 	if userIdent == nil {
 		Unauthorized(w)
+		return
+	}
+	if !s.authorizeUserSkillInjectionWrite(w, r, userIdent) {
 		return
 	}
 
@@ -587,37 +613,15 @@ func (s *Server) setUserInjectedSkills(w http.ResponseWriter, r *http.Request) {
 			CreatedBy:    userIdent.ID(),
 		})
 	}
-	// Collect old progeny IDs before the replace so we can clean up
-	// their policies after the replace succeeds. Deleting before the
-	// replace risks inconsistent state if the replace fails.
-	var oldProgenyIDs []string
-	if existing, err := s.store.ListSkillInjections(ctx, store.SkillInjectionScopeUser, userIdent.ID()); err == nil {
-		for _, e := range existing {
-			if e.AllowProgeny {
-				oldProgenyIDs = append(oldProgenyIDs, e.ID)
-			}
-		}
-	}
-
 	if err := s.store.SetSkillInjections(ctx, store.SkillInjectionScopeUser, userIdent.ID(), injections, userIdent.ID()); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
-	}
-
-	// Clean up old progeny policies only after the replace succeeded.
-	for _, id := range oldProgenyIDs {
-		s.deleteSkillProgenyPolicy(ctx, id)
 	}
 
 	sis, err := s.store.ListSkillInjections(ctx, store.SkillInjectionScopeUser, userIdent.ID())
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
-	}
-
-	// Reconcile progeny policies for all user entries after bulk replace
-	for i := range sis {
-		s.ensureSkillProgenyPolicy(ctx, &sis[i])
 	}
 
 	writeJSON(w, http.StatusOK, api.SkillInjectionList{
@@ -632,6 +636,9 @@ func (s *Server) removeUserInjectedSkill(w http.ResponseWriter, r *http.Request,
 	userIdent := GetUserIdentityFromContext(ctx)
 	if userIdent == nil {
 		Unauthorized(w)
+		return
+	}
+	if !s.authorizeUserSkillInjectionWrite(w, r, userIdent) {
 		return
 	}
 
@@ -653,11 +660,6 @@ func (s *Server) removeUserInjectedSkill(w http.ResponseWriter, r *http.Request,
 	if ownedEntry == nil {
 		NotFound(w, "Skill injection entry")
 		return
-	}
-
-	// Clean up progeny policy if the entry had AllowProgeny enabled
-	if ownedEntry.AllowProgeny {
-		s.deleteSkillProgenyPolicy(ctx, ownedEntry.ID)
 	}
 
 	if err := s.store.RemoveSkillInjection(ctx, entryID); err != nil {
@@ -685,7 +687,7 @@ func (s *Server) handleHubInjectedSkills(w http.ResponseWriter, r *http.Request)
 	case http.MethodPut:
 		s.setHubInjectedSkills(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPut)
 	}
 }
 
@@ -818,29 +820,6 @@ func (s *Server) setHubInjectedSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 // =============================================================================
-// Progeny policy helpers for skill injections
-// =============================================================================
-//
-// RG1 migration note: The RelationshipGrantResolver (authz_relationship.go)
-// provides the target replacement for these DelegatedFrom Policy rows. At CO1
-// cutover, the resolver is wired into the evaluator and these functions become
-// no-ops. Until then, Policy rows are still created here so that the existing
-// checkDelegation path (authz.go) continues to grant progeny access for newly
-// created resources.
-
-// skillProgenyPolicyName returns the canonical policy name for a progeny skill injection policy.
-func skillProgenyPolicyName(skillInjectionID string) string {
-	return "progeny-skill-access:" + skillInjectionID
-}
-
-// ensureSkillProgenyPolicy is a no-op after CO1 cutover. Progeny access is
-// now handled by the RelationshipGrantResolver (authz_relationship.go).
-func (s *Server) ensureSkillProgenyPolicy(_ context.Context, _ *store.SkillInjection) {}
-
-// deleteSkillProgenyPolicy is a no-op after CO1 cutover.
-func (s *Server) deleteSkillProgenyPolicy(_ context.Context, _ string) {}
-
-// =============================================================================
 // Shared helpers
 // =============================================================================
 
@@ -892,7 +871,7 @@ func (s *Server) enrichSkillInjections(ctx context.Context, sis []store.SkillInj
 	entries := make([]api.SkillInjectionEntry, 0, len(sis))
 	for _, si := range sis {
 		e := skillInjectionToEntry(si)
-		baseURI := skillBaseURI(si.SkillURI)
+		baseURI := api.SkillBaseURI(si.SkillURI)
 		slug := skillSlugFromURI(baseURI)
 		if slug != "" {
 			if sk, ok := skillBySlug[slug]; ok {
@@ -905,18 +884,14 @@ func (s *Server) enrichSkillInjections(ctx context.Context, sis []store.SkillInj
 	return entries
 }
 
-// skillBaseURI strips the version specifier from a skill URI.
-// "scion://my-skill@1.0" → "scion://my-skill"; "scion://my-skill" → "scion://my-skill".
-func skillBaseURI(uri string) string {
-	if i := strings.LastIndex(uri, "@"); i > strings.Index(uri, "://") {
-		return uri[:i]
-	}
-	return uri
-}
-
 // skillSlugFromURI extracts a slug from the last path segment of a skill URI.
 // "scion://my-skill" → "my-skill"; "https://example.com/skills/my-skill" → "my-skill".
+// Any query or fragment is dropped first: api.SkillBaseURI keeps them in the
+// key, but they are not part of the slug.
 func skillSlugFromURI(uri string) string {
+	if idx := strings.IndexAny(uri, "?#"); idx >= 0 {
+		uri = uri[:idx]
+	}
 	// Strip scheme.
 	if idx := strings.Index(uri, "://"); idx >= 0 {
 		uri = uri[idx+3:]

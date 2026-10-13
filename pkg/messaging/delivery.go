@@ -26,69 +26,108 @@ const (
 
 // ConversationInfo is the conversation context delivered to agents.
 type ConversationInfo struct {
-	ID           string   `json:"id"`
-	Kind         string   `json:"kind"`                   // "direct" or "group"
-	Surface      string   `json:"surface"`                // "native", "discord", etc.
-	Name         string   `json:"name,omitempty"`         // human-readable
-	Participants []string `json:"participants,omitempty"` // principal refs
+	ID      string `json:"id"`
+	Kind    string `json:"kind"`           // "direct" or "group"
+	Surface string `json:"surface"`        // "native", "discord", etc.
+	Name    string `json:"name,omitempty"` // human-readable
 }
 
 // DeliveryEnvelope is the new agent-facing message format.
 // It replaces the old deliveryMessage struct in pkg/messages/format.go.
 type DeliveryEnvelope struct {
-	Timestamp    string           `json:"timestamp"`
-	Conversation ConversationInfo `json:"conversation"`
-	From         string           `json:"from"`         // PrincipalRef
-	To           []string         `json:"to,omitempty"` // addressee PrincipalRefs
-	Kind         MessageKind      `json:"kind"`
-	Intent       *TextIntent      `json:"intent,omitempty"` // Kind == text
-	Event        *EventBody       `json:"event,omitempty"`  // Kind == event
-	Msg          string           `json:"msg"`
-	Visibility   Visibility       `json:"visibility,omitempty"`
-	Attachments  []string         `json:"attachments,omitempty"`
-	ReplyTo      *string          `json:"reply_to,omitempty"` // msg ID
+	Timestamp    string            `json:"timestamp"`
+	MessageID    string            `json:"message_id,omitempty"` // persisted message ID; omitted when there is no stored row
+	Conversation *ConversationInfo `json:"conversation,omitempty"`
+	From         string            `json:"from"`            // PrincipalRef
+	To           []string          `json:"to,omitempty"`    // addressee PrincipalRefs
+	Type         string            `json:"type"`            // "message" | "event" | "mention" | "reply"
+	Event        *EventBody        `json:"event,omitempty"` // Type == "event"
+	Msg          string            `json:"msg"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Urgent       bool              `json:"urgent,omitempty"`
+	Attachments  []string          `json:"attachments,omitempty"`
+	ReplyTo      *string           `json:"reply_to,omitempty"`      // msg ID
+	ReplyContext string            `json:"reply_context,omitempty"` // first 32 chars of replied-to message
 }
 
 // DeliveryOptions captures transport-level options that are not part of the
 // message envelope itself (per design section 2.8).
 type DeliveryOptions struct {
-	Plain bool // deliver raw text only, no JSON wrapper
-	Raw   bool // keystroke injection — raw text only
+	Plain bool // deliver the message text only, no JSON wrapper
 }
 
 // FormatNewDelivery formats a new-style Message with its Addressees and
 // conversation context into the delivery envelope for an agent.
-// If the message has plain/raw delivery options, only the raw msg text is returned.
+// convInfo may be nil when no conversation context is available; the
+// "conversation" key is omitted from the envelope rather than fabricated.
+// If the message has the plain delivery option, only the msg text is returned.
+//
+// The envelope's "message_id" carries msg.ID, the persisted message row's ID,
+// so a recipient can refer to the exact message it received. When msg.ID is
+// empty (no stored row), the key is omitted rather than fabricated.
+//
+// isMention, when true, sets the envelope's type to "mention" (instead of
+// "message") and forces the "to" field to be present even for a single
+// addressee. Both are set explicitly by the routing call site that knows
+// whether the message was @-mention-routed.
 func FormatNewDelivery(
 	msg *Message,
 	addrs []Addressee,
-	convInfo ConversationInfo,
+	convInfo *ConversationInfo,
 	opts DeliveryOptions,
+	isMention bool,
+	isReply bool,
 ) string {
-	if opts.Plain || opts.Raw {
+	if opts.Plain {
 		return msg.Body
 	}
 
 	env := DeliveryEnvelope{
 		Timestamp:    msg.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		MessageID:    msg.ID,
 		Conversation: convInfo,
 		From:         string(msg.From),
-		Kind:         msg.Kind,
-		Intent:       msg.Intent,
+		Type:         typeString(msg.Kind, isMention, isReply),
 		Event:        msg.Event,
 		Msg:          msg.Body,
-		Visibility:   msg.Visibility,
+		Metadata:     msg.Metadata,
+		Urgent:       msg.Urgent,
 		ReplyTo:      msg.ReplyToID,
 	}
 
 	// Build addressee principal refs for the "to" field.
-	for _, a := range addrs {
-		env.To = append(env.To, a.PrincipalKind+":"+a.PrincipalID)
+	// For non-mention single-recipient (direct) messages the recipient is
+	// implicit — omit "to" to reduce envelope noise. Multi-recipient (group)
+	// messages still list every addressee so agents know who else received.
+	// Mention-routed messages always include "to" regardless of count — a
+	// single mentioned agent sees "to" naming itself, confirming no one else
+	// was mentioned.
+	if len(addrs) > 1 || isMention {
+		for _, a := range addrs {
+			env.To = append(env.To, a.PrincipalKind+":"+a.PrincipalID)
+		}
 	}
 
 	// Map attachments to plain paths.
 	for _, a := range msg.Attachments {
 		env.Attachments = append(env.Attachments, a.Path)
+	}
+
+	// Promote RE-to from metadata to top-level reply_context.
+	if v, ok := msg.Metadata["RE-to"]; ok {
+		env.ReplyContext = v
+		// Remove from metadata to avoid duplication.
+		filtered := make(map[string]string, len(msg.Metadata))
+		for k, mv := range msg.Metadata {
+			if k != "RE-to" {
+				filtered[k] = mv
+			}
+		}
+		if len(filtered) > 0 {
+			env.Metadata = filtered
+		} else {
+			env.Metadata = nil
+		}
 	}
 
 	jsonBytes, err := json.MarshalIndent(env, "", "  ")
@@ -98,4 +137,20 @@ func FormatNewDelivery(
 	}
 
 	return deliveryIntro + "\n\n" + beginDelimiter + "\n" + string(jsonBytes) + "\n" + endDelimiter
+}
+
+// typeString maps internal MessageKind and the explicit mention/reply flags to
+// the four-value wire type: "event", "mention", "reply", or "message".
+// KindEvent → "event"; isReply → "reply"; isMention → "mention"; else → "message".
+func typeString(k MessageKind, isMention bool, isReply bool) string {
+	if k == KindEvent {
+		return "event"
+	}
+	if isReply {
+		return "reply"
+	}
+	if isMention {
+		return "mention"
+	}
+	return "message"
 }

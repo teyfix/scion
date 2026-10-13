@@ -31,6 +31,12 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
 import { apiFetch } from '../../../client/api.js';
+import { formatInstant, formatInstantWithZone, formatRelative } from '../../../utils/time.js';
+import { DisplayZoneController } from '../../../utils/display-zone-controller.js';
+import { focusElement } from '../focus-moved.js';
+
+/** Ages under this are shown relative; older ones as an absolute date. */
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Shape of a search result from GET /api/v1/chat/search */
 interface SearchResult {
@@ -51,6 +57,9 @@ interface SearchResponse {
 
 @customElement('scion-chat-search')
 export class ScionChatSearch extends LitElement {
+  /** Re-renders absolute result dates when the display zone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
   /** Current project ID for scoped search. */
   @property()
   projectId = '';
@@ -101,7 +110,7 @@ export class ScionChatSearch extends LitElement {
     .search-input-wrap sl-icon {
       position: absolute;
       left: 0.5rem;
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
       color: var(--scion-text-muted, #64748b);
       pointer-events: none;
     }
@@ -111,7 +120,7 @@ export class ScionChatSearch extends LitElement {
       padding: 0.375rem 0.5rem 0.375rem 1.75rem;
       border: 1px solid var(--scion-border, #e2e8f0);
       border-radius: 6px;
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
       outline: none;
       background: var(--scion-bg, #f8fafc);
       color: var(--scion-text, #1e293b);
@@ -126,6 +135,15 @@ export class ScionChatSearch extends LitElement {
       color: var(--scion-text-muted, #94a3b8);
     }
 
+    /* Stop iOS/Android focus-zoom: this is a native <input>, not a
+       Shoelace component, so it is not covered by the app-wide
+       --sl-input-font-size-* rule. */
+    @media (pointer: coarse) {
+      .search-input {
+        font-size: max(16px, var(--chat-fs-md));
+      }
+    }
+
     .close-btn {
       flex-shrink: 0;
     }
@@ -137,7 +155,7 @@ export class ScionChatSearch extends LitElement {
       padding: 0.375rem 0.75rem;
       border-bottom: 1px solid var(--scion-border, #e2e8f0);
       background: var(--scion-surface, #ffffff);
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
     }
 
@@ -147,7 +165,7 @@ export class ScionChatSearch extends LitElement {
       cursor: pointer;
       border: 1px solid transparent;
       background: none;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
     }
 
@@ -164,6 +182,9 @@ export class ScionChatSearch extends LitElement {
     .results-list {
       flex: 1;
       overflow-y: auto;
+      overscroll-behavior: contain;
+      /* Set by the chat page's mobile panels; see chat.ts. */
+      touch-action: var(--chat-touch-action, auto);
       padding: 0.25rem 0;
     }
 
@@ -189,7 +210,7 @@ export class ScionChatSearch extends LitElement {
     }
 
     .result-thread {
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       font-weight: 600;
       color: var(--scion-text-muted, #64748b);
       white-space: nowrap;
@@ -198,20 +219,20 @@ export class ScionChatSearch extends LitElement {
     }
 
     .result-time {
-      font-size: 0.625rem;
+      font-size: var(--chat-fs-xs);
       color: var(--scion-text-muted, #94a3b8);
       white-space: nowrap;
       flex-shrink: 0;
     }
 
     .result-sender {
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       font-weight: 600;
       color: var(--scion-text, #1e293b);
     }
 
     .result-snippet {
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text, #334155);
       line-height: 1.4;
       word-break: break-word;
@@ -230,7 +251,7 @@ export class ScionChatSearch extends LitElement {
       justify-content: center;
       padding: 2rem;
       color: var(--scion-text-muted, #64748b);
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
       text-align: center;
     }
 
@@ -246,12 +267,25 @@ export class ScionChatSearch extends LitElement {
       border-radius: 6px;
       background: var(--scion-surface, #ffffff);
       color: var(--scion-text, #1e293b);
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       cursor: pointer;
     }
 
     .load-more button:hover {
       background: var(--scion-bg-subtle, #f1f5f9);
+    }
+
+    /* Clear a landscape phone's notch and rounded corners (the page uses
+       viewport-fit=cover) on whichever sides this column meets the screen
+       edge. Each inset is a transparent border, so the row's background still
+       paints to the screen edge and only its content moves in. The chat page
+       sets --chat-inset-left and --chat-inset-right for the edges the
+       conversation touches; both are 0 everywhere else. */
+    .search-header,
+    .scope-toggle,
+    .results-list {
+      border-left: var(--chat-inset-left, 0px) solid transparent;
+      border-right: var(--chat-inset-right, 0px) solid transparent;
     }
   `;
 
@@ -280,7 +314,7 @@ export class ScionChatSearch extends LitElement {
     // Focus the input after render.
     requestAnimationFrame(() => {
       const input = this.shadowRoot?.querySelector('.search-input') as HTMLInputElement;
-      input?.focus();
+      focusElement(input);
     });
   }
 
@@ -383,18 +417,15 @@ export class ScionChatSearch extends LitElement {
   private formatTime(iso: string): string {
     const d = new Date(iso);
     if (isNaN(d.getTime())) return '';
-    const now = Date.now();
-    const diffMs = now - d.getTime();
-    const diffMin = Math.floor(diffMs / 60000);
+    const ageMs = Date.now() - d.getTime();
+    // A future instant is clock skew between hub and browser.
+    if (ageMs < 0) return 'now';
+    // Under a week: a compact relative age.
+    if (ageMs < WEEK_MS) return formatRelative(iso, { style: 'narrow' });
 
-    if (diffMin < 1) return 'now';
-    if (diffMin < 60) return `${diffMin}m ago`;
-    const diffHrs = Math.floor(diffMin / 60);
-    if (diffHrs < 24) return `${diffHrs}h ago`;
-    const diffDays = Math.floor(diffHrs / 24);
-    if (diffDays < 7) return `${diffDays}d ago`;
-
-    return d.toLocaleDateString('en', { month: 'short', day: 'numeric' });
+    // Older than a week: a compact absolute date in the display zone; the
+    // zone is named in the element's title (the slot does not shrink).
+    return formatInstant(iso, 'date');
   }
 
   /** Sanitize snippet HTML to only allow <mark> tags. */
@@ -406,8 +437,8 @@ export class ScionChatSearch extends LitElement {
       .replace(/<\/mark>/g, '\x01MARK_CLOSE\x01')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/\x01MARK_OPEN\x01/g, '<mark>')
-      .replace(/\x01MARK_CLOSE\x01/g, '</mark>');
+      .replaceAll('\x01MARK_OPEN\x01', '<mark>')
+      .replaceAll('\x01MARK_CLOSE\x01', '</mark>');
   }
 
   override render() {
@@ -415,6 +446,7 @@ export class ScionChatSearch extends LitElement {
 
     const hasConversation = !!this.conversationKey;
 
+    // prettier-ignore
     return html`
       <div class="search-header">
         <div class="search-input-wrap">
@@ -436,44 +468,52 @@ export class ScionChatSearch extends LitElement {
         ></sl-icon-button>
       </div>
 
-      ${hasConversation
-        ? html`
-            <div class="scope-toggle">
-              <button
-                class="scope-btn ${!this.scopeAll ? 'active' : ''}"
-                @click=${() => this.toggleScope(false)}
-              >
-                In ${this.conversationName || 'this conversation'}
-              </button>
-              <button
-                class="scope-btn ${this.scopeAll ? 'active' : ''}"
-                @click=${() => this.toggleScope(true)}
-              >
-                All conversations
-              </button>
-            </div>
-          `
-        : nothing}
-
-      <div class="results-list">
-        ${this.loading
-          ? html`<div class="status-msg"><sl-spinner></sl-spinner></div>`
-          : this.noResults
-            ? html`<div class="status-msg">No messages found</div>`
-            : this.results.length === 0 && this.query.trim().length < 2
-              ? html`<div class="status-msg">Type at least 2 characters to search</div>`
-              : this.results.map((r) => this.renderResult(r))}
-        ${this.nextCursor && !this.loading
+      ${
+        hasConversation
           ? html`
-              <div class="load-more">
-                ${this.loadingMore
-                  ? html`<sl-spinner></sl-spinner>`
-                  : html`<button @click=${() => void this.performSearch(true)}>
-                      Load more
-                    </button>`}
+              <div class="scope-toggle">
+                <button
+                  class="scope-btn ${!this.scopeAll ? 'active' : ''}"
+                  @click=${() => this.toggleScope(false)}
+                >
+                  In ${this.conversationName || 'this conversation'}
+                </button>
+                <button
+                  class="scope-btn ${this.scopeAll ? 'active' : ''}"
+                  @click=${() => this.toggleScope(true)}
+                >
+                  All conversations
+                </button>
               </div>
             `
-          : nothing}
+          : nothing
+      }
+
+      <div class="results-list">
+        ${
+          this.loading
+            ? html`<div class="status-msg"><sl-spinner></sl-spinner></div>`
+            : this.noResults
+              ? html`<div class="status-msg">No messages found</div>`
+              : this.results.length === 0 && this.query.trim().length < 2
+                ? html`<div class="status-msg">Type at least 2 characters to search</div>`
+                : this.results.map((r) => this.renderResult(r))
+        }
+        ${
+          this.nextCursor && !this.loading
+            ? html`
+                <div class="load-more">
+                  ${
+                    this.loadingMore
+                      ? html`<sl-spinner></sl-spinner>`
+                      : html`<button @click=${() => void this.performSearch(true)}>
+                          Load more
+                        </button>`
+                  }
+                </div>
+              `
+            : nothing
+        }
       </div>
     `;
   }
@@ -483,7 +523,11 @@ export class ScionChatSearch extends LitElement {
       <div class="result-item" @click=${() => this.handleResultClick(result)}>
         <div class="result-top">
           <span class="result-thread">${result.threadName || result.conversationKey}</span>
-          <span class="result-time">${this.formatTime(result.timestamp)}</span>
+          <span
+            class="result-time"
+            title=${formatInstantWithZone(result.timestamp, 'datetime-full')}
+            >${this.formatTime(result.timestamp)}</span
+          >
         </div>
         <span class="result-sender">${result.senderName}</span>
         <span class="result-snippet">${unsafeHTML(this.sanitizeSnippet(result.snippet))}</span>

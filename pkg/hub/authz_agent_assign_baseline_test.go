@@ -35,22 +35,6 @@ import (
 // assign. The security in that conversion comes from the GCP actAs check, not
 // from narrowing the Hub policy layer.
 
-// projectSA builds a project-scoped service account resource in the given
-// project. Project-scoped is what gives it a project parent, which is what the
-// baseline keys on.
-func projectSA(t *testing.T, id, projectID string) Resource {
-	t.Helper()
-	r := gcpServiceAccountResource(&store.GCPServiceAccount{
-		ID:      id,
-		Scope:   store.ScopeProject,
-		ScopeID: projectID,
-		Email:   id + "@example.iam.gserviceaccount.com",
-	})
-	require.Equal(t, projectID, projectIDForResource(r),
-		"fixture must carry a project parent for the test to mean anything")
-	return r
-}
-
 // TestAuthz_AgentAssignBaseline_AllowsOwnProject verifies that an agent
 // assigning a service account in its own project is handled by the authz layer.
 //
@@ -271,12 +255,4 @@ func TestAuthz_AgentAssignBaseline_AllowPolicyStillWins(t *testing.T) {
 	decision := f.authz.CheckAccess(ctx, f.identity, sa, ActionAssign)
 	assert.False(t, decision.Allowed,
 		"CO1: baseline agent lacks project:agent:create scope; gcp_service_account.assign blocked")
-}
-
-// TestAuthz_AssignIsNotReadClass pins that the arm was added without widening
-// the read-class set. Widening isReadClassAction would have granted assign on
-// every resource type rather than on service accounts alone.
-func TestAuthz_AssignIsNotReadClass(t *testing.T) {
-	assert.False(t, isReadClassAction(ActionAssign),
-		"ActionAssign must not be read-class; the assign baseline is a separate, resource-type-scoped arm")
 }

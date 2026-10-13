@@ -30,6 +30,7 @@ import {
   saListUrl,
   saMintUrl,
   saRef,
+  saStatusUrl,
   saVerifyUrl,
 } from './gcp-service-account-urls.js';
 
@@ -136,13 +137,13 @@ describe('saListUrl', () => {
   });
 });
 
-describe('saCreateUrl — hub-scoped creation must reach the Hub’s refusal', () => {
+describe('saCreateUrl — hub-scoped creation addresses the flat collection', () => {
   /**
-   * The requirement is not "creation fails at hub scope". It is that it fails
-   * AT THE SERVER, where the refusal is implemented and where lifting the hold
-   * (#19) will change it. A create URL that pointed at some project's
-   * collection would SUCCEED, and succeed at making the wrong thing: a
-   * project-scoped account registered from a hub-scoped screen.
+   * Hub-scope BYO registration is now live (enabled in P9). The test’s value
+   * is ensuring the URL points at the flat collection — not at some project’s
+   * nested collection. A create URL that pointed at a project’s collection
+   * would succeed at making the wrong thing: a project-scoped account
+   * registered from a hub-scoped screen.
    */
   it('points at the flat collection with scope=hub, never at a project', () => {
     const url = saCreateUrl('hub', '');
@@ -155,12 +156,9 @@ describe('saCreateUrl — hub-scoped creation must reach the Hub’s refusal', (
   });
 });
 
-describe('saMintUrl — “nowhere to send this” is a value, not a URL', () => {
-  it('returns null at hub scope', () => {
-    // The flat route has no mint endpoint: /api/v1/gcp-service-accounts/mint
-    // parses as an account whose id is "mint". A plausible-looking string here
-    // would produce a 404 that reads like a missing account.
-    expect(saMintUrl('hub', '')).toBeNull();
+describe('saMintUrl — scope-appropriate mint endpoint', () => {
+  it('returns the flat mint URL with scope=hub at hub scope', () => {
+    expect(saMintUrl('hub', '')).toBe('/api/v1/gcp-service-accounts/mint?scope=hub');
   });
 
   it('returns the project mint endpoint at project scope', () => {
@@ -169,12 +167,33 @@ describe('saMintUrl — “nowhere to send this” is a value, not a URL', () =>
 });
 
 describe('saDetailPath', () => {
-  it('offers a detail page for parentless accounts only', () => {
+  it('offers the plain detail page for parentless accounts', () => {
     expect(saDetailPath(hubScoped)).toBe('/settings/service-accounts/sa-2');
     expect(saDetailPath(userScoped)).toBe('/settings/service-accounts/sa-3');
-    // Project-scoped accounts are managed from their project's settings tab,
-    // which is the surface whose list route computes their capabilities. A
-    // detail page for them could only render buttons from existence.
-    expect(saDetailPath(projectScoped)).toBeNull();
+  });
+
+  it('names the owning Scion project for a project-scoped account', () => {
+    // scopeId, never projectId (the GCP project): the page reads the status
+    // view and the row from the owning project.
+    expect(saDetailPath(projectScoped)).toBe(
+      '/settings/service-accounts/sa-1?project=scion-project-abc'
+    );
+    expect(saDetailPath({ ...projectScoped, scopeId: '' })).toBeNull();
+  });
+});
+
+describe('saStatusUrl', () => {
+  it('is nested under the Scion project and escapes the ref', () => {
+    expect(saStatusUrl('scion-project-abc', 'sa-1')).toBe(
+      '/api/v1/projects/scion-project-abc/gcp-service-accounts/sa-1/status'
+    );
+    expect(saStatusUrl('p', 'Worker SA')).toBe(
+      '/api/v1/projects/p/gcp-service-accounts/Worker%20SA/status'
+    );
+  });
+
+  it('refuses a missing project or account', () => {
+    expect(() => saStatusUrl('', 'sa-1')).toThrow();
+    expect(() => saStatusUrl('p', '')).toThrow();
   });
 });

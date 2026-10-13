@@ -16,7 +16,6 @@ package hubclient
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"time"
@@ -105,36 +104,6 @@ type Schedule struct {
 	UpdatedBy     string     `json:"updatedBy,omitempty"`
 }
 
-// UnmarshalJSON implements custom unmarshaling to support legacy groveId field.
-func (s *Schedule) UnmarshalJSON(data []byte) error {
-	type Alias Schedule
-	aux := &struct {
-		GroveID string `json:"groveId"`
-		*Alias
-	}{
-		Alias: (*Alias)(s),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	if s.ProjectID == "" && aux.GroveID != "" {
-		s.ProjectID = aux.GroveID
-	}
-	return nil
-}
-
-// MarshalJSON implements custom marshaling to support legacy groveId field.
-func (s Schedule) MarshalJSON() ([]byte, error) {
-	type Alias Schedule
-	return json.Marshal(&struct {
-		Alias
-		GroveID string `json:"groveId,omitempty"`
-	}{
-		Alias:   Alias(s),
-		GroveID: s.ProjectID,
-	})
-}
-
 // ListSchedulesOptions configures schedule listing.
 type ListSchedulesOptions struct {
 	Status string
@@ -156,7 +125,7 @@ func (s *scheduleService) Create(ctx context.Context, req *CreateScheduleRequest
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Schedule](resp)
+	return apiclient.DecodeRequired[Schedule](resp)
 }
 
 // Get retrieves a schedule by ID.
@@ -165,7 +134,7 @@ func (s *scheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Schedule](resp)
+	return apiclient.DecodeRequired[Schedule](resp)
 }
 
 // List returns schedules matching the filter criteria.
@@ -185,7 +154,7 @@ func (s *scheduleService) List(ctx context.Context, opts *ListSchedulesOptions) 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListSchedulesResponse](resp)
+	return apiclient.DecodeRequired[ListSchedulesResponse](resp)
 }
 
 // Update updates a schedule.
@@ -194,7 +163,7 @@ func (s *scheduleService) Update(ctx context.Context, id string, req *UpdateSche
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Schedule](resp)
+	return apiclient.DecodeRequired[Schedule](resp)
 }
 
 // Delete deletes a schedule.
@@ -212,7 +181,7 @@ func (s *scheduleService) Pause(ctx context.Context, id string) (*Schedule, erro
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Schedule](resp)
+	return apiclient.DecodeRequired[Schedule](resp)
 }
 
 // Resume resumes a paused schedule.
@@ -221,7 +190,7 @@ func (s *scheduleService) Resume(ctx context.Context, id string) (*Schedule, err
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Schedule](resp)
+	return apiclient.DecodeRequired[Schedule](resp)
 }
 
 // History returns execution history for a schedule.
@@ -235,5 +204,5 @@ func (s *scheduleService) History(ctx context.Context, id string, opts *ListSche
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListScheduledEventsResponse](resp)
+	return apiclient.DecodeRequired[ListScheduledEventsResponse](resp)
 }

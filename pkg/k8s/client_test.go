@@ -18,12 +18,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/k8s/api/v1alpha1"
+	"golang.org/x/oauth2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +37,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 func TestClient_ListSandboxClaims(t *testing.T) {
@@ -339,6 +344,74 @@ func TestNewClientWithContext_DoesNotFallBackWhenContextExplicit(t *testing.T) {
 	}
 }
 
+// TestFallbackToGCEAuth_RequestsExpectedScopesAndAuth exercises the real
+// fallbackToGCEAuth call path (not just the gceFallbackAuthScopes literal):
+// it stubs defaultTokenSource to record the scopes it was called with, then
+// drives an actual request through the resulting client to confirm the
+// token is presented as a bearer credential and the exec plugin is cleared.
+func TestFallbackToGCEAuth_RequestsExpectedScopesAndAuth(t *testing.T) {
+	var gotScopes []string
+	var gotAuthHeader string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	origTokenSource := defaultTokenSource
+	t.Cleanup(func() { defaultTokenSource = origTokenSource })
+	defaultTokenSource = func(_ context.Context, scope ...string) (oauth2.TokenSource, error) {
+		gotScopes = scope
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}), nil
+	}
+
+	cfg := &rest.Config{Host: srv.URL}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatalf("failed to build clientset: %v", err)
+	}
+	// Set ExecProvider after building the clientset: kubernetes.NewForConfig
+	// validates it eagerly (apiVersion/command), and the only thing this test
+	// needs from it is a non-nil value that fallbackToGCEAuth must clear.
+	cfg.ExecProvider = &clientcmdapi.ExecConfig{
+		APIVersion: "client.authentication.k8s.io/v1beta1",
+		Command:    "gke-gcloud-auth-plugin",
+	}
+
+	client := &Client{Config: cfg, Clientset: clientset}
+
+	if err := client.fallbackToGCEAuth(); err != nil {
+		t.Fatalf("fallbackToGCEAuth failed: %v", err)
+	}
+
+	wantScopes := map[string]bool{
+		"https://www.googleapis.com/auth/cloud-platform": true,
+		"https://www.googleapis.com/auth/userinfo.email": true,
+	}
+	if len(gotScopes) != len(wantScopes) {
+		t.Fatalf("expected %d scopes passed to defaultTokenSource, got %d: %v", len(wantScopes), len(gotScopes), gotScopes)
+	}
+	for _, scope := range gotScopes {
+		if !wantScopes[scope] {
+			t.Errorf("unexpected scope passed to defaultTokenSource: %q", scope)
+		}
+		delete(wantScopes, scope)
+	}
+	for missing := range wantScopes {
+		t.Errorf("missing expected scope passed to defaultTokenSource: %q", missing)
+	}
+
+	if gotAuthHeader != "Bearer test-token" {
+		t.Errorf("expected server to see 'Bearer test-token', got %q", gotAuthHeader)
+	}
+
+	if client.Config.ExecProvider != nil {
+		t.Error("expected ExecProvider to be cleared after falling back to token-source auth")
+	}
+}
+
 func TestNewClientWithContext_ReportsBothKubeconfigAndInClusterErrors(t *testing.T) {
 	_, err := newClientWithContext(
 		"",
@@ -362,5 +435,74 @@ func TestNewClientWithContext_ReportsBothKubeconfigAndInClusterErrors(t *testing
 
 	if !errors.Is(err, errMissingServiceAccountToken) {
 		t.Fatalf("expected in-cluster error in chain, got: %v", err)
+	}
+}
+
+func testKubeconfigFor(server string) string {
+	return `apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: ` + server + `
+  name: test-cluster
+contexts:
+- context:
+    cluster: test-cluster
+    user: test-user
+  name: test-context
+current-context: test-context
+users:
+- name: test-user
+  user:
+    token: fake-token
+`
+}
+
+// NewClientWithContextTimeout bounds every request, Verify included.
+func TestNewClientWithContextTimeout(t *testing.T) {
+	var versionCalls int
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			versionCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"major":"1","minor":"30","gitVersion":"v1.30.0"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ok.Close()
+	c, err := NewClientWithContextTimeout(writeTestKubeconfig(t, testKubeconfigFor(ok.URL)), "test-context", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Config.Timeout != 3*time.Second {
+		t.Errorf("Config.Timeout = %v, want 3s", c.Config.Timeout)
+	}
+	if c.CurrentContext != "test-context" {
+		t.Errorf("CurrentContext = %q", c.CurrentContext)
+	}
+	if err := c.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if versionCalls != 1 {
+		t.Errorf("version calls = %d, want 1", versionCalls)
+	}
+
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer hang.Close()
+	defer close(release)
+	c, err = NewClientWithContextTimeout(writeTestKubeconfig(t, testKubeconfigFor(hang.URL)), "", 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := c.Verify(); err == nil {
+		t.Fatal("Verify against a hung API server succeeded")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("Verify took %v, want it bounded by the timeout", d)
 	}
 }

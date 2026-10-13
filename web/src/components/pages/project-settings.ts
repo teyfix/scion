@@ -20,7 +20,7 @@
  * Displays project-scoped templates, environment variables, secrets, and danger-zone actions (delete).
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type {
@@ -34,8 +34,12 @@ import type {
   GCPServiceAccount,
   PreStartHook,
   PreStartHookSummary,
+  CrossProjectInboundPolicy,
+  ProjectMessagingPolicy,
 } from '../../shared/types.js';
 import { can, canAny } from '../../shared/types.js';
+import { isBrokerKubernetesOnly } from '../../shared/runtime-kind.js';
+import { projectServiceAccountListUrl } from '../../shared/gcp-sa-assign-status.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import type { AccessBoundarySummary } from '../../shared/access-boundaries.js';
@@ -58,6 +62,9 @@ import '../shared/injected-skills-panel.js';
 import '../shared/pre-start-hook-list.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
+import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
+import { DisplayZoneController } from '../../utils/display-zone-controller.js';
+import { navigateTo } from '../../client/navigation.js';
 
 interface ProjectResourceSpec {
   requests?: { cpu?: string | undefined; memory?: string | undefined };
@@ -111,6 +118,9 @@ interface RuntimeBrokerWithProvider extends RuntimeBroker {
 
 @customElement('scion-page-project-settings')
 export class ScionPageProjectSettings extends LitElement {
+  /** Re-renders absolute times when the display timezone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
   @property({ type: Object })
   pageData: PageData | null = null;
 
@@ -159,6 +169,10 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private dropdownTemplates: Template[] = [];
+
+  /** The Default Template list failed to load (the saved value is kept). */
+  @state()
+  private dropdownTemplatesLoadFailed = false;
 
   @state()
   private harnessConfigs: HarnessConfigEntry[] = [];
@@ -284,6 +298,22 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private boundaryError = '';
+
+  // Cross-project messaging policy
+  @state()
+  private messagingPolicy: ProjectMessagingPolicy | null = null;
+
+  @state()
+  private messagingPolicyLoading = true;
+
+  @state()
+  private messagingPolicySaving = false;
+
+  @state()
+  private messagingPolicyError: string | null = null;
+
+  @state()
+  private messagingPolicySuccess: string | null = null;
 
   private brokerRelativeTimeInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -574,6 +604,10 @@ export class ScionPageProjectSettings extends LitElement {
       color: var(--scion-text-muted, #64748b);
     }
 
+    .config-field .field-help-error {
+      color: var(--sl-color-danger-600, #dc2626);
+    }
+
     .config-actions {
       display: flex;
       align-items: center;
@@ -842,6 +876,7 @@ export class ScionPageProjectSettings extends LitElement {
     void this.loadHarnessConfigs();
     void this.loadBrokers();
     void this.loadGCPServiceAccounts();
+    void this.loadMessagingPolicy();
   }
 
   override disconnectedCallback(): void {
@@ -920,6 +955,177 @@ export class ScionPageProjectSettings extends LitElement {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Cross-project messaging policy
+  // ---------------------------------------------------------------------------
+
+  private async loadMessagingPolicy(): Promise<void> {
+    this.messagingPolicyLoading = true;
+    this.messagingPolicyError = null;
+    try {
+      const res = await apiFetch(`/api/v1/projects/${this.projectId}/messaging-policy`);
+      if (res.ok) {
+        this.messagingPolicy = (await res.json()) as ProjectMessagingPolicy;
+      }
+    } catch {
+      // Non-critical — section won't render
+    } finally {
+      this.messagingPolicyLoading = false;
+    }
+  }
+
+  private async saveMessagingPolicy(value: CrossProjectInboundPolicy): Promise<void> {
+    if (!this.messagingPolicy) return;
+    const previous = this.messagingPolicy.crossProjectInbound;
+    this.messagingPolicy = { ...this.messagingPolicy, crossProjectInbound: value }; // optimistic
+    this.messagingPolicySaving = true;
+    this.messagingPolicyError = null;
+    this.messagingPolicySuccess = null;
+    try {
+      const res = await apiFetch(`/api/v1/projects/${this.projectId}/messaging-policy`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          crossProjectInbound: value,
+          expectedRevision: this.messagingPolicy.revision,
+        }),
+      });
+      if (res.status === 409) {
+        this.messagingPolicy = { ...this.messagingPolicy, crossProjectInbound: previous }; // revert
+        await this.loadMessagingPolicy();
+        this.messagingPolicyError = 'Settings were modified by another user. Refreshing...';
+        return;
+      }
+      if (!res.ok) {
+        throw new Error(await extractApiError(res, 'Failed to save'));
+      }
+      this.messagingPolicy = (await res.json()) as ProjectMessagingPolicy;
+      this.messagingPolicySuccess = 'Messaging policy saved.';
+    } catch (err) {
+      this.messagingPolicyError = err instanceof Error ? err.message : 'Failed to save policy';
+      this.messagingPolicy = { ...this.messagingPolicy, crossProjectInbound: previous }; // revert
+    } finally {
+      this.messagingPolicySaving = false;
+    }
+  }
+
+  private renderMessagingPolicySection() {
+    // Don't render until data is loaded (or if the endpoint is unavailable)
+    if (this.messagingPolicyLoading) {
+      return html`
+        <div class="section">
+          <h2>Cross-Project Messaging</h2>
+          <p>Controls which external agents can send messages to agents in this project.</p>
+          <div style="text-align: center; padding: 1rem;"><sl-spinner></sl-spinner></div>
+        </div>
+      `;
+    }
+
+    if (!this.messagingPolicy) return nothing;
+
+    const canEdit = can(this.project?._capabilities, 'manage');
+    const policy = this.messagingPolicy;
+    const hubDisabled = !policy.hubCrossProjectEnabled;
+    const currentValue = policy.crossProjectInbound;
+
+    const policyLabels: Record<CrossProjectInboundPolicy, string> = {
+      none: 'No external agents',
+      members: 'Agents created by this project’s members',
+      any: 'Agents from any project on this Hub',
+    };
+
+    const policyHelp: Record<CrossProjectInboundPolicy, string> = {
+      none: 'No agents from other projects can send messages to agents in this project.',
+      members:
+        'Accepts messages from agents in other projects whose originating user is a current member of this project, including members via groups.',
+      any: 'Accepts messages from eligible agents in any project on this Hub.',
+    };
+
+    return html`
+      <div class="section">
+        <h2>Cross-Project Messaging</h2>
+        <p>
+          Controls which external agents can send messages to agents in this project. This is an
+          inbound policy &mdash; replies from your agents to other projects require Hub mode and the
+          destination project&rsquo;s consent.
+        </p>
+
+        ${hubDisabled
+          ? html`
+              <sl-alert variant="warning" open>
+                <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+                <strong>Disabled by Hub administrator.</strong> Cross-project messaging is turned
+                off at the Hub level. Your configured selection below is preserved and will take
+                effect when the Hub administrator enables cross-project messaging.
+              </sl-alert>
+            `
+          : ''}
+        ${this.messagingPolicyError
+          ? html`<div
+              class="config-status error"
+              style="margin-bottom: 0.75rem; font-size: 0.8125rem;"
+            >
+              ${this.messagingPolicyError}
+            </div>`
+          : ''}
+        ${this.messagingPolicySuccess
+          ? html`<div
+              class="config-status success"
+              style="margin-bottom: 0.75rem; font-size: 0.8125rem;"
+            >
+              ${this.messagingPolicySuccess}
+            </div>`
+          : ''}
+
+        <sl-radio-group
+          label="Inbound policy"
+          value=${currentValue}
+          @sl-change=${(e: Event) => {
+            if (!canEdit) return;
+            const value = (e.target as HTMLInputElement).value as CrossProjectInboundPolicy;
+            void this.saveMessagingPolicy(value);
+          }}
+        >
+          ${(['none', 'members', 'any'] as CrossProjectInboundPolicy[]).map(
+            (value) => html`
+              <sl-radio-button value=${value} ?disabled=${!canEdit || this.messagingPolicySaving}>
+                ${policyLabels[value]}
+              </sl-radio-button>
+            `
+          )}
+        </sl-radio-group>
+
+        <p
+          style="margin-top: 0.75rem; font-size: 0.8125rem; color: var(--scion-text-muted, #64748b);"
+        >
+          ${policyHelp[currentValue]}
+        </p>
+
+        ${!canEdit
+          ? html`
+              <p
+                style="margin-top: 0.5rem; font-size: 0.8125rem; color: var(--scion-text-muted, #64748b); font-style: italic;"
+              >
+                Only project owners can change the messaging policy.
+              </p>
+            `
+          : ''}
+        ${currentValue !== 'none' && !hubDisabled
+          ? html`
+              <p
+                style="margin-top: 0.5rem; font-size: 0.8125rem; color: var(--scion-text-muted, #64748b);"
+              >
+                Choosing &ldquo;${policyLabels[currentValue]}&rdquo; can admit external messages to
+                existing project-mode agents. It does not grant those agents external send
+                authority. Replying requires their own Hub mode and the peer project&rsquo;s
+                consent.
+              </p>
+            `
+          : ''}
+      </div>
+    `;
+  }
+
   /**
    * Loads the active hub-scoped pre-start hook for the inherited indicator.
    * This is best-effort: if the endpoint is forbidden or unavailable the banner
@@ -992,8 +1198,10 @@ export class ScionPageProjectSettings extends LitElement {
         `/api/v1/templates?${params.toString()}`,
         'templates'
       );
+      this.dropdownTemplatesLoadFailed = false;
     } catch (err) {
       console.error('Failed to load dropdown templates:', err);
+      this.dropdownTemplatesLoadFailed = true;
     }
   }
 
@@ -1166,6 +1374,113 @@ export class ScionPageProjectSettings extends LitElement {
     `;
   }
 
+  /**
+   * Whether every runtime broker linked to this project (the same list shown
+   * on the Brokers tab) is reliably known to be Kubernetes: at least one
+   * linked broker, and every one of them registers only "kubernetes"
+   * profiles. This deliberately does not guess — a project with no linked
+   * broker, a broker with no profile info, or a mix of runtime types across
+   * its brokers, all read as false here.
+   */
+  private get projectIsKubernetesOnly(): boolean {
+    if (this.brokers.length === 0) return false;
+    return this.brokers.every((b) => isBrokerKubernetesOnly(b));
+  }
+
+  /** Explanation text shared by the help-text slot and the disabled option's tooltip. */
+  private static readonly gcpIdentityK8sHintText =
+    'Block is not supported on the Kubernetes runtime: this project’s runtime brokers are ' +
+    'Kubernetes. Choose Passthrough or Assign Service Account instead.';
+
+  /**
+   * Short explanation rendered into the GCP identity select's `help-text`
+   * slot when this project's linked brokers are reliably Kubernetes-only:
+   * block is disabled in that case (existing stored "block" values still
+   * display; the server rejects saving a new one).
+   *
+   * Rendered as a slotted child of the `<sl-select>` (not a sibling
+   * `aria-describedby` reference) because the element that receives focus is
+   * the `role="combobox"` input inside Shoelace's shadow root, which an
+   * attribute on the host cannot reach across the shadow boundary. Shoelace
+   * wires its own `help-text` slot to that combobox's `aria-describedby`
+   * internally.
+   */
+  private renderKubernetesBlockHint(): TemplateResult | typeof nothing {
+    if (!this.projectIsKubernetesOnly) return nothing;
+    return html`<div slot="help-text">${ScionPageProjectSettings.gcpIdentityK8sHintText}</div>`;
+  }
+
+  /**
+   * Describes the hub default GCP identity this project inherits while its
+   * own setting is "inherit". For "assign" it names the service account (the
+   * mode alone doesn't say which identity agents get); for "passthrough" it
+   * notes that the hub default only takes effect on the embedded broker.
+   */
+  private renderInheritedGCPIdentityHint() {
+    if (this.configDefaultGCPIdentityMode) {
+      return nothing;
+    }
+    const mode = this.resolvedSettings['scion.io/default-gcp-identity-mode'];
+    if (!mode || mode.hubDefault !== 'present' || !mode.hubValue) {
+      return nothing;
+    }
+    if (mode.hubValue === 'assign') {
+      const saEntry = this.resolvedSettings['scion.io/default-gcp-identity-service-account-id'];
+      const saID =
+        saEntry?.hubDefault === 'present' && saEntry.hubValue != null
+          ? String(saEntry.hubValue)
+          : '';
+      // No service account configured: the consumption-side ladder falls
+      // through to "Block" the same way an unverified one does, which this
+      // project's Kubernetes runtime rejects at dispatch.
+      if (!saID && this.projectIsKubernetesOnly) {
+        return html`<span class="field-help"
+          >Inherited from hub: the hub default is "Assign", but no service account is configured, so
+          it falls back to "Block" — rejected at dispatch for this project's Kubernetes runtime. Set
+          a project-level default of Passthrough or Assign Service Account.</span
+        >`;
+      }
+      const sa = this.gcpServiceAccounts.find((s) => s.id === saID);
+      const saLabel = sa ? sa.email : saID;
+      return html`<span class="field-help"
+        >Inherited from hub: agents are assigned
+        ${saLabel || 'the hub default service account'}.</span
+      >`;
+    }
+    if (mode.hubValue === 'passthrough') {
+      if (this.projectIsKubernetesOnly) {
+        // This rung only ever reaches passthrough for a local container
+        // runtime (docker/podman) on the hub's own embedded broker
+        // (hubDefaultPassthroughAllowed + hubDefaultRuntimeAllowed,
+        // pkg/hub/default_gcp_identity.go, ptone/scion#2186) — Kubernetes is
+        // never in that allowed set, embedded broker or not. When denied,
+        // Phase 1 (ptone/scion#2338) leaves the identity unset rather than
+        // writing an explicit "block", so the broker applies its own
+        // Kubernetes default (passthrough). For a confirmed Kubernetes-bound
+        // project that denial is unconditional, so this is informational,
+        // not a rejection warning.
+        return html`<span class="field-help"
+          >Inherited from hub: passthrough only reaches a local container runtime (docker/podman) on
+          the hub's own embedded broker — Kubernetes is never eligible, so here no identity is
+          explicitly set, and this project's Kubernetes runtime applies its own default
+          automatically.</span
+        >`;
+      }
+      return html`<span class="field-help"
+        >Inherited from hub: passthrough applies only to agents on the hub's embedded broker; agents
+        on other brokers get "Block".</span
+      >`;
+    }
+    if (mode.hubValue === 'block' && this.projectIsKubernetesOnly) {
+      return html`<span class="field-help"
+        >Inherited from hub: the hub default is "Block", but this project's runtime brokers are
+        Kubernetes, which rejects it at dispatch. Set a project-level default of Passthrough or
+        Assign Service Account.</span
+      >`;
+    }
+    return nothing;
+  }
+
   private async loadHarnessConfigs(): Promise<void> {
     try {
       const response = await apiFetch(
@@ -1182,7 +1497,11 @@ export class ScionPageProjectSettings extends LitElement {
 
   private async loadGCPServiceAccounts(): Promise<void> {
     try {
-      const response = await apiFetch(`/api/v1/projects/${this.projectId}/gcp-service-accounts`);
+      const response = await apiFetch(
+        // No assignStatus: the project default applies to every runtime
+        // profile, so there is no single target to report a mapping for.
+        projectServiceAccountListUrl(this.projectId, null)
+      );
       if (response.ok) {
         const data = (await response.json()) as { items?: GCPServiceAccount[] };
         this.gcpServiceAccounts = (data.items || []).filter((sa) => sa.verified);
@@ -1262,25 +1581,30 @@ export class ScionPageProjectSettings extends LitElement {
           ? this.defaultCustomModelId
           : this.defaultModelSelection;
 
+      // The PUT keeps any field the body leaves out, so every field this
+      // page manages is sent: "" / 0 / {} clears it, and null resets a
+      // tri-state field (telemetry, auto-expose, thinking level) to inherit.
+      // Fields this page does not manage (activeProfile, the per-profile
+      // service account map) are left out so a save keeps them.
       const body: ProjectSettings = {
-        defaultTemplate: this.configDefaultTemplate || undefined,
-        defaultHarnessConfig: this.configDefaultHarnessConfig || undefined,
-        defaultHarnessAuth: this.configDefaultHarnessAuth || undefined,
-        defaultModel: defaultModel || undefined,
+        defaultTemplate: this.configDefaultTemplate || '',
+        defaultHarnessConfig: this.configDefaultHarnessConfig || '',
+        defaultHarnessAuth: this.configDefaultHarnessAuth || '',
+        defaultModel: defaultModel || '',
         telemetryEnabled: this.configTelemetryEnabled,
         autoExposePortsEnabled: this.configAutoExposePortsEnabled,
-        defaultMaxTurns: this.configDefaultMaxTurns || undefined,
-        defaultMaxModelCalls: this.configDefaultMaxModelCalls || undefined,
-        defaultMaxDuration: this.configDefaultMaxDuration || undefined,
-        defaultResources,
+        defaultMaxTurns: this.configDefaultMaxTurns || 0,
+        defaultMaxModelCalls: this.configDefaultMaxModelCalls || 0,
+        defaultMaxDuration: this.configDefaultMaxDuration || '',
+        defaultResources: defaultResources ?? {},
         defaultThinkingLevel: this.defaultThinkingLevel,
-        defaultGCPIdentityMode: this.configDefaultGCPIdentityMode || undefined,
+        defaultGCPIdentityMode: this.configDefaultGCPIdentityMode || '',
         defaultGCPIdentityServiceAccountID:
           this.configDefaultGCPIdentityMode === 'assign'
-            ? this.configDefaultGCPIdentitySAID || undefined
-            : undefined,
-        maxAgentRole: this.configMaxAgentRole || undefined,
-        defaultAgentRole: this.configDefaultAgentRole || undefined,
+            ? this.configDefaultGCPIdentitySAID || ''
+            : '',
+        maxAgentRole: this.configMaxAgentRole || '',
+        defaultAgentRole: this.configDefaultAgentRole || '',
       };
 
       const response = await apiFetch(`/api/v1/projects/${this.projectId}/settings`, {
@@ -1329,8 +1653,7 @@ export class ScionPageProjectSettings extends LitElement {
       }
 
       // Navigate back to projects list
-      window.history.pushState({}, '', '/projects');
-      window.dispatchEvent(new PopStateEvent('popstate'));
+      navigateTo('/projects');
     } catch (err) {
       console.error('Failed to delete project:', err);
       showToast(err instanceof Error ? err.message : 'Failed to delete project');
@@ -1359,14 +1682,16 @@ export class ScionPageProjectSettings extends LitElement {
         <h1>${this.project.name} Settings</h1>
       </div>
 
-      ${this.renderConfigSection()} ${this.renderGitHubAppSection()}
+      ${this.renderConfigSection()}
       <scion-project-members-editor
         projectId=${this.project.id}
         ?readOnly=${!canAny(this.project._capabilities, 'update', 'manage')}
         compact
         sectionTitle="Members"
-        sectionDescription="Users and groups with access to this project. Adding a member creates a project-scoped role binding."
+        sectionDescription="Users and groups with access to this project. Each member holds at most one built-in tier (owner, admin or member) and may also hold custom project roles."
       ></scion-project-members-editor>
+      ${this.renderResourcesSection()} ${this.renderMessagingPolicySection()}
+      ${this.renderGitHubAppSection()}
       <scion-boundary-summary-notice
         label="Access constraints affecting this project"
         .groups=${this.boundaryGroups}
@@ -1376,8 +1701,6 @@ export class ScionPageProjectSettings extends LitElement {
           this.projectId
         )}"
       ></scion-boundary-summary-notice>
-
-      ${this.renderResourcesSection()}
       ${this.pageData?.user
         ? html`
             <scion-subscription-manager
@@ -1550,7 +1873,7 @@ export class ScionPageProjectSettings extends LitElement {
                   ? html`
                       <div class="github-status-item">
                         <span class="field-help">Last Token Mint</span>
-                        <span>${new Date(status.last_token_mint).toLocaleString()}</span>
+                        <span>${formatInstantWithZone(status.last_token_mint)}</span>
                       </div>
                     `
                   : ''}
@@ -1775,7 +2098,10 @@ export class ScionPageProjectSettings extends LitElement {
           <sl-tab slot="nav" panel="general" ?active=${this.activeConfigTab === 'general'}
             >General</sl-tab
           >
-          <sl-tab slot="nav" panel="auth-security" ?active=${this.activeConfigTab === 'auth-security'}
+          <sl-tab
+            slot="nav"
+            panel="auth-security"
+            ?active=${this.activeConfigTab === 'auth-security'}
             >Auth &amp; Security</sl-tab
           >
           <sl-tab slot="nav" panel="limits" ?active=${this.activeConfigTab === 'limits'}
@@ -1814,9 +2140,17 @@ export class ScionPageProjectSettings extends LitElement {
                     (t) => html` <sl-option value=${t.name}>${t.displayName || t.name}</sl-option> `
                   )}
                 </sl-select>
-                <span class="field-help"
-                  >Template used when creating agents without specifying one.</span
-                >
+                ${this.dropdownTemplatesLoadFailed
+                  ? html`<span class="field-help field-help-error"
+                      >Could not load
+                      templates.${this.configDefaultTemplate
+                        ? ` The saved default (${this.configDefaultTemplate}) is kept.`
+                        : ''}
+                      Reload the page to try again.</span
+                    >`
+                  : html`<span class="field-help"
+                      >Template used when creating agents without specifying one.</span
+                    >`}
               </div>
 
               <div
@@ -2034,7 +2368,6 @@ export class ScionPageProjectSettings extends LitElement {
                   default" inherits the server-level setting.</span
                 >
               </div>
-
             </div>
           </sl-tab-panel>
 
@@ -2130,8 +2463,15 @@ export class ScionPageProjectSettings extends LitElement {
                 >
               </div>
 
-              <div class="config-field">
-                <label>Default Service Account</label>
+              <div
+                class="config-field ${this.isHubDefault('scion.io/default-gcp-identity-mode')
+                  ? 'hub-inherited'
+                  : ''}"
+              >
+                <label
+                  >Default Service Account
+                  ${this.renderHubIndicator('scion.io/default-gcp-identity-mode')}</label
+                >
                 <sl-select
                   value=${this.configDefaultGCPIdentityMode || 'inherit'}
                   ?disabled=${!canEdit}
@@ -2143,16 +2483,32 @@ export class ScionPageProjectSettings extends LitElement {
                     }
                   }}
                 >
-                  <sl-option value="inherit">None (default to block)</sl-option>
-                  <sl-option value="block">Block</sl-option>
+                  <sl-option value="inherit"
+                    >${this.hubSelectLabel(
+                      'scion.io/default-gcp-identity-mode',
+                      this.projectIsKubernetesOnly
+                        ? 'None (default to passthrough)'
+                        : 'None (default to block)'
+                    )}</sl-option
+                  >
+                  <sl-option
+                    value="block"
+                    ?disabled=${this.projectIsKubernetesOnly}
+                    title=${this.projectIsKubernetesOnly
+                      ? ScionPageProjectSettings.gcpIdentityK8sHintText
+                      : nothing}
+                    >Block</sl-option
+                  >
                   <sl-option value="passthrough">Passthrough</sl-option>
                   <sl-option value="assign">Assign Service Account</sl-option>
+                  ${this.renderKubernetesBlockHint()}
                 </sl-select>
                 <span class="field-help"
                   >Controls GCP metadata server access for new agents. "Block" prevents access,
                   "Passthrough" allows host identity, "Assign" binds a specific service
                   account.</span
                 >
+                ${this.renderInheritedGCPIdentityHint()}
               </div>
 
               ${this.configDefaultGCPIdentityMode === 'assign'
@@ -2209,7 +2565,9 @@ export class ScionPageProjectSettings extends LitElement {
                                 (sa) => html`
                                   <sl-option value=${sa.id}>
                                     ${sa.displayName || sa.email}
-                                    <small>(${sa.email})</small>
+                                    <small>(${sa.email})</small>${sa.scope === 'hub'
+                                      ? ' (Hub)'
+                                      : ''}
                                   </sl-option>
                                 `
                               )
@@ -2220,7 +2578,9 @@ export class ScionPageProjectSettings extends LitElement {
                       </div>
                       <span class="field-help"
                         >The GCP service account to assign to new agents by default. Only verified
-                        accounts are shown.</span
+                        accounts are shown. This default applies to any runtime profile that has no
+                        default of its own, so no mapping state is shown here; the agent create and
+                        configure pickers show it for the agent's Kubernetes profile.</span
                       >
                     </div>
                   `
@@ -2722,29 +3082,8 @@ export class ScionPageProjectSettings extends LitElement {
   }
 
   private formatRelativeTime(dateString: string): string {
-    try {
-      const date = new Date(dateString);
-      if (isNaN(date.getTime())) return '\u2014';
-      const diffMs = Date.now() - date.getTime();
-      const diffSeconds = Math.round(diffMs / 1000);
-      const diffMinutes = Math.round(diffMs / (1000 * 60));
-      const diffHours = Math.round(diffMs / (1000 * 60 * 60));
-      const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-
-      const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-
-      if (Math.abs(diffSeconds) < 60) {
-        return rtf.format(-diffSeconds, 'second');
-      } else if (Math.abs(diffMinutes) < 60) {
-        return rtf.format(-diffMinutes, 'minute');
-      } else if (Math.abs(diffHours) < 24) {
-        return rtf.format(-diffHours, 'hour');
-      } else {
-        return rtf.format(-diffDays, 'day');
-      }
-    } catch {
-      return dateString;
-    }
+    if (Number.isNaN(new Date(dateString).getTime())) return '\u2014';
+    return formatRelative(dateString);
   }
 
   private renderBrokersContent() {

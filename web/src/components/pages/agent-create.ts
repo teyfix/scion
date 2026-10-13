@@ -17,22 +17,19 @@
 /**
  * Unified agent creation page component
  *
- * Single-surface form for creating and starting a new agent. All settings
- * (previously split between agent-create and agent-configure) are available
- * in a default section + an "Additional Options" disclosure with tabbed
- * advanced settings.
+ * Single-surface form for creating and starting a new agent: an identity
+ * section (name, project, template, harness config, broker, profile, task,
+ * notify) and an "Additional Options" disclosure that embeds the shared
+ * <scion-agent-config-form> (ptone/scion#3974). The form sends only the
+ * fields the user set; everything else is resolved by the hub, and the
+ * inherited values the page can read are shown as source-labelled
+ * placeholders (resolveInheritedPlaceholders).
  */
 
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
-import type {
-  Project,
-  RuntimeBroker,
-  Template,
-  GCPServiceAccount,
-  MessageMode,
-} from '../../shared/types.js';
+import type { Project, RuntimeBroker, Template } from '../../shared/types.js';
 
 interface HarnessConfigEntry {
   id: string;
@@ -44,18 +41,23 @@ interface HarnessConfigEntry {
 }
 
 import { isSharedWorkspace } from '../../shared/types.js';
-import {
-  BUILT_IN_DOCKER_LABEL_VARIABLES,
-  buildDockerRuntimeConfig,
-  findMissingDockerLabelVariables,
-} from '../../shared/docker-runtime.js';
+import { isTargetKubernetesOnly } from '../../shared/runtime-kind.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
-import { normalizeModelAlias } from '../../shared/model-utils.js';
-import { MESSAGE_MODE_DISPLAY } from '../../shared/message-mode.js';
+import { defaultTriggersHint } from '../../shared/notification-triggers.js';
+import {
+  resolveInheritedPlaceholders,
+  type AgentConfigPlaceholder,
+  type HubPublicDefaults,
+  type ProjectCreateDefaults,
+} from '../../shared/agent-config-inherited.js';
+import { GcpIdentityState } from '../../shared/gcp-identity-state.js';
+import { assignStatusTarget } from '../../shared/gcp-sa-assign-status.js';
+import { GCPServiceAccountsLoader } from '../../client/gcp-sa-accounts-loader.js';
 import { apiFetch, apiFetchAllPages, parseApiError } from '../../client/api.js';
-import { navigateTo } from '../../client/main.js';
-import type { EnvEntry } from '../shared/env-editor.js';
-import '../shared/env-editor.js';
+import { navigateTo } from '../../client/navigation.js';
+import { showToast } from '../../utils/toast.js';
+import type { AgentOtherInlineConfig, ScionAgentConfigForm } from '../shared/agent-config-form.js';
+import '../shared/agent-config-form.js';
 import '../shared/status-badge.js';
 
 @customElement('scion-page-agent-create')
@@ -64,8 +66,9 @@ export class ScionPageAgentCreate extends LitElement {
   @state() private projects: Project[] = [];
   @state() private brokers: RuntimeBroker[] = [];
   @state() private templates: Template[] = [];
+  /** The template list failed to load; the rest of the form still loads. */
+  @state() private templatesLoadFailed = false;
   @state() private harnessConfigs: HarnessConfigEntry[] = [];
-  @state() private gcpServiceAccounts: GCPServiceAccount[] = [];
 
   // ── UI State ────────────────────────────────────────────────────────
   @state() private loading = true;
@@ -85,74 +88,47 @@ export class ScionPageAgentCreate extends LitElement {
   @state() private task = '';
   @state() private notify = true;
 
-  // ── Additional Options > General Tab ────────────────────────────────
-  @state() private branch = '';
-  @state() private modelSelection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other' = '';
-  @state() private customModelId = '';
-  @state() private thinkingLevel: number | null = null;
-  @state() private image = '';
-  @state() private containerUser = '';
-  @state() private dockerPrivileged: 'inherit' | 'enabled' | 'disabled' = 'inherit';
-  @state() private requireGpu = false;
-  @state() private telemetryEnabled = false;
-  @state() private autoExposePortsEnabled = false;
-  @state() private hubDefaultRuntimeBroker = '';
-  @state() private autoExposePortsMode = 'allowlist';
-  @state() private autoExposePortsList = '';
-  @state() private autoExposePortsInterval = '3s';
+  // ── Additional Options ──────────────────────────────────────────
+  /** The hub's public settings, for the hub-tier placeholders. */
+  @state() private hubSettings: HubPublicDefaults = {};
+  /** The selected project's settings, for the project-tier placeholders. */
+  @state() private projectSettings: ProjectCreateDefaults | null = null;
 
-  // ── Additional Options > Auth & Security Tab ────────────────────────
-  @state() private agentRole = '';
-  @state() private messageMode = '';
-  @state() private harnessAuth = '';
-  @state() private gcpMetadataMode: 'block' | 'passthrough' | 'assign' = 'block';
-  @state() private gcpServiceAccountId = '';
-
-  // ── Additional Options > Prompts Tab ────────────────────────────────
-  @state() private systemPrompt = '';
-  @state() private agentInstructions = '';
-
-  // ── Additional Options > Limits & Resources Tab ─────────────────────
-  @state() private maxTurns = 0;
-  @state() private maxModelCalls = 0;
-  @state() private maxDuration = '';
-  @state() private cpuRequest = '';
-  @state() private memoryRequest = '';
-  @state() private cpuLimit = '';
-  @state() private memoryLimit = '';
-  @state() private disk = '';
-
-  // ── Additional Options > Environment & Labels Tab ───────────────────
-  @state() private envEntries: EnvEntry[] = [];
-  @state() private labelEntries: Array<{ key: string; value: string }> = [];
-  @state() private dockerNetworks: string[] = [];
-  @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
+  /**
+   * The GCP identity picker's state. Owned here, so submit can validate and
+   * build gcp_identity from it, and rendered by the shared form.
+   */
+  readonly gcp = new GcpIdentityState();
 
   // ── Internal ────────────────────────────────────────────────────────
+
+  /** The form data has loaded at least once. */
+  private loadedOnce = false;
 
   /** Whether the projectId was explicitly passed via URL query param */
   private projectFromUrl = false;
 
   /** Cached project settings keyed by projectId */
-  private projectSettingsCache: Map<
-    string,
-    {
-      defaultTemplate?: string;
-      defaultHarnessConfig?: string;
-      defaultMaxTurns?: number;
-      defaultMaxModelCalls?: number;
-      defaultMaxDuration?: string;
-      defaultGCPIdentityMode?: string;
-      defaultGCPIdentityServiceAccountID?: string;
-      defaultModel?: string;
-    }
-  > = new Map();
+  private projectSettingsCache: Map<string, ProjectCreateDefaults> = new Map();
 
   /** Profiles available on the currently selected broker */
   private get selectedBrokerProfiles(): import('../../shared/types.js').BrokerProfile[] {
     if (!this.brokerId) return [];
     const broker = this.brokers.find((b) => b.id === this.brokerId);
     return broker?.profiles?.filter((p) => p.available) ?? [];
+  }
+
+  /**
+   * Whether the currently selected broker/profile combination is reliably
+   * known to resolve to a Kubernetes runtime. Block is not offered in that
+   * case. This deliberately does not guess: with no broker selected, no
+   * matching profile, or (with no profile chosen) a broker whose available
+   * profiles mix runtime types, this is false.
+   */
+  private get targetRuntimeIsKubernetesOnly(): boolean {
+    if (!this.brokerId) return false;
+    const broker = this.brokers.find((b) => b.id === this.brokerId);
+    return isTargetKubernetesOnly(broker, this.profile);
   }
 
   /** The currently selected project */
@@ -166,9 +142,28 @@ export class ScionPageAgentCreate extends LitElement {
     return this.projects.find((p) => p.id === this.projectId);
   }
 
-  /** Verified GCP service accounts for the assign dropdown */
-  private get verifiedGCPServiceAccounts(): GCPServiceAccount[] {
-    return this.gcpServiceAccounts.filter((sa) => sa.verified);
+  /** The selected template, if any. */
+  private get selectedTemplate(): Template | undefined {
+    return this.templates.find((t) => t.id === this.templateId);
+  }
+
+  /** Inherited values for the form's unset fields, from what this page fetched. */
+  private get placeholders(): Record<string, AgentConfigPlaceholder> {
+    return resolveInheritedPlaceholders({
+      template: this.selectedTemplate,
+      projectSettings: this.projectSettings,
+      hubSettings: this.hubSettings,
+    });
+  }
+
+  /** Template-supplied inline config the form does not edit, shown read-only. */
+  private get otherInlineConfig(): AgentOtherInlineConfig | null {
+    const kubernetes = this.selectedTemplate?.config?.kubernetes;
+    return kubernetes ? { config: { kubernetes }, source: 'from the template' } : null;
+  }
+
+  private get form(): ScionAgentConfigForm | null {
+    return this.shadowRoot?.querySelector('scion-agent-config-form') ?? null;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -279,6 +274,11 @@ export class ScionPageAgentCreate extends LitElement {
       margin-bottom: 1.25rem;
     }
 
+    .notify-field .source-label {
+      font-size: 0.75rem;
+      color: var(--scion-text-muted, #64748b);
+    }
+
     .notify-field sl-checkbox::part(label) {
       font-size: 0.875rem;
       color: var(--scion-text, #1e293b);
@@ -361,20 +361,6 @@ export class ScionPageAgentCreate extends LitElement {
     sl-details::part(content) {
       padding: 0 1rem 1rem 1rem;
     }
-
-    sl-tab-group {
-      --indicator-color: var(--scion-primary, #3b82f6);
-    }
-
-    sl-tab-group::part(body) {
-      padding-top: 1.25rem;
-    }
-
-    .field-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-    }
   `;
 
   // ═══════════════════════════════════════════════════════════════════
@@ -401,11 +387,37 @@ export class ScionPageAgentCreate extends LitElement {
     void this.loadFormData();
   }
 
+  override willUpdate(changedProperties: Map<string, unknown>): void {
+    super.willUpdate(changedProperties);
+    // Block is not offered for a Kubernetes runtime target. Hand the GCP
+    // identity state the current target whenever the broker/profile
+    // selection or the broker list changes; it corrects the displayed mode
+    // (normalizeGcpModeForTarget) in the same update cycle. Whether an
+    // explicit identity is sent is gated separately by gcpIdentityUserSet.
+    if (
+      changedProperties.has('brokerId') ||
+      changedProperties.has('profile') ||
+      changedProperties.has('brokers')
+    ) {
+      this.gcp.setTarget(this.targetRuntimeIsKubernetesOnly, this.profile);
+      // The accounts' mapping state is for one target: ask again when it
+      // changes (ptone/scion#4391). Not before the first load has started.
+      void this.gcpAccounts.targetChanged();
+    }
+  }
+
   override updated(changedProperties: Map<string, unknown>): void {
     super.updated(changedProperties);
     if (changedProperties.has('error') && this.error) {
       this.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
+  }
+
+  /** Completes once this page and the embedded form have rendered. */
+  protected override async getUpdateComplete(): Promise<boolean> {
+    const done = await super.getUpdateComplete();
+    await this.form?.updateComplete;
+    return done;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -427,9 +439,29 @@ export class ScionPageAgentCreate extends LitElement {
 
       const [projectsRes, brokersRes, templates, settingsRes, harnessConfigsRes] =
         await Promise.all([
-          fetch('/api/v1/projects?mine=true&limit=100', { credentials: 'include' }),
+          // Not `mine=true`: on the server that resolves to projects where the
+          // caller holds the project-owner role specifically, but creating an
+          // agent does not require ownership — project-member carries
+          // agent.create, and POST /api/v1/agents authorizes against the target
+          // project, not against ownership. Asking for owned projects hid every
+          // project a member belongs to from this picker, so members could not
+          // create an agent anywhere even though the API would have allowed it.
+          // The unfiltered list is already scoped to what the caller may read.
+          apiFetch('/api/v1/projects?limit=100'),
           fetch('/api/v1/runtime-brokers?limit=100', { credentials: 'include' }),
-          apiFetchAllPages<Template>(tmplUrl, 'templates'),
+          // Caught on its own: a failed template page leaves the template
+          // list empty with an inline error instead of failing the form.
+          apiFetchAllPages<Template>(tmplUrl, 'templates').then(
+            (list) => {
+              this.templatesLoadFailed = false;
+              return list;
+            },
+            (err: unknown) => {
+              console.error('Failed to load templates:', err);
+              this.templatesLoadFailed = true;
+              return [] as Template[];
+            }
+          ),
           fetch('/api/v1/settings/public', { credentials: 'include' }),
           apiFetch('/api/v1/harness-configs?status=active&limit=100'),
         ]);
@@ -448,14 +480,7 @@ export class ScionPageAgentCreate extends LitElement {
       this.templates = templates;
 
       if (settingsRes.ok) {
-        const data = (await settingsRes.json()) as {
-          telemetryEnabled?: boolean;
-          autoExposePortsEnabled?: boolean;
-          defaultRuntimeBroker?: string;
-        };
-        this.telemetryEnabled = data.telemetryEnabled ?? false;
-        this.autoExposePortsEnabled = data.autoExposePortsEnabled ?? false;
-        this.hubDefaultRuntimeBroker = data.defaultRuntimeBroker ?? '';
+        this.hubSettings = (await settingsRes.json()) as HubPublicDefaults;
       }
 
       if (harnessConfigsRes.ok) {
@@ -485,9 +510,9 @@ export class ScionPageAgentCreate extends LitElement {
         await this.loadGCPServiceAccounts();
       }
 
-      // Apply project-settings defaults to advanced fields
+      // Project settings, for the inherited placeholders
       if (this.projectId) {
-        await this.applyProjectDefaults();
+        await this.loadProjectSettings();
       }
 
       // Reload harness configs scoped to the selected project
@@ -499,46 +524,21 @@ export class ScionPageAgentCreate extends LitElement {
       this.error = 'Failed to load form data. Please try again.';
     } finally {
       this.loading = false;
+      this.loadedOnce = true;
     }
   }
 
-  /** Apply project-settings defaults to advanced fields.
-   *  Resets all project-defaultable fields first so that switching projects
-   *  does not leak the previous project's defaults into the new one. */
-  private async applyProjectDefaults(): Promise<void> {
-    // Reset to base defaults before applying new project settings
-    this.maxTurns = 0;
-    this.maxModelCalls = 0;
-    this.maxDuration = '';
-    this.modelSelection = '';
-    this.customModelId = '';
-
+  /**
+   * Loads the selected project's settings, shown as inherited placeholders.
+   * The hub applies them itself when a field is left unset, so the form
+   * never copies them into a field's value.
+   */
+  private async loadProjectSettings(): Promise<void> {
+    const isStale = this.projectLoadGuard();
+    this.projectSettings = null;
     const settings = await this.fetchProjectSettings(this.projectId);
-    if (!settings) return;
-
-    if (settings.defaultMaxTurns) this.maxTurns = settings.defaultMaxTurns;
-    if (settings.defaultMaxModelCalls) this.maxModelCalls = settings.defaultMaxModelCalls;
-    if (settings.defaultMaxDuration) this.maxDuration = settings.defaultMaxDuration;
-    if (settings.defaultModel) {
-      const derived = this.deriveModelSelection(settings.defaultModel);
-      this.modelSelection = derived.selection;
-      this.customModelId = derived.customId;
-    }
-  }
-
-  private deriveModelSelection(model: string): {
-    selection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other';
-    customId: string;
-  } {
-    if (!model) return { selection: '', customId: '' };
-    const normalized = normalizeModelAlias(model);
-    if (['small', 'medium', 'large', 'extra-large'].includes(normalized)) {
-      return {
-        selection: normalized as 'small' | 'medium' | 'large' | 'extra-large',
-        customId: '',
-      };
-    }
-    return { selection: 'other', customId: model };
+    if (isStale()) return;
+    this.projectSettings = settings;
   }
 
   /**
@@ -557,12 +557,13 @@ export class ScionPageAgentCreate extends LitElement {
     }
 
     // Fallback: hub-level default broker
-    if (this.hubDefaultRuntimeBroker) {
+    const hubDefaultRuntimeBroker = this.hubSettings.defaultRuntimeBroker ?? '';
+    if (hubDefaultRuntimeBroker) {
       const hubBroker = this.brokers.find(
         (b) =>
-          b.id === this.hubDefaultRuntimeBroker ||
-          (b.name && b.name.toLowerCase() === this.hubDefaultRuntimeBroker.toLowerCase()) ||
-          (b.slug && b.slug.toLowerCase() === this.hubDefaultRuntimeBroker.toLowerCase())
+          b.id === hubDefaultRuntimeBroker ||
+          (b.name && b.name.toLowerCase() === hubDefaultRuntimeBroker.toLowerCase()) ||
+          (b.slug && b.slug.toLowerCase() === hubDefaultRuntimeBroker.toLowerCase())
       );
       if (hubBroker) {
         this.brokerId = hubBroker.id;
@@ -611,10 +612,13 @@ export class ScionPageAgentCreate extends LitElement {
    * Select the default template and harness config for the current project.
    */
   private async selectDefaultTemplate(): Promise<void> {
+    const isStale = this.projectLoadGuard();
     const visible = this.filteredTemplates;
 
     const settings = this.projectId ? await this.fetchProjectSettings(this.projectId) : null;
-    const harnessDefault = settings?.defaultHarnessConfig || 'antigravity';
+    if (isStale()) return;
+    const harnessDefault =
+      settings?.defaultHarnessConfig || this.hubSettings.defaultHarnessConfig || 'claude';
 
     const harnessFor = (t: { defaultHarnessConfig?: string; harness?: string }) =>
       t.defaultHarnessConfig || t.harness || harnessDefault;
@@ -627,6 +631,19 @@ export class ScionPageAgentCreate extends LitElement {
       if (match) {
         this.templateId = match.id;
         this.setHarnessFromValue(harnessFor(match));
+        templateResolved = true;
+      }
+    }
+
+    // Hub-level default template fallback: try before the generic 'default' slug.
+    const hubDefaultTemplate = this.hubSettings.defaultTemplate ?? '';
+    if (!templateResolved && hubDefaultTemplate) {
+      const hubMatch = visible.find(
+        (t) => t.name === hubDefaultTemplate || t.slug === hubDefaultTemplate
+      );
+      if (hubMatch) {
+        this.templateId = hubMatch.id;
+        this.setHarnessFromValue(harnessFor(hubMatch));
         templateResolved = true;
       }
     }
@@ -655,7 +672,24 @@ export class ScionPageAgentCreate extends LitElement {
     }
   }
 
+  /**
+   * Incremented on every project switch. Project-scoped loaders capture it
+   * (with the project id) through projectLoadGuard and drop their results
+   * when a switch happened while they were waiting, so a slow response for
+   * the previous project cannot overwrite the current project's template,
+   * limits or harness configs.
+   */
+  private projectLoadSeq = 0;
+
+  /** Returns a check that is true once the project changed since the call. */
+  private projectLoadGuard(): () => boolean {
+    const seq = this.projectLoadSeq;
+    const projectId = this.projectId;
+    return () => seq !== this.projectLoadSeq || this.projectId !== projectId;
+  }
+
   private async loadHarnessConfigs(): Promise<void> {
+    const isStale = this.projectLoadGuard();
     try {
       const url = this.projectId
         ? `/api/v1/harness-configs?status=active&projectId=${encodeURIComponent(this.projectId)}&limit=100`
@@ -663,6 +697,7 @@ export class ScionPageAgentCreate extends LitElement {
       const res = await apiFetch(url);
       if (res.ok) {
         const data = (await res.json()) as { harnessConfigs?: HarnessConfigEntry[] };
+        if (isStale()) return;
         this.harnessConfigs = (data.harnessConfigs || []).sort((a, b) =>
           (a.displayName || a.name).localeCompare(b.displayName || b.name)
         );
@@ -672,50 +707,37 @@ export class ScionPageAgentCreate extends LitElement {
     }
   }
 
+  /**
+   * Loads the project's accounts with their mapping state on the chosen
+   * Kubernetes target, and asks again when the target changes. Its guard
+   * also drops a slow load for a previous project (ptone/scion#2548): project
+   * switches fire the load unawaited.
+   */
+  private readonly gcpAccounts = new GCPServiceAccountsLoader({
+    projectId: () => this.projectId,
+    target: () =>
+      assignStatusTarget(this.targetRuntimeIsKubernetesOnly, this.brokerId, this.profile),
+    accounts: () => this.gcp.gcpServiceAccounts,
+    setAccounts: (accounts) => this.gcp.setAccounts(accounts),
+  });
+
   private async loadGCPServiceAccounts(): Promise<void> {
-    this.gcpServiceAccounts = [];
-    this.gcpServiceAccountId = '';
-    this.gcpMetadataMode = 'block';
+    // Recomputing defaults from scratch (initial load, or a project change).
+    // This runs synchronously, before any await, so it is always performed
+    // by the newest load.
+    this.gcp.reset();
 
-    if (!this.projectId) return;
+    const isStale = await this.gcpAccounts.load();
+    if (!isStale) return;
 
-    try {
-      const res = await apiFetch(`/api/v1/projects/${this.projectId}/gcp-service-accounts`);
-      if (res.ok) {
-        const data = (await res.json()) as { items?: GCPServiceAccount[] } | GCPServiceAccount[];
-        this.gcpServiceAccounts = Array.isArray(data) ? data : data.items || [];
-      }
-    } catch {
-      // Non-critical
-    }
-
-    // Apply project default GCP identity if configured
+    // The project's default identity: applied to the displayed value only
+    // when the user has not already picked while the fetches were in flight.
     const settings = await this.fetchProjectSettings(this.projectId);
-    if (settings?.defaultGCPIdentityMode) {
-      const mode = settings.defaultGCPIdentityMode as 'block' | 'passthrough' | 'assign';
-      if (mode === 'assign' && settings.defaultGCPIdentityServiceAccountID) {
-        const verified = this.verifiedGCPServiceAccounts;
-        const match = verified.find((sa) => sa.id === settings.defaultGCPIdentityServiceAccountID);
-        if (match) {
-          this.gcpMetadataMode = 'assign';
-          this.gcpServiceAccountId = match.id;
-        }
-      } else if (mode === 'passthrough' || mode === 'block') {
-        this.gcpMetadataMode = mode;
-      }
-    }
+    if (isStale()) return;
+    this.gcp.applyProjectDefaults(settings);
   }
 
-  private async fetchProjectSettings(projectId: string): Promise<{
-    defaultTemplate?: string;
-    defaultHarnessConfig?: string;
-    defaultMaxTurns?: number;
-    defaultMaxModelCalls?: number;
-    defaultMaxDuration?: string;
-    defaultGCPIdentityMode?: string;
-    defaultGCPIdentityServiceAccountID?: string;
-    defaultModel?: string;
-  } | null> {
+  private async fetchProjectSettings(projectId: string): Promise<ProjectCreateDefaults | null> {
     if (!projectId) return null;
 
     const cached = this.projectSettingsCache.get(projectId);
@@ -724,16 +746,7 @@ export class ScionPageAgentCreate extends LitElement {
     try {
       const res = await apiFetch(`/api/v1/projects/${projectId}/settings`);
       if (res.ok) {
-        const data = (await res.json()) as {
-          defaultTemplate?: string;
-          defaultHarnessConfig?: string;
-          defaultMaxTurns?: number;
-          defaultMaxModelCalls?: number;
-          defaultMaxDuration?: string;
-          defaultGCPIdentityMode?: string;
-          defaultGCPIdentityServiceAccountID?: string;
-          defaultModel?: string;
-        };
+        const data = (await res.json()) as ProjectCreateDefaults;
         this.projectSettingsCache.set(projectId, data);
         return data;
       }
@@ -796,120 +809,14 @@ export class ScionPageAgentCreate extends LitElement {
     return `Template suggests: ${configName}`;
   }
 
-  private buildLabels(): Record<string, string> | undefined {
-    const valid = this.labelEntries.filter((l) => l.key.trim());
-    if (valid.length === 0) return undefined;
-    const labels: Record<string, string> = {};
-    for (const l of valid) {
-      labels[l.key.trim()] = l.value.trim();
-    }
-    return labels;
-  }
-
-  /**
-   * Build the config payload for advanced fields (mirrors agent-configure.ts buildConfig).
-   */
-  private buildConfig(): Record<string, unknown> {
-    const config: Record<string, unknown> = {};
-
-    // Model
-    const model = this.modelSelection === 'other' ? this.customModelId : this.modelSelection;
-    if (model) config.model = model;
-
-    // Thinking level
-    config.thinking_level = this.thinkingLevel;
-
-    // Container
-    if (this.image) config.image = this.image;
-    if (this.containerUser) config.user = this.containerUser;
-
-    // Docker runtime labels are intentionally separate from searchable agent labels.
-    const dockerBase =
-      this.dockerPrivileged === 'enabled'
-        ? { privileged: true }
-        : this.dockerPrivileged === 'disabled'
-          ? { privileged: false }
-          : undefined;
-    const dockerConfig = buildDockerRuntimeConfig(
-      { ...dockerBase, nvidia_gpu: this.requireGpu },
-      this.dockerNetworks,
-      this.dockerLabelEntries
-    );
-    if (dockerConfig) config.docker = dockerConfig;
-
-    // Auth
-    if (this.harnessAuth) config.auth_selectedType = this.harnessAuth;
-
-    // Prompts
-    if (this.systemPrompt) config.system_prompt = this.systemPrompt;
-    if (this.agentInstructions) config.agent_instructions = this.agentInstructions;
-
-    // Limits
-    if (this.maxTurns) config.max_turns = this.maxTurns;
-    if (this.maxModelCalls) config.max_model_calls = this.maxModelCalls;
-    if (this.maxDuration) config.max_duration = this.maxDuration;
-
-    // Resources
-    const hasResources =
-      this.cpuRequest || this.memoryRequest || this.cpuLimit || this.memoryLimit || this.disk;
-    if (hasResources) {
-      const resources: Record<string, unknown> = {};
-      if (this.cpuRequest || this.memoryRequest) {
-        const requests: Record<string, string> = {};
-        if (this.cpuRequest) requests.cpu = this.cpuRequest;
-        if (this.memoryRequest) requests.memory = this.memoryRequest;
-        resources.requests = requests;
-      }
-      if (this.cpuLimit || this.memoryLimit) {
-        const limits: Record<string, string> = {};
-        if (this.cpuLimit) limits.cpu = this.cpuLimit;
-        if (this.memoryLimit) limits.memory = this.memoryLimit;
-        resources.limits = limits;
-      }
-      if (this.disk) resources.disk = this.disk;
-      config.resources = resources;
-    }
-
-    // Environment variables
-    const env: Record<string, string> = {};
-    for (const entry of this.envEntries) {
-      if (entry.key) {
-        env[entry.key] = entry.value;
-      }
-    }
-
-    // Telemetry (use structured config property, matching agent-configure.ts)
-    config.telemetry = { enabled: this.telemetryEnabled };
-
-    // Auto-expose ports
-    env.SCION_AUTO_EXPOSE_PORTS = this.autoExposePortsEnabled ? 'true' : 'false';
-    if (this.autoExposePortsEnabled) {
-      env.SCION_AUTO_EXPOSE_MODE = this.autoExposePortsMode;
-      if (this.autoExposePortsList) {
-        env.SCION_AUTO_EXPOSE_PORTS_LIST = this.autoExposePortsList;
-      }
-      env.SCION_AUTO_EXPOSE_INTERVAL = this.autoExposePortsInterval || '3s';
-    }
-
-    if (Object.keys(env).length > 0) {
-      config.env = env;
-    }
-
-    return config;
-  }
-
   // ═══════════════════════════════════════════════════════════════════
   // Submit
   // ═══════════════════════════════════════════════════════════════════
 
   /**
-   * Create the agent without starting it. Navigates to the agent detail page.
+   * Create the agent and start it, then navigate to the agent detail page.
    */
-  private async handleCreateOnly(_e: Event): Promise<void> {
-    return this.handleSubmit(_e, true);
-  }
-
-  private async handleSubmit(_e: Event, provisionOnly = false): Promise<void> {
+  private async handleSubmit(_e: Event): Promise<void> {
     if (!this.name.trim()) {
       this.error = 'Agent name is required.';
       return;
@@ -919,9 +826,18 @@ export class ScionPageAgentCreate extends LitElement {
       return;
     }
 
-    // Validate GCP assign mode
-    if (this.gcpMetadataMode === 'assign' && !this.gcpServiceAccountId) {
-      this.error = 'Please select a service account for GCP identity assignment.';
+    // The submit-time guards read the live target, even if no update has
+    // handed it to the identity state yet.
+    this.gcp.targetKubernetesOnly = this.targetRuntimeIsKubernetesOnly;
+    this.gcp.profile = this.profile;
+
+    // The form's validation includes the GCP identity rules. The form is
+    // rendered once the page has loaded; the identity state is checked
+    // directly otherwise.
+    const form = this.form;
+    const errors = form ? form.validate() : [this.gcp.validate()].filter((e): e is string => !!e);
+    if (errors.length > 0) {
+      this.error = errors.join(' ');
       return;
     }
 
@@ -937,33 +853,22 @@ export class ScionPageAgentCreate extends LitElement {
         notify: this.notify,
       };
 
-      if (this.branch.trim()) body.branch = this.branch.trim();
       if (this.templateId) body.template = this.templateId;
       if (this.brokerId) body.runtimeBrokerId = this.brokerId;
       if (this.profile) body.profile = this.profile;
       if (this.task.trim()) body.task = this.task.trim();
-      if (this.agentRole) body.agentRole = this.agentRole;
-      if (this.messageMode) body.messageMode = this.messageMode;
-      if (this.requireGpu) body.requireGpu = true;
-      if (provisionOnly) body.provisionOnly = true;
 
-      const builtLabels = this.buildLabels();
-      if (builtLabels) body.labels = builtLabels;
-
-      // GCP identity
-      if (this.gcpMetadataMode === 'assign' && this.gcpServiceAccountId) {
-        body.gcp_identity = {
-          metadata_mode: 'assign',
-          service_account_id: this.gcpServiceAccountId,
-        };
-      } else if (this.gcpMetadataMode === 'passthrough') {
-        body.gcp_identity = { metadata_mode: 'passthrough' };
-      } else if (this.gcpMetadataMode === 'block') {
-        body.gcp_identity = { metadata_mode: 'block' };
+      // Additional Options: only what the user set. Everything else
+      // (including gcp_identity with no explicit pick) is left to the hub's
+      // own precedence instead of being pinned client-side.
+      if (form) {
+        Object.assign(body, form.collectTopLevel());
+        const config = form.collectConfigPatch();
+        if (Object.keys(config).length > 0) body.config = config;
+      } else {
+        const gcpIdentity = this.gcp.toRequest();
+        if (gcpIdentity) body.gcp_identity = gcpIdentity;
       }
-
-      // Advanced config
-      body.config = this.buildConfig();
 
       const response = await fetch('/api/v1/agents', {
         method: 'POST',
@@ -996,18 +901,31 @@ export class ScionPageAgentCreate extends LitElement {
         throw new Error('No agent ID in response');
       }
 
-      // Start the agent unless provisionOnly was requested
-      if (!provisionOnly) {
-        const startedPhases = ['running', 'provisioning', 'cloning', 'starting'];
-        const alreadyStarted = agent?.phase ? startedPhases.includes(agent.phase) : false;
-        if (!alreadyStarted) {
+      // Start the agent unless the create response shows it already started.
+      const startedPhases = ['running', 'provisioning', 'cloning', 'starting'];
+      const alreadyStarted = agent?.phase ? startedPhases.includes(agent.phase) : false;
+      if (!alreadyStarted) {
+        // The agent exists, so a failed start, including a rejected fetch,
+        // is reported and its page still opens, where the user can start
+        // it again without creating a second agent. The toast stack
+        // outlives the navigation.
+        let startError: string | null = null;
+        try {
           const startResp = await fetch(`/api/v1/agents/${agentId}/start`, {
             method: 'POST',
             credentials: 'include',
           });
           if (!startResp.ok) {
-            console.warn('Agent created but failed to start:', startResp.status);
+            const fallback = `HTTP ${startResp.status}`;
+            startError = (await parseApiError(startResp, fallback)).message;
           }
+        } catch (startErr) {
+          startError =
+            startErr instanceof Error && startErr.message ? startErr.message : 'Request failed';
+        }
+        if (startError !== null) {
+          console.warn('Agent created but failed to start:', startError);
+          showToast(`Agent was created but did not start: ${startError}`, 'danger');
         }
       }
 
@@ -1026,7 +944,9 @@ export class ScionPageAgentCreate extends LitElement {
   // ═══════════════════════════════════════════════════════════════════
 
   override render() {
-    if (this.loading) {
+    // After the first load the form stays mounted during a reload, so the
+    // user's Additional Options edits (kept in the form) survive it.
+    if (this.loading && !this.loadedOnce) {
       return html`
         <div class="loading-state">
           <sl-spinner></sl-spinner>
@@ -1086,33 +1006,24 @@ export class ScionPageAgentCreate extends LitElement {
           @sl-show=${(e: Event) => {
             if (e.target !== e.currentTarget) return;
             this.advancedOpen = true;
-            // Force the tab-group to show the General tab when disclosure opens.
-            // sl-tab-group may not initialize correctly when hidden inside sl-details.
-            requestAnimationFrame(() => {
-              const tabGroup = this.shadowRoot?.querySelector('sl-tab-group');
-              if (tabGroup) {
-                (tabGroup as any).show?.('general');
-              }
-            });
+            // Show the General tab when the disclosure opens: a tab group
+            // initialized while hidden inside sl-details may show none.
+            requestAnimationFrame(() => this.form?.showTab('general'));
           }}
           @sl-hide=${(e: Event) => {
             if (e.target !== e.currentTarget) return;
             this.advancedOpen = false;
           }}
         >
-          <sl-tab-group>
-            <sl-tab slot="nav" panel="general" active>General</sl-tab>
-            <sl-tab slot="nav" panel="auth-security">Auth &amp; Security</sl-tab>
-            <sl-tab slot="nav" panel="env-labels">Environment &amp; Labels</sl-tab>
-            <sl-tab slot="nav" panel="limits">Limits &amp; Resources</sl-tab>
-            <sl-tab slot="nav" panel="prompts">Prompts</sl-tab>
-
-            <sl-tab-panel name="general">${this.renderGeneralTab()}</sl-tab-panel>
-            <sl-tab-panel name="auth-security">${this.renderAuthSecurityTab()}</sl-tab-panel>
-            <sl-tab-panel name="env-labels">${this.renderEnvironmentTab()}</sl-tab-panel>
-            <sl-tab-panel name="limits">${this.renderLimitsTab()}</sl-tab-panel>
-            <sl-tab-panel name="prompts">${this.renderPromptsTab()}</sl-tab-panel>
-          </sl-tab-group>
+          <scion-agent-config-form
+            mode="create"
+            .placeholders=${this.placeholders}
+            .gcpIdentity=${this.gcp}
+            .otherInlineConfig=${this.otherInlineConfig}
+            ?branchAvailable=${!!this.selectedProject?.gitRemote &&
+            !isSharedWorkspace(this.selectedProject)}
+            ?disabled=${this.submitting}
+          ></scion-agent-config-form>
         </sl-details>
 
         <!-- ═══════ Form Actions ═══════ -->
@@ -1125,13 +1036,6 @@ export class ScionPageAgentCreate extends LitElement {
           >
             <sl-icon slot="prefix" name="play-circle"></sl-icon>
             Start
-          </sl-button>
-          <sl-button
-            variant="default"
-            ?disabled=${this.submitting}
-            @click=${(e: Event) => this.handleCreateOnly(e)}
-          >
-            Create
           </sl-button>
           <sl-button
             variant="text"
@@ -1177,14 +1081,12 @@ export class ScionPageAgentCreate extends LitElement {
                 .value=${this.projectId}
                 @sl-change=${(e: Event) => {
                   this.projectId = (e.target as HTMLElement & { value: string }).value;
+                  this.projectLoadSeq++;
                   this.selectBrokerForProject();
                   void this.selectDefaultTemplate();
                   void this.loadHarnessConfigs();
                   void this.loadGCPServiceAccounts();
-                  void this.applyProjectDefaults();
-                  if (!this.selectedProject?.gitRemote) {
-                    this.branch = '';
-                  }
+                  void this.loadProjectSettings();
                 }}
                 required
               >
@@ -1217,7 +1119,11 @@ export class ScionPageAgentCreate extends LitElement {
               >`
           )}
         </sl-select>
-        <div class="hint">Agent configuration template.</div>
+        ${this.templatesLoadFailed
+          ? html`<div class="hint" style="color: var(--sl-color-danger-600);">
+              Could not load templates. Reload the page to try again.
+            </div>`
+          : html`<div class="hint">Agent configuration template.</div>`}
       </div>
 
       <!-- Harness Config -->
@@ -1288,32 +1194,14 @@ export class ScionPageAgentCreate extends LitElement {
             this.autoSelectProfile();
           }}
         >
-          ${this.brokers.map((b) => {
-            const hasGpu = Boolean(
-              b.capabilities?.nvidiaGpu ||
-              (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
-            );
-            const isGpuDisabled = this.requireGpu && !hasGpu;
-            const disabled = b.status === 'offline' || isGpuDisabled;
-            return html`<sl-option
-              value=${b.id}
-              ?disabled=${disabled}
-              title=${isGpuDisabled ? 'Requires GPU support' : ''}
-            >
-              ${b.name}
-              (${b.status})${hasGpu
-                ? html` <scion-status-badge status="neutral" icon="gpu" size="small"
-                    >GPU</scion-status-badge
-                  >`
-                : ''}
-            </sl-option>`;
-          })}
+          ${this.brokers.map(
+            (b) =>
+              html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
+                ${b.name} (${b.status})
+              </sl-option>`
+          )}
         </sl-select>
-        <div class="hint">
-          ${this.requireGpu
-            ? 'The compute node that will run this agent (brokers without GPU support are disabled).'
-            : 'The compute node that will run this agent.'}
-        </div>
+        <div class="hint">The compute node that will run this agent.</div>
       </div>
 
       <!-- Runtime Profile (conditional: broker has profiles) -->
@@ -1364,784 +1252,9 @@ export class ScionPageAgentCreate extends LitElement {
         >
           Notify me on important agent state changes
         </sl-checkbox>
-        <sl-tooltip
-          content="You will be notified when this agent reaches: Completed, Waiting for Input, or Limits Exceeded."
-          hoist
-        >
+        <sl-tooltip content=${defaultTriggersHint()} hoist>
           <span class="help-badge">?</span>
         </sl-tooltip>
-      </div>
-    `;
-  }
-
-  // ── Additional Options > General Tab ──────────────────────────────
-
-  private renderGeneralTab() {
-    return html`
-      <!-- Branch (conditional: project has gitRemote and is not shared workspace) -->
-      ${this.selectedProject?.gitRemote && !isSharedWorkspace(this.selectedProject)
-        ? html`
-            <div class="form-field">
-              <label>Branch</label>
-              <sl-input
-                placeholder="defaults to agent name"
-                .value=${this.branch}
-                @sl-input=${(e: Event) => {
-                  this.branch = (e.target as HTMLElement & { value: string }).value;
-                }}
-              ></sl-input>
-              <div class="hint">Git branch for this agent's workspace.</div>
-            </div>
-          `
-        : nothing}
-
-      <!-- Model -->
-      <div class="form-field">
-        <label>Model</label>
-        <sl-select
-          placeholder="Use harness default"
-          .value=${this.modelSelection}
-          clearable
-          @sl-change=${(e: Event) => {
-            this.modelSelection = (e.target as HTMLElement & { value: string })
-              .value as typeof this.modelSelection;
-            if (this.modelSelection !== 'other') this.customModelId = '';
-          }}
-        >
-          <sl-option value="small">Small</sl-option>
-          <sl-option value="medium">Medium</sl-option>
-          <sl-option value="large">Large</sl-option>
-          <sl-option value="extra-large">Extra Large</sl-option>
-          <sl-option value="other">Other (specify)</sl-option>
-        </sl-select>
-      </div>
-
-      <!-- Custom Model ID (conditional) -->
-      ${this.modelSelection === 'other'
-        ? html`
-            <div class="form-field">
-              <label>Custom Model ID</label>
-              <sl-input
-                placeholder="e.g. claude-opus-4-8"
-                .value=${this.customModelId}
-                @sl-input=${(e: Event) => {
-                  this.customModelId = (e.target as HTMLElement & { value: string }).value;
-                }}
-              ></sl-input>
-            </div>
-          `
-        : nothing}
-
-      <!-- Thinking Level -->
-      <div class="form-field">
-        <label>
-          Thinking
-          Level${this.thinkingLevel !== null
-            ? html` <span style="font-weight:normal;color:var(--sl-color-neutral-500)"
-                >(${this.thinkingLevel})</span
-              >`
-            : nothing}
-        </label>
-        <div style="display:flex;align-items:center;gap:0.75rem">
-          <sl-range
-            min="0"
-            max="100"
-            step="1"
-            .value=${this.thinkingLevel ?? 50}
-            ?disabled=${this.thinkingLevel === null}
-            style="flex:1"
-            @sl-input=${(e: Event) => {
-              this.thinkingLevel = (e.target as HTMLElement & { value: number }).value;
-            }}
-          ></sl-range>
-          <sl-checkbox
-            ?checked=${this.thinkingLevel !== null}
-            @sl-change=${(e: Event) => {
-              this.thinkingLevel = (e.target as HTMLInputElement).checked ? 50 : null;
-            }}
-          >
-            Set
-          </sl-checkbox>
-        </div>
-        <div class="hint" style="display:flex;justify-content:space-between;margin-top:0.25rem">
-          <span>0 = minimal reasoning</span>
-          <span>${this.thinkingLevel === null ? 'Using harness default' : ''}</span>
-          <span>100 = maximum reasoning</span>
-        </div>
-      </div>
-
-      <!-- Container Image -->
-      <div class="form-field">
-        <label>Container Image</label>
-        <sl-input
-          placeholder="Container image override"
-          .value=${this.image}
-          @sl-input=${(e: Event) => {
-            this.image = (e.target as HTMLElement & { value: string }).value;
-          }}
-        ></sl-input>
-        <div class="hint">Override the default container image.</div>
-      </div>
-
-      <!-- Container User -->
-      <div class="form-field">
-        <label>Container User</label>
-        <sl-input
-          placeholder="Unix user inside container"
-          .value=${this.containerUser}
-          @sl-input=${(e: Event) => {
-            this.containerUser = (e.target as HTMLElement & { value: string }).value;
-          }}
-        ></sl-input>
-      </div>
-
-      <!-- Container Privileges -->
-      <div class="form-field">
-        <label>Container Privileges</label>
-        <sl-radio-group
-          .value=${this.dockerPrivileged}
-          @sl-change=${(e: Event) => {
-            this.dockerPrivileged = (e.target as HTMLElement & { value: string })
-              .value as typeof this.dockerPrivileged;
-          }}
-        >
-          <sl-radio-button value="inherit">Inherit</sl-radio-button>
-          <sl-radio-button value="enabled">Enabled</sl-radio-button>
-          <sl-radio-button value="disabled">Disabled</sl-radio-button>
-        </sl-radio-group>
-        <div class="hint">
-          ${this.dockerPrivileged === 'enabled'
-            ? 'Container runs with extended privileges (full host capabilities).'
-            : this.dockerPrivileged === 'disabled'
-              ? 'Container runs unprivileged.'
-              : 'Inherit privileged mode from broker profile or runtime defaults.'}
-        </div>
-      </div>
-
-      <!-- Require GPU -->
-      <div class="notify-field">
-        <sl-checkbox
-          ?checked=${this.requireGpu}
-          @sl-change=${(e: Event) => {
-            this.requireGpu = (e.target as HTMLInputElement).checked;
-            if (this.requireGpu) {
-              const currentBroker = this.brokers.find((b) => b.id === this.brokerId);
-              const currentHasGpu =
-                currentBroker &&
-                Boolean(
-                  currentBroker.capabilities?.nvidiaGpu ||
-                  (currentBroker._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
-                );
-              if (!currentHasGpu) {
-                const gpuBroker =
-                  this.brokers.find(
-                    (b) =>
-                      b.status === 'online' &&
-                      Boolean(
-                        b.capabilities?.nvidiaGpu ||
-                        (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
-                      )
-                  ) ||
-                  this.brokers.find((b) =>
-                    Boolean(
-                      b.capabilities?.nvidiaGpu ||
-                      (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
-                    )
-                  );
-                this.brokerId = gpuBroker ? gpuBroker.id : '';
-                this.autoSelectProfile();
-              }
-            }
-          }}
-        >
-          Enable NVIDIA GPU
-        </sl-checkbox>
-        <sl-tooltip
-          content="Attach NVIDIA GPU devices to this agent. Only GPU-capable brokers will be selectable. Uncheck to disable inherited NVIDIA device grants."
-          hoist
-        >
-          <span class="help-badge">?</span>
-        </sl-tooltip>
-      </div>
-
-      <!-- Telemetry -->
-      <div class="notify-field">
-        <sl-checkbox
-          ?checked=${this.telemetryEnabled}
-          @sl-change=${(e: Event) => {
-            this.telemetryEnabled = (e.target as HTMLInputElement).checked;
-          }}
-        >
-          Enable Telemetry
-        </sl-checkbox>
-        <sl-tooltip content="Collect telemetry data for this agent." hoist>
-          <span class="help-badge">?</span>
-        </sl-tooltip>
-      </div>
-
-      <!-- Auto-Expose Ports -->
-      <div class="notify-field">
-        <sl-checkbox
-          ?checked=${this.autoExposePortsEnabled}
-          @sl-change=${(e: Event) => {
-            this.autoExposePortsEnabled = (e.target as HTMLInputElement).checked;
-          }}
-        >
-          Enable Auto-Expose Ports
-        </sl-checkbox>
-        <sl-tooltip
-          content="Automatically detect and expose TCP listening ports from this agent's container."
-          hoist
-        >
-          <span class="help-badge">?</span>
-        </sl-tooltip>
-      </div>
-
-      <!-- Auto-Expose Sub-fields (conditional) -->
-      ${this.autoExposePortsEnabled
-        ? html`
-            <div class="form-field">
-              <label>Port Filter Mode</label>
-              <sl-select
-                .value=${this.autoExposePortsMode}
-                @sl-change=${(e: Event) => {
-                  this.autoExposePortsMode = (e.target as HTMLElement & { value: string }).value;
-                }}
-              >
-                <sl-option value="allowlist">Allowlist</sl-option>
-                <sl-option value="denylist">Denylist</sl-option>
-              </sl-select>
-              <div class="hint">
-                ${this.autoExposePortsMode === 'allowlist'
-                  ? 'Only expose ports in the filter list below.'
-                  : 'Expose all ports except those in the filter list below.'}
-              </div>
-            </div>
-            <div class="form-field">
-              <label>Port Filter List</label>
-              <sl-input
-                placeholder="e.g. 3000,5173,8080"
-                .value=${this.autoExposePortsList}
-                @sl-input=${(e: Event) => {
-                  this.autoExposePortsList = (e.target as HTMLElement & { value: string }).value;
-                }}
-              ></sl-input>
-              <div class="hint">
-                Comma-separated list of ports to
-                ${this.autoExposePortsMode === 'allowlist' ? 'allow' : 'deny'}.
-              </div>
-            </div>
-            <div class="form-field">
-              <label>Scan Interval</label>
-              <sl-input
-                placeholder="3s"
-                .value=${this.autoExposePortsInterval}
-                @sl-input=${(e: Event) => {
-                  this.autoExposePortsInterval = (
-                    e.target as HTMLElement & { value: string }
-                  ).value;
-                }}
-              ></sl-input>
-              <div class="hint">How often to scan for new listening ports (e.g. 3s, 5s).</div>
-            </div>
-          `
-        : nothing}
-    `;
-  }
-
-  // ── Additional Options > Auth & Security Tab ──────────────────────
-
-  private renderAuthSecurityTab() {
-    return html`
-      <!-- Agent Role -->
-      <div class="form-field">
-        <label>Agent Role</label>
-        <sl-select
-          placeholder="Select a role..."
-          .value=${this.agentRole}
-          @sl-change=${(e: Event) => {
-            this.agentRole = (e.target as HTMLElement & { value: string }).value;
-          }}
-        >
-          <sl-option value="">Default (determined by project settings)</sl-option>
-          <sl-option value="none">None (no hub access)</sl-option>
-          <sl-option value="readonly">Read-only</sl-option>
-          <sl-option value="baseline">Baseline (standard)</sl-option>
-          <sl-option value="full">Full (requires admin)</sl-option>
-        </sl-select>
-        <div class="hint">Authorization role for hub API access.</div>
-      </div>
-
-      <!-- Message Mode -->
-      <div class="form-field">
-        <label>Message Mode</label>
-        <sl-select
-          placeholder="Select a message mode..."
-          .value=${this.messageMode}
-          @sl-change=${(e: Event) => {
-            this.messageMode = (e.target as HTMLElement & { value: string }).value;
-          }}
-        >
-          <sl-option value="">Default (inherit from parent)</sl-option>
-          ${(
-            Object.entries(MESSAGE_MODE_DISPLAY) as [
-              MessageMode,
-              (typeof MESSAGE_MODE_DISPLAY)[MessageMode],
-            ][]
-          ).map(
-            ([mode, display]) => html`
-              <sl-option value=${mode}>
-                <sl-icon slot="prefix" name=${display.icon}></sl-icon>
-                ${display.label} — ${display.description}
-              </sl-option>
-            `
-          )}
-        </sl-select>
-        ${this.messageMode === 'none'
-          ? html`<div class="hint" style="color: var(--sl-color-danger-600);">
-              This agent will be created in sealed mode. It will not be able to send or receive
-              messages.
-            </div>`
-          : html`<div class="hint">
-              Message authorization scope. Default inherits from the parent agent's mode.
-            </div>`}
-      </div>
-
-      <!-- Harness Authentication -->
-      <div class="form-field">
-        <label>Harness Authentication</label>
-        <sl-select
-          placeholder="Select auth method..."
-          .value=${this.harnessAuth}
-          @sl-change=${(e: Event) => {
-            this.harnessAuth = (e.target as HTMLElement & { value: string }).value;
-          }}
-        >
-          <sl-option value="">Auto Detected</sl-option>
-          <sl-option value="api-key">Provider API Key</sl-option>
-          <sl-option value="oauth-token">OAuth Token (env var)</sl-option>
-          <sl-option value="vertex-ai">Vertex Model Garden</sl-option>
-          <sl-option value="auth-file">Harness credential file</sl-option>
-          <sl-option value="none">No Authentication</sl-option>
-        </sl-select>
-        <div class="hint">Override the authentication method for the harness.</div>
-      </div>
-
-      <!-- GCP Identity -->
-      <div class="form-field">
-        <label>GCP Identity</label>
-        <sl-select
-          .value=${this.gcpMetadataMode}
-          @sl-change=${(e: Event) => {
-            this.gcpMetadataMode = (e.target as HTMLElement & { value: string }).value as
-              | 'block'
-              | 'passthrough'
-              | 'assign';
-            if (this.gcpMetadataMode !== 'assign') {
-              this.gcpServiceAccountId = '';
-            }
-          }}
-        >
-          <sl-option value="block">Block</sl-option>
-          ${this.gcpServiceAccounts.length > 0
-            ? html`<sl-option value="assign">Assign Service Account</sl-option>`
-            : ''}
-          <sl-option value="passthrough">Passthrough</sl-option>
-        </sl-select>
-        <div class="hint">
-          ${this.gcpMetadataMode === 'block'
-            ? 'Prevents the agent from accessing any GCP identity. Token requests are denied.'
-            : this.gcpMetadataMode === 'assign'
-              ? 'Assigns a registered GCP service account. GCP client libraries will authenticate automatically.'
-              : "No metadata interception. The agent inherits the broker's GCP identity. Requires broker ownership."}
-        </div>
-      </div>
-
-      <!-- GCP Service Account (conditional) -->
-      ${this.gcpMetadataMode === 'assign'
-        ? html`
-            <div class="form-field">
-              <label>Service Account</label>
-              ${this.verifiedGCPServiceAccounts.length > 0
-                ? html`
-                    <sl-select
-                      placeholder="Select a service account..."
-                      .value=${this.gcpServiceAccountId}
-                      @sl-change=${(e: Event) => {
-                        this.gcpServiceAccountId = (
-                          e.target as HTMLElement & { value: string }
-                        ).value;
-                      }}
-                    >
-                      ${this.verifiedGCPServiceAccounts.map(
-                        (sa) =>
-                          html`<sl-option value=${sa.id}>
-                            ${sa.email}${sa.displayName ? ` (${sa.displayName})` : ''}
-                          </sl-option>`
-                      )}
-                    </sl-select>
-                  `
-                : html`
-                    <div class="hint" style="margin-top: 0;">
-                      No verified service accounts available. Register and verify service accounts
-                      in project settings.
-                    </div>
-                  `}
-            </div>
-          `
-        : nothing}
-    `;
-  }
-
-  // ── Additional Options > Prompts Tab ──────────────────────────────
-
-  private renderPromptsTab() {
-    return html`
-      <div class="form-field">
-        <label>System Prompt</label>
-        <sl-textarea
-          placeholder="System prompt content or file:// URI..."
-          .value=${this.systemPrompt}
-          @sl-input=${(e: Event) => {
-            this.systemPrompt = (e.target as HTMLElement & { value: string }).value;
-          }}
-          rows="6"
-          resize="auto"
-        ></sl-textarea>
-        <div class="hint">
-          Custom system prompt for the agent. Can be inline text or a file:// URI.
-        </div>
-      </div>
-
-      <div class="form-field">
-        <label>Agent Instructions</label>
-        <sl-textarea
-          placeholder="Agent instructions content or file:// URI..."
-          .value=${this.agentInstructions}
-          @sl-input=${(e: Event) => {
-            this.agentInstructions = (e.target as HTMLElement & { value: string }).value;
-          }}
-          rows="6"
-          resize="auto"
-        ></sl-textarea>
-        <div class="hint">
-          Additional instructions for the agent. Can be inline text or a file:// URI.
-        </div>
-      </div>
-    `;
-  }
-
-  // ── Additional Options > Limits & Resources Tab ───────────────────
-
-  private renderLimitsTab() {
-    return html`
-      <div class="field-row">
-        <div class="form-field">
-          <label>Max Turns</label>
-          <sl-input
-            type="number"
-            placeholder="0 = unlimited"
-            .value=${String(this.maxTurns || '')}
-            @sl-input=${(e: Event) => {
-              this.maxTurns = parseInt((e.target as HTMLElement & { value: string }).value) || 0;
-            }}
-          ></sl-input>
-        </div>
-        <div class="form-field">
-          <label>Max Model Calls</label>
-          <sl-input
-            type="number"
-            placeholder="0 = unlimited"
-            .value=${String(this.maxModelCalls || '')}
-            @sl-input=${(e: Event) => {
-              this.maxModelCalls =
-                parseInt((e.target as HTMLElement & { value: string }).value) || 0;
-            }}
-          ></sl-input>
-        </div>
-      </div>
-
-      <div class="form-field">
-        <label>Max Duration</label>
-        <sl-input
-          placeholder="e.g. 30m, 2h"
-          .value=${this.maxDuration}
-          @sl-input=${(e: Event) => {
-            this.maxDuration = (e.target as HTMLElement & { value: string }).value;
-          }}
-        ></sl-input>
-        <div class="hint">Go duration string. Empty means no limit.</div>
-      </div>
-
-      <div class="field-row">
-        <div class="form-field">
-          <label>CPU Request</label>
-          <sl-input
-            placeholder='e.g. "2", "500m"'
-            .value=${this.cpuRequest}
-            @sl-input=${(e: Event) => {
-              this.cpuRequest = (e.target as HTMLElement & { value: string }).value;
-            }}
-          ></sl-input>
-        </div>
-        <div class="form-field">
-          <label>Memory Request</label>
-          <sl-input
-            placeholder='e.g. "4Gi"'
-            .value=${this.memoryRequest}
-            @sl-input=${(e: Event) => {
-              this.memoryRequest = (e.target as HTMLElement & { value: string }).value;
-            }}
-          ></sl-input>
-        </div>
-      </div>
-
-      <div class="field-row">
-        <div class="form-field">
-          <label>CPU Limit</label>
-          <sl-input
-            placeholder='e.g. "4"'
-            .value=${this.cpuLimit}
-            @sl-input=${(e: Event) => {
-              this.cpuLimit = (e.target as HTMLElement & { value: string }).value;
-            }}
-          ></sl-input>
-        </div>
-        <div class="form-field">
-          <label>Memory Limit</label>
-          <sl-input
-            placeholder='e.g. "8Gi"'
-            .value=${this.memoryLimit}
-            @sl-input=${(e: Event) => {
-              this.memoryLimit = (e.target as HTMLElement & { value: string }).value;
-            }}
-          ></sl-input>
-        </div>
-      </div>
-
-      <div class="form-field">
-        <label>Disk</label>
-        <sl-input
-          placeholder='e.g. "20Gi"'
-          .value=${this.disk}
-          @sl-input=${(e: Event) => {
-            this.disk = (e.target as HTMLElement & { value: string }).value;
-          }}
-        ></sl-input>
-      </div>
-    `;
-  }
-
-  // ── Additional Options > Environment & Labels Tab ─────────────────
-
-  private getAvailableVariables() {
-    const builtIn = [...BUILT_IN_DOCKER_LABEL_VARIABLES];
-
-    let hostProvided: string[] = [];
-    const profile = this.selectedBrokerProfiles.find((p) => p.name === this.profile);
-    if (profile && profile.envKeys) {
-      hostProvided = profile.envKeys;
-    }
-
-    const userProvided = this.envEntries.map((e) => e.key).filter((k) => k && k.trim() !== '');
-
-    return { builtIn, hostProvided, userProvided };
-  }
-
-  private getMissingVariables(): string[] {
-    const vars = this.getAvailableVariables();
-    return findMissingDockerLabelVariables(this.dockerLabelEntries, [
-      ...vars.builtIn,
-      ...vars.hostProvided,
-      ...vars.userProvided,
-    ]);
-  }
-
-  private renderDynamicVariableBadges() {
-    const vars = this.getAvailableVariables();
-    const missing = this.getMissingVariables();
-
-    return html`
-      <div style="display: flex; flex-wrap: wrap; gap: 0.5em; margin-bottom: 1em;">
-        ${vars.builtIn.map((v) => html`<sl-badge variant="primary">\${${v}}</sl-badge>`)}
-        ${vars.hostProvided.map((v) => html`<sl-badge variant="success">\${${v}}</sl-badge>`)}
-        ${vars.userProvided.map((v) => html`<sl-badge variant="neutral">\${${v}}</sl-badge>`)}
-        ${missing.map((v) => html`<sl-badge variant="danger">Missing: \${${v}}</sl-badge>`)}
-      </div>
-    `;
-  }
-
-  private renderEnvironmentTab() {
-    return html`
-      <!-- Environment Variables -->
-      <div class="form-field">
-        <label>Environment Variables</label>
-        <scion-env-editor
-          .entries=${this.envEntries}
-          @env-change=${(e: CustomEvent<{ entries: EnvEntry[] }>) => {
-            this.envEntries = e.detail.entries;
-          }}
-        ></scion-env-editor>
-      </div>
-
-      <!-- Docker Networks -->
-      <div class="form-field" style="margin-top: 1.5rem;">
-        <label>Docker Networks</label>
-        ${this.dockerNetworks.map(
-          (network, i) => html`
-            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
-              <sl-input
-                size="small"
-                placeholder="network_name"
-                .value=${network}
-                @sl-input=${(e: Event) => {
-                  const updated = [...this.dockerNetworks];
-                  updated[i] = (e.target as HTMLElement & { value: string }).value;
-                  this.dockerNetworks = updated;
-                }}
-                style="flex: 1;"
-              ></sl-input>
-              <sl-icon-button
-                name="x-lg"
-                label="Remove"
-                @click=${() => {
-                  this.dockerNetworks = this.dockerNetworks.filter((_, idx) => idx !== i);
-                }}
-              ></sl-icon-button>
-            </div>
-          `
-        )}
-        <sl-button
-          size="small"
-          variant="text"
-          @click=${() => {
-            this.dockerNetworks = [...this.dockerNetworks, ''];
-          }}
-        >
-          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
-          Add network
-        </sl-button>
-        <div class="hint">Custom Docker networks to attach to the agent container.</div>
-      </div>
-
-      <!-- Docker runtime labels -->
-      <div class="form-field" style="margin-top: 1.5rem;">
-        <label>Docker Labels</label>
-        <div class="hint" style="margin-bottom: 1em;">
-          Container runtime labels used by Docker integrations. You can use \${...} dynamic
-          variables in keys and values.
-        </div>
-        ${this.renderDynamicVariableBadges()}
-        ${this.dockerLabelEntries.map(
-          (entry, i) => html`
-            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
-              <sl-input
-                size="small"
-                placeholder="key"
-                .value=${entry.key}
-                @sl-input=${(e: Event) => {
-                  const updated = [...this.dockerLabelEntries];
-                  updated[i] = {
-                    ...updated[i],
-                    key: (e.target as HTMLElement & { value: string }).value,
-                  };
-                  this.dockerLabelEntries = updated;
-                }}
-                style="flex: 1;"
-              ></sl-input>
-              <sl-input
-                size="small"
-                placeholder="value"
-                .value=${entry.value}
-                @sl-input=${(e: Event) => {
-                  const updated = [...this.dockerLabelEntries];
-                  updated[i] = {
-                    ...updated[i],
-                    value: (e.target as HTMLElement & { value: string }).value,
-                  };
-                  this.dockerLabelEntries = updated;
-                }}
-                style="flex: 1;"
-              ></sl-input>
-              <sl-icon-button
-                name="x-lg"
-                label="Remove"
-                @click=${() => {
-                  this.dockerLabelEntries = this.dockerLabelEntries.filter((_, idx) => idx !== i);
-                }}
-              ></sl-icon-button>
-            </div>
-          `
-        )}
-        <sl-button
-          size="small"
-          variant="text"
-          @click=${() => {
-            this.dockerLabelEntries = [...this.dockerLabelEntries, { key: '', value: '' }];
-          }}
-        >
-          <sl-icon slot="prefix" name="plus-lg"></sl-icon>
-          Add Docker label
-        </sl-button>
-      </div>
-
-      <!-- Searchable agent labels -->
-      <div class="form-field" style="margin-top: 1.5rem;">
-        <label>Agent Labels</label>
-        ${this.labelEntries.map(
-          (entry, i) => html`
-            <div style="display: flex; gap: 0.5em; margin-bottom: 0.5em; align-items: center;">
-              <sl-input
-                size="small"
-                placeholder="key"
-                .value=${entry.key}
-                @sl-input=${(e: Event) => {
-                  const updated = [...this.labelEntries];
-                  updated[i] = {
-                    ...updated[i],
-                    key: (e.target as HTMLElement & { value: string }).value,
-                  };
-                  this.labelEntries = updated;
-                }}
-                style="flex: 1;"
-              ></sl-input>
-              <sl-input
-                size="small"
-                placeholder="value"
-                .value=${entry.value}
-                @sl-input=${(e: Event) => {
-                  const updated = [...this.labelEntries];
-                  updated[i] = {
-                    ...updated[i],
-                    value: (e.target as HTMLElement & { value: string }).value,
-                  };
-                  this.labelEntries = updated;
-                }}
-                style="flex: 1;"
-              ></sl-input>
-              <sl-icon-button
-                name="x-lg"
-                label="Remove"
-                @click=${() => {
-                  this.labelEntries = this.labelEntries.filter((_, idx) => idx !== i);
-                }}
-              ></sl-icon-button>
-            </div>
-          `
-        )}
-        ${this.labelEntries.length < 16
-          ? html`<sl-button
-              size="small"
-              variant="text"
-              @click=${() => {
-                this.labelEntries = [...this.labelEntries, { key: '', value: '' }];
-              }}
-            >
-              <sl-icon slot="prefix" name="plus-lg"></sl-icon>
-              Add agent label
-            </sl-button>`
-          : nothing}
-        <div class="hint">Optional key-value labels to organize agents (max 16).</div>
       </div>
     `;
   }

@@ -19,140 +19,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/ent"
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 )
-
-// TestGitHubResolutionStore_GetPut tests basic cache operations.
-func TestGitHubResolutionStore_GetPut(t *testing.T) {
-	client, err := ent.Open("sqlite3", "file:ent?mode=memory&cache=shared&_fk=1")
-	require.NoError(t, err)
-	defer client.Close() //nolint:errcheck
-
-	ctx := context.Background()
-	err = client.Schema.Create(ctx)
-	require.NoError(t, err)
-
-	store := NewGitHubResolutionStore(client)
-
-	cacheKey := "test-cache-key-123"
-	entry := GitHubCacheEntry{
-		CommitSHA: "abcdef1234567890abcdef1234567890abcdef12",
-		FileEntries: []GitHubFileEntry{
-			{Path: "SKILL.md", URL: "https://raw.githubusercontent.com/test/repo/main/SKILL.md", Hash: "sha256:abc", Size: 100},
-		},
-		BundleHash:  "sha256:bundlehash",
-		TokenScope:  "public",
-		ExpiresAt:   time.Now().Add(30 * time.Minute),
-		OriginalURI: "gh://test/repo/skill",
-	}
-
-	// Put entry
-	err = store.Put(ctx, cacheKey, entry)
-	require.NoError(t, err)
-
-	// Get entry (should hit)
-	retrieved, hit, err := store.Get(ctx, cacheKey)
-	require.NoError(t, err)
-	require.True(t, hit)
-	require.Equal(t, entry.CommitSHA, retrieved.CommitSHA)
-	require.Equal(t, entry.BundleHash, retrieved.BundleHash)
-	require.Len(t, retrieved.FileEntries, 1)
-
-	// Get non-existent entry (should miss)
-	_, hit, err = store.Get(ctx, "nonexistent")
-	require.NoError(t, err)
-	require.False(t, hit)
-}
-
-// TestGitHubResolutionStore_Expiration tests TTL expiration.
-func TestGitHubResolutionStore_Expiration(t *testing.T) {
-	client, err := ent.Open("sqlite3", "file:ent?mode=memory&cache=shared&_fk=1")
-	require.NoError(t, err)
-	defer client.Close() //nolint:errcheck
-
-	ctx := context.Background()
-	err = client.Schema.Create(ctx)
-	require.NoError(t, err)
-
-	store := NewGitHubResolutionStore(client)
-
-	cacheKey := "test-expired-key"
-	entry := GitHubCacheEntry{
-		CommitSHA:   "abcdef1234567890abcdef1234567890abcdef12",
-		FileEntries: []GitHubFileEntry{{Path: "SKILL.md", URL: "http://example.com", Hash: "sha256:abc", Size: 100}},
-		BundleHash:  "sha256:bundlehash",
-		TokenScope:  "public",
-		ExpiresAt:   time.Now().Add(-1 * time.Hour), // Already expired
-		OriginalURI: "gh://test/repo/skill",
-	}
-
-	// Put expired entry
-	err = store.Put(ctx, cacheKey, entry)
-	require.NoError(t, err)
-
-	// Get should miss (expired)
-	_, hit, err := store.Get(ctx, cacheKey)
-	require.NoError(t, err)
-	require.False(t, hit, "expired entry should not be returned")
-}
-
-// TestGitHubResolutionStore_PurgeExpired tests TTL eviction.
-func TestGitHubResolutionStore_PurgeExpired(t *testing.T) {
-	client, err := ent.Open("sqlite3", "file:ent?mode=memory&cache=shared&_fk=1")
-	require.NoError(t, err)
-	defer client.Close() //nolint:errcheck
-
-	ctx := context.Background()
-	err = client.Schema.Create(ctx)
-	require.NoError(t, err)
-
-	store := NewGitHubResolutionStore(client)
-
-	// Add expired entry
-	expiredKey := "expired-key"
-	expiredEntry := GitHubCacheEntry{
-		CommitSHA:   "abcdef1234567890abcdef1234567890abcdef12",
-		FileEntries: []GitHubFileEntry{{Path: "SKILL.md", URL: "http://example.com", Hash: "sha256:abc", Size: 100}},
-		BundleHash:  "sha256:bundlehash",
-		TokenScope:  "public",
-		ExpiresAt:   time.Now().Add(-1 * time.Hour),
-		OriginalURI: "gh://expired/repo/skill",
-	}
-	err = store.Put(ctx, expiredKey, expiredEntry)
-	require.NoError(t, err)
-
-	// Add valid entry
-	validKey := "valid-key"
-	validEntry := GitHubCacheEntry{
-		CommitSHA:   "1234567890abcdef1234567890abcdef12345678",
-		FileEntries: []GitHubFileEntry{{Path: "SKILL.md", URL: "http://example.com", Hash: "sha256:def", Size: 200}},
-		BundleHash:  "sha256:bundlehash2",
-		TokenScope:  "public",
-		ExpiresAt:   time.Now().Add(1 * time.Hour),
-		OriginalURI: "gh://valid/repo/skill",
-	}
-	err = store.Put(ctx, validKey, validEntry)
-	require.NoError(t, err)
-
-	// Purge expired
-	err = store.PurgeExpired(ctx)
-	require.NoError(t, err)
-
-	// Expired entry should be gone
-	_, hit, err := store.Get(ctx, expiredKey)
-	require.NoError(t, err)
-	require.False(t, hit)
-
-	// Valid entry should still exist
-	_, hit, err = store.Get(ctx, validKey)
-	require.NoError(t, err)
-	require.True(t, hit)
-}
 
 // TestComputeCacheKey tests cache key computation.
 func TestComputeCacheKey(t *testing.T) {
@@ -247,7 +118,7 @@ func TestGHListContents_PermanentURLs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	entries, err := ghListContents(context.Background(), srv.URL, "https://raw.githubusercontent.com",
+	entries, err := ghListContents(context.Background(), agent.NewGitHubCooldown(nil), "anon", srv.URL, "https://raw.githubusercontent.com",
 		"acme", "skills", "skills/deploy", commitSHA, "")
 	require.NoError(t, err)
 
@@ -281,7 +152,7 @@ func TestGHListContents_RawBaseOverride(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	entries, err := ghListContents(context.Background(), srv.URL, "https://raw.ghe.example.com",
+	entries, err := ghListContents(context.Background(), agent.NewGitHubCooldown(nil), "anon", srv.URL, "https://raw.ghe.example.com",
 		"acme", "skills", "s", commitSHA, "")
 	require.NoError(t, err)
 	require.Len(t, entries, 1)

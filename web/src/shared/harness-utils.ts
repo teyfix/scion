@@ -44,7 +44,6 @@ export const KNOWN_HARNESS_NAMES = [
   'hermes',
   'grok-build',
   'muse-code',
-  'jcode',
 ] as const;
 
 /** A canonical harness identifier. */
@@ -73,7 +72,6 @@ const HARNESS_DISPLAY_NAMES: Record<KnownHarnessName, string> = {
   hermes: 'Hermes',
   'grok-build': 'Grok Build',
   'muse-code': 'Muse Code',
-  jcode: 'jcode',
 };
 
 /**

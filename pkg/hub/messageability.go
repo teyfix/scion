@@ -64,6 +64,24 @@ func mapReasonToCode(reason string) string {
 		return ReasonModeLineageAgentAgent
 	case strings.HasPrefix(reason, "agent.message permission denied"):
 		return ReasonMissingPermission
+	// Phase 5: Cross-project denial codes mapped to API-safe values.
+	// Order matters: longer/more-specific prefixes must be checked BEFORE
+	// shorter/broader ones so the broad "cross-project messaging" catch-all
+	// does not shadow more specific matches.
+	case strings.HasPrefix(reason, "cross-project messaging requires sender mode hub"):
+		return string(MessageDenialCrossProjectSenderMode)
+	case strings.HasPrefix(reason, "cross-project messaging requires hub-attested"):
+		return string(MessageDenialCrossProjectUntrusted)
+	case reason == "cross-project messaging is not enabled on this Hub":
+		return string(MessageDenialCrossProjectDisabled)
+	case strings.HasPrefix(reason, "cross-project target must be"):
+		return string(MessageDenialCrossProjectTargetMode)
+	case reason == "destination project does not accept external agent messages":
+		return string(MessageDenialCrossProjectInboundNone)
+	case reason == "origin user is not an active member of the destination project":
+		return string(MessageDenialCrossProjectNotMember)
+	case strings.HasPrefix(reason, "cross-project"):
+		return string(MessageDenialCrossProjectUnsupported)
 	default:
 		// For unrecognized reasons, return a generic code rather than leaking
 		// internal reason strings to the API consumer.
@@ -79,12 +97,30 @@ func (s *Server) ComputeMessageability(
 	viewerIdentity Identity,
 	targetAgent *store.Agent,
 ) *AgentMessageability {
+	defer perfPhaseStart(ctx, perfPhaseMessageability)()
+	return s.computeMessageability(ctx, viewerIdentity, targetAgent)
+}
+
+// computeMessageability is ComputeMessageability without the perf_trace
+// phase, so ComputeMessageabilityDetail can time its whole computation as a
+// single phase.
+func (s *Server) computeMessageability(
+	ctx context.Context,
+	viewerIdentity Identity,
+	targetAgent *store.Agent,
+) *AgentMessageability {
 	if viewerIdentity == nil || targetAgent == nil {
 		return &AgentMessageability{}
 	}
+	// An agent delegated credential is reported as not messageable, and
+	// nothing about the target's reachability is computed for it
+	// (.design/agent-delegation.md §11.7).
+	if isDelegatedAgentIdentity(viewerIdentity) {
+		return &AgentMessageability{CanMessage: false, Reason: mapReasonToCode(messageReasonSenderNotPermitted)}
+	}
 
 	// canMessage: can the viewer send a message to this agent?
-	canMessage, reason := s.authorizeAgentMessage(ctx, viewerIdentity, targetAgent, false)
+	canMessage, reason, _ := s.authorizeAgentMessage(ctx, viewerIdentity, targetAgent, false)
 
 	// canReachViewer: can this agent send a message to the viewer?
 	canReachViewer := computeCanReachViewer(viewerIdentity, targetAgent)
@@ -123,8 +159,9 @@ func computeCanReachViewer(viewerIdentity Identity, targetAgent *store.Agent) bo
 	switch mode {
 	case store.MessageModeNone:
 		return false
-	case store.MessageModeProject:
-		// Project-mode agents can message any user/agent in the project.
+	case store.MessageModeProject, store.MessageModeHub:
+		// Project/hub-mode agents can message any user/agent in the project.
+		// Hub mode behaves like project for same-project sends.
 		// For user viewers, this is generally true (they are browsing the project).
 		// For agent viewers, the full check requires the viewer agent's mode — this
 		// is a simplified approximation (see design doc Section 3.2).
@@ -152,23 +189,19 @@ func (s *Server) ComputeMessageabilityDetail(
 	targetAgent *store.Agent,
 	projectAgents []store.Agent,
 ) *AgentMessageabilityDetail {
-	base := s.ComputeMessageability(ctx, viewerIdentity, targetAgent)
+	defer perfPhaseStart(ctx, perfPhaseMessageability)()
+	// The sender's standing is the same for every target in this request:
+	// a per-request memo evaluates it once, whatever the viewer's identity.
+	// The memo lives in this call's context only.
+	ctx = withStandingMemo(ctx)
 
-	// Count reachable agents: for each agent in projectAgents, check if
-	// targetAgent could message it. We construct a temporary AgentIdentity
-	// from the target agent record and run the forward authorization check.
-	reachableAgents := 0
-	senderIdentity := agentIdentityFromAgent(targetAgent)
-	for i := range projectAgents {
-		other := &projectAgents[i]
-		if other.ID == targetAgent.ID {
-			continue
-		}
-		allowed, _ := s.authorizeAgentMessage(ctx, senderIdentity, other, false)
-		if allowed {
-			reachableAgents++
-		}
+	base := s.computeMessageability(ctx, viewerIdentity, targetAgent)
+	// Nothing about the target's reachability is computed for an agent
+	// delegated credential (.design/agent-delegation.md §11.7).
+	if isDelegatedAgentIdentity(viewerIdentity) {
+		return &AgentMessageabilityDetail{AgentMessageability: *base}
 	}
+	reachableAgents := s.countReachableAgents(ctx, targetAgent, projectAgents)
 
 	// Count reachable users: simplified approach based on message mode.
 	reachableUsers := countReachableUsers(targetAgent)
@@ -178,6 +211,33 @@ func (s *Server) ComputeMessageabilityDetail(
 		ReachableAgentCount: reachableAgents,
 		ReachableUserCount:  reachableUsers,
 	}
+}
+
+// countReachableAgents counts the agents in projectAgents that targetAgent
+// could message. Each decision is authorizeAgentMessage's agent-sender path
+// (EvaluateAgentMessage) for a sender built from targetAgent. The sender row
+// is targetAgent itself, which the caller read from the store in this
+// request, so it is not read again per target; the sender's standing is
+// still evaluated on its own fresh read by ID (agentStanding), and a sender
+// with no stored row or a failed standing lookup reaches no agent.
+func (s *Server) countReachableAgents(ctx context.Context, targetAgent *store.Agent, projectAgents []store.Agent) int {
+	if targetAgent == nil {
+		return 0
+	}
+	senderIdentity := agentIdentityFromAgent(targetAgent)
+	reachable := 0
+	for i := range projectAgents {
+		other := &projectAgents[i]
+		// Self is not counted; authorizeAgentMessage's self-message
+		// exemption never applies here.
+		if other.ID == targetAgent.ID {
+			continue
+		}
+		if s.evaluateAgentMessageForSender(ctx, senderIdentity, targetAgent, other).Allowed {
+			reachable++
+		}
+	}
+	return reachable
 }
 
 // agentIdentityFromAgent constructs a minimal AgentIdentity from a store.Agent
@@ -219,8 +279,9 @@ func countReachableUsers(targetAgent *store.Agent) int {
 			return 1
 		}
 		return 0
-	case store.MessageModeProject:
-		// Project-mode agents can reach all project members. Without a
+	case store.MessageModeProject, store.MessageModeHub:
+		// Project/hub-mode agents can reach all project members. Hub mode
+		// behaves like project for same-project sends. Without a
 		// project-member count available here, return -1 to signal "all
 		// project members" or a sentinel. The brief says simplified approach
 		// is acceptable, so return a positive indicator.

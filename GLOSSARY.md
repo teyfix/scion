@@ -2,7 +2,7 @@
 
 Scion is a container-based orchestration platform for running multiple LLM "deep agents" concurrently, each isolated in its own container, workspace, and credentials. This document fixes the preferred term for each domain concept so that code, docs, UI, and prompts share one vocabulary.
 
-> Two naming rules run throughout: the concept formerly called *grove* is now **project**, and bare **"broker"** is never used on its own — it is ambiguous across three distinct concepts (**Runtime Broker**, **Message Broker**, and the **Event Bus**), so it must always be qualified (see the disambiguation rule under [Hub & Hosted](#hub--hosted)). The codebase does not yet fully match either rule; the known gaps are tracked as GitHub issues.
+> Two naming rules run throughout: the concept formerly called *grove* is now **project** (see `docs-site/src/content/docs/reference/grove-removal.md` for what changed), and bare **"broker"** is never used on its own — it is ambiguous across three distinct concepts (**Runtime Broker**, **Message Broker**, and the **Event Bus**), so it must always be qualified (see the disambiguation rule under [Hub & Hosted](#hub--hosted)). The codebase does not yet fully match either rule; the known gaps are tracked as GitHub issues.
 
 ## Orchestration
 
@@ -13,6 +13,9 @@ _Avoid_: worker, bot, instance, process
 **Sub-agent**:
 An agent spawned by another agent; "sub" only from the orchestrating user's view, since it is a full agent in capability.
 _Avoid_: helper, thread, worker thread
+
+**Reincarnation**:
+Migrating an existing agent to a new *generation*: the Hub re-resolves its template, image, and harness-config, then starts it again with the same agent ID and slug and a handoff as its first task. Done with `scion reincarnate`. Distinct from *restart* (same config) and *resume* (same harness session).
 
 **Project**:
 A namespace and collection of agents and configuration, represented by a `.scion` directory and usually one-to-one with a git repository.
@@ -73,12 +76,12 @@ _Avoid_: agent tool, scion-tool
 ## Runtime & Workspace
 
 **Agent Port Forwarding**:
-A feature that allows exposing local HTTP ports running inside an agent container through the Hub as authenticated, reverse-proxied URLs. Built on an outbound WebSocket reverse tunnel.
-_Avoid_: agent tunnel, port proxy, hub reverse tunnel, web access
-_See also_: sciontool
+A feature that allows exposing local HTTP ports running inside an agent container through the Hub as authenticated, reverse-proxied URLs. Built on an outbound WebSocket connection from the container.
+_Avoid_: agent tunnel, port proxy, hub reverse tunnel, web access (for raw TCP or SSH access through `scion tunnel`, see **Tunnel (Conduit user tunnel)**)
+_See also_: sciontool, Tunnel (Conduit user tunnel)
 
 **Runtime**:
-The container technology that executes an agent's container: Docker, Podman, Apple Container, or Kubernetes.
+The container technology that executes an agent's container: Docker, Podman, Apple Container, Kubernetes, Cloud Run Instances, or Substrate (Agent Substrate actors on GKE).
 _Avoid_: backend, engine, executor, environment
 _See also_: Runtime Broker, Profile
 
@@ -87,7 +90,7 @@ The working directory mounted into a single agent's container at `/workspace`. H
 _Avoid_: project, repo, mount
 
 **Workspace sharing mode**:
-How a project's workspace is provisioned across its agents — one universal set of modes intended for both local and Hub-managed projects: **Shared-plain**, **Worktree-per-agent**, and **Clone-per-agent**.
+How a project's workspace is provisioned across its agents. There are four canonical modes: **Shared-plain**, **Worktree-per-agent** and **Clone-per-agent**, plus **Empty-per-agent** for Hub-managed projects without git. The mode is chosen when the project is created (API/CLI value `shared`, `per-agent` or `worktree-per-agent`; `per-agent` resolves to Clone-per-agent for git projects and to Empty-per-agent otherwise) and cannot be changed afterwards. "Workspace mode" is used only as the name of the API field (`workspaceMode`) and CLI flag (`--workspace-mode`) whose values select the sharing mode; in prose, say "workspace sharing mode".
 _Avoid_: workspace mode, isolation mode
 
 **Shared-plain**:
@@ -95,12 +98,17 @@ A workspace sharing mode where one workspace directory is mounted into every age
 _Avoid_: shared mount, plain workspace
 
 **Worktree-per-agent**:
-A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history. Supported in local mode today; not yet on Hub-managed projects.
+A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history. Supported in local mode and on Hub-managed git projects; on Kubernetes it requires NFS workspace storage.
 _Avoid_: worktree mode, shared checkout
 
 **Clone-per-agent**:
-A workspace sharing mode where each agent gets its own full git clone of the repository.
+A workspace sharing mode where each agent gets its own full git clone of the repository. It is also what a Hub git project resolves to when it has no workspace mode set: only `shared` selects the shared checkout.
 _Avoid_: clone mode, per-agent clone
+
+**Empty-per-agent**:
+A workspace sharing mode for Hub-managed projects without git, where each agent gets its own private directory that starts empty and is not a git repository. It is kept across suspend/resume where storage allows and deleted with the agent. Selected with workspace mode `per-agent` on a project without a git remote.
+_Avoid_: plain-per-agent, private workspace
+_See also_: Shared directory
 
 **Shared directory**:
 A persistent, mutable volume shared by the agents within one project.
@@ -204,9 +212,14 @@ _Avoid_: credential, vault, secret store, env secret
 _See also_: Harness-config, Profile
 
 **Port Forwarding**:
-The feature that allows users, developers, and external systems to access HTTP services running inside agent containers securely via the Hub's reverse proxy. Requests are routed over a persistent, authenticated WebSocket-based reverse tunnel established from within the container to the Hub.
-_Avoid_: tunnel, docker proxy, ingress
-_See also_: Auto-Expose, Hub
+The feature that allows users, developers, and external systems to access HTTP services running inside agent containers securely via the Hub's reverse proxy. Requests are routed over a persistent, authenticated outbound WebSocket connection from the container to the Hub.
+_Avoid_: tunnel (that term is reserved for **Tunnel (Conduit user tunnel)**; the route `/ports/tunnel` and its error text keep their legacy names), docker proxy, ingress
+_See also_: Auto-Expose, Hub, Tunnel (Conduit user tunnel)
+
+**Tunnel (Conduit user tunnel)**:
+A raw TCP or SSH connection from a user's machine to a port or the SSH service inside an agent, opened with `scion tunnel` over a Conduit session with the Hub (behind the `hub.conduit` experiment). The local end is a `127.0.0.1` listener or stdin/stdout. Distinct from **Port Forwarding**, which serves HTTP through the Hub's proxy URLs.
+_Avoid_: port forward (for this feature), SSH proxy
+_See also_: Port Forwarding, sciontool
 
 **Auto-Expose**:
 A sub-feature of port forwarding where `sciontool` periodically scans for listening TCP sockets inside the agent container (by reading `/proc/net/tcp` and `/proc/net/tcp6`), filters them by policy, and registers them with the Hub using the `auto-scan` label. Stale registrations are automatically cleaned up when the service stops listening.
@@ -222,25 +235,35 @@ A standalone, self-managed service that translates standard A2A JSON-RPC payload
 _Avoid_: A2A bridge, A2A adapter, A2A proxy
 _See also_: A2A Protocol, Hub
 
+**Join token**:
+A short-lived, single-use token the Hub issues when a user creates or re-registers a Runtime Broker. The Runtime Broker host redeems it at `POST /api/v1/brokers/join` for its Runtime Broker credentials, and the token is consumed in the same step. Its lifetime defaults to 1 hour and can be set per request, from 5 minutes to 24 hours (`joinTokenTtlSeconds` on `POST /api/v1/brokers`, or `--ttl` on `scion hub brokers join-token create`). `scion runtime-broker register` creates and redeems one in a single step; `scion hub brokers join-token create` and `scion runtime-broker join` split the two across machines.
+_Avoid_: registration token, bootstrap secret
+_See also_: Runtime Broker, User Access Token (UAT) (a different credential)
+
+**Artifact**:
+A published file or folder (a bundle) stored by the Hub, with numbered immutable versions and a stable reference `scion://artifact/<id>[@<seq>]` that works from any Runtime Broker and in the web UI. Owned by the publishing agent or user and homed in a project. Gated by the `hub.artifacts` experiment. Not a build output or a chat attachment.
+_Avoid_: attachment, upload, build artifact
+_See also_: Project
+
 ## Users & Access
 
 **Access Boundary**:
-The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing.
+The user-facing term and UI representation of an underlying **AccessConstraint**. It defines a monotonic maximum-permissions boundary (permission ceiling) for users, group closures, or all principals. Admins can view, create, and manage access boundaries via a guided authoring workflow, previewing and dry-running changes using the built-in preview engine and effective-access integration before committing. It is not a User Access Token's boundary (the single project or the hub a UAT is bound to).
 _Avoid_: access ceiling, permission boundary, role constraint
-_See also_: AccessConstraint, Group, RoleBinding
+_See also_: AccessConstraint, Group, RoleBinding, User Access Token (UAT)
 
 **Agent Authorization Role**:
-A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. Resolves via a two-gate authority lattice matching requested role, user ceiling, and project maximums.
+A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. At creation, the requested or default role is capped by the project maximum and, for sub-agents, the parent agent's role. Live delegation checks separately verify the caller's authority.
 _Avoid_: raw template scopes, agent scopes
 _See also_: User Access Token (UAT)
 
 **Group**:
-A named collection of Hub users (and nested groups) used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
+A named collection of Hub users, agents and nested groups used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
 _Avoid_: team, org, role
 _See also_: Message Group (different concept — message recipients, not users)
 
 **User Access Token (UAT)**:
-A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes).
+A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT has a boundary, either a single project or (for a hub-bound token, minted through the API) the hub, and carries a specific list of action permissions (scopes). The token boundary is not an **Access Boundary**.
 _Avoid_: personal access token (PAT), API key, secret token
 _See also_: Hub
 
@@ -251,6 +274,23 @@ _Avoid_: rate limits, usage caps
 
 **LimitDefinition**:
 A seeded system or custom limit configuration that defines a quota boundary within the Quota System.
+
+**Runtime Broker Settings**:
+A settings document on the Hub for one Runtime Broker (`/api/v1/runtime-brokers/{id}/settings`). Its first key, `maxAgents`, overrides the `max_agents_per_broker` limit for that Runtime Broker. The effective cap resolves from the Runtime Broker's setting, then an entitlement binding, then the hub default.
+_Avoid_: Broker Settings (bare "broker"); an entitlement binding scoped to a Runtime Broker (the retired way to set a cap for one Runtime Broker)
+
+**Flat Runtime Broker**:
+A Runtime Broker identity that serves exactly one runtime target, recorded as its runtime target ID; placement selects the Runtime Broker, not a profile, and agents placed on it stay pinned to that target. Gated by the `hub.flat_runtime_brokers` experiment (see `.design/flat-runtime-brokers-contract.md`).
+_See also_: Runtime target ID, Runtime Broker, Profile
+
+**Runtime target ID**:
+The opaque, stable identifier of a flat Runtime Broker's single runtime target, minted by the Runtime Broker instance and carried in the `runtimeTarget` registration descriptor (`{id, type, displayName}`), on Runtime Broker API objects, in `expectedRuntimeTargetId` and in an agent's pinned placement. It is not an inventory target key.
+_Avoid_: target name, context, inventory target
+_See also_: Inventory target key, Flat Runtime Broker
+
+**Inventory target key**:
+The `auxiliaryRuntimeIdentity` string (runtime name, plus context and namespace on Kubernetes) that heartbeats, start claims and recovery use to name the runtime an agent was observed on. It appears as `appliedConfig.runtimeTarget`/`runtimeTargetCandidate`, `hubclient.AgentHeartbeat.RuntimeTarget` and the Hub-side heartbeat agent type. It is not a runtime target ID.
+_See also_: Runtime target ID
 
 ## Messaging
 
@@ -268,9 +308,19 @@ _Avoid_: group, set, group chat, room, thread
 _See also_: Group (different concept — hub users, not recipients)
 
 **Message Mode**:
-A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of four values: **none**, **lineage**, **branch**, or **project** (the default). Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
+A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: **none**, **lineage**, **branch**, **project** (the default), or **hub**. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
 _Avoid_: messaging mode, communication mode, access mode
-_See also_: Ancestry chain, Piercing
+_See also_: Ancestry chain, Piercing, Hub mode
+
+**Hub mode** (message mode):
+A message mode that behaves like Project mode within the agent's own project and additionally permits the agent to send direct messages across project boundaries (when cross-project messaging is enabled at the Hub and receiving-project level). A project-mode agent can receive a cross-project DM but cannot reply until granted Hub mode. Hub mode is subject to a non-escalation grant guard: an agent can only grant it to another agent if the granting agent is itself in Hub mode and has the `full` authorization role.
+_Avoid_: global mode, cross-project mode
+_See also_: Message Mode, Cross-project inbound policy
+
+**Cross-project inbound policy**:
+A project-level setting (`crossProjectInbound`) that controls whether the project accepts agent messages originating from other projects. One of three values: `none` (default — reject all), `members` (accept only when the sender's originating human is a member of this project), or `any` (accept from any project on the Hub). One of three independent controls required for cross-project messaging (alongside the Hub-level `cross_project_messaging_enabled` flag and the sender agent's Hub message mode).
+_Avoid_: cross-project policy, inbound policy
+_See also_: Hub mode, Message Mode
 
 **Messageability**:
 A server-computed assessment of whether a specific viewer can message a specific agent, considering the agent's message mode, the viewer's identity, ancestry relationship, and permissions. Exposed in API responses as `_messageability` with `canMessage` and `canReachViewer` booleans. Used by the UI to gate message buttons and show reachability indicators.
@@ -321,6 +371,31 @@ _See also_: Phase (the container stage), Blocked (a specific activity value)
 The activity an agent assigns to itself when intentionally waiting for an expected event, so it is not mistaken for stalled.
 _Avoid_: stalled, stuck, idle, waiting
 _See also_: Activity (Blocked is one of its values)
+
+**Stalled**:
+A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. Distinct from `offline`, which means no heartbeat for over 2 minutes.
+_Avoid_: stuck, hung (as a state name), offline
+_See also_: Activity, Blocked, Auto-Suspend
+
+**Auto-Suspend**:
+A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
+_Avoid_: idle timeout, auto-stop
+_See also_: Stalled, Phase
+
+**Run intent**:
+Whether the Hub has been asked to keep an agent running (`running`) or stopped (`stopped`). It is recorded when a lifecycle request (start, restart, wake, create-and-start, stop, suspend or delete) is accepted, before dispatch to the Runtime Broker, so it reflects the request even when the dispatch is queued or fails. Kept separately from phase and not shown in the agent's API record.
+_Avoid_: desired state, target phase
+_See also_: Phase, Run ID, Start claim
+
+**Run ID**:
+The identity of one run of an agent, minted by the Hub for each create, start or restart dispatch. It is applied to the runtime entry as the `scion.run_id` label and carried as the `run_id` claim in the agent's Hub token, so a delete that names a run only targets that run, not a later run of an agent with the same name. A start without a Hub (local mode) gets a run ID from the agent manager instead.
+_Avoid_: session ID, instance ID; not the `runId` of an admin maintenance operation
+_See also_: Run intent, Reincarnation
+
+**Start claim**:
+A leased, per-agent claim the Hub takes for every start, restart, create-and-start, message wake, automatic recovery and reincarnation start, and while applying a queued stop, so only one of these runs at a time. A competing request gets `409 start_in_progress`, with the holder's kind and state (`live`, or `unconfirmed` when the outcome is not yet known) in `error.details`.
+_Avoid_: start lock, launch lock
+_See also_: Run intent, Run ID
 
 ## Modes
 

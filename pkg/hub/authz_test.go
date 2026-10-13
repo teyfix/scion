@@ -30,17 +30,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// authzTestSetup creates a test server with the authz service and pre-populated data.
-// Note: testServer() removes the delegation edge backfill marker so that
-// agents created directly via the store (without delegation edges) are
-// not denied by the post-backfill no-edge check. Tests that specifically
-// exercise post-backfill behavior re-create the marker explicitly.
-func authzTestSetup(t *testing.T) (*AuthzService, store.Store) {
-	t.Helper()
-	srv, s := testServer(t)
-	return srv.authzService, s
-}
-
 func TestAuthz_AdminBypass(t *testing.T) {
 	authz, s := authzTestSetup(t)
 	ctx := context.Background()
@@ -394,25 +383,6 @@ func TestAuthz_ResourceTypeMismatch(t *testing.T) {
 	// Project resource should not match (no project.read permission)
 	decision = authz.CheckAccess(ctx, user, Resource{Type: "project", ID: "g1"}, ActionRead)
 	assert.False(t, decision.Allowed)
-}
-
-func TestEvaluatePolicies_NoMatch(t *testing.T) {
-	// CO1: Legacy function removed; test retained as shell.
-}
-
-func TestMatchesAction(t *testing.T) {
-	// CO1: Legacy function removed; test retained as shell.
-}
-
-func TestMatchesResource(t *testing.T) {
-	// CO1: Legacy function removed; test retained as shell.
-}
-
-func TestScopeLevel(t *testing.T) {
-	assert.Equal(t, 0, scopeLevel("hub"))
-	assert.Equal(t, 1, scopeLevel("project"))
-	assert.Equal(t, 2, scopeLevel("resource"))
-	assert.Equal(t, -1, scopeLevel("unknown"))
 }
 
 func TestAuthz_BrokerDispatch_OwnerAllowed(t *testing.T) {
@@ -1250,8 +1220,8 @@ func TestGetEffectivePermissions_AppliesConstraintIntersection(t *testing.T) {
 // ===========================================================================
 
 // TestGetEffectivePermissions_PrincipalConstraintTargetingGroup verifies that
-// a {principal, group, G} constraint is enforced by getEffectivePermissions
-// when the user is a member of group G.
+// a group_closure constraint is enforced by getEffectivePermissions when the
+// user is a member of the targeted group.
 // Regression test for B1 fix 1: exact-principal matching fail-open.
 func TestGetEffectivePermissions_PrincipalConstraintTargetingGroup(t *testing.T) {
 	authz, s := authzTestSetup(t)
@@ -1286,17 +1256,14 @@ func TestGetEffectivePermissions_PrincipalConstraintTargetingGroup(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	// Create a constraint targeting group:b1-target-group that allows only agent.read.
-	groupIDStr := groupID
-	principalType := "group"
+	// Create a group_closure constraint targeting b1-target-group that allows only agent.read.
 	_, err = s.CreateAccessConstraint(ctx, &store.AccessConstraint{
-		Name:                 "b1-group-targeting-constraint",
-		SubjectKind:          store.ConstraintSubjectPrincipal,
-		SubjectPrincipalType: &principalType,
-		SubjectPrincipalID:   &groupIDStr,
-		ScopeType:            store.RoleScopeSystem,
-		MaximumPermissions:   []string{"agent.read"},
-		Purpose:              "B1 test: group-targeted principal constraint",
+		Name:               "b1-group-targeting-constraint",
+		SubjectKind:        store.ConstraintSubjectGroupClosure,
+		SubjectGroupID:     &groupID,
+		ScopeType:          store.RoleScopeSystem,
+		MaximumPermissions: []string{"agent.read"},
+		Purpose:            "B1 test: group_closure constraint targeting group members",
 	})
 	require.NoError(t, err)
 
@@ -1305,7 +1272,7 @@ func TestGetEffectivePermissions_PrincipalConstraintTargetingGroup(t *testing.T)
 
 	assert.Contains(t, perms, "agent.read", "agent.read should survive the constraint")
 	assert.NotContains(t, perms, "project.read",
-		"project.read should be removed by group-targeted principal constraint")
+		"project.read should be removed by group_closure constraint")
 }
 
 // TestGetEffectivePermissions_ProjectScopeConstraint verifies that project-scoped
@@ -1357,52 +1324,9 @@ func TestGetEffectivePermissions_ProjectScopeConstraint(t *testing.T) {
 		"project-scoped constraint should remove agent.create")
 }
 
-// createTestRoleDefinition creates a custom role definition for tests.
-func createTestRoleDefinition(t *testing.T, s store.Store, name, scopeType string, permissions []string) *store.RoleDefinition {
-	t.Helper()
-	ctx := context.Background()
-	rd, err := s.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name:        name,
-		ScopeType:   scopeType,
-		Permissions: permissions,
-	})
-	require.NoError(t, err)
-	return rd
-}
-
 // ===========================================================================
 // R1: Fail-closed error-path regression tests
 // ===========================================================================
-
-// errorInjectingStore wraps a real store and allows injecting errors into
-// specific methods. All other methods delegate to the embedded store.
-type errorInjectingStore struct {
-	store.Store
-	getEffectiveGroupsErr         error
-	getEffectiveGroupsForAgentErr error
-	getGroupMembersErr            error
-}
-
-func (s *errorInjectingStore) GetEffectiveGroups(ctx context.Context, userID string) ([]string, error) {
-	if s.getEffectiveGroupsErr != nil {
-		return nil, s.getEffectiveGroupsErr
-	}
-	return s.Store.GetEffectiveGroups(ctx, userID)
-}
-
-func (s *errorInjectingStore) GetEffectiveGroupsForAgent(ctx context.Context, agentID string) ([]string, error) {
-	if s.getEffectiveGroupsForAgentErr != nil {
-		return nil, s.getEffectiveGroupsForAgentErr
-	}
-	return s.Store.GetEffectiveGroupsForAgent(ctx, agentID)
-}
-
-func (s *errorInjectingStore) GetGroupMembers(ctx context.Context, groupID string) ([]store.GroupMember, error) {
-	if s.getGroupMembersErr != nil {
-		return nil, s.getGroupMembersErr
-	}
-	return s.Store.GetGroupMembers(ctx, groupID)
-}
 
 // TestGetEffectivePermissions_GroupResolutionFailure_FailsClosed verifies that
 // when GetEffectiveGroups returns an error, getEffectivePermissions returns an
@@ -1448,14 +1372,14 @@ func TestGetEffectivePermissions_GroupResolutionFailure_FailsClosed(t *testing.T
 	assert.ErrorIs(t, err, injectedErr, "original error must be wrapped")
 }
 
-// TestResolveConstraintAdminUsers_GetGroupMembersFailure_FailsClosed verifies
+// TestResolveAdminUsers_GetGroupMembersFailure_FailsClosed verifies
 // that when GetGroupMembers returns an error during lockout resolution,
-// resolveConstraintAdminUsers propagates the error (fail-closed) instead of
+// resolveAdminUsers propagates the error (fail-closed) instead of
 // silently continuing with incomplete admin data.
 //
 // Regression test for B1 fix 4a: lockout helper store fault → reject mutation.
-func TestResolveConstraintAdminUsers_GetGroupMembersFailure_FailsClosed(t *testing.T) {
-	srv, realStore := testServer(t)
+func TestResolveAdminUsers_GetGroupMembersFailure_FailsClosed(t *testing.T) {
+	_, realStore := testServer(t)
 	ctx := context.Background()
 
 	// Create a group and a role with constraint-admin permission.
@@ -1476,29 +1400,29 @@ func TestResolveConstraintAdminUsers_GetGroupMembersFailure_FailsClosed(t *testi
 	})
 	require.NoError(t, err)
 
-	// Inject GetGroupMembers error and replace the store on the server.
+	// Inject GetGroupMembers error into the production lockout resolver.
 	injectedErr := errors.New("simulated GetGroupMembers failure")
 	errStore := &errorInjectingStore{
 		Store:              realStore,
 		getGroupMembersErr: injectedErr,
 	}
-	srv.store = errStore
+	preview := &PreviewService{store: errStore}
 
-	_, err = srv.resolveConstraintAdminUsers(ctx, ScopeTypeSystem, "")
+	_, err = preview.resolveAdminUsers(ctx, time.Now(), ScopeTypeSystem, "")
 
 	// Must fail closed: error propagates instead of continuing with empty members.
-	assert.Error(t, err, "resolveConstraintAdminUsers must propagate GetGroupMembers error")
+	assert.Error(t, err, "resolveAdminUsers must propagate GetGroupMembers error")
 	assert.ErrorIs(t, err, injectedErr, "original error must be wrapped")
 }
 
-// TestResolveConstraintAdminUsers_GetEffectiveGroupsFailure_FailsClosed verifies
+// TestResolveAdminUsers_GetEffectiveGroupsFailure_FailsClosed verifies
 // that when GetEffectiveGroups returns an error during lockout resolution,
-// resolveConstraintAdminUsers propagates the error (fail-closed) instead of
+// resolveAdminUsers propagates the error (fail-closed) instead of
 // silently setting groupIDs to nil.
 //
 // Regression test for B1 fix 4b: lockout helper store fault → reject mutation.
-func TestResolveConstraintAdminUsers_GetEffectiveGroupsFailure_FailsClosed(t *testing.T) {
-	srv, realStore := testServer(t)
+func TestResolveAdminUsers_GetEffectiveGroupsFailure_FailsClosed(t *testing.T) {
+	_, realStore := testServer(t)
 	ctx := context.Background()
 
 	// Create a user and bind them directly to a constraint-admin role.
@@ -1519,17 +1443,141 @@ func TestResolveConstraintAdminUsers_GetEffectiveGroupsFailure_FailsClosed(t *te
 	})
 	require.NoError(t, err)
 
-	// Inject GetEffectiveGroups error and replace the store on the server.
+	// Inject GetEffectiveGroups error into the production lockout resolver.
 	injectedErr := errors.New("simulated GetEffectiveGroups failure")
 	errStore := &errorInjectingStore{
 		Store:                 realStore,
 		getEffectiveGroupsErr: injectedErr,
 	}
-	srv.store = errStore
+	preview := &PreviewService{store: errStore}
 
-	_, err = srv.resolveConstraintAdminUsers(ctx, ScopeTypeSystem, "")
+	_, err = preview.resolveAdminUsers(ctx, time.Now(), ScopeTypeSystem, "")
 
 	// Must fail closed: error propagates instead of setting groupIDs = nil.
-	assert.Error(t, err, "resolveConstraintAdminUsers must propagate GetEffectiveGroups error")
+	assert.Error(t, err, "resolveAdminUsers must propagate GetEffectiveGroups error")
 	assert.ErrorIs(t, err, injectedErr, "original error must be wrapped")
+}
+
+// isBindingActive uses the kernel's activation rule (evaluateActivation):
+// notBefore is inclusive, expiresAt is exclusive, and a zero evaluation
+// time with any bound set is inactive.
+func TestIsBindingActive_BoundariesMatchKernel(t *testing.T) {
+	ref := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { v := ref.Add(d); return &v }
+	zeroBound := func() *time.Time { return &time.Time{} }
+	cases := []struct {
+		name      string
+		now       time.Time
+		notBefore *time.Time
+		expiresAt *time.Time
+		want      bool
+	}{
+		{"unbounded", ref, nil, nil, true},
+		{"now equals notBefore", ref, at(0), nil, true},
+		{"now before notBefore", ref, at(time.Nanosecond), nil, false},
+		{"now equals expiresAt", ref, nil, at(0), false},
+		{"now before expiresAt", ref, nil, at(time.Nanosecond), true},
+		{"now after expiresAt", ref, nil, at(-time.Nanosecond), false},
+		{"zero now unbounded", time.Time{}, nil, nil, true},
+		{"zero now with only expiresAt", time.Time{}, nil, at(time.Hour), false},
+		{"zero now with only notBefore", time.Time{}, at(-time.Hour), nil, false},
+		{"set but zero expiresAt", ref, nil, zeroBound(), false},
+		{"set but zero notBefore", ref, zeroBound(), nil, true},
+		{"zero now with set but zero notBefore", time.Time{}, zeroBound(), nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &store.RoleBinding{ID: "rb", NotBefore: tc.notBefore, ExpiresAt: tc.expiresAt}
+			assert.Equal(t, tc.want, isBindingActive(b, tc.now))
+			assert.Equal(t, tc.want, bindingActivationOK(b, tc.now),
+				"bindingActivationOK must apply the same rule")
+			cands := toCandidateBindings([]*store.RoleBinding{b})
+			require.Len(t, cands, 1)
+			assert.Equal(t, tc.want, evaluateActivation(&cands[0], tc.now).Active,
+				"the kernel's candidate path must apply the same rule")
+		})
+	}
+}
+
+// The kernel's decision path (toCandidateBindings then Evaluate) applies
+// the same activation rule to stored role bindings as isBindingActive.
+func TestEvaluate_StoredBindingWindowMatchesIsBindingActive(t *testing.T) {
+	ref := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { v := ref.Add(d); return &v }
+	zeroBound := func() *time.Time { return &time.Time{} }
+	roles := map[string]*RolePermissions{
+		"r1": NewRolePermissions("r1", "reader", ScopeTypeSystem, []string{"agent.read"}),
+	}
+	cases := []struct {
+		name      string
+		now       time.Time
+		notBefore *time.Time
+		expiresAt *time.Time
+		want      bool
+	}{
+		{"unbounded", ref, nil, nil, true},
+		{"in window", ref, at(-time.Hour), at(time.Hour), true},
+		{"now equals expiresAt", ref, nil, at(0), false},
+		{"zero now with only expiresAt", time.Time{}, nil, at(time.Hour), false},
+		{"set but zero expiresAt", ref, nil, zeroBound(), false},
+		{"set but zero notBefore", ref, zeroBound(), nil, true},
+		{"zero now with set but zero notBefore", time.Time{}, zeroBound(), nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &store.RoleBinding{
+				ID:               "rb",
+				RoleDefinitionID: "r1",
+				PrincipalType:    "user",
+				PrincipalID:      "user1",
+				ScopeType:        ScopeTypeSystem,
+				NotBefore:        tc.notBefore,
+				ExpiresAt:        tc.expiresAt,
+			}
+			d := Evaluate(KernelRequest{
+				Permission:        "agent.read",
+				PrincipalClosure:  closureOf("user:user1"),
+				Resource:          ResourceContext{ProjectID: "proj-a"},
+				CandidateBindings: toCandidateBindings([]*store.RoleBinding{b}),
+				RoleDefinitions:   roles,
+				Now:               tc.now,
+			})
+			assert.Equal(t, tc.want, d.Allowed, "kernel decision")
+			assert.Equal(t, isBindingActive(b, tc.now), d.Allowed,
+				"kernel decision must agree with isBindingActive")
+		})
+	}
+}
+
+// Evaluation times for the nil binding tests, including the zero time,
+// the setZeroBound instant itself and an instant before year 1.
+func nilBindingEvalTimes() []time.Time {
+	ref := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	return []time.Time{
+		ref,
+		time.Time{},
+		setZeroBound,
+		time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC),
+	}
+}
+
+// A nil role binding is never active.
+func TestBindingActivationOK_NilBindingInactive(t *testing.T) {
+	for _, now := range nilBindingEvalTimes() {
+		assert.False(t, bindingActivationOK(nil, now), "bindingActivationOK(nil, %v)", now)
+		assert.False(t, isBindingActive(nil, now), "isBindingActive(nil, %v)", now)
+	}
+}
+
+// candidateActivationBounds gives a nil binding bounds the kernel never
+// treats as active. Zero bounds would read as unbounded.
+func TestCandidateActivationBounds_NilBindingNeverActive(t *testing.T) {
+	notBefore, expiresAt := candidateActivationBounds(nil)
+	assert.False(t, notBefore.IsZero(), "nil binding NotBefore must be set")
+	assert.False(t, expiresAt.IsZero(), "nil binding ExpiresAt must be set")
+	cb := &CandidateBinding{NotBefore: notBefore, ExpiresAt: expiresAt}
+	for _, now := range nilBindingEvalTimes() {
+		assert.False(t, evaluateActivation(cb, now).Active, "evaluateActivation at %v", now)
+	}
 }

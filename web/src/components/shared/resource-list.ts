@@ -18,12 +18,15 @@
  * Shared resource list component
  *
  * Lists file-based resources (templates or harness-configs) for a given scope
- * and links each one to its detail/editor page. Used by both the project
- * settings Resources section and the Hub Resources page so the two render
- * identically.
+ * (project, global, or user) and links each one to its detail/editor page.
+ * Used by the project settings Resources section, the Hub Resources page, and
+ * the user profile Templates page so they all render identically.
  *
- * It does not handle import/creation — those affordances (where they exist,
- * e.g. template import) are rendered by the host page around this list.
+ * It does not handle import — that affordance is rendered by the host page
+ * via <scion-resource-import> around this list.
+ *
+ * Emits a `resource-changed` CustomEvent on mutations:
+ *   detail: { action: 'created' | 'cloned' | 'renamed' | 'deleted', kind: ResourceKind, id: string }
  */
 
 import { LitElement, html, css, nothing } from 'lit';
@@ -31,8 +34,37 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import { apiFetch, apiFetchAllPages, extractApiError } from '../../client/api.js';
 import { showToast } from '../../utils/toast.js';
+import { navigateTo } from '../../client/navigation.js';
+import { isTemplateSourceRefreshable } from '../../shared/source-url.js';
 
 export type ResourceKind = 'template' | 'harness-config';
+
+/** How many refreshes "Refresh All from Source" runs at the same time. */
+export const REFRESH_ALL_CONCURRENCY = 4;
+
+/**
+ * Runs fn over items with at most limit calls in flight, and returns the
+ * results in item order.
+ */
+export async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () =>
+    worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 interface ResourceItem {
   id: string;
@@ -50,9 +82,9 @@ export class ScionResourceList extends LitElement {
   @property({ type: String })
   kind: ResourceKind = 'template';
 
-  /** Resource scope: 'project' or 'global'. */
+  /** Resource scope: 'project', 'global', or 'user'. */
   @property({ type: String })
-  scope: 'project' | 'global' = 'project';
+  scope: 'project' | 'global' | 'user' = 'project';
 
   /** Scope id (project id) — required for project scope, omitted for global. */
   @property({ type: String })
@@ -78,6 +110,14 @@ export class ScionResourceList extends LitElement {
   @property({ type: Boolean })
   cloneFromGlobal = false;
 
+  /** When true, show a "Create" button in the list header and handle create dialog. */
+  @property({ type: Boolean })
+  canCreate = false;
+
+  /** When true, show a "Rename" menu item in each row's action dropdown. */
+  @property({ type: Boolean })
+  canRename = false;
+
   @state() private items: ResourceItem[] = [];
   @state() private loading = true;
   @state() private error: string | null = null;
@@ -94,6 +134,19 @@ export class ScionResourceList extends LitElement {
     new Map();
 
   private _statusClearTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Create dialog state
+  @state() private createDialogOpen = false;
+  @state() private createLoading = false;
+  @state() private createError = '';
+  @state() private newResourceName = '';
+  @state() private newResourceHarness = '';
+
+  // Rename dialog state
+  @state() private renameTarget: ResourceItem | null = null;
+  @state() private renameName = '';
+  @state() private renameLoading = false;
+  @state() private renameError = '';
 
   @state() private globalPickerOpen = false;
   @state() private globalItems: ResourceItem[] = [];
@@ -548,9 +601,19 @@ export class ScionResourceList extends LitElement {
     }
   }
 
+  /**
+   * Whether an item can be refreshed from its source. Templates need a GitHub
+   * source URL (built-in templates and templates without a source are not
+   * refreshable); harness configs need any stored source URL.
+   */
+  private isRefreshable(item: ResourceItem): boolean {
+    if (this.kind === 'template') return isTemplateSourceRefreshable(item.sourceUrl);
+    return !!item.sourceUrl;
+  }
+
   private async _handleRefreshAll(): Promise<void> {
     if (this._refreshAllRunning) return;
-    const refreshable = this.items.filter((item) => item.sourceUrl);
+    const refreshable = this.items.filter((item) => this.isRefreshable(item));
     if (refreshable.length === 0) return;
 
     // Clear any pending status-clear timer from a previous run
@@ -568,40 +631,39 @@ export class ScionResourceList extends LitElement {
     }
     this.requestUpdate();
 
-    // Fire all in parallel
-    const results = await Promise.allSettled(
-      refreshable.map(async (item) => {
-        this._itemRefreshStatus.set(item.id, 'running');
-        this.requestUpdate();
-        try {
-          const response = await apiFetch(`/api/v1/${this.apiResource}/${item.id}/reimport`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
-          });
-          if (!response.ok) {
-            const errMsg = await extractApiError(response, `HTTP ${response.status}`);
-            throw new Error(errMsg);
-          }
-          this._itemRefreshStatus.set(item.id, 'success');
-          this.requestUpdate();
-          return { id: item.id, name: item.name, success: true };
-        } catch (err) {
-          this._itemRefreshStatus.set(item.id, 'error');
-          this.requestUpdate();
-          return { id: item.id, name: item.name, success: false, error: err };
+    // Run a few at a time: each refresh downloads its whole source on the hub.
+    const results = await runWithConcurrency(refreshable, REFRESH_ALL_CONCURRENCY, async (item) => {
+      this._itemRefreshStatus.set(item.id, 'running');
+      this.requestUpdate();
+      try {
+        const response = await apiFetch(`/api/v1/${this.apiResource}/${item.id}/reimport`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!response.ok) {
+          const errMsg = await extractApiError(response, `HTTP ${response.status}`);
+          throw new Error(errMsg);
         }
-      })
-    );
+        this._itemRefreshStatus.set(item.id, 'success');
+        this.requestUpdate();
+        return { id: item.id, name: item.name, success: true };
+      } catch (err) {
+        this._itemRefreshStatus.set(item.id, 'error');
+        this.requestUpdate();
+        return { id: item.id, name: item.name, success: false, error: err };
+      }
+    });
 
     this._refreshAllRunning = false;
 
     // Show summary toast
-    const succeeded = results.filter((r) => r.status === 'fulfilled' && r.value.success).length;
+    const succeeded = results.filter((r) => r.success).length;
     const failed = refreshable.length - succeeded;
+    const noun = this.kindLabel;
     if (failed === 0) {
       showToast(
-        `Refreshed ${succeeded} harness config${succeeded !== 1 ? 's' : ''} successfully`,
+        `Refreshed ${succeeded} ${noun}${succeeded !== 1 ? 's' : ''} successfully`,
         'success'
       );
     } else {
@@ -629,17 +691,29 @@ export class ScionResourceList extends LitElement {
       return html`<div class="error">${this.error}</div>`;
     }
 
-    const hasActions = this.canClone || this.canDelete;
+    const hasActions = this.canClone || this.canDelete || this.canRename;
 
-    const showRefreshAll =
-      this.kind === 'harness-config' && this.items.some((item) => item.sourceUrl);
+    const showRefreshAll = this.items.some((item) => this.isRefreshable(item));
 
-    const hasListHeader = (this.cloneFromGlobal && this.canClone) || showRefreshAll;
+    const hasListHeader =
+      (this.cloneFromGlobal && this.canClone) || showRefreshAll || this.canCreate;
 
     return html`
       ${hasListHeader
         ? html`
             <div class="list-header">
+              ${this.canCreate
+                ? html`
+                    <sl-button
+                      size="small"
+                      variant="primary"
+                      @click=${() => this.openCreateDialog()}
+                    >
+                      <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+                      Create ${this.kind === 'template' ? 'Template' : 'Harness Config'}
+                    </sl-button>
+                  `
+                : nothing}
               ${this.cloneFromGlobal && this.canClone
                 ? html`
                     <sl-button
@@ -677,6 +751,7 @@ export class ScionResourceList extends LitElement {
             </div>
           `}
       ${this.renderDeleteDialog()} ${this.renderCloneDialog()} ${this.renderGlobalPickerDialog()}
+      ${this.renderCreateDialog()} ${this.renderRenameDialog()}
     `;
   }
 
@@ -788,7 +863,17 @@ export class ScionResourceList extends LitElement {
                     </sl-menu-item>
                   `
                 : nothing}
-              ${this.canClone && this.canDelete ? html`<sl-divider></sl-divider>` : nothing}
+              ${this.canRename
+                ? html`
+                    <sl-menu-item @click=${() => this.openRenameDialog(item)}>
+                      <sl-icon slot="prefix" name="pencil"></sl-icon>
+                      Rename
+                    </sl-menu-item>
+                  `
+                : nothing}
+              ${(this.canClone || this.canRename) && this.canDelete
+                ? html`<sl-divider></sl-divider>`
+                : nothing}
               ${this.canDelete
                 ? html`
                     <sl-menu-item
@@ -809,10 +894,12 @@ export class ScionResourceList extends LitElement {
 
   private renderEmpty() {
     const label = this.kind === 'template' ? 'templates' : 'harness configs';
+    const scopeLabel =
+      this.scope === 'global' ? 'global' : this.scope === 'user' ? 'user' : 'project';
     return html`
       <div class="empty">
         <sl-icon name="file-earmark"></sl-icon>
-        <p>No ${this.scope === 'global' ? 'global' : 'project'} ${label} yet.</p>
+        <p>No ${scopeLabel} ${label} yet.</p>
       </div>
     `;
   }
@@ -875,7 +962,7 @@ export class ScionResourceList extends LitElement {
 
     const isFromGlobal =
       this.cloneFromGlobal &&
-      this.scope === 'project' &&
+      (this.scope === 'project' || this.scope === 'user') &&
       !this.items.find((i) => i.id === this.cloneTarget!.id);
 
     return html`
@@ -889,7 +976,10 @@ export class ScionResourceList extends LitElement {
       >
         <p>
           Clone <strong>${this.cloneTarget.displayName || this.cloneTarget.name}</strong>
-          ${isFromGlobal ? html` from global into this project` : nothing}.
+          ${isFromGlobal
+            ? html` from global
+              ${this.scope === 'user' ? 'into your templates' : 'into this project'}`
+            : nothing}.
         </p>
         <sl-input
           label="New name"
@@ -922,12 +1012,216 @@ export class ScionResourceList extends LitElement {
     `;
   }
 
+  // ── Create dialog ───────────────────────────────────────────────
+
+  private openCreateDialog(): void {
+    this.createDialogOpen = true;
+    this.createError = '';
+    this.createLoading = false;
+    this.newResourceName = '';
+    this.newResourceHarness = '';
+  }
+
+  private closeCreateDialog(): void {
+    this.createDialogOpen = false;
+    this.createError = '';
+  }
+
+  private async confirmCreate(): Promise<void> {
+    if (!this.newResourceName.trim()) {
+      this.createError = `${this.kind === 'template' ? 'Template' : 'Harness config'} name is required.`;
+      return;
+    }
+    this.createLoading = true;
+    this.createError = '';
+    try {
+      const body: Record<string, string> = {
+        name: this.newResourceName.trim(),
+        scope: this.scope,
+      };
+      if (this.scope === 'project' && this.scopeId) {
+        body.scopeId = this.scopeId;
+      }
+      if (this.newResourceHarness.trim()) {
+        body.harness = this.newResourceHarness.trim();
+      }
+      const resp = await apiFetch(`/api/v1/${this.apiResource}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 409) {
+        this.createError = 'A resource with this name already exists. Choose a different name.';
+        this.createLoading = false;
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error(await extractApiError(resp, `Failed to create ${this.kindLabel}`));
+      }
+      const created = (await resp.json()) as { id: string };
+      this.closeCreateDialog();
+      showToast(`${this.kind === 'template' ? 'Template' : 'Harness config'} created`, 'success');
+      this.emitChanged('created', created.id);
+      // Navigate to the new resource's detail page
+      navigateTo(`${this.detailBasePath}/${this.detailSegment}/${created.id}`);
+    } catch (err) {
+      this.createError = err instanceof Error ? err.message : `Failed to create ${this.kindLabel}`;
+    } finally {
+      this.createLoading = false;
+    }
+  }
+
+  private renderCreateDialog() {
+    if (!this.createDialogOpen) return nothing;
+    return html`
+      <sl-dialog
+        label="Create ${this.kind === 'template' ? 'Template' : 'Harness Config'}"
+        open
+        @sl-request-close=${(e: Event) => {
+          if (this.createLoading) e.preventDefault();
+          else this.closeCreateDialog();
+        }}
+      >
+        <p>Create a new ${this.scope === 'user' ? 'personal ' : ''}${this.kindLabel}.</p>
+        <sl-input
+          label="${this.kind === 'template' ? 'Template' : 'Harness Config'} Name"
+          placeholder="My ${this.kind === 'template' ? 'Template' : 'Config'}"
+          .value=${this.newResourceName}
+          @sl-input=${(e: Event) => (this.newResourceName = (e.target as HTMLInputElement).value)}
+          ?disabled=${this.createLoading}
+        ></sl-input>
+        ${this.kind === 'template'
+          ? html`
+              <sl-input
+                label="Harness (optional)"
+                placeholder="e.g. claude-code"
+                .value=${this.newResourceHarness}
+                @sl-input=${(e: Event) =>
+                  (this.newResourceHarness = (e.target as HTMLInputElement).value)}
+                ?disabled=${this.createLoading}
+                style="margin-top: 1rem;"
+              ></sl-input>
+            `
+          : nothing}
+        ${this.createError ? html`<div class="dialog-error">${this.createError}</div>` : nothing}
+        <div slot="footer">
+          <sl-button
+            variant="default"
+            size="small"
+            ?disabled=${this.createLoading}
+            @click=${() => this.closeCreateDialog()}
+          >
+            Cancel
+          </sl-button>
+          <sl-button
+            variant="primary"
+            size="small"
+            ?loading=${this.createLoading}
+            ?disabled=${this.createLoading || !this.newResourceName.trim()}
+            @click=${() => this.confirmCreate()}
+          >
+            Create ${this.kind === 'template' ? 'Template' : 'Harness Config'}
+          </sl-button>
+        </div>
+      </sl-dialog>
+    `;
+  }
+
+  // ── Rename dialog ───────────────────────────────────────────────
+
+  private openRenameDialog(item: ResourceItem): void {
+    this.renameTarget = item;
+    this.renameName = item.displayName || item.name;
+    this.renameError = '';
+    this.renameLoading = false;
+  }
+
+  private closeRenameDialog(): void {
+    this.renameTarget = null;
+    this.renameError = '';
+  }
+
+  private async confirmRename(): Promise<void> {
+    if (!this.renameTarget || !this.renameName.trim()) return;
+    this.renameLoading = true;
+    this.renameError = '';
+    try {
+      const resp = await apiFetch(`/api/v1/${this.apiResource}/${this.renameTarget.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: this.renameName.trim() }),
+      });
+      if (resp.status === 409) {
+        this.renameError = 'A resource with this name already exists. Choose a different name.';
+        this.renameLoading = false;
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error(await extractApiError(resp, `Failed to rename ${this.kindLabel}`));
+      }
+      const targetId = this.renameTarget.id;
+      this.closeRenameDialog();
+      showToast(`${this.kind === 'template' ? 'Template' : 'Harness config'} renamed`, 'success');
+      this.emitChanged('renamed', targetId);
+      void this.load();
+    } catch (err) {
+      this.renameError = err instanceof Error ? err.message : `Failed to rename ${this.kindLabel}`;
+    } finally {
+      this.renameLoading = false;
+    }
+  }
+
+  private renderRenameDialog() {
+    if (!this.renameTarget) return nothing;
+    return html`
+      <sl-dialog
+        label="Rename ${this.kindLabel}"
+        open
+        @sl-request-close=${(e: Event) => {
+          if (this.renameLoading) e.preventDefault();
+          else this.closeRenameDialog();
+        }}
+      >
+        <p>Rename <strong>${this.renameTarget.displayName || this.renameTarget.name}</strong>.</p>
+        <sl-input
+          label="New name"
+          .value=${this.renameName}
+          @sl-input=${(e: Event) => (this.renameName = (e.target as HTMLInputElement).value)}
+          ?disabled=${this.renameLoading}
+        ></sl-input>
+        ${this.renameError ? html`<div class="dialog-error">${this.renameError}</div>` : nothing}
+        <div slot="footer">
+          <sl-button
+            variant="default"
+            size="small"
+            ?disabled=${this.renameLoading}
+            @click=${() => this.closeRenameDialog()}
+          >
+            Cancel
+          </sl-button>
+          <sl-button
+            variant="primary"
+            size="small"
+            ?loading=${this.renameLoading}
+            ?disabled=${this.renameLoading || !this.renameName.trim()}
+            @click=${() => this.confirmRename()}
+          >
+            Rename
+          </sl-button>
+        </div>
+      </sl-dialog>
+    `;
+  }
+
   private renderGlobalPickerDialog() {
     if (!this.globalPickerOpen) return nothing;
     const label = this.kind === 'template' ? 'templates' : 'harness configs';
     return html`
       <sl-dialog label="Clone from Global" open @sl-request-close=${() => this.closeGlobalPicker()}>
-        <p>Select a global ${this.kindLabel} to clone into this project.</p>
+        <p>
+          Select a global ${this.kindLabel} to clone
+          ${this.scope === 'user' ? 'into your templates' : 'into this project'}.
+        </p>
         ${this.globalLoading
           ? html`<div class="empty"><sl-spinner></sl-spinner></div>`
           : this.globalError

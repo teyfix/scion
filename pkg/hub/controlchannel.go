@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -105,6 +104,7 @@ type BrokerConnection struct {
 	sessionID string
 	conn      *wsprotocol.Connection
 	config    ControlChannelConfig
+	log       *slog.Logger
 
 	// Pending requests waiting for responses
 	pendingRequests map[string]chan *wsprotocol.ResponseEnvelope
@@ -124,15 +124,57 @@ type BrokerConnection struct {
 	cancel context.CancelFunc
 }
 
+// StreamOutputLimit is the most broker output, in bytes, a StreamProxy holds
+// for its reader. The control-channel read loop hands frames to the stream
+// without blocking; if the reader (the PTY client) falls this far behind,
+// the stream is closed with ClosePTYTryAgainLater instead of stalling every
+// other stream and tunneled request on the same broker connection. The queue
+// only grows while the client WebSocket write is slower than the agent's
+// output, so 8 MiB absorbs large output bursts (e.g. cat of a big file) on a
+// slow link while keeping per-stream memory bounded.
+const StreamOutputLimit = 8 << 20
+
+// Close reason the Hub sends when a stream's reader falls behind.
+const closeReasonSlowConsumer = "slow_consumer"
+
+// errStreamClosed and errStreamOverflow are returned by StreamProxy.Write.
+var (
+	errStreamClosed   = errors.New("stream closed")
+	errStreamOverflow = errors.New("stream output buffer full")
+)
+
 // StreamProxy represents a multiplexed stream over the control channel.
 type StreamProxy struct {
 	streamID   string
 	streamType string
 	agentID    string
-	dataCh     chan []byte
 	closeCh    chan struct{}
 	closed     bool
+	closeErr   *StreamClosedError // set once under closeMu, before closeCh is closed
 	closeMu    sync.Mutex
+
+	// Output frames not yet returned by Read, guarded by closeMu. queued is
+	// their total size in bytes and never exceeds limit.
+	queue  [][]byte
+	queued int
+	limit  int
+	// notify has capacity 1; Write signals it after queueing a frame.
+	notify chan struct{}
+}
+
+// StreamClosedError is returned by StreamProxy.Read once the stream has been
+// closed and all buffered data has been drained. Code is the WebSocket close
+// code (see pkg/wsprotocol/pty_close.go) that describes why the stream ended.
+type StreamClosedError struct {
+	Code   int
+	Reason string
+}
+
+func (e *StreamClosedError) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("stream closed (code %d)", e.Code)
+	}
+	return fmt.Sprintf("stream closed (code %d): %s", e.Code, e.Reason)
 }
 
 // NewStreamProxy creates a new stream proxy.
@@ -141,49 +183,112 @@ func NewStreamProxy(streamID, streamType, agentID string) *StreamProxy {
 		streamID:   streamID,
 		streamType: streamType,
 		agentID:    agentID,
-		dataCh:     make(chan []byte, 256), // Buffer for data frames
 		closeCh:    make(chan struct{}),
+		limit:      StreamOutputLimit,
+		notify:     make(chan struct{}, 1),
 	}
 }
 
-// Write sends data to the stream.
+// Write queues data for Read. It never blocks: it returns errStreamOverflow
+// if queueing data would exceed the stream's output limit, and
+// errStreamClosed once the stream is closed. Empty frames carry no output
+// and are skipped.
 func (s *StreamProxy) Write(data []byte) error {
 	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	if s.closed {
-		s.closeMu.Unlock()
-		return errors.New("stream closed")
+		return errStreamClosed
 	}
-	s.closeMu.Unlock()
-
-	select {
-	case s.dataCh <- data:
+	if len(data) == 0 {
 		return nil
-	case <-s.closeCh:
-		return errors.New("stream closed")
 	}
-}
-
-// Read reads data from the stream.
-func (s *StreamProxy) Read(ctx context.Context) ([]byte, error) {
+	if s.queued+len(data) > s.limit {
+		return errStreamOverflow
+	}
+	s.queue = append(s.queue, data)
+	s.queued += len(data)
 	select {
-	case data, ok := <-s.dataCh:
-		if !ok {
-			return nil, io.EOF
+	case s.notify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// Read reads data from the stream. Once the stream is closed, Read first
+// returns any frames that were delivered before the close, then returns the
+// stream's *StreamClosedError.
+func (s *StreamProxy) Read(ctx context.Context) ([]byte, error) {
+	for {
+		s.closeMu.Lock()
+		if len(s.queue) > 0 {
+			// Frames queued before a close are still returned first, so the
+			// final output (e.g. tmux's "[detached]") is not lost and
+			// precedes the close code.
+			data := s.queue[0]
+			s.queue[0] = nil
+			s.queue = s.queue[1:]
+			s.queued -= len(data)
+			s.closeMu.Unlock()
+			return data, nil
 		}
-		return data, nil
-	case <-s.closeCh:
-		return nil, io.EOF
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if s.closed {
+			err := s.closeErr
+			s.closeMu.Unlock()
+			return nil, err
+		}
+		s.closeMu.Unlock()
+
+		select {
+		case <-s.notify:
+		case <-s.closeCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
-// Close closes the stream.
-func (s *StreamProxy) Close() {
+// closeError returns the error recorded by CloseWith, or nil if the stream
+// is still open. It returns error, not *StreamClosedError, so the nil case
+// is not a typed nil.
+func (s *StreamProxy) closeError() error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
+	if s.closeErr == nil {
+		return nil
+	}
+	return s.closeErr
+}
+
+// Close closes the stream as a normal closure (1000). It is equivalent to
+// CloseWith(1000, "").
+func (s *StreamProxy) Close() {
+	s.CloseWith(wsprotocol.ClosePTYNormal, "")
+}
+
+// CloseWith closes the stream, recording code and reason as the cause that
+// Read reports. Only the first close takes effect.
+func (s *StreamProxy) CloseWith(code int, reason string) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	s.closeLocked(code, reason)
+}
+
+// closeDiscarding closes the stream like CloseWith and also drops any queued
+// output, so Read reports the close at once and the memory is released. It
+// is used when the reader fell behind, where the queued output is already
+// incomplete.
+func (s *StreamProxy) closeDiscarding(code int, reason string) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	s.closeLocked(code, reason)
+	s.queue = nil
+	s.queued = 0
+}
+
+func (s *StreamProxy) closeLocked(code int, reason string) {
 	if !s.closed {
 		s.closed = true
+		s.closeErr = &StreamClosedError{Code: code, Reason: reason}
 		close(s.closeCh)
 	}
 }
@@ -214,6 +319,7 @@ func (m *ControlChannelManager) HandleUpgrade(w http.ResponseWriter, r *http.Req
 		sessionID:       sessionID,
 		conn:            wsConn,
 		config:          m.config,
+		log:             m.log,
 		pendingRequests: make(map[string]chan *wsprotocol.ResponseEnvelope),
 		streams:         make(map[string]*StreamProxy),
 		connectedAt:     time.Now(),
@@ -382,7 +488,37 @@ func (m *ControlChannelManager) handleStreamData(hc *BrokerConnection, data []by
 		return nil
 	}
 
-	return stream.Write(frame.Data)
+	// Write never blocks, so one slow reader cannot stall this read loop and
+	// with it every other stream and tunneled request on the connection.
+	switch err := stream.Write(frame.Data); {
+	case errors.Is(err, errStreamOverflow):
+		m.log.Warn("Control channel stream reader fell behind; closing stream",
+			"brokerID", hc.brokerID, "streamID", frame.StreamID, "limitBytes", stream.limit)
+		hc.closeSlowStream(frame.StreamID, stream)
+	case errors.Is(err, errStreamClosed):
+		// The reader is gone and the stream is being torn down.
+	}
+	return nil
+}
+
+// closeSlowStream closes a stream whose reader fell behind with
+// ClosePTYTryAgainLater, and tells the broker so it stops sending. The broker
+// write runs in its own goroutine so the read loop never waits on it.
+func (hc *BrokerConnection) closeSlowStream(streamID string, stream *StreamProxy) {
+	hc.streamsMu.Lock()
+	if hc.streams[streamID] == stream {
+		delete(hc.streams, streamID)
+	}
+	hc.streamsMu.Unlock()
+
+	stream.closeDiscarding(wsprotocol.ClosePTYTryAgainLater, closeReasonSlowConsumer)
+
+	closeMsg := wsprotocol.NewStreamCloseMessage(streamID, closeReasonSlowConsumer, wsprotocol.ClosePTYTryAgainLater)
+	go func() {
+		if err := hc.conn.WriteJSON(closeMsg); err != nil && hc.log != nil {
+			hc.log.Debug("Failed to send stream close to broker", "streamID", streamID, "error", err)
+		}
+	}()
 }
 
 // handleStreamClose processes a stream close message.
@@ -399,12 +535,14 @@ func (m *ControlChannelManager) handleStreamClose(hc *BrokerConnection, data []b
 	}
 	hc.streamsMu.Unlock()
 
+	code := wsprotocol.MapBrokerStreamCloseCode(close.Code)
 	if stream != nil {
-		stream.Close()
+		stream.CloseWith(code, close.Reason)
 	}
 
 	if m.config.Debug {
-		m.log.Debug("Control channel stream closed", "streamID", close.StreamID, "reason", close.Reason)
+		m.log.Debug("Control channel stream closed", "streamID", close.StreamID,
+			"brokerCode", close.Code, "code", code, "reason", close.Reason)
 	}
 
 	return nil
@@ -510,7 +648,7 @@ func (m *ControlChannelManager) TunnelRequest(ctx context.Context, brokerID stri
 
 	hc := m.GetConnection(brokerID)
 	if hc == nil {
-		err := fmt.Errorf("broker %s not connected", brokerID)
+		err := fmt.Errorf("broker %s not connected: %w", brokerID, errStartBrokerNotConnected)
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
@@ -632,11 +770,32 @@ func (hc *BrokerConnection) TunnelRequest(ctx context.Context, req *wsprotocol.R
 	case resp := <-respCh:
 		return resp, nil
 	case <-ctx.Done():
+		// The caller (e.g. the original HTTP request) gave up. Tell the
+		// broker so it can abort the in-flight request instead of running
+		// it to completion after nobody is listening for the result — see
+		// ptone/scion#1886.
+		hc.sendCancel(req.RequestID)
 		return nil, ctx.Err()
 	case <-time.After(timeout):
+		// We gave up waiting past our own dispatch timeout. Tell the broker
+		// for the same reason as above.
+		hc.sendCancel(req.RequestID)
 		return nil, fmt.Errorf("request timeout after %v", timeout)
 	case <-hc.ctx.Done():
 		return nil, fmt.Errorf("connection closed")
+	}
+}
+
+// sendCancel best-effort notifies the broker that the Hub has given up
+// waiting for the response to requestID, so the broker can abort the
+// in-flight request. A write failure here doesn't change the outcome
+// already decided for TunnelRequest's caller, and an old broker that
+// doesn't understand the "cancel" message type just ignores it (see
+// ControlChannelClient.handleMessage's default case), so this is
+// backward compatible.
+func (hc *BrokerConnection) sendCancel(requestID string) {
+	if err := hc.conn.WriteJSON(wsprotocol.NewCancelMessage(requestID)); err != nil && hc.log != nil {
+		hc.log.Debug("Failed to send cancel for tunneled request", "requestID", requestID, "error", err)
 	}
 }
 
@@ -692,12 +851,15 @@ func (hc *BrokerConnection) ResizeStream(streamID string, cols, rows int) error 
 
 // Close closes the broker connection.
 func (hc *BrokerConnection) Close() {
-	hc.cancel()
+	if hc.cancel != nil {
+		hc.cancel()
+	}
 
-	// Close all streams
+	// Close all streams. The control channel is gone, so every stream ends
+	// with 4503: the broker may come back, and a reconnect may succeed.
 	hc.streamsMu.Lock()
 	for _, stream := range hc.streams {
-		stream.Close()
+		stream.CloseWith(wsprotocol.ClosePTYUpstreamUnavailable, wsprotocol.CloseReasonBrokerDisconnected)
 	}
 	hc.streams = make(map[string]*StreamProxy)
 	hc.streamsMu.Unlock()
@@ -713,7 +875,9 @@ func (hc *BrokerConnection) Close() {
 	hc.pendingMu.Unlock()
 
 	// Close WebSocket connection
-	_ = hc.conn.Close()
+	if hc.conn != nil {
+		_ = hc.conn.Close()
+	}
 }
 
 // GetSessionID returns the session ID.

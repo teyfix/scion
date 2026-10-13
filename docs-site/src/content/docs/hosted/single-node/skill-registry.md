@@ -9,7 +9,7 @@ The Hub is the authoritative **Skill Registry** for the Skill Bank: it stores pu
 
 The Hub persists two record types:
 
-- **Skill** — the logical skill: `name`, `slug`, `description`, `tags`, `scope` (`core`, `global`, `project`, `user`) and optional `scope_id`, `visibility`, ownership, and `status` (`active` or `archived`). Skills are unique per `(slug, scope, scope_id)`.
+- **Skill** — the logical skill: `name`, `slug`, `description`, `tags`, `scope` (`core`, `global`, `project`, `user`) and optional `scope_id`, ownership, and `status` (`active` or `archived`). Skills are unique per `(slug, scope, scope_id)`.
 - **SkillVersion** — an immutable release of a skill: `version` (semver), `status` (`draft`, `published`, `deprecated`, `archived`), a `sha256:` `content_hash`, the file manifest, publisher, download count, and — for deprecated versions — a deprecation message and optional replacement URI.
 
 `scion skills delete` performs a **soft delete**: the skill's status becomes `archived` and its records are retained for audit and history.
@@ -45,6 +45,11 @@ To avoid hitting GitHub API rate limits during concurrent agent launches, the Ru
 - **Broker-Level Singleton:** The cache is a long-lived, shared singleton service running within the Runtime Broker daemon, rather than a per-request ephemeral cache.
 - **Extended TTLs:** General resolution metadata remains cached for **30 minutes**.
 - **Git SHA Resolution (24h TTL):** Once a reference (like a branch or tag name) has been fully resolved to a specific Git commit SHA, the SHA resolution is cached for **24 hours**, bypassing external API queries entirely on subsequent requests.
+- **Shared resolutions:** Concurrent creates that need the same ref with the same credential share one resolution instead of each calling GitHub, and at most four GitHub fetches run at once per credential.
+- **Stale-while-revalidate:** After its 30-minute TTL expires, a branch or tag entry is still served for up to 24 hours from when it was cached while a background refresh runs. Full-SHA entries are not served stale.
+- **Rate-limit cooldown:** A GitHub `429`, or a `403` reporting an exhausted or secondary rate limit, starts a cooldown for that credential (or for all unauthenticated requests), taken from `Retry-After` or `X-RateLimit-Reset`, defaulting to 60 seconds and capped at 5 minutes. During the cooldown no request is sent for that credential: a cached or stale entry is served without a refresh, and a miss fails immediately with a rate-limit error that names the ref. The Hub's own `gh://` resolution uses the same cooldown.
+- **Resolution budget:** Each resolution has its own **20-second** budget, so a slow or retrying resolution fails inside the create request with an error that names the cause instead of a bare "context canceled".
+- **Persistence:** Resolutions made with a credential are written to the Runtime Broker's on-disk cache (keyed by a fingerprint of the credential, never the token itself) along with anonymous ones, so they survive a Runtime Broker restart.
 
 #### Private repository resolution
 
@@ -142,6 +147,12 @@ The web dashboard includes both user-facing and admin surfaces for skills:
 - **Skill Registries admin** (`/admin/skill-registries`) — list, create, edit, and remove external registries, toggle their status, and set their trust level. The registry detail page manages the registry's **pinned hashes** (add and remove pins) for pinned-trust registries.
 
 Registry administration is capability-gated; it is available to users with the appropriate admin permissions.
+
+### Global catalog authoring
+
+Publishing skills to the `global` scope requires the `skill.create_global` permission. Hub administrators hold this permission by default. For non-admin users who need to author global skills, assign the system-scoped `global-catalog-author` role. This role grants only `skill.create_global`, decoupling global skill authoring from full Hub administration authority.
+
+See [Permissions & Policy — Roles](/scion/hosted/ha/permissions/#roles) for the complete role listing.
 
 ## See also
 

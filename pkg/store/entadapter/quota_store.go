@@ -310,6 +310,14 @@ func (q *QuotaStore) CreateUsageReservation(ctx context.Context, reservation *st
 		SetResourceID(reservation.ResourceID).
 		SetReserved(reservation.Reserved)
 
+	// CreatedAt is normally left to the schema default (time.Now at
+	// creation); callers that need to backdate a reservation — e.g. tests
+	// simulating a reservation old enough to clear
+	// reconcileMinReservationAge — may set it explicitly.
+	if !reservation.CreatedAt.IsZero() {
+		builder.SetCreatedAt(reservation.CreatedAt)
+	}
+
 	if reservation.ID != "" {
 		uid, err := parseUUID(reservation.ID)
 		if err != nil {
@@ -345,6 +353,26 @@ func (q *QuotaStore) CountActiveReservations(ctx context.Context, limitDefinitio
 		return 0, mapError(err)
 	}
 	return int64(count), nil
+}
+
+// HasActiveReservation reports whether resourceID already holds a
+// non-released reservation for the given limit, regardless of scope.
+func (q *QuotaStore) HasActiveReservation(ctx context.Context, limitDefinitionID, resourceID string) (bool, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return false, err
+	}
+	count, err := q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ResourceIDEQ(resourceID),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		Count(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	return count > 0, nil
 }
 
 // ReleaseReservation releases a reservation by setting released_at.
@@ -383,6 +411,62 @@ func (q *QuotaStore) ReleaseReservationsByResource(ctx context.Context, resource
 		SetReleasedAt(now).
 		Save(ctx)
 	return mapError(err)
+}
+
+// ListActiveReservationsByScopeType returns active (non-released)
+// reservations for a limit across every scope ID of scopeType, ordered by
+// created_at ascending, in one query.
+func (q *QuotaStore) ListActiveReservationsByScopeType(ctx context.Context, limitDefinitionID, scopeType string) ([]*store.UsageReservation, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	urs, err := q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ScopeTypeEQ(usagereservation.ScopeType(scopeType)),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		Order(ent.Asc(usagereservation.FieldCreatedAt)).
+		All(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	result := make([]*store.UsageReservation, len(urs))
+	for i, ur := range urs {
+		result[i] = entUsageReservationToStore(ur)
+	}
+	return result, nil
+}
+
+// CountActiveReservationsByScope returns active (non-released) reservation
+// counts for a limit and scopeType, grouped by scope ID, in one query.
+func (q *QuotaStore) CountActiveReservationsByScope(ctx context.Context, limitDefinitionID, scopeType string) (map[string]int64, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ScopeID string `json:"scope_id"`
+		Count   int64  `json:"count"`
+	}
+	err = q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ScopeTypeEQ(usagereservation.ScopeType(scopeType)),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		GroupBy(usagereservation.FieldScopeID).
+		Aggregate(ent.Count()).
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	counts := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		counts[r.ScopeID] = r.Count
+	}
+	return counts, nil
 }
 
 // ListActiveReservations returns active (non-released) reservations for a limit and scope.

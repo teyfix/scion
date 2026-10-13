@@ -145,7 +145,7 @@ never see each other's prompts through a shared mount.
 > the basename `workspace` causes git to auto-suffix entries (`workspace`, `workspace1`,
 > …). Using `worktrees/<agentID>` as the worktree path gives each a **unique basename**
 > (the agent UUID), eliminating that ambiguity. Scion associates worktrees by branch
-> (`FindWorktreeByBranch`) regardless, but unique basenames make `git worktree list`
+> (`FindWorktreeByBranchIn`) regardless, but unique basenames make `git worktree list`
 > legible.
 
 ---
@@ -156,10 +156,10 @@ never see each other's prompts through a shared mount.
 
 When the first agent for a project lands on a node in worktree-per-agent mode:
 
-1. **Acquire the per-project advisory lock** (`store.AdvisoryLocker` /
-   `LockWorkspaceProvision`, keyed by a stable project hash — same guard the NFS
-   backend uses, `workspace_backend_nfs.go:227-268`). On Postgres this is
-   `pg_try_advisory_lock`; on SQLite/single-node it serializes naturally.
+1. **Acquire the per-project provisioning lock** — the `.scion-provision.lock`
+   file lock that `pkg/provision` takes on the project's state directory (a lock
+   directory with heartbeats, stale reclaim and a bounded wait), the same guard
+   that NFS workspace provisioning uses.
 2. **Check the `.scion-provisioned` sentinel.** If present, skip to §4.2.
 3. **Clone the remote once** into `base/` using the dispatched `GitCloneConfig`
    (URL/branch/depth). This is the *only* network clone for the project on this node.
@@ -349,6 +349,32 @@ New work for the base repo:
    shared-ref rewrite is visible to siblings. Branch-per-agent contains *normal*
    workflows, not adversarial ones.
 6. **K8s node-local path unproven** — may be NFS-only in v1 (§7).
+7. **In-container `.git/config` is read-only for hub-managed bases.** The
+   shared base repo's `.git/config`, `.git/hooks/`, and `.git/info/` are
+   mounted read-only into each agent container; objects, refs, and the
+   per-agent worktree's own `HEAD`/`index`/logs stay writable, so ordinary
+   `git commit`, `git status`, `git fetch`, explicit `git pull --ff-only`,
+   and `git checkout -b`/`git switch -c` (without requesting a tracking
+   branch) are unaffected. The base sets `branch.autoSetupMerge=false`, so
+   the most common in-container workflow — checking out or switching onto a
+   remote-tracking branch (`git checkout -b <local> origin/<branch>`, or
+   `git switch <remote-branch>`) — degrades to a plain untracked local
+   branch instead of failing. A few less common workflows still fail or only
+   partially apply, because they need to *write* repo config: `git push -u`
+   (the push succeeds, but the upstream is silently not recorded), `git
+   branch --set-upstream-to` (fails), `git branch -m` (the rename succeeds,
+   but the config update fails, which git reports as an error), `git remote
+   add`, and `git config <key> <value>` (local). **Workaround:** run those
+   specific commands from the broker host against the shared base directly
+   (for example, `git -C <base> branch --set-upstream-to=origin/<branch>
+   <local-branch>` after an in-container `git push -u` if the upstream needs
+   to be recorded), or set the upstream when opening the PR/merge instead of
+   relying on a locally-recorded tracking branch. This is a deliberate
+   trade-off, not an oversight: making `.git/config`/`hooks`/`info`
+   read-only in the container is what keeps a container from being able to
+   change what the broker's own git operations do against the shared base;
+   see `pkg/provision/provision.go`'s `SafeGitCommand` and
+   `pkg/runtime/common.go`'s `narrowGitAdminMounts`.
 
 ---
 
@@ -359,7 +385,7 @@ New work for the base repo:
 | Worktree add (host, relative) | `util.CreateWorktree` | `pkg/util/git.go`, `provision.go:470` |
 | Worktree add (NFS, with reuse) | `nfsBackend.ensureWorktree` | `workspace_backend_nfs.go:318-376` |
 | Branch name from agent | `api.Slugify` / `sanitizeBranchName` | `workspace_backend_nfs.go:378-393` |
-| First-access guard | sentinel + `store.AdvisoryLocker` | `workspace_backend_nfs.go:141-268` |
+| First-access guard | sentinel + `.scion-provision.lock` file lock (`acquireProvisionLock`) | `pkg/provision/provision.go` |
 | Dual mount (`.git` + worktree) | runtime mount registration | `common.go:181-189` |
 | Worktree teardown + prune | `RemoveWorktree`/`PruneWorktreesIn`/`DeleteBranchIn` | `provision.go:35-146` |
 | In-container worktree guard | `SCION_HOST_UID` → `isGit=false` | `provision.go:303-309` |

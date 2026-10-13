@@ -29,10 +29,9 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 )
 
@@ -42,6 +41,15 @@ const (
 
 	// dedupTTL is how long a message ID is remembered for deduplication.
 	dedupTTL = 5 * time.Minute
+
+	// askUserExpiry is how long a posted question accepts button and
+	// modal answers.
+	askUserExpiry = 24 * time.Hour
+
+	// askUserCleanupInterval is the minimum time between deletions of
+	// expired ask-user entries. Answer handlers check expiry themselves,
+	// so cleanup only needs to run occasionally.
+	askUserCleanupInterval = time.Hour
 
 	// OriginMarkerKey is the config key injected into outbound messages
 	// to identify messages originating from the scion hub.
@@ -67,6 +75,11 @@ type Config struct {
 	GuildIDs       []string // parsed from comma-separated "guild_ids" config value; empty = global commands
 	DBPath         string
 	MentionRouting bool
+
+	// RoutedInboundEnabled controls whether ordinary user messages use the
+	// centralized /api/v1/broker/inbound/routed endpoint instead of legacy
+	// /api/v1/broker/inbound. Default false; enable only against an upgraded hub.
+	RoutedInboundEnabled bool
 }
 
 // inboundPayload is the JSON body sent to the hub API inbound endpoint.
@@ -75,28 +88,64 @@ type inboundPayload struct {
 	Message *messages.StructuredMessage `json:"message"`
 }
 
+// routedInboundPayload is the JSON body sent to the hub routed inbound endpoint.
+type routedInboundPayload struct {
+	ProjectID    string                      `json:"project_id"`
+	DefaultAgent string                      `json:"default_agent,omitempty"`
+	Surface      string                      `json:"surface,omitempty"`
+	ExternalRef  string                      `json:"external_ref,omitempty"`
+	ParentRef    string                      `json:"parent_ref,omitempty"`
+	Message      *messages.StructuredMessage `json:"message"`
+}
+
+// routedInboundResult is the success response from the hub routed endpoint.
+type routedInboundResult struct {
+	Delivered    bool   `json:"delivered"`
+	PrimaryAgent string `json:"primary_agent"`
+}
+
 // hubError represents a structured error returned by the hub API.
 type hubError struct {
 	StatusCode int
 	Code       string `json:"code"`
 	Message    string `json:"message"`
+	// DeniedAction and ResourceType come from the error details of a
+	// denial, when present.
+	DeniedAction string `json:"-"`
+	ResourceType string `json:"-"`
 }
 
 func (e *hubError) Error() string {
 	return fmt.Sprintf("hub error %d (%s): %s", e.StatusCode, e.Code, e.Message)
 }
 
-// userFacingMessage returns a short message suitable for displaying to chat users.
-func (e *hubError) userFacingMessage() string {
+// userFacingMessage returns the text shown for a failed message delivery.
+// email is the sender's linked Scion account email and project the project
+// slug; either is "" when unknown.
+func (e *hubError) userFacingMessage(email, project string) string {
 	switch e.Code {
 	case "agent_not_found":
 		return "Target agent not found. Use `/scion agents` to see available agents."
 	case "forbidden":
-		return "You don't have permission to message this agent."
+		// The hub sends no distinct code when the linked user is unknown or
+		// inactive, so this matches on the message text.
+		if strings.HasPrefix(e.Message, "on-behalf-of principal") || strings.HasPrefix(e.Message, "sender identity") {
+			return staleLinkText
+		}
+		if action := actionPhrase(e.DeniedAction, e.ResourceType); action != "" {
+			return permissionDeniedText(email, action, project)
+		}
+		return permissionDeniedText(email, "message agents", project)
+	case "message_denied":
+		return permissionDeniedText(email, "message agents", project)
 	case "agent_not_running":
 		return "Agent is not running. It may be stopped, suspended, or in error state."
 	case "broker_auth_failed", "unauthorized":
 		return "Authentication error — please contact an administrator."
+	case "transport_error":
+		return "Message delivery could not be confirmed — the service may be temporarily unavailable."
+	case "local_error":
+		return "Failed to prepare your message for delivery. Please try again or contact an administrator."
 	default:
 		return "Failed to deliver message. Please try again or contact an administrator."
 	}
@@ -115,6 +164,10 @@ func parseHubError(resp *http.Response) *hubError {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
+			Details struct {
+				DeniedAction string `json:"denied_action"`
+				ResourceType string `json:"resource_type"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Error.Code == "" {
@@ -124,6 +177,8 @@ func parseHubError(resp *http.Response) *hubError {
 	}
 	he.Code = envelope.Error.Code
 	he.Message = envelope.Error.Message
+	he.DeniedAction = envelope.Error.Details.DeniedAction
+	he.ResourceType = envelope.Error.Details.ResourceType
 	return he
 }
 
@@ -164,6 +219,20 @@ type DiscordBroker struct {
 
 	threadParents map[string]string // channelID -> parentID (cached thread lookups)
 
+	// replyCooldown holds when a throttled reply was last sent, keyed by
+	// channel, sender and reply kind.
+	replyCooldown   map[string]time.Time
+	replyCooldownMu sync.Mutex
+
+	// lastAskUserCleanup is when expired ask-user entries were last
+	// deleted; askUserCleanupMu guards it.
+	lastAskUserCleanup time.Time
+	askUserCleanupMu   sync.Mutex
+
+	// now returns the current time; nil means time.Now. Tests set it to
+	// control the ask-user cleanup cadence.
+	now func() time.Time
+
 	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string // injected by hub: projectID -> slug
 	downloadsPath  string            // override for file download directory; empty = default
@@ -173,6 +242,11 @@ type DiscordBroker struct {
 	hostCallbacks plugin.HostCallbacks
 
 	InboundHandler func(topic string, msg *messages.StructuredMessage)
+
+	// createDMChannel opens (or returns) the Discord DM channel with the
+	// given Discord user and returns its channel ID. Nil means use the
+	// gateway session. Tests replace it to avoid calling Discord.
+	createDMChannel func(discordUserID string) (string, error)
 }
 
 // NewBroker creates a new DiscordBroker with the given logger.
@@ -295,6 +369,10 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			cfg.MentionRouting = v != "false" && v != "0"
 		}
 
+		if v, ok := config["routed_inbound_enabled"]; ok {
+			cfg.RoutedInboundEnabled = v == "true" || v == "1"
+		}
+
 		cfg.DBPath = config["db_path"]
 		if cfg.DBPath == "" {
 			cfg.DBPath = defaultDBPath
@@ -344,6 +422,16 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			if err != nil {
 				return fmt.Errorf("invalid agent_cache_ttl: %w", err)
 			}
+			if d < 0 {
+				b.log.Warn("agent_cache_ttl is negative; using the default",
+					"agent_cache_ttl", d, "default", defaultAgentCacheTTL)
+				d = defaultAgentCacheTTL
+			}
+			if d > maxAgentCacheTTL {
+				b.log.Warn("agent_cache_ttl is longer than the agent-cache retention allows; clamping",
+					"agent_cache_ttl", d, "max", maxAgentCacheTTL)
+				d = maxAgentCacheTTL
+			}
 			b.agentCacheTTL = d
 		}
 
@@ -357,6 +445,7 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			"guild_ids", cfg.GuildIDs,
 			"db_path", cfg.DBPath,
 			"mention_routing", cfg.MentionRouting,
+			"routed_inbound_enabled", cfg.RoutedInboundEnabled,
 		)
 	}
 
@@ -430,7 +519,7 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 					if hc == nil {
 						continue
 					}
-					if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
+					if err := hc.RequestSubscription(projectkeys.AllProjectsPattern()); err != nil {
 						b.log.Warn("Failed to request bootstrap subscription", "error", err)
 						continue
 					}
@@ -510,6 +599,9 @@ func (b *DiscordBroker) Unsubscribe(pattern string) error {
 //  1. Direct channel ID from metadata (discord_channel_id)
 //  2. ConversationContext for recipient
 //  3. Broadcast to all ChannelLinks for project
+//
+// A direct message to a user is never broadcast: with no stored channel it
+// goes to the user's Discord DM channel, or Publish returns an error.
 func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages.StructuredMessage) error {
 	b.mu.RLock()
 	if b.closed {
@@ -554,53 +646,10 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 	// Determine the project and agent from the topic.
 	projectID, agentSlug := parseTopicComponents(topic)
 
-	// Collect target channel IDs via dynamic routing.
-	var channelIDs []string
-
-	// Priority 0: Thread routing — ThreadID maps directly to a Discord
-	// channel or thread snowflake. This takes precedence over all other
-	// routing so replies land in the same channel/thread as the original.
-	if msg != nil && msg.ThreadID != "" {
-		channelIDs = append(channelIDs, msg.ThreadID)
-	}
-
-	// Priority 1: Direct channel ID from metadata.
-	if len(channelIDs) == 0 && msg != nil && msg.Metadata != nil {
-		if chID, ok := msg.Metadata["discord_channel_id"]; ok && chID != "" {
-			channelIDs = append(channelIDs, chID)
-		}
-	}
-
-	// Priority 2: Look up via ConversationContext for the recipient.
-	if len(channelIDs) == 0 && msg != nil && msg.Recipient != "" && store != nil {
-		ccSlug := agentSlug
-		if ccSlug == "" && msg.Sender != "" && strings.HasPrefix(msg.Sender, "agent:") {
-			ccSlug = strings.TrimPrefix(msg.Sender, "agent:")
-		}
-		channelIDs = b.resolveRecipientChannels(ctx, msg.Recipient, msg.RecipientID, projectID, ccSlug)
-	}
-
-	// Priority 3: Broadcast to all ChannelLinks for the project.
-	if len(channelIDs) == 0 && projectID != "" && store != nil {
-		links, err := store.GetChannelLinksForProject(ctx, projectID)
-		if err != nil {
-			b.log.Warn("Failed to get channel links for broadcast", "project_id", projectID, "error", err)
-		}
-		for _, link := range links {
-			if link.Active {
-				channelIDs = append(channelIDs, link.ChannelID)
-			}
-		}
-	}
-
-	if len(channelIDs) == 0 {
-		b.log.Debug("No Discord channel for topic, dropping message", "topic", topic)
-		return nil
-	}
-
-	// Always suppress commentary messages — Discord has no user toggle for this.
+	// Discard the retired end-of-turn assistant-reply mirror; an older hub
+	// may still forward it.
 	if msg != nil && msg.Type == messages.TypeAssistantReply {
-		b.log.Debug("Filtering assistant-reply message (commentary always suppressed in Discord)")
+		b.log.Debug("Discarding retired assistant-reply message")
 		return nil
 	}
 
@@ -630,6 +679,76 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		text = formatMessage(msg, agentSlug)
 	}
 	if text == "" {
+		return nil
+	}
+
+	// Only an all-digit ThreadID is a Discord channel or thread ID. Any
+	// other ThreadID (such as a Scion direct-message conversation key) is
+	// never sent to Discord as a channel ID: the message is resolved to the
+	// addressed user's own Discord channel below and is never broadcast.
+	recipientRouted := msg.ThreadID != "" && !isDiscordSnowflake(msg.ThreadID)
+	discordThreadID := msg.ThreadID
+	if recipientRouted {
+		discordThreadID = ""
+		if !strings.HasPrefix(msg.Recipient, "user:") {
+			b.log.Debug("No Discord channel for a non-Discord thread ID without a user recipient, dropping message",
+				"topic", topic, "recipient", msg.Recipient)
+			return nil
+		}
+	}
+
+	// Collect target channel IDs via dynamic routing.
+	var channelIDs []string
+
+	// Priority 0: Thread routing — ThreadID maps directly to a Discord
+	// channel or thread snowflake. This takes precedence over all other
+	// routing so replies land in the same channel/thread as the original.
+	if discordThreadID != "" {
+		channelIDs = append(channelIDs, discordThreadID)
+	}
+
+	// Priority 1: Direct channel ID from metadata.
+	if len(channelIDs) == 0 && msg != nil && msg.Metadata != nil {
+		if chID, ok := msg.Metadata["discord_channel_id"]; ok && chID != "" {
+			channelIDs = append(channelIDs, chID)
+		}
+	}
+
+	// Priority 2: Look up via ConversationContext for the recipient.
+	if len(channelIDs) == 0 && msg != nil && msg.Recipient != "" && store != nil {
+		ccSlug := agentSlug
+		if ccSlug == "" && msg.Sender != "" && strings.HasPrefix(msg.Sender, "agent:") {
+			ccSlug = strings.TrimPrefix(msg.Sender, "agent:")
+		}
+		channelIDs = b.resolveRecipientChannels(ctx, msg.Recipient, msg.RecipientID, projectID, ccSlug)
+	}
+
+	// Priority 2b: a direct message with no stored channel goes to the
+	// Discord DM channel of the addressed user's linked Discord account.
+	if len(channelIDs) == 0 && recipientRouted {
+		dmChannelID, err := b.resolveRecipientDMChannel(ctx, msg.Recipient, msg.RecipientID)
+		if err != nil {
+			return fmt.Errorf("discord: cannot deliver direct message to %s: %w", msg.Recipient, err)
+		}
+		channelIDs = append(channelIDs, dmChannelID)
+	}
+
+	// Priority 3: Broadcast to all ChannelLinks for the project. Never
+	// used for direct messages.
+	if len(channelIDs) == 0 && !recipientRouted && projectID != "" && store != nil {
+		links, err := store.GetChannelLinksForProject(ctx, projectID)
+		if err != nil {
+			b.log.Warn("Failed to get channel links for broadcast", "project_id", projectID, "error", err)
+		}
+		for _, link := range links {
+			if link.Active {
+				channelIDs = append(channelIDs, link.ChannelID)
+			}
+		}
+	}
+
+	if len(channelIDs) == 0 {
+		b.log.Debug("No Discord channel for topic, dropping message", "topic", topic)
 		return nil
 	}
 
@@ -691,7 +810,7 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		// Forum and media channels (types 15, 16) are thread-only containers.
 		// Sending without a thread ID would broadcast to an invalid target;
 		// return an error so callers know a thread ID is required.
-		if msg.ThreadID == "" && b.isForumChannel(channelID) {
+		if discordThreadID == "" && b.isForumChannel(channelID) {
 			errs = append(errs, fmt.Errorf(
 				"discord channel %s is a forum/media channel — a thread ID is required to send messages; omit the channel or specify a thread ID",
 				channelID,
@@ -784,8 +903,12 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 					})
 				}
 			}
+		} else if msg.Type == messages.TypeInputNeeded && store != nil && senderSlug != "" {
+			// Questions get answer buttons and a pending ask-user entry.
+			err = b.sendInputNeeded(ctx, session, sendQueue, store, channelID, text, msg, senderSlug, projectID, files)
 		} else {
-			// Send via bot API (state changes, input-needed, non-agent messages).
+			// Send via bot API (state changes, non-agent messages, and
+			// input-needed without a store or sender slug).
 			if sendQueue != nil {
 				_, err = sendQueue.Send(ctx, channelID, text, nil, nil, files)
 			} else {
@@ -807,6 +930,82 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// sendInputNeeded posts an input-needed message with answer buttons and
+// records the pending ask-user entry that the button and modal handlers
+// look up. Each channel gets its own request ID.
+func (b *DiscordBroker) sendInputNeeded(
+	ctx context.Context,
+	session *discordgo.Session,
+	sendQueue *SendQueue,
+	store Store,
+	channelID, text string,
+	msg *messages.StructuredMessage,
+	agentSlug, projectID string,
+	files []*discordgo.File,
+) error {
+	requestID := generateRequestID()
+	_, components := RenderInputNeeded(msg, agentSlug, requestID)
+
+	var sent *discordgo.Message
+	var err error
+	if sendQueue != nil {
+		sent, err = sendQueue.Send(ctx, channelID, text, nil, components, files)
+	} else {
+		sent, err = session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+			Content:    text,
+			Components: components,
+			Files:      files,
+		})
+	}
+	if err != nil {
+		return err
+	}
+
+	// Stored choices match the rendered buttons (nil for Reply/Dismiss)
+	// and keep the full text of any truncated label.
+	pending := &PendingAskUser{
+		RequestID: requestID,
+		ChannelID: channelID,
+		AgentSlug: agentSlug,
+		ProjectID: projectID,
+		Choices:   inputNeededChoices(msg),
+		ExpiresAt: time.Now().Add(askUserExpiry),
+	}
+	if sent != nil {
+		pending.MessageID = sent.ID
+	}
+	if b.askUserCleanupDue() {
+		if _, delErr := store.DeleteExpiredAskUsers(ctx); delErr != nil {
+			b.log.Warn("Failed to delete expired ask-user entries", "error", delErr)
+		}
+	}
+	// The message is already posted, so a failed write is logged rather
+	// than returned; returning it would not make the buttons answerable.
+	if createErr := store.CreatePendingAskUser(ctx, pending); createErr != nil {
+		b.log.Error("Failed to record pending ask-user; its buttons will not work",
+			"request_id", requestID, "channel_id", channelID,
+			"message_id", pending.MessageID, "error", createErr)
+	}
+	return nil
+}
+
+// askUserCleanupDue reports whether expired ask-user entries should be
+// deleted now, and if so records the time. Cleanup runs on the first call
+// and then at most once per askUserCleanupInterval.
+func (b *DiscordBroker) askUserCleanupDue() bool {
+	now := time.Now()
+	if b.now != nil {
+		now = b.now()
+	}
+	b.askUserCleanupMu.Lock()
+	defer b.askUserCleanupMu.Unlock()
+	if !b.lastAskUserCleanup.IsZero() && now.Sub(b.lastAskUserCleanup) < askUserCleanupInterval {
+		return false
+	}
+	b.lastAskUserCleanup = now
+	return true
 }
 
 // Close shuts down the Discord broker, closing the gateway session,
@@ -1229,6 +1428,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	b.mu.RLock()
 	store := b.store
 	botUser := b.botUser
+	config := b.config
 	b.mu.RUnlock()
 
 	channelID := m.ChannelID
@@ -1254,21 +1454,9 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		botUserID = botUser.ID
 	}
 
-	// Get project agents (with cache refresh).
-	agents := b.getProjectAgents(ctx, link.ProjectID)
-
-	// Three-tier @-mention routing.
-	targets, isAll := resolveTargetAgents(m, botUserID, link.DefaultAgent, agents)
-
-	// Fallback: reply-to-bot message — extract agent from webhook username.
-	if len(targets) == 0 && m.ReferencedMessage != nil {
-		slug := agentFromReply(m.ReferencedMessage, botUserID)
-		if slug != "" {
-			targets = []string{slug}
-		}
-	}
-
 	// Resolve effective default — thread override first, then channel fallback.
+	// Computed before resolveTargetAgents so the additive model uses the
+	// correct implicit primary (thread-level override when present).
 	effectiveDefault := link.DefaultAgent
 	if parentID, isThread := b.resolveThreadParent(channelID); isThread {
 		if threadDefault, err := store.GetThreadDefault(ctx, parentID, channelID); err != nil {
@@ -1278,12 +1466,80 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 	}
 
-	// Fallback: unaddressed text → default agent (if configured).
-	// Skip if the message @-mentions a non-bot Discord user — those are
-	// directed at humans, not the bot's default agent.
+	// Resolve the sender's link before any agent-cache access or routing:
+	// a sender the plugin cannot act as is never routed nor served cached
+	// data.
+	senderMapping, lookupErr := getUserMapping(ctx, store, b.log, m.Author.ID)
+	if lookupErr != nil || principalForMapping(senderMapping) == "" {
+		b.log.Debug("Message from unresolved sender not routed", "channel_id", channelID, "sender_id", m.Author.ID)
+		routed := config != nil && config.RoutedInboundEnabled
+		b.replyUnresolvedSender(s, m, channelID, botUserID, effectiveDefault, routed, senderMapping, lookupErr)
+		return
+	}
+
+	// Determine if routed inbound is enabled.
+	routedEnabled := config != nil && config.RoutedInboundEnabled
+
+	// --- Routed inbound path ---
+	// When routed_inbound_enabled is true, use the centralized hub endpoint
+	// that handles mention extraction and multi-agent dispatch. The adapter
+	// supplies the project ID, effective default agent slug, and the message;
+	// the hub resolves routing. @all broadcasts stay legacy.
+	if routedEnabled {
+		// extractAgentMentions returns hasAll=true when it sees "@all"
+		// regardless of the agent list — pure text detection.
+		_, hasAll := extractAgentMentions(m.Content, nil)
+		if !hasAll {
+			b.handleRoutedInbound(ctx, s, m, store, link, senderMapping, channelID, botUserID, effectiveDefault)
+			return
+		}
+		// @all broadcast: fall through to legacy path below.
+	}
+
+	// Get project agents (cached per user, refreshed as the sender) — only
+	// needed for the legacy path.
+	agents, agentsErr := b.getProjectAgents(ctx, link.ProjectID, principalForMapping(senderMapping))
+	// agentListErrText tells the sender why their message could not be
+	// routed when no agent list is available, instead of reporting an
+	// addressed agent as unknown.
+	agentListErrText := func() string {
+		return hubErrorText(agentsErr, senderMapping.ScionEmail, link.ProjectSlug, agentListUnavailableText)
+	}
+	// replyAgentListErr tells the sender why their message was not routed.
+	// A message addressed to the bot is always answered; otherwise the
+	// reply is sent at most once per cooldown per sender and kind.
+	replyAgentListErr := func() {
+		addressed := isBotMentioned(m, botUserID) || b.isReplyToBot(m, botUserID)
+		if !addressed && b.shouldSuppressReply(channelID, m.Author.ID, "agent_list:"+agentListErrorKind(agentsErr)) {
+			return
+		}
+		s.ChannelMessageSend(channelID, agentListErrText())
+	}
+
+	// Three-tier @-mention routing (additive model: effectiveDefault is
+	// included as implicit primary when explicit agent mentions are present).
+	targets, isAll := resolveTargetAgents(m, botUserID, effectiveDefault, agents)
+
+	// Fallback: a reply to an agent message posted through the plugin's
+	// own webhook goes to that agent (the webhook username is its slug).
+	if len(targets) == 0 && m.ReferencedMessage != nil {
+		slug := agentFromReply(m.ReferencedMessage, func(webhookID string) bool {
+			return b.ownsWebhook(m.ChannelID, webhookID)
+		})
+		if slug != "" {
+			targets = []string{slug}
+		}
+	}
+
+	// Fallback: unaddressed text or attachment-only message → default
+	// agent (if configured). Skip if the message @-mentions a non-bot
+	// Discord user — those are directed at humans, not the bot's default
+	// agent.
 	if len(targets) == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
 		text := strings.TrimSpace(m.Content)
-		if text != "" && !strings.HasPrefix(text, "/") {
+		hasText := text != "" && !strings.HasPrefix(text, "/")
+		attachmentOnly := text == "" && len(m.Attachments) > 0
+		if hasText || attachmentOnly {
 			targets = []string{effectiveDefault}
 		}
 	}
@@ -1291,6 +1547,10 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	if len(targets) == 0 {
 		// If bot was mentioned but no agent resolved, send error feedback.
 		if isBotMentioned(m, botUserID) {
+			if agentsErr != nil {
+				replyAgentListErr()
+				return
+			}
 			unresolved := extractUnresolvedMentions(m.Content, botUserID, agents)
 			if len(unresolved) > 0 {
 				errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.", strings.Join(unresolved, ", "))
@@ -1300,18 +1560,16 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		return
 	}
 
-	// Determine sender identity.
-	sender := "discord:" + m.Author.Username
-	senderID := m.Author.ID
-
-	mapping, err := store.GetUserMapping(ctx, senderID)
-	if err == nil && mapping != nil && mapping.ScionEmail != "" {
-		sender = "user:" + mapping.ScionEmail
-	} else if mapping == nil {
-		b.log.Debug("Unregistered user tried to mention agent", "sender_id", senderID)
-		s.ChannelMessageSend(channelID, "Please use `/scion register` first to interact with agents.")
+	// A sender the hub denies (including a link it no longer accepts) is
+	// never routed; they are told why instead.
+	if isForbiddenHubError(agentsErr) {
+		replyAgentListErr()
 		return
 	}
+
+	// Sender identity.
+	sender := principalForMapping(senderMapping)
+	senderID := m.Author.ID
 
 	// Classify mentions by position before stripping.
 	var classified ClassifiedMentions
@@ -1329,6 +1587,11 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 				hasUnknownStartMention = true
 				break
 			}
+		}
+		if hasUnknownStartMention && countAgentStartMentions(classified) == 0 && agentsErr != nil {
+			// Without an agent list the mention cannot be checked.
+			replyAgentListErr()
+			return
 		}
 		if hasUnknownStartMention && countAgentStartMentions(classified) == 0 {
 			var unresolved []string
@@ -1409,6 +1672,37 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 	}
 
+	// Additive mention routing: ensure the implicit primary (effectiveDefault)
+	// is present at position 0 in targets when mentioned agents exist.
+	// The start-mention filter above may have removed it because the default
+	// agent was not explicitly @-mentioned. Re-inserting here mirrors the
+	// native chat additive model (handlers_chat_v2.go:958-1001).
+	if !isAll && effectiveDefault != "" && len(targets) > 0 {
+		hasDefault := false
+		hasOther := false
+		for _, t := range targets {
+			if strings.EqualFold(t, effectiveDefault) {
+				hasDefault = true
+			} else {
+				hasOther = true
+			}
+		}
+		if hasOther && !hasDefault {
+			// Default agent was filtered out — re-insert at position 0.
+			targets = append([]string{effectiveDefault}, targets...)
+		} else if hasOther && hasDefault && !strings.EqualFold(targets[0], effectiveDefault) {
+			// Default agent exists but not at position 0 — move it to front.
+			reordered := make([]string, 0, len(targets))
+			reordered = append(reordered, effectiveDefault)
+			for _, t := range targets {
+				if !strings.EqualFold(t, effectiveDefault) {
+					reordered = append(reordered, t)
+				}
+			}
+			targets = reordered
+		}
+	}
+
 	// Strip bot and start-mention agent mentions from message text.
 	// Body-mention agents remain visible in the delivered text.
 	cleanText := stripMentions(m.Content, botUserID, stripSlugs)
@@ -1424,6 +1718,9 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if err != nil {
 			b.log.Error("Failed to download Discord attachment",
 				"filename", att.Filename, "error", err)
+			// The error can name host paths; the sender only gets fixed
+			// text, and the full error stays in the plugin log.
+			s.ChannelMessageSend(channelID, attachmentFailureText(att.Filename, err))
 			continue
 		}
 		attachmentPaths = append(attachmentPaths, agentPath)
@@ -1440,20 +1737,26 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		return
 	}
 
-	// Determine message type and recipients for multi-agent routing.
-	msgType := messages.TypeInstruction
-	var groupRecipients string
+	// --- Additive mention routing delivery ---
+	//
+	// Delivery model (mirroring native chat's additive model):
+	//   - targets[0] is the implicit primary (default agent) → TypeInstruction
+	//   - targets[1:] are explicitly mentioned agents → TypeMention
+	//   - @all broadcasts: all targets get TypeInstruction (unchanged)
+	//   - Body-mentioned agents (not in targets): TypeMention
+	//
+	// Co-addressees metadata enables the hub's broker inbound handler to
+	// produce the "to" field on the delivery envelope.
+
+	// Build co-addressees metadata for multi-agent routing.
+	var coAddresseesMeta string
 	if len(targets) > 1 && !isAll {
-		msgType = messages.TypeGroupSet
-		recipientIDs := make([]string, len(targets))
-		for i, slug := range targets {
-			recipientIDs[i] = "agent:" + slug
-		}
-		groupRecipients = messages.FormatGroupRecipients(sender, recipientIDs)
+		slugsJSON, _ := json.Marshal(targets)
+		coAddresseesMeta = string(slugsJSON)
 	}
 
-	// Deliver to each target agent.
-	for _, agentSlug := range targets {
+	// saveConversationContext records conversation context for each target.
+	saveConversationContext := func(agentSlug string) {
 		cc := &ConversationContext{
 			DiscordUserID: senderID,
 			ProjectID:     link.ProjectID,
@@ -1464,28 +1767,60 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if err := store.SetConversationContext(ctx, cc); err != nil {
 			b.log.Warn("Failed to save conversation context", "error", err)
 		}
+	}
 
-		topic := projectcompat.AgentTopic(link.ProjectID, agentSlug)
+	// buildDiscordMeta returns the standard Discord metadata map.
+	buildDiscordMeta := func() map[string]string {
+		meta := map[string]string{
+			"discord_channel_id": channelID,
+			"discord_message_id": m.ID,
+			"discord_guild_id":   m.GuildID,
+			"project_id":         link.ProjectID,
+		}
+		if coAddresseesMeta != "" {
+			meta["mention_co_addressees"] = coAddresseesMeta
+		}
+		return meta
+	}
+
+	// Deliver to each target.
+	for i, agentSlug := range targets {
+		saveConversationContext(agentSlug)
+
+		topic := projectkeys.AgentTopic(link.ProjectID, agentSlug)
 		recipient := "agent:" + agentSlug
 
-		msg := &messages.StructuredMessage{
-			Version:     messages.Version,
-			Timestamp:   m.Timestamp.UTC().Format(time.RFC3339),
-			Channel:     "discord",
-			ThreadID:    channelID,
-			Sender:      sender,
-			SenderID:    senderID,
-			Recipient:   recipient,
-			Recipients:  groupRecipients,
-			Msg:         cleanText,
-			Type:        msgType,
-			Attachments: attachmentPaths,
-			Metadata: map[string]string{
-				"discord_channel_id": channelID,
-				"discord_message_id": m.ID,
-				"discord_guild_id":   m.GuildID,
-				"project_id":         link.ProjectID,
-			},
+		var msg *messages.StructuredMessage
+
+		if isAll || i == 0 {
+			// Primary target (or @all broadcast): TypeInstruction.
+			msg = &messages.StructuredMessage{
+				Version:     messages.Version,
+				Timestamp:   m.Timestamp.UTC().Format(time.RFC3339),
+				Channel:     "discord",
+				ThreadID:    channelID,
+				Sender:      sender,
+				SenderID:    senderID,
+				Recipient:   recipient,
+				Msg:         cleanText,
+				Type:        messages.TypeInstruction,
+				Attachments: attachmentPaths,
+				Metadata:    buildDiscordMeta(),
+			}
+		} else {
+			// Secondary target: TypeMention — mirrors the native chat fan-out
+			// path (handlers_chat_v2.go:1346).
+			mentionSource := "agent:" + targets[0]
+			msg = messages.NewMention(sender, recipient, cleanText, mentionSource)
+			msg.SenderID = senderID
+			msg.Channel = "discord"
+			msg.ThreadID = channelID
+			for k, v := range buildDiscordMeta() {
+				msg.Metadata[k] = v
+			}
+			if len(attachmentPaths) > 0 {
+				msg.Attachments = attachmentPaths
+			}
 		}
 
 		if isEcho(msg) {
@@ -1494,33 +1829,29 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 
 		b.log.Debug("Delivering inbound message",
-			"topic", topic, "sender", sender, "agent", agentSlug)
+			"topic", topic, "sender", sender, "agent", agentSlug,
+			"type", msg.Type)
 
 		if he := b.deliverInbound(topic, msg); he != nil {
-			s.ChannelMessageSend(channelID, he.userFacingMessage())
+			s.ChannelMessageSend(channelID, he.userFacingMessage(senderMapping.ScionEmail, link.ProjectSlug))
 		}
 	}
 
 	// Deliver TypeMention notifications for body mentions.
+	// Agents already in the targets list (primary or secondary) are skipped.
 	if !isAll && len(classified.BodyMentions) > 0 {
 		targetSet := make(map[string]bool, len(targets))
 		for _, slug := range targets {
 			targetSet[strings.ToLower(slug)] = true
 		}
 
-		// Build the mention source: who the primary message was addressed to.
-		var mentionSource string
-		if groupRecipients != "" {
-			mentionSource = groupRecipients
-		} else if len(targets) == 1 {
-			mentionSource = "agent:" + targets[0]
-		}
+		mentionSource := "agent:" + targets[0]
 
 		for _, bm := range classified.BodyMentions {
 			if bm.Kind != "agent" {
 				continue
 			}
-			// Skip agents already receiving the primary message.
+			// Skip agents already receiving a primary or secondary message.
 			if targetSet[strings.ToLower(bm.Name)] {
 				continue
 			}
@@ -1529,24 +1860,156 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 			mentionMsg.SenderID = senderID
 			mentionMsg.Channel = "discord"
 			mentionMsg.ThreadID = channelID
-			mentionMsg.Metadata["discord_channel_id"] = channelID
-			mentionMsg.Metadata["discord_message_id"] = m.ID
-			mentionMsg.Metadata["discord_guild_id"] = m.GuildID
-			mentionMsg.Metadata["project_id"] = link.ProjectID
+			for k, v := range buildDiscordMeta() {
+				mentionMsg.Metadata[k] = v
+			}
 			if len(attachmentPaths) > 0 {
 				mentionMsg.Attachments = attachmentPaths
 			}
 
-			mentionTopic := projectcompat.AgentTopic(link.ProjectID, bm.Name)
+			mentionTopic := projectkeys.AgentTopic(link.ProjectID, bm.Name)
 
 			b.log.Debug("Delivering body mention notification",
 				"topic", mentionTopic, "sender", sender, "mentioned_agent", bm.Name)
 
 			if he := b.deliverInbound(mentionTopic, mentionMsg); he != nil {
 				b.log.Warn("Failed to deliver mention notification",
-					"agent", bm.Name, "error", he.userFacingMessage())
+					"agent", bm.Name, "error", he.Error())
 			}
 		}
+	}
+}
+
+// --- Routed inbound handler ---
+
+// handleRoutedInbound processes an incoming Discord message through the
+// centralized routed hub endpoint. The hub handles mention extraction and
+// multi-agent routing; the adapter supplies the project, effective default
+// agent, identity, attachments, and the raw message text.
+func (b *DiscordBroker) handleRoutedInbound(
+	ctx context.Context,
+	s *discordgo.Session,
+	m *discordgo.MessageCreate,
+	store Store,
+	link *ChannelLink,
+	mapping *DiscordUserMapping,
+	channelID, botUserID, effectiveDefault string,
+) {
+	senderID := m.Author.ID
+	// mapping is the sender's resolved link; the routed endpoint requires
+	// the "user:<email>" sender format.
+	sender := principalForMapping(mapping)
+
+	// Skip messages directed only at non-bot humans — these should not be
+	// routed to the hub. If no default agent is configured and no bot mention
+	// is present and the only mentions are human users, drop silently.
+	if effectiveDefault == "" && !isBotMentioned(m, botUserID) {
+		if hasNonBotMentions(m.Message, botUserID) {
+			return
+		}
+		// Plain text with no default agent: nothing to route.
+		text := strings.TrimSpace(m.Content)
+		if text == "" || strings.HasPrefix(text, "/") {
+			return
+		}
+	}
+
+	// Strip Discord bot mentions (<@BOT_ID>) from text but leave text-format
+	// @agent mentions raw — the hub planner handles agent extraction.
+	cleanText := stripBotMention(m.Content, botUserID)
+	cleanText = strings.TrimSpace(cleanText)
+
+	// Download Discord attachments and build metadata.
+	var attachmentPaths []string
+	for _, att := range m.Attachments {
+		if att == nil || att.URL == "" {
+			continue
+		}
+		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug, link.ProjectID)
+		if err != nil {
+			b.log.Error("Failed to download Discord attachment",
+				"filename", att.Filename, "error", err)
+			// The error can name host paths; the sender only gets fixed
+			// text, and the full error stays in the plugin log.
+			s.ChannelMessageSend(channelID, attachmentFailureText(att.Filename, err))
+			continue
+		}
+		attachmentPaths = append(attachmentPaths, agentPath)
+		if placeholder != "" {
+			if cleanText != "" {
+				cleanText = cleanText + "\n" + placeholder
+			} else {
+				cleanText = placeholder
+			}
+		}
+	}
+
+	if cleanText == "" {
+		return
+	}
+
+	// Build the routed message. The hub resolves routing from the text @mentions.
+	// Do NOT set Recipient — the hub determines that.
+	msg := &messages.StructuredMessage{
+		Version:     messages.Version,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Channel:     "discord",
+		ThreadID:    channelID,
+		Sender:      sender,
+		SenderID:    senderID,
+		Msg:         cleanText,
+		Type:        messages.TypeInstruction,
+		Attachments: attachmentPaths,
+		Metadata: map[string]string{
+			"discord_channel_id": channelID,
+			"discord_message_id": m.ID,
+			"discord_guild_id":   m.GuildID,
+		},
+	}
+
+	b.log.Debug("Delivering routed inbound message",
+		"project_id", link.ProjectID, "sender", sender,
+		"default_agent", effectiveDefault)
+
+	result, he := b.deliverRoutedInbound(link.ProjectID, effectiveDefault, msg)
+	if he != nil {
+		s.ChannelMessageSend(channelID, he.userFacingMessage(mapping.ScionEmail, link.ProjectSlug))
+		return
+	}
+
+	// Save conversation context ONLY when the hub explicitly confirms
+	// delivered=true with a nonempty primary_agent. No fallback to the
+	// configured default — a nil result, delivered=false, empty primary,
+	// malformed/empty 200, or decode error means the routing outcome is
+	// uncertain and must not be persisted. The adapter does not retry
+	// and does not fall back to legacy.
+	if result != nil && result.Delivered && result.PrimaryAgent != "" {
+		// Fresh context for the store call: the parent ctx (10s preflight)
+		// will have expired during the hub's 6-minute fan-out window.
+		// deliverRoutedInbound uses its own http.Client timeout and does
+		// not propagate ctx, so we must not reuse ctx for post-response work.
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer storeCancel()
+		cc := &ConversationContext{
+			DiscordUserID: senderID,
+			ProjectID:     link.ProjectID,
+			AgentSlug:     result.PrimaryAgent,
+			LastChannelID: channelID,
+			LastMessageAt: time.Now(),
+		}
+		if err := store.SetConversationContext(storeCtx, cc); err != nil {
+			b.log.Warn("Failed to save conversation context", "error", err)
+		}
+	} else if result == nil || !result.Delivered {
+		// Uncertain result: no error from transport, but the hub response
+		// was nil, malformed, or did not confirm delivery. Surface feedback
+		// so the user knows the outcome is uncertain.
+		b.log.Warn("Routed delivery returned uncertain result",
+			"result_nil", result == nil,
+			"project_id", link.ProjectID,
+			"default_agent", effectiveDefault)
+		s.ChannelMessageSend(channelID,
+			"Message delivery could not be confirmed — the service may be temporarily unavailable.")
 	}
 }
 
@@ -1619,56 +2082,311 @@ func (b *DiscordBroker) deliverInbound(topic string, msg *messages.StructuredMes
 	return nil
 }
 
+// deliverRoutedInbound sends a message to the hub's centralized routed inbound
+// endpoint. This endpoint handles mention extraction and multi-agent dispatch
+// on the hub side, replacing the legacy topic-based single-agent delivery.
+func (b *DiscordBroker) deliverRoutedInbound(projectID, defaultAgent string, msg *messages.StructuredMessage) (*routedInboundResult, *hubError) {
+	b.mu.RLock()
+	hubURL := b.hubURL
+	hmacKey := b.hmacKey
+	brokerID := b.brokerID
+	pluginName := b.pluginName
+	b.mu.RUnlock()
+
+	if hubURL == "" {
+		b.log.Debug("No hub URL configured, dropping routed inbound message",
+			"project_id", projectID)
+		return nil, nil
+	}
+
+	payload := routedInboundPayload{
+		ProjectID:    projectID,
+		DefaultAgent: defaultAgent,
+		Message:      msg,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		b.log.Error("Failed to marshal routed inbound message", "error", err)
+		return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
+	}
+
+	routedURL := hubURL + "/api/v1/broker/inbound/routed"
+	req, err := http.NewRequest("POST", routedURL, bytes.NewReader(body))
+	if err != nil {
+		b.log.Error("Failed to create routed inbound request", "error", err)
+		return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Plugin-Name", pluginName)
+
+	if brokerID != "" && hmacKey != "" {
+		if err := signInboundRequest(req, brokerID, hmacKey); err != nil {
+			b.log.Error("Failed to sign routed inbound request", "error", err)
+			return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
+		}
+	}
+
+	// Use a longer timeout for routed requests: the hub may fan out to up to
+	// 11 recipients sequentially (30s each), plus preparation overhead.
+	client := &http.Client{Timeout: 6 * time.Minute}
+	// Inherit transport from broker's httpClient so IAP auth is preserved.
+	b.mu.RLock()
+	if b.httpClient != nil {
+		client.Transport = b.httpClient.Transport
+	}
+	b.mu.RUnlock()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		b.log.Error("Failed to deliver routed inbound message",
+			"error", err, "project_id", projectID)
+		// Surface transport failures to the user. Do NOT advise retry —
+		// a timeout has uncertain delivery (the hub may have received and
+		// processed the request before the client gave up).
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		he := parseHubError(resp)
+		b.log.Error("Hub rejected routed inbound message",
+			"status", resp.StatusCode, "code", he.Code, "message", he.Message,
+			"project_id", projectID, "default_agent", defaultAgent)
+		return nil, he
+	}
+
+	// Parse success response to extract primary_agent for context tracking.
+	// Treat read or decode errors as uncertain delivery: return nil result
+	// with an uncertain-result hubError so the caller never saves context
+	// from a partially populated struct.
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		b.log.Error("Failed to read routed inbound response body",
+			"error", readErr, "project_id", projectID)
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	var result routedInboundResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		b.log.Error("Failed to decode routed inbound response",
+			"error", err, "project_id", projectID)
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	return &result, nil
+}
+
 // --- Agent cache ---
 
-// getProjectAgents returns the cached agent slugs for a project, refreshing
-// from the Hub API if the cache is stale.
-func (b *DiscordBroker) getProjectAgents(ctx context.Context, projectID string) []string {
+// getProjectAgents returns the agent slugs of a project for routing a
+// message from the linked user onBehalfOf.
+//
+// The cache is kept per user and project: the user is only served a list
+// fetched as themselves. When their entry is stale the list is refreshed
+// from the hub as that user; a stale entry also covers a failed refresh,
+// except when the hub denies the user. A non-nil error means no list is
+// available: errNoLinkedUser without a user, otherwise the hub error.
+//
+// Known limitation: the cache has a 30s TTL (defaultAgentCacheTTL). If an agent
+// is created or renamed after the last refresh, it won't appear in the slug list
+// until the cache expires. During that window, @-mentions of the new agent are
+// silently treated as unrecognized text, falling through to default-agent routing
+// instead of being delivered to the mentioned agent. This is a known transient
+// gap, not addressed here — the centralized mention-routing design (Phase 4)
+// will replace this Discord-side resolution entirely.
+func (b *DiscordBroker) getProjectAgents(ctx context.Context, projectID, onBehalfOf string) ([]string, error) {
 	b.mu.RLock()
 	store := b.store
 	hubClient := b.hubClient
 	ttl := b.agentCacheTTL
 	b.mu.RUnlock()
 
-	if store == nil {
-		return nil
+	if onBehalfOf == "" {
+		return nil, errNoLinkedUser
 	}
+	return cachedAgentSlugs(ctx, store, hubClient, b.log, ttl, projectID, onBehalfOf)
+}
 
-	cached, err := store.GetProjectAgents(ctx, projectID)
-	if err != nil {
-		b.log.Warn("Failed to read agent cache", "project_id", projectID, "error", err)
-	}
-	if cached != nil && time.Since(cached.RefreshedAt) < ttl {
-		return cached.AgentSlugs
+// cachedAgentSlugs returns the agent slugs of a project as seen by the
+// linked user onBehalfOf (non-empty), from that user's cache entry while it
+// is younger than ttl, otherwise from the hub. A stale entry of the same
+// user covers a failed refresh, except when the hub denies the request.
+func cachedAgentSlugs(ctx context.Context, store Store, hubClient HubClient, log *slog.Logger, ttl time.Duration, projectID, onBehalfOf string) ([]string, error) {
+	var cached *ProjectAgents
+	if store != nil {
+		var err error
+		cached, err = store.GetProjectAgents(ctx, onBehalfOf, projectID)
+		if err != nil {
+			log.Warn("Failed to read agent cache", "project_id", projectID, "error", err)
+		}
+		if cached != nil && time.Since(cached.RefreshedAt) < ttl {
+			return cached.AgentSlugs, nil
+		}
 	}
 
 	if hubClient == nil {
 		if cached != nil {
-			return cached.AgentSlugs
+			return cached.AgentSlugs, nil
 		}
-		return nil
+		return nil, errors.New("hub client not configured")
 	}
 
-	agents, err := hubClient.ListAgents(ctx, projectID)
+	agents, err := hubClient.ListAgents(ctx, projectID, onBehalfOf)
 	if err != nil {
-		b.log.Warn("Failed to refresh agent list from hub", "project_id", projectID, "error", err)
-		if cached != nil {
-			return cached.AgentSlugs
+		log.Warn("Failed to refresh agent list from hub", "project_id", projectID, "error", err)
+		// A stale entry covers an unavailable hub, not a denial: when the
+		// user is denied (or their link is no longer accepted) the error is
+		// returned so they are told why.
+		if cached != nil && !isForbiddenHubError(err) {
+			return cached.AgentSlugs, nil
 		}
-		return nil
+		return nil, err
 	}
 
 	slugs := agentSlugs(agents)
-	saveErr := store.SetProjectAgents(ctx, &ProjectAgents{
-		ProjectID:   projectID,
-		AgentSlugs:  slugs,
-		RefreshedAt: time.Now(),
-	})
-	if saveErr != nil {
-		b.log.Warn("Failed to cache agents", "project_id", projectID, "error", saveErr)
+	if store != nil {
+		saveErr := store.SetProjectAgents(ctx, &ProjectAgents{
+			User:        onBehalfOf,
+			ProjectID:   projectID,
+			AgentSlugs:  slugs,
+			RefreshedAt: time.Now(),
+		})
+		if saveErr != nil {
+			log.Warn("Failed to cache agents", "project_id", projectID, "error", saveErr)
+		}
 	}
+	return slugs, nil
+}
 
-	return slugs
+// msgRegisterToInteract is the reply to an unlinked sender who addresses
+// the bot.
+const msgRegisterToInteract = "Please use `/scion register` first to interact with agents."
+
+// msgSomethingWentWrong is the reply when the sender's link could not be
+// read.
+const msgSomethingWentWrong = "Something went wrong. Please try again."
+
+// replyUnresolvedSender answers a channel message whose sender cannot be
+// acted as (not linked, link without email, or lookup failure). Nothing
+// derived from the agent cache is used. A sender who addresses the bot is
+// told what to do. A sender with a link that needs re-registering, or whose
+// link could not be read, is also told when the message would go to the
+// default agent. Other messages are ignored.
+func (b *DiscordBroker) replyUnresolvedSender(s *discordgo.Session, m *discordgo.MessageCreate, channelID, botUserID, effectiveDefault string, routed bool, mapping *DiscordUserMapping, lookupErr error) {
+	addressed := isBotMentioned(m, botUserID) || b.isReplyToBot(m, botUserID)
+	text, kind := msgRegisterToInteract, ""
+	switch {
+	case lookupErr != nil:
+		text, kind = msgSomethingWentWrong, "lookup_failed"
+	case mapping != nil:
+		text, kind = staleLinkText, "stale_link"
+	}
+	if !addressed {
+		// A message that would go to the default agent is answered for a
+		// link that needs attention, at most once per cooldown per sender.
+		if kind == "" || !defaultAgentApplies(m, botUserID, effectiveDefault, routed) {
+			return
+		}
+		if b.shouldSuppressReply(channelID, m.Author.ID, "unresolved_sender:"+kind) {
+			return
+		}
+	}
+	s.ChannelMessageSend(channelID, text)
+}
+
+// replyCooldownDuration is how long a throttled reply is not repeated to
+// the same sender in the same channel.
+const replyCooldownDuration = 5 * time.Minute
+
+// shouldSuppressReply reports whether a reply of kind to senderID in
+// channelID was already sent within replyCooldownDuration; otherwise it
+// records this one and returns false.
+func (b *DiscordBroker) shouldSuppressReply(channelID, senderID, kind string) bool {
+	key := channelID + ":" + senderID + ":" + kind
+	now := time.Now()
+
+	b.replyCooldownMu.Lock()
+	defer b.replyCooldownMu.Unlock()
+	if b.replyCooldown == nil {
+		b.replyCooldown = make(map[string]time.Time)
+	}
+	if len(b.replyCooldown) > 1000 {
+		for k, t := range b.replyCooldown {
+			if now.Sub(t) >= replyCooldownDuration {
+				delete(b.replyCooldown, k)
+			}
+		}
+	}
+	if last, ok := b.replyCooldown[key]; ok && now.Sub(last) < replyCooldownDuration {
+		return true
+	}
+	b.replyCooldown[key] = now
+	return false
+}
+
+// agentListErrorKind names the kind of agent-list failure, for keying
+// throttled replies.
+func agentListErrorKind(err error) string {
+	switch {
+	case isStaleLinkError(err):
+		return "stale_link"
+	case isForbiddenHubError(err):
+		return "forbidden"
+	default:
+		return "unavailable"
+	}
+}
+
+// isReplyToBot reports whether the message replies to a message from the
+// bot, or from an agent through a webhook this plugin owns.
+func (b *DiscordBroker) isReplyToBot(m *discordgo.MessageCreate, botUserID string) bool {
+	ref := m.ReferencedMessage
+	if ref == nil {
+		return false
+	}
+	if ref.Author != nil && botUserID != "" && ref.Author.ID == botUserID && ref.WebhookID == "" {
+		return true
+	}
+	return b.ownsWebhook(m.ChannelID, ref.WebhookID)
+}
+
+// ownsWebhook reports whether webhookID is the webhook this plugin uses
+// to post agent messages in channelID. It never creates a webhook.
+func (b *DiscordBroker) ownsWebhook(channelID, webhookID string) bool {
+	if webhookID == "" {
+		return false
+	}
+	b.mu.RLock()
+	webhooks := b.webhooks
+	b.mu.RUnlock()
+	if webhooks == nil {
+		return false
+	}
+	// Threads use their parent channel's webhook.
+	if parentID, isThread := b.resolveThreadParent(channelID); isThread {
+		channelID = parentID
+	}
+	return webhooks.owns(channelID, webhookID)
+}
+
+// defaultAgentApplies reports whether an unaddressed message would go to
+// the channel's default agent. It does not use the agent list. On the
+// routed path any text that is not a command, or an attachment, counts
+// when a default is set: the hub decides the routing. On the legacy path
+// the message needs text that is not a command and must not mention
+// another Discord user; a leading @name counts because the default agent
+// receives it either as the implicit primary or as the fallback.
+func defaultAgentApplies(m *discordgo.MessageCreate, botUserID, effectiveDefault string, routed bool) bool {
+	if effectiveDefault == "" {
+		return false
+	}
+	text := strings.TrimSpace(m.Content)
+	if strings.HasPrefix(text, "/") {
+		return false
+	}
+	if routed {
+		return text != "" || len(m.Attachments) > 0
+	}
+	return text != "" && !hasNonBotMentions(m.Message, botUserID)
 }
 
 // --- Routing helpers ---
@@ -1780,24 +2498,8 @@ func (b *DiscordBroker) resolveRecipientChannels(ctx context.Context, recipient,
 		return nil
 	}
 
-	mapping, err := store.GetUserMappingByEmail(ctx, email)
-	if err != nil {
-		b.log.Error("Failed to look up user mapping by email", "email", email, "error", err)
-	}
-
-	// Fallback: try scion user ID lookup (handles display-name recipients).
-	if (err != nil || mapping == nil) && recipientID != "" {
-		var fallbackErr error
-		mapping, fallbackErr = store.GetUserMappingByScionUserID(ctx, recipientID)
-		if fallbackErr != nil {
-			b.log.Error("Failed to look up user mapping by scion user ID", "recipientID", recipientID, "error", fallbackErr)
-			err = fallbackErr
-		} else {
-			err = nil
-		}
-	}
-
-	if err != nil || mapping == nil {
+	mapping := b.lookupRecipientMapping(ctx, store, email, recipientID)
+	if mapping == nil {
 		return nil
 	}
 
@@ -1816,6 +2518,93 @@ func (b *DiscordBroker) resolveRecipientChannels(ctx context.Context, recipient,
 	}
 
 	return nil
+}
+
+// lookupRecipientMapping returns the Discord user mapping for a Scion user,
+// by email first and then by Scion user ID. It returns nil when the user has
+// no linked Discord account or the lookup fails.
+func (b *DiscordBroker) lookupRecipientMapping(ctx context.Context, store Store, email, recipientID string) *DiscordUserMapping {
+	mapping, err := store.GetUserMappingByEmail(ctx, email)
+	if err != nil {
+		b.log.Error("Failed to look up user mapping by email", "email", email, "error", err)
+	}
+
+	// Fallback: try scion user ID lookup (handles display-name recipients).
+	if (err != nil || mapping == nil) && recipientID != "" {
+		var fallbackErr error
+		mapping, fallbackErr = store.GetUserMappingByScionUserID(ctx, recipientID)
+		if fallbackErr != nil {
+			b.log.Error("Failed to look up user mapping by scion user ID", "recipientID", recipientID, "error", fallbackErr)
+			err = fallbackErr
+		} else {
+			err = nil
+		}
+	}
+
+	if err != nil || mapping == nil || mapping.DiscordUserID == "" {
+		return nil
+	}
+	return mapping
+}
+
+// resolveRecipientDMChannel returns the Discord DM channel ID for the
+// addressed Scion user, opening the DM channel through Discord when needed.
+// Only the recipient's own linked Discord account is used.
+func (b *DiscordBroker) resolveRecipientDMChannel(ctx context.Context, recipient, recipientID string) (string, error) {
+	email := strings.TrimPrefix(recipient, "user:")
+	if email == recipient || email == "" {
+		return "", fmt.Errorf("recipient is not a user")
+	}
+
+	b.mu.RLock()
+	store := b.store
+	session := b.session
+	createDM := b.createDMChannel
+	b.mu.RUnlock()
+
+	if store == nil {
+		return "", fmt.Errorf("no user mapping store configured")
+	}
+	mapping := b.lookupRecipientMapping(ctx, store, email, recipientID)
+	if mapping == nil {
+		return "", fmt.Errorf("user has no linked Discord account")
+	}
+
+	if createDM == nil {
+		if session == nil {
+			return "", fmt.Errorf("discord session not configured")
+		}
+		createDM = func(discordUserID string) (string, error) {
+			ch, err := session.UserChannelCreate(discordUserID, discordgo.WithContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			return ch.ID, nil
+		}
+	}
+
+	channelID, err := createDM(mapping.DiscordUserID)
+	if err != nil {
+		return "", fmt.Errorf("opening Discord DM channel: %w", err)
+	}
+	if channelID == "" {
+		return "", fmt.Errorf("opening Discord DM channel: empty channel ID")
+	}
+	return channelID, nil
+}
+
+// isDiscordSnowflake reports whether id has the form of a Discord channel
+// or thread ID (a non-empty string of ASCII digits).
+func isDiscordSnowflake(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveStaleChannelSlugs updates ChannelLinks where ProjectSlug equals
@@ -1970,7 +2759,12 @@ func (b *DiscordBroker) resolveSharedDirAttachmentPath(ctx context.Context, atta
 		return ""
 	}
 
-	sharedDirBase := config.SharedDirHostPath(home, slug, projectID, sharedDirName)
+	sharedDirBase, err := resolveSharedDirHostPath(home, slug, projectID, sharedDirName)
+	if err != nil {
+		b.log.Error("Cannot resolve shared dir attachment path",
+			"attach_path", attachPath, "project_id", projectID, "shared_dir", sharedDirName, "error", err)
+		return ""
+	}
 	var hostPath string
 	if relPath == "" || relPath == "." {
 		hostPath = sharedDirBase
@@ -2012,8 +2806,9 @@ const maxDiscordAttachmentSize = 25 * 1024 * 1024 // 25 MB
 //
 // The function uses a three-tier fallback for the destination directory:
 //  1. downloadsPath config (highest priority, supports {project_slug} placeholder)
-//  2. Shared dir infrastructure via config.SharedDirHostPath — writes to the host
-//     and exposes the file at /scion-volumes/scratchpad/.attachments/_discord/
+//  2. The scratchpad shared dir, resolved through its storage backend (local
+//     or nfs) — makes the file available at /scion-volumes/scratchpad/.attachments/_discord/.
+//     An unavailable nfs mount is an error, never a local fallback.
 //  3. Legacy /home/scion/.scion/projects/<slug>/downloads/ (last resort)
 func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug, projectID string) (agentPath, placeholder string, err error) {
 	if projectSlug == "" {
@@ -2056,12 +2851,16 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 	} else if projectID != "" {
 		home, homeErr := os.UserHomeDir()
 		if homeErr == nil {
-			// NOTE: SharedDirHostPath is a pure path computation; it does not verify that
-			// "scratchpad" is actually configured on the project. If it is not configured,
-			// the file will be written to the host but won't be visible inside the agent
-			// container. Projects using container-based agents should always have
-			// scratchpad configured.
-			sharedDirBase := config.SharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+			// The scratchpad dir resolves through its storage backend (local
+			// or nfs). It is not checked against the project's declared
+			// shared dirs: if scratchpad is not configured, the file is
+			// written on the host but no agent container sees it.
+			sharedDirBase, resolveErr := resolveSharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+			if resolveErr != nil {
+				// Never fall back to a local directory for an nfs-backed
+				// scratchpad: no agent mounts it.
+				return "", "", fmt.Errorf("resolve scratchpad shared dir for %q: %w", att.Filename, resolveErr)
+			}
 			hostDir = filepath.Join(sharedDirBase, ".attachments", "_discord")
 			useSharedDir = true
 		}
@@ -2112,18 +2911,17 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 // --- Topic parsing ---
 
 // parseTopicComponents extracts projectID and agentSlug from a broker topic.
-// Legacy scion.grove topics are accepted by projectcompat at this adapter boundary.
 func parseTopicComponents(topic string) (projectID, agentSlug string) {
-	parsed, err := projectcompat.ParseTopic(topic)
+	parsed, err := projectkeys.ParseTopic(topic)
 	if err == nil {
 		projectID = parsed.ProjectID
-		if parsed.Kind == projectcompat.TopicKindAgent {
+		if parsed.Kind == projectkeys.TopicKindAgent {
 			agentSlug = parsed.Actor
 		}
 	} else {
 		parts := strings.Split(topic, ".")
 		for i, part := range parts {
-			if (part == "grove" || part == "project") && i+1 < len(parts) {
+			if part == "project" && i+1 < len(parts) {
 				projectID = parts[i+1]
 			}
 			if part == "agent" && i+1 < len(parts) {

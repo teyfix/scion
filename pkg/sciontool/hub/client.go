@@ -23,18 +23,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/conduit/clock"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/dirfd"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
 // ErrTokenRefreshUnauthorized indicates the hub rejected the token refresh
@@ -63,6 +70,9 @@ const (
 	EnvHubToken = "SCION_AUTH_TOKEN"
 	// EnvAgentID is the environment variable for the agent ID.
 	EnvAgentID = "SCION_AGENT_ID"
+	// EnvLaunchID is the environment variable for the agent's run (launch)
+	// id, set by the broker.
+	EnvLaunchID = "SCION_LAUNCH_ID"
 	// EnvAgentMode is the environment variable for the agent mode.
 	EnvAgentMode = "SCION_AGENT_MODE"
 
@@ -149,6 +159,12 @@ type StatusUpdate struct {
 
 	// Exit tracking
 	ExitCode *int `json:"exitCode,omitempty"`
+
+	// SSHHostKey is the public key (authorized_keys line) of the agent's
+	// conduit SSH server host key. The hub records it with the conduit
+	// experiment on; the reported host key is bound to the reporting
+	// agent's current run.
+	SSHHostKey string `json:"sshHostKey,omitempty"`
 }
 
 // Client is a Hub API client for sciontool.
@@ -162,6 +178,38 @@ type Client struct {
 	retryBaseDelay time.Duration
 	retryMaxDelay  time.Duration
 	oidcSource     transportauth.TokenSource // transport-layer OIDC token source (nil = disabled)
+	oidcMode       transportauth.HeaderMode  // header carrying the transport token
+	// oidcLate is true when oidcSource is the file-backed source installed
+	// in proxy mode for an agent that started without a transport token.
+	oidcLate bool
+	// tokenChownUID and tokenChownGID are the ownership StartTokenRefresh
+	// applies (via WriteTokenFile) to the token file after every refresh.
+	// Guarded by tokenMu alongside token itself. Set once, before the
+	// refresh loop's first iteration; RefreshToken reads them under the
+	// same lock it already takes to update token, so a direct RefreshToken
+	// call outside StartTokenRefresh (as tests do) sees the zero value and
+	// skips the chown, matching WriteTokenFile's own "uid<=0 skips chown"
+	// contract.
+	tokenChownUID int
+	tokenChownGID int
+	// runID is the agent's run id (EnvLaunchID), sent as RunIDHeader.
+	runID string
+	// writes paces status writes after the hub refuses the agent's token.
+	writes writeGate
+	// refreshKick holds at most one pending KickTokenRefresh for the
+	// refresh loop, so kicks coalesce. Created on first use.
+	refreshKickOnce sync.Once
+	refreshKick     chan struct{}
+	// refreshSubs are notified of each refresh attempt the loop makes
+	// (SubscribeTokenRefresh), keyed by registration.
+	refreshSubsMu sync.Mutex
+	refreshSubs   map[uint64]func(TokenRefreshResult)
+	refreshSubSeq uint64
+	// refreshSeq is the Seq of the last refresh attempt's result.
+	refreshSeq atomic.Uint64
+	// onKickWait, when set, is called by KickTokenRefreshWait once it has
+	// subscribed and kicked (test hook).
+	onKickWait func()
 }
 
 // NewClient creates a new Hub client from environment variables.
@@ -200,6 +248,7 @@ func NewClient() *Client {
 		hubURL:         hubURL,
 		token:          token,
 		agentID:        agentID,
+		runID:          os.Getenv(EnvLaunchID),
 		maxRetries:     DefaultMaxRetries,
 		retryBaseDelay: DefaultRetryBaseDelay,
 		retryMaxDelay:  DefaultRetryMaxDelay,
@@ -245,6 +294,16 @@ func (c *Client) HubURL() string {
 	return c.hubURL
 }
 
+// HTTPClient returns the client's HTTP client, which carries the hub
+// transport settings (timeout and transport credential), so other hub
+// callers share them.
+func (c *Client) HTTPClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.client
+}
+
 func (c *Client) AgentID() string {
 	if c == nil {
 		return ""
@@ -283,7 +342,19 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal status: %w", err)
 	}
+	return c.postJSONWithRetry(ctx, endpoint, body)
+}
 
+// ReportSSHHostKey sends the conduit SSH server's public host key
+// (authorized_keys line) in a status update carrying nothing else.
+func (c *Client) ReportSSHHostKey(ctx context.Context, publicKey string) error {
+	return c.UpdateStatus(ctx, StatusUpdate{SSHHostKey: publicKey})
+}
+
+func (c *Client) postJSONWithRetry(ctx context.Context, endpoint string, body []byte) error {
+	if err := c.writes.allow(); err != nil {
+		return err
+	}
 	// Read token under lock to avoid data race with concurrent RefreshToken calls.
 	c.tokenMu.RLock()
 	currentToken := c.token
@@ -310,7 +381,7 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Scion-Agent-Token", currentToken)
+		c.setAgentAuth(req.Header, currentToken)
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -326,6 +397,7 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 		// Read response body
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		c.writes.observe(resp.StatusCode)
 
 		// Success
 		if resp.StatusCode < 400 {
@@ -431,7 +503,7 @@ func (c *Client) RegisterPort(ctx context.Context, req RegisterPortRequest) (*Ex
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -439,7 +511,7 @@ func (c *Client) RegisterPort(ctx context.Context, req RegisterPortRequest) (*Ex
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	var out ExposedPort
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -458,7 +530,7 @@ func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -466,7 +538,7 @@ func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	var out ListPortsResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -487,7 +559,7 @@ func (c *Client) DeletePort(ctx context.Context, port int) error {
 	if err != nil {
 		return err
 	}
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return err
@@ -495,9 +567,28 @@ func (c *Client) DeletePort(ctx context.Context, port int) error {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	return nil
+}
+
+// StatusError is returned by the port API methods when the hub answers
+// with an unexpected HTTP status. Its message keeps the
+// "hub returned error <code>: <body>" form used by the other methods.
+type StatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("hub returned error %d: %s", e.StatusCode, e.Body)
+}
+
+// IsUnauthorized reports whether err carries an HTTP 401 from the hub,
+// meaning the hub did not accept the agent's current credential.
+func IsUnauthorized(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized
 }
 
 func (c *Client) absoluteURL(path string) string {
@@ -542,7 +633,7 @@ func (c *Client) SetSecret(ctx context.Context, key, value, secretType, target, 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -598,7 +689,7 @@ func (c *Client) GetSecret(ctx context.Context, key string) (*GetSecretResponse,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -649,7 +740,7 @@ func (c *Client) ListSecrets(ctx context.Context) (*ListSecretsResponse, error) 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -687,6 +778,9 @@ type RefreshTokenResponse struct {
 	Token     string              `json:"token"`
 	ExpiresAt string              `json:"expires_at"`
 	Tokens    []RefreshTokenEntry `json:"tokens,omitempty"`
+	// TransportError is set by the hub when it is configured to mint
+	// transport tokens but could not mint one for this refresh.
+	TransportError string `json:"transportError,omitempty"`
 }
 
 // RefreshToken calls the Hub to refresh the agent's authentication token.
@@ -711,7 +805,7 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 		return "", time.Time{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -728,6 +822,7 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 		// "token refresh failed with status %d" wording is preserved for the
 		// non-auth path because existing log-based tooling matches on it.
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			c.writes.refreshRefused()
 			return "", time.Time{}, fmt.Errorf("%w: token refresh failed with status %d: %s",
 				ErrTokenRefreshUnauthorized, resp.StatusCode, string(respBody))
 		}
@@ -748,11 +843,16 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 	// Update the client's token under write lock
 	c.tokenMu.Lock()
 	c.token = result.Token
+	chownUID, chownGID := c.tokenChownUID, c.tokenChownGID
 	c.tokenMu.Unlock()
+	c.writes.reset()
 
 	// Persist the new token to a file so child processes can read it.
 	// Errors are non-fatal — the in-memory token is already updated.
-	if err := WriteTokenFile(result.Token); err != nil {
+	// Ownership is applied by WriteTokenFile itself (fchown on the open fd,
+	// before the rename onto the final path), not by a separate path-based
+	// os.Chown call afterwards.
+	if err := WriteTokenFile(result.Token, chownUID, chownGID); err != nil {
 		// Log will be handled by caller; we don't import log here
 		_ = err
 	}
@@ -760,25 +860,89 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 	// Process the generalized tokens[] array if present.
 	// Apply each entry to the appropriate subsystem by layer/type.
 	if len(result.Tokens) > 0 {
-		c.applyRefreshTokens(result.Tokens)
+		c.applyRefreshTokens(result.Tokens, chownUID, chownGID)
 	}
+	c.recordTransportRefreshOutcome(result, chownUID, chownGID)
 
 	return result.Token, expiresAt, nil
 }
 
 // applyRefreshTokens processes the tokens[] array from a refresh response,
-// applying each entry to the appropriate subsystem.
-func (c *Client) applyRefreshTokens(tokens []RefreshTokenEntry) {
+// applying each entry to the appropriate subsystem. A refreshed transport
+// token is also persisted to the transport token file (owned by uid:gid
+// when uid > 0) so that every other hub client in the container — hooks,
+// sciontool subcommands, the scion CLI — uses it instead of the original
+// injected value, which expires after about an hour.
+func (c *Client) applyRefreshTokens(tokens []RefreshTokenEntry, uid, gid int) {
 	for _, entry := range tokens {
 		switch {
 		case entry.Layer == "transport" && entry.Type == "google_oidc":
-			// Update the OIDC transport's token source
+			if entry.Value == "" {
+				continue
+			}
+			entryExpiry := time.Now().Add(time.Duration(entry.ExpiresIn) * time.Second)
+			// Update the OIDC transport's token source and, when that
+			// source is hub-provided, share the value through the file.
+			// Clients without a hub-provided source (none, or the
+			// metadata server) leave the file alone.
 			if c.oidcSource != nil {
-				entryExpiry := time.Now().Add(time.Duration(entry.ExpiresIn) * time.Second)
 				c.oidcSource.SetToken(entry.Value, entryExpiry)
+			}
+			if !c.hasHubProvidedTransport() {
+				continue
+			}
+			if err := WriteTransportTokenFile(entry.Value, uid, gid); err != nil {
+				log.Error("Failed to persist refreshed transport token: %v", err)
 			}
 			// app/scion_access is already handled via the legacy token field above
 		}
+	}
+}
+
+// hasHubProvidedTransport reports whether the client's transport source is
+// a hub-provided token (injected or file-backed), as opposed to none or a
+// self-refreshing metadata source.
+func (c *Client) hasHubProvidedTransport() bool {
+	switch c.oidcSource.(type) {
+	case *transportauth.InjectedSource, *transportauth.FileSource:
+		return true
+	}
+	return false
+}
+
+// recordTransportRefreshOutcome records whether this refresh delivered a
+// transport token, so a hub-side mint failure is visible inside the agent
+// (agent log and sciontool doctor) instead of only in hub logs. It records
+// only for agents that use a hub-provided transport token: other agents
+// (metadata mode, or no transport) ignore transport entries, so neither a
+// status nor an error would be meaningful for them.
+func (c *Client) recordTransportRefreshOutcome(result RefreshTokenResponse, uid, gid int) {
+	if !c.hasHubProvidedTransport() {
+		return
+	}
+	hasEntry := false
+	for _, e := range result.Tokens {
+		if e.Layer == "transport" && e.Type == "google_oidc" && e.Value != "" {
+			hasEntry = true
+			break
+		}
+	}
+
+	st := TransportRefreshStatus{At: time.Now().UTC()}
+	switch {
+	case hasEntry:
+		st.Outcome = TransportRefreshOutcomeRefreshed
+	case result.TransportError != "":
+		st.Outcome = TransportRefreshOutcomeFailed
+		st.Error = result.TransportError
+		log.Error("Token refresh succeeded but no transport token was issued: %s", result.TransportError)
+	default:
+		st.Outcome = TransportRefreshOutcomeAbsent
+		log.Error("Token refresh succeeded but the hub returned no transport token; " +
+			"the current transport token will not be renewed")
+	}
+	if err := WriteTransportRefreshStatus(st, uid, gid); err != nil {
+		log.Error("Failed to record transport refresh status: %v", err)
 	}
 }
 
@@ -791,9 +955,11 @@ func (c *Client) adjustRefreshForTransportTokens(proposed time.Time) time.Time {
 		return proposed
 	}
 
-	// MetadataSource self-refreshes; only InjectedSource needs refresh
-	// driven from here.
-	if _, ok := c.oidcSource.(*transportauth.InjectedSource); !ok {
+	// MetadataSource self-refreshes; only hub-provided (injected or
+	// file-backed) sources need refresh driven from here.
+	switch c.oidcSource.(type) {
+	case *transportauth.InjectedSource, *transportauth.FileSource:
+	default:
 		return proposed
 	}
 
@@ -830,6 +996,122 @@ type TokenRefreshConfig struct {
 	// RetryMaxDelay overrides the cap on backoff between failed refresh attempts.
 	// Zero uses tokenRefreshRetryMaxDelay.
 	RetryMaxDelay time.Duration
+
+	// clock drives the loop's schedule (tests); nil uses the real clock.
+	clock clock.Clock
+	// onWait, when set, is called each time the loop starts waiting,
+	// with the time it will refresh unless kicked, whether a kick can
+	// wake it, and the number of kicks pending (test hook).
+	onWait func(refreshAt time.Time, kickable bool, pending int)
+}
+
+// KickTokenRefresh queues a refresh request for the loop started by
+// StartTokenRefresh. It never blocks and never refreshes itself: kicks
+// coalesce into at most one pending request, which the loop serves at
+// once while it waits for a scheduled refresh, and only once a failure
+// backoff has elapsed while it is backing off. A refresh satisfies every
+// kick that arrived before it started. A kick made before the loop
+// starts, or while no loop runs (for example when the token's expiry
+// cannot be parsed), stays pending until one starts.
+func (c *Client) KickTokenRefresh() {
+	select {
+	case c.refreshKicks() <- struct{}{}:
+	default: // a kick is already pending
+	}
+}
+
+// TokenRefreshResult is the outcome of one refresh attempt made by the
+// loop started by StartTokenRefresh.
+type TokenRefreshResult struct {
+	// Token is the refreshed agent token ("" when Err is set).
+	Token string
+	// ExpiresAt is the refreshed token's expiry (zero when Err is set).
+	ExpiresAt time.Time
+	// Err is why the attempt failed (nil on success).
+	Err error
+	// Seq numbers the client's refresh attempts in the order they
+	// completed, from 1. Results reach subscribers in that order, but a
+	// subscriber that hands them to other goroutines can use Seq to tell
+	// a newer token from an older one (two tokens can share an expiry).
+	Seq uint64
+}
+
+// SubscribeTokenRefresh registers fn to be called with the result of
+// every refresh attempt the refresh loop completes, successful or not,
+// until the returned function is called. fn runs on the loop's goroutine
+// after the client holds the new token, so it must not block; it is how
+// other components learn of a new token without the loop knowing about
+// them.
+func (c *Client) SubscribeTokenRefresh(fn func(TokenRefreshResult)) (unsubscribe func()) {
+	c.refreshSubsMu.Lock()
+	defer c.refreshSubsMu.Unlock()
+	if c.refreshSubs == nil {
+		c.refreshSubs = make(map[uint64]func(TokenRefreshResult))
+	}
+	c.refreshSubSeq++
+	id := c.refreshSubSeq
+	c.refreshSubs[id] = fn
+	return func() {
+		c.refreshSubsMu.Lock()
+		delete(c.refreshSubs, id)
+		c.refreshSubsMu.Unlock()
+	}
+}
+
+// notifyTokenRefresh calls every subscriber with r, outside the lock.
+func (c *Client) notifyTokenRefresh(r TokenRefreshResult) {
+	c.refreshSubsMu.Lock()
+	subs := make([]func(TokenRefreshResult), 0, len(c.refreshSubs))
+	for _, fn := range c.refreshSubs {
+		subs = append(subs, fn)
+	}
+	c.refreshSubsMu.Unlock()
+	for _, fn := range subs {
+		fn(r)
+	}
+}
+
+// ErrTokenRefreshWaitTimeout is returned by KickTokenRefreshWait when no
+// refresh attempt completed within its bound.
+var ErrTokenRefreshWaitTimeout = errors.New("token refresh did not complete in time")
+
+// KickTokenRefreshWait kicks the refresh loop (KickTokenRefresh) and
+// waits, for at most bound, for the result of the next refresh attempt
+// the loop completes. A kick that coalesces with a refresh already in
+// flight returns that refresh's result. It never refreshes itself, so
+// refreshes stay single-flight in the loop. It returns the attempt's
+// error, ErrTokenRefreshWaitTimeout when bound elapses first (for
+// example while the loop backs off after failures, or when no loop
+// runs), or ctx's error.
+func (c *Client) KickTokenRefreshWait(ctx context.Context, bound time.Duration) error {
+	done := make(chan error, 1)
+	unsubscribe := c.SubscribeTokenRefresh(func(r TokenRefreshResult) {
+		select {
+		case done <- r.Err:
+		default: // an earlier attempt already answered
+		}
+	})
+	defer unsubscribe()
+	// Subscribed before the kick, so an attempt already in flight answers.
+	c.KickTokenRefresh()
+	if c.onKickWait != nil {
+		c.onKickWait()
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return ErrTokenRefreshWaitTimeout
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) refreshKicks() chan struct{} {
+	c.refreshKickOnce.Do(func() { c.refreshKick = make(chan struct{}, 1) })
+	return c.refreshKick
 }
 
 // DefaultTokenRefreshTimeout is the default timeout for token refresh requests.
@@ -898,6 +1180,19 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 		retryMax = retryBase
 	}
 
+	clk := clock.Real()
+	if config != nil && config.clock != nil {
+		clk = config.clock
+	}
+	kicks := c.refreshKicks()
+
+	if config != nil {
+		c.tokenMu.Lock()
+		c.tokenChownUID = config.ChownUID
+		c.tokenChownGID = config.ChownGID
+		c.tokenMu.Unlock()
+	}
+
 	go func() {
 		defer close(done)
 
@@ -922,22 +1217,40 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 		authLostNotified := false
 
 		for {
-			delay := time.Until(refreshAt)
+			delay := refreshAt.Sub(clk.Now())
 			if delay < 0 {
 				delay = 0
 			}
-			timer := time.NewTimer(delay)
+			timer, stopTimer := clock.After(clk, delay)
+			// A kick wakes the loop only while it waits for a scheduled
+			// refresh. During a failure backoff it stays pending and is
+			// served when the backoff ends.
+			var kick <-chan struct{}
+			if consecutiveFailures == 0 {
+				kick = kicks
+			}
+			if config != nil && config.onWait != nil {
+				config.onWait(refreshAt, kick != nil, len(kicks))
+			}
 
 			select {
 			case <-ctx.Done():
-				timer.Stop()
+				stopTimer()
 				return
-			case <-timer.C:
+			case <-timer:
+			case <-kick:
+				stopTimer()
+			}
+			// This refresh satisfies any kick that arrived before it.
+			select {
+			case <-kicks:
+			default:
 			}
 
 			refreshCtx, cancel := context.WithTimeout(ctx, timeout)
-			_, newExpiry, err := c.RefreshToken(refreshCtx)
+			newToken, newExpiry, err := c.RefreshToken(refreshCtx)
 			cancel()
+			c.notifyTokenRefresh(TokenRefreshResult{Token: newToken, ExpiresAt: newExpiry, Err: err, Seq: c.refreshSeq.Add(1)})
 
 			if err != nil {
 				if config != nil && config.OnError != nil {
@@ -952,7 +1265,7 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 				// or a fresh token is injected. The previous implementation reset
 				// the expiry estimate on every retry, so OnAuthLost never fired and
 				// the loop hot-looped every 30s indefinitely.
-				if !authLostNotified && !time.Now().Before(tokenExpiry) {
+				if !authLostNotified && !clk.Now().Before(tokenExpiry) {
 					authLostNotified = true
 					if config != nil && config.OnAuthLost != nil {
 						config.OnAuthLost()
@@ -960,7 +1273,7 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 				}
 
 				consecutiveFailures++
-				refreshAt = time.Now().Add(tokenRefreshBackoff(consecutiveFailures, retryBase, retryMax))
+				refreshAt = clk.Now().Add(tokenRefreshBackoff(consecutiveFailures, retryBase, retryMax))
 				continue
 			}
 
@@ -969,15 +1282,6 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 			consecutiveFailures = 0
 			authLostNotified = false
 			tokenExpiry = newExpiry
-
-			// Fix ownership after atomic rewrite (init runs as root).
-			if config.ChownUID > 0 {
-				if chownErr := os.Chown(TokenFilePath(), config.ChownUID, config.ChownGID); chownErr != nil {
-					if config.OnError != nil {
-						config.OnError(fmt.Errorf("failed to chown token file: %w", chownErr))
-					}
-				}
-			}
 
 			if config != nil && config.OnRefreshed != nil {
 				config.OnRefreshed(newExpiry)
@@ -990,9 +1294,9 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 			// to drive refresh timing (transport tokens ~1h need a tighter margin).
 			refreshAt = c.adjustRefreshForTransportTokens(refreshAt)
 
-			if refreshAt.Before(time.Now()) {
+			if refreshAt.Before(clk.Now()) {
 				// Token duration is very short; refresh in 1 minute
-				refreshAt = time.Now().Add(1 * time.Minute)
+				refreshAt = clk.Now().Add(1 * time.Minute)
 			}
 		}
 	}()
@@ -1016,6 +1320,7 @@ func (c *Client) SetToken(token string) {
 	c.tokenMu.Lock()
 	c.token = token
 	c.tokenMu.Unlock()
+	c.writes.reset()
 }
 
 // Environment variable and file path constants for GitHub App token refresh.
@@ -1061,7 +1366,7 @@ func (c *Client) RefreshGitHubToken(ctx context.Context) (string, time.Time, err
 		return "", time.Time{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1161,31 +1466,21 @@ func (c *Client) StartGitHubTokenRefresh(ctx context.Context, config *GitHubToke
 				continue
 			}
 
-			// Write the fresh token and expiry to the token file
+			// Write the fresh token and expiry to the token file. Ownership
+			// is applied by WriteGitHubTokenFile/WriteGitHubTokenExpiry
+			// themselves (fchown on the open fd, before the rename) rather
+			// than by a separate path-based os.Chown call afterwards.
 			if config.TokenPath != "" {
-				if writeErr := WriteGitHubTokenFile(config.TokenPath, newToken); writeErr != nil {
+				if writeErr := WriteGitHubTokenFile(config.TokenPath, newToken, config.ChownUID, config.ChownGID); writeErr != nil {
 					if config.OnError != nil {
 						config.OnError(fmt.Errorf("failed to write GitHub token file: %w", writeErr))
 					}
 				} else {
 					// Write the companion expiry file so the credential helper
 					// (a separate process) can detect stale tokens.
-					if expiryErr := WriteGitHubTokenExpiry(config.TokenPath, newExpiry); expiryErr != nil {
+					if expiryErr := WriteGitHubTokenExpiry(config.TokenPath, newExpiry, config.ChownUID, config.ChownGID); expiryErr != nil {
 						if config.OnError != nil {
 							config.OnError(fmt.Errorf("failed to write GitHub token expiry file: %w", expiryErr))
-						}
-					}
-					if config.ChownUID > 0 {
-						if chownErr := os.Chown(config.TokenPath, config.ChownUID, config.ChownGID); chownErr != nil {
-							if config.OnError != nil {
-								config.OnError(fmt.Errorf("failed to chown GitHub token file: %w", chownErr))
-							}
-						}
-						expiryPath := GitHubTokenExpiryPath(config.TokenPath)
-						if chownErr := os.Chown(expiryPath, config.ChownUID, config.ChownGID); chownErr != nil {
-							if config.OnError != nil {
-								config.OnError(fmt.Errorf("failed to chown GitHub token expiry file: %w", chownErr))
-							}
 						}
 					}
 				}
@@ -1210,21 +1505,98 @@ func (c *Client) StartGitHubTokenRefresh(ctx context.Context, config *GitHubToke
 	return done
 }
 
-// WriteGitHubTokenFile writes a GitHub token to the specified path atomically.
-func WriteGitHubTokenFile(path, token string) error {
+// githubTokenFileMode is the mode both the token file and its companion
+// expiry file are created with. It has not changed by this hardening: only
+// how it gets applied has (fchmod on the open fd instead of the mode
+// argument to a path-based write).
+const githubTokenFileMode = 0600
+
+// fchownFn performs the fd-based ownership change WriteFileNoFollowChown
+// uses. It is a package var purely so tests that don't run as root can
+// replace it with a fake and still exercise the call site; production code
+// never overrides it.
+var fchownFn = syscall.Fchown
+
+// enforceTokenFileOwnerChecks gates the extra "owner is root or the
+// containing directory's owner" check that ReadTokenFile and
+// ChownTokenFile apply on top of their always-on regular-file/Nlink==1
+// checks. Left at its default (false) for a caller that can legitimately
+// hand the container a host-written token file whose owner isn't provably
+// root or the target uid (see ReadTokenFile's doc comment) — enforcing the
+// check there risks treating a valid token as absent. A caller that
+// enforces InitRunOptions.RequirePrivilegeDrop always has an actual,
+// less-privileged workload user to defend the token file against, and
+// calls EnforceTokenFileOwnerChecks(true) once, early, with that same
+// value; substrate is the current example (see
+// InitRunOptions.RequirePrivilegeDrop). Gating it here, rather than
+// proving byte-identical behaviour across every other token-provisioning
+// path, makes the default case provably unchanged: the check simply never
+// runs unless this is called with true.
+var enforceTokenFileOwnerChecks atomic.Bool
+
+// EnforceTokenFileOwnerChecks enables or disables the owner check described
+// above. Call once, early in process startup, before any ReadTokenFile or
+// ChownTokenFile call — see the variable's doc comment for when to pass
+// true.
+func EnforceTokenFileOwnerChecks(enabled bool) {
+	enforceTokenFileOwnerChecks.Store(enabled)
+}
+
+// WriteGitHubTokenFile writes a GitHub token to the specified path
+// atomically. When uid > 0, the final file is chowned to uid:gid (the
+// scion container user); uid <= 0 leaves ownership as the writing process
+// (matching the zero-value "skip chown" contract the caller configs already
+// document). See WriteFileNoFollowChown for the symlink/non-regular-file
+// handling this relies on.
+func WriteGitHubTokenFile(path, token string, uid, gid int) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	// dirfd.EnsureDirNoFollow, not os.MkdirAll: this can run as root
+	// (sciontool init, before privilege drop) against a world-writable
+	// directory (in practice /tmp, DefaultGitHubTokenPath's parent) where
+	// the workload can plant a symlink at the leaf. A symlinked dir would
+	// make os.MkdirAll's own Stat-based existence check treat "the
+	// symlink's target is a directory" as "dir already exists" and
+	// silently no-op through it. dirfd.EnsureDirNoFollow only ever creates
+	// dir's own leaf (its parent must already exist) and refuses a
+	// symlinked leaf outright instead.
+	d, err := dirfd.EnsureDirNoFollow(dir, 0700)
+	if err != nil {
 		return fmt.Errorf("failed to create token file directory: %w", err)
 	}
-
-	// Write to temp file then rename for atomicity
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(token), 0600); err != nil {
+	_ = d.Close()
+	if err := WriteFileNoFollowChown(path, []byte(token), githubTokenFileMode, uid, gid); err != nil {
 		return fmt.Errorf("failed to write GitHub token file: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("failed to rename GitHub token file: %w", err)
+	return nil
+}
+
+// WriteFileNoFollowChown atomically writes data to path without ever
+// following a symlink — at path's own leaf or at any directory component
+// above it — and without chowning/chmoding by path.
+//
+// Exported for reuse by any other root-owned writer under a
+// workload-writable directory (e.g. cmd/sciontool/commands' scion-env
+// writer), not just the token writers in this package that first needed it.
+//
+// This is a thin wrapper over dirfd.WriteFileNoFollowWithChown, passing
+// dirfd.RefuseSymlink: a planted symlink or other non-regular entry at
+// path's leaf is refused outright — no write at all — rather than silently
+// replaced, since every caller of this specific entry point writes a
+// credential or state file (an auth token, a GitHub token's expiry
+// companion, scion-env) where that substitution means tampering worth
+// reporting, not a stale leaf to overwrite quietly. (Compare
+// dirfd.ReplaceLeaf, used for installs into a directory the workload owns
+// outright, e.g. agent-limits.json or agent-info.json, where the opposite
+// is true.)
+// dirfd itself does the actual parent-directory walk, temp-file creation,
+// write, fsync, and fd-based chmod/chown/rename — see its own doc comment
+// for the full safety argument.
+//
+// fchownFn is threaded through as the chown callback so this package's own
+// tests can intercept the fd-based chown call directly.
+func WriteFileNoFollowChown(path string, data []byte, mode os.FileMode, uid, gid int) error {
+	if err := dirfd.WriteFileNoFollowWithChown(path, data, mode, uid, gid, dirfd.RefuseSymlink, fchownFn); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }
@@ -1246,10 +1618,11 @@ func GitHubTokenExpiryPath(tokenPath string) string {
 
 // WriteGitHubTokenExpiry writes the token expiry time to a companion file
 // alongside the token file. This allows the credential helper (a separate
-// process) to check whether the cached token is still valid.
-func WriteGitHubTokenExpiry(tokenPath string, expiry time.Time) error {
+// process) to check whether the cached token is still valid. Ownership
+// follows the same uid/gid contract as WriteGitHubTokenFile.
+func WriteGitHubTokenExpiry(tokenPath string, expiry time.Time, uid, gid int) error {
 	expiryPath := GitHubTokenExpiryPath(tokenPath)
-	return os.WriteFile(expiryPath, []byte(expiry.Format(time.RFC3339)), 0600)
+	return WriteFileNoFollowChown(expiryPath, []byte(expiry.UTC().Format(time.RFC3339)), githubTokenFileMode, uid, gid)
 }
 
 // ReadGitHubTokenExpiry reads the token expiry time from the companion expiry
@@ -1286,8 +1659,10 @@ func GitHubTokenPath() string {
 }
 
 // IsGitHubAppEnabled returns true if GitHub App token refresh is active.
+// The hub sets SCION_GITHUB_APP_ENABLED=true; util.ParseBoolEnv also accepts
+// the other boolean spellings so every reader of the variable agrees.
 func IsGitHubAppEnabled() bool {
-	return os.Getenv(EnvGitHubAppEnabled) == "true"
+	return util.ParseBoolEnv(EnvGitHubAppEnabled, false)
 }
 
 // ParseTokenExpiry extracts the expiry time from a JWT token without
@@ -1403,10 +1778,18 @@ func TokenFilePath() string {
 	return filepath.Join(tokenHomeResolver(), ".scion", TokenFile)
 }
 
-// WriteTokenFile writes the agent token to the canonical token file.
-// Called by sciontool init to seed the initial value and by the refresh
-// loop to persist updated tokens. Written atomically via temp file + rename.
-func WriteTokenFile(token string) error {
+// tokenFileMode is the mode the agent token file is created with.
+const tokenFileMode = 0600
+
+// WriteTokenFile writes the agent token to the canonical token file. Called
+// by sciontool init to seed the initial value and by the refresh loop to
+// persist updated tokens. When uid > 0, the final file is chowned to
+// uid:gid (the scion container user) via WriteFileNoFollowChown — an fchown
+// on the open file descriptor, before the rename, never a path-based chown
+// that a symlink swapped in afterwards could redirect. uid <= 0 leaves
+// ownership as the writing process, matching the zero-value "skip chown"
+// contract TokenRefreshConfig.ChownUID already documents.
+func WriteTokenFile(token string, uid, gid int) error {
 	// Guardrail: under `go test`, refuse to write the real token file unless a
 	// test has explicitly isolated it via SetTokenHome. resolveTokenHome
 	// resolves to the live scion user's home inside agent containers, so a test
@@ -1421,85 +1804,413 @@ func WriteTokenFile(token string) error {
 	path := TokenFilePath()
 	dir := filepath.Dir(path)
 
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	// dirfd.EnsureDirNoFollow, not os.MkdirAll: this can run as root
+	// (sciontool init, before privilege drop) against ".scion" under the
+	// scion user's home, which the workload owns and can replace with a
+	// symlink — see WriteGitHubTokenFile's identical reasoning. dir's own
+	// parent (the home directory itself) always already exists here, so
+	// EnsureDirNoFollow's single-leaf-only creation is not a capability
+	// loss versus os.MkdirAll's full recursive create.
+	d, err := dirfd.EnsureDirNoFollow(dir, 0700)
+	if err != nil {
 		return fmt.Errorf("failed to create token file directory: %w", err)
 	}
+	_ = d.Close()
 
-	// Write to temp file then rename for atomicity
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(token), 0600); err != nil {
+	if err := WriteFileNoFollowChown(path, []byte(token), tokenFileMode, uid, gid); err != nil {
 		return fmt.Errorf("failed to write token file: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("failed to rename token file: %w", err)
 	}
 	return nil
 }
 
+// TransportTokenFilePath returns the path of the transport token file, a
+// sibling of the agent credential file. Like TokenFilePath it resolves to
+// the scion user's home so that root (sciontool init) and the scion user
+// (child processes) agree on the same path.
+func TransportTokenFilePath() string {
+	return filepath.Join(tokenHomeResolver(), ".scion", transportauth.TransportTokenFileName)
+}
+
+// NewTransportTokenFileSource returns a file-backed transport source on
+// TransportTokenFilePath() that reads with the same guarded, no-follow
+// reader as the agent token file. It has no bootstrap value.
+func NewTransportTokenFileSource() *transportauth.FileSource {
+	return transportauth.NewFileSource(TransportTokenFilePath(), ReadTransportTokenFileGuarded)
+}
+
+// WriteTransportTokenFile persists the hub-provided transport token to the
+// transport token file, mode 0600, through the same fchown-then-rename
+// path WriteTokenFile uses. uid <= 0 skips the chown.
+func WriteTransportTokenFile(token string, uid, gid int) error {
+	if testing.Testing() && !tokenHomeOverridden {
+		panic("scion/hub: WriteTransportTokenFile called during a test without SetTokenHome(); " +
+			"call SetTokenHome(t.TempDir()) so tests never overwrite the real ~/.scion/transport-token")
+	}
+
+	path := TransportTokenFilePath()
+	d, err := dirfd.EnsureDirNoFollow(filepath.Dir(path), 0700)
+	if err != nil {
+		return fmt.Errorf("failed to create transport token file directory: %w", err)
+	}
+	_ = d.Close()
+
+	if err := WriteFileNoFollowChown(path, []byte(token), tokenFileMode, uid, gid); err != nil {
+		return fmt.Errorf("failed to write transport token file: %w", err)
+	}
+	return nil
+}
+
+// SeedTransportTokenFile writes the injected bootstrap transport token to
+// the transport token file unless the file already holds a token that
+// expires later (for example after an in-place container restart, where
+// the bootstrap value is older than the last refresh). Returns the path.
+func SeedTransportTokenFile(token string, uid, gid int) (string, error) {
+	path := TransportTokenFilePath()
+	if existing, err := ReadTransportTokenFileGuarded(path); err == nil {
+		existing = strings.TrimSpace(existing)
+		if existing != "" {
+			fileExp, ferr := transportauth.ParseTokenExpiry(existing)
+			envExp, eerr := transportauth.ParseTokenExpiry(token)
+			if ferr == nil && eerr == nil && fileExp.After(envExp) {
+				return path, nil
+			}
+		}
+	}
+	return path, WriteTransportTokenFile(token, uid, gid)
+}
+
+// AdoptTransportTokenFile re-reads the transport token file after it was
+// written from outside this process (reset-auth writes it through the
+// broker), rewrites it so its mode and ownership are 0600 and uid:gid
+// (uid <= 0 skips the chown), and hands the value to this client's
+// transport source. It returns false, with no error, when there is no
+// transport token file or the client does not use a hub-provided transport
+// token. A value whose expiry cannot be parsed is not adopted: the current
+// credential is kept, and an error is returned.
+func (c *Client) AdoptTransportTokenFile(uid, gid int) (bool, error) {
+	if !c.hasHubProvidedTransport() {
+		return false, nil
+	}
+	tok, err := ReadTransportTokenFileGuarded(TransportTokenFilePath())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return false, nil
+	}
+	expiry, err := transportauth.ParseTokenExpiry(tok)
+	if err != nil {
+		// Not a usable credential: keep the current one in memory, restore
+		// the file from it so other processes keep using it, and record the
+		// reset as failed rather than successful.
+		c.restoreTransportTokenFile(uid, gid)
+		st := TransportRefreshStatus{
+			At:      time.Now().UTC(),
+			Outcome: TransportRefreshOutcomeFailed,
+			Error:   transportResetUnparseableMessage,
+		}
+		if werr := WriteTransportRefreshStatus(st, uid, gid); werr != nil {
+			log.Error("Failed to record transport refresh status: %v", werr)
+		}
+		// Fixed message: the parse error can quote parts of the value.
+		return false, errors.New(transportResetUnparseableMessage)
+	}
+	if err := WriteTransportTokenFile(tok, uid, gid); err != nil {
+		return false, err
+	}
+	c.oidcSource.SetToken(tok, expiry)
+	// Record the reset so doctor does not keep showing an earlier failed
+	// refresh next to the freshly installed credential.
+	st := TransportRefreshStatus{At: time.Now().UTC(), Outcome: TransportRefreshOutcomeReset}
+	if err := WriteTransportRefreshStatus(st, uid, gid); err != nil {
+		log.Error("Failed to record transport refresh status: %v", err)
+	}
+	return true, nil
+}
+
+// transportResetUnparseableMessage is recorded when reset-auth delivers a
+// transport token whose expiry cannot be parsed.
+const transportResetUnparseableMessage = "reset-auth delivered a transport token that could not be parsed; kept the current one"
+
+// restoreTransportTokenFile rewrites the transport token file with the
+// credential this client currently uses, when that credential parses. The
+// source gives an unparseable file value zero expiry, so a valid in-memory
+// or bootstrap value is what Token returns here. A client in proxy mode
+// that started without a transport token may have no valid credential to
+// restore; the unparseable file is then removed, so other processes do not
+// pick it up.
+func (c *Client) restoreTransportTokenFile(uid, gid int) {
+	cur, err := c.oidcSource.Token()
+	if err != nil || cur == "" {
+		return
+	}
+	if _, err := transportauth.ParseTokenExpiry(cur); err != nil {
+		if c.oidcLate {
+			if _, rerr := removeFileNoFollow(TransportTokenFilePath()); rerr != nil {
+				log.Error("Failed to remove unusable transport token file: %v", rerr)
+			}
+		}
+		return
+	}
+	if err := WriteTransportTokenFile(cur, uid, gid); err != nil {
+		log.Error("Failed to restore transport token file: %v", err)
+	}
+}
+
+// RemoveTransportTokenFile removes the transport token file and its refresh
+// status file, resolving parent directories without following symlinks. A
+// missing file is not an error. It returns true if the token file was
+// removed.
+func RemoveTransportTokenFile() (bool, error) {
+	if testing.Testing() && !tokenHomeOverridden {
+		panic("scion/hub: RemoveTransportTokenFile called during a test without SetTokenHome()")
+	}
+	removed, err := removeFileNoFollow(TransportTokenFilePath())
+	if err != nil {
+		return removed, err
+	}
+	if _, err := removeFileNoFollow(TransportRefreshStatusPath()); err != nil {
+		return removed, fmt.Errorf("failed to remove transport refresh status: %w", err)
+	}
+	return removed, nil
+}
+
+// removeFileNoFollow unlinks the leaf of path (never a symlink target),
+// resolving parent directories without following symlinks. A missing file
+// is not an error; it returns true if a file was removed.
+func removeFileNoFollow(path string) (bool, error) {
+	dirFd, leaf, err := dirfd.OpenParentNoFollow(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() { _ = syscall.Close(dirFd) }()
+	if err := dirfd.UnlinkAt(dirFd, leaf); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// Transport refresh outcomes recorded in TransportRefreshStatus.
+const (
+	// TransportRefreshOutcomeRefreshed: the refresh delivered a transport token.
+	TransportRefreshOutcomeRefreshed = "refreshed"
+	// TransportRefreshOutcomeFailed: the hub reported it could not mint one.
+	TransportRefreshOutcomeFailed = "failed"
+	// TransportRefreshOutcomeAbsent: no transport token and no reason given
+	// (for example the hub has no transport minter configured).
+	TransportRefreshOutcomeAbsent = "absent"
+	// TransportRefreshOutcomeReset: reset-auth installed a fresh transport
+	// token (recorded by init when it adopts the file).
+	TransportRefreshOutcomeReset = "reset"
+)
+
+// transportRefreshStatusFileName is written next to the transport token
+// file. It never contains token values.
+const transportRefreshStatusFileName = transportauth.TransportTokenFileName + ".status"
+
+// TransportRefreshStatus is the outcome of the most recent token refresh
+// for the transport layer, persisted for sciontool doctor.
+type TransportRefreshStatus struct {
+	At      time.Time `json:"at"`
+	Outcome string    `json:"outcome"`
+	Error   string    `json:"error,omitempty"`
+}
+
+// TransportRefreshStatusPath returns the path of the transport refresh
+// status file.
+func TransportRefreshStatusPath() string {
+	return filepath.Join(tokenHomeResolver(), ".scion", transportRefreshStatusFileName)
+}
+
+// WriteTransportRefreshStatus persists st to the transport refresh status
+// file (mode 0600, chowned to uid:gid when uid > 0).
+func WriteTransportRefreshStatus(st TransportRefreshStatus, uid, gid int) error {
+	if testing.Testing() && !tokenHomeOverridden {
+		panic("scion/hub: WriteTransportRefreshStatus called during a test without SetTokenHome()")
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	path := TransportRefreshStatusPath()
+	d, err := dirfd.EnsureDirNoFollow(filepath.Dir(path), 0700)
+	if err != nil {
+		return fmt.Errorf("failed to create transport status directory: %w", err)
+	}
+	_ = d.Close()
+	return WriteFileNoFollowChown(path, data, tokenFileMode, uid, gid)
+}
+
+// ReadTransportRefreshStatus reads the transport refresh status file.
+// ok is false when the file does not exist or cannot be parsed.
+func ReadTransportRefreshStatus() (TransportRefreshStatus, bool) {
+	var st TransportRefreshStatus
+	data, err := readTokenFileGuarded(TransportRefreshStatusPath())
+	if err != nil {
+		return st, false
+	}
+	if err := json.Unmarshal([]byte(data), &st); err != nil {
+		return st, false
+	}
+	return st, true
+}
+
+// ReadTransportTokenFileGuarded reads the transport token file through the
+// same symlink-safe, single-link-regular-file guard ReadTokenFile uses,
+// since sciontool init (root) reads it from a directory the workload owns.
+// It is a transportauth.FileReadFunc; pass it to
+// transportauth.FromEnvWithReader from processes that may run as root.
+//
+// Under go test without SetTokenHome it refuses to read the default path,
+// because the token home resolves to the real agent user's home (not
+// $HOME) and tests must never pick up a live transport token.
+func ReadTransportTokenFileGuarded(path string) (string, error) {
+	if testing.Testing() && !tokenHomeOverridden && path == TransportTokenFilePath() {
+		return "", fmt.Errorf("scion/hub: refusing to read %s during a test without SetTokenHome()", path)
+	}
+	return readTokenFileGuarded(path)
+}
+
+// ChownTokenFile fixes the ownership of an already-written token file to
+// uid:gid — used when the token file was written by another process (the
+// host-side agent manager, before this container started) and this
+// (root) process only needs to hand it off to the scion user, not rewrite
+// its content.
+//
+// It resolves the token file's parent directory the same symlink-safe way
+// WriteFileNoFollowChown does (dirfd.OpenParentNoFollow), then opens the
+// leaf itself without following a symlink, and refuses to chown anything
+// but a single-link regular file — a hardlink to a root-owned file would
+// otherwise pass a bare "is this a regular file" check and hand that file
+// to the scion user. This check always applies, on every runtime. The
+// chown is fchown on that open fd, never a path-based chown that a symlink
+// swapped in afterwards could redirect.
+//
+// When EnforceTokenFileOwnerChecks(true) has been called (substrate only),
+// it additionally requires the file's current owner to be root or the
+// containing directory's own owner before chowning it — the same rule
+// readTokenFileGuarded applies, gated the same way and for the same
+// reason: it isn't provably safe to require on every runtime's
+// token-provisioning path, only on the one that requires privilege drop.
+func ChownTokenFile(uid, gid int) error {
+	path := TokenFilePath()
+	dirFd, leaf, err := dirfd.OpenParentNoFollow(path)
+	if err != nil {
+		return fmt.Errorf("failed to open parent directory of token file: %w", err)
+	}
+	defer func() { _ = syscall.Close(dirFd) }()
+
+	var dirSt syscall.Stat_t
+	if err := syscall.Fstat(dirFd, &dirSt); err != nil {
+		return fmt.Errorf("failed to stat parent directory of token file: %w", err)
+	}
+
+	f, err := dirfd.OpenAt(dirFd, leaf, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open token file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return fmt.Errorf("failed to stat token file: %w", err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
+		return fmt.Errorf("refusing to chown token file: not a single-link regular file")
+	}
+	if enforceTokenFileOwnerChecks.Load() && st.Uid != 0 && st.Uid != dirSt.Uid {
+		return fmt.Errorf("refusing to chown token file: unexpected owner")
+	}
+	if err := f.Chown(uid, gid); err != nil {
+		return fmt.Errorf("failed to chown token file: %w", err)
+	}
+	return nil
+}
+
+// tokenFileMaxBytes bounds readTokenFileGuarded's read: the agent token is
+// a compact JWT-style string, so anything this long already isn't a token
+// this process (or the host-side agent manager) wrote.
+const tokenFileMaxBytes = 8192
+
 // ReadTokenFile reads the agent token from the canonical token file.
 // Returns empty string if the file doesn't exist or can't be read.
+//
+// This runs inside sciontool init, which is root for its whole life, so
+// the read goes through the same symlink-safe path WriteFileNoFollowChown
+// and ChownTokenFile use: a workload that owns $HOME/.scion can otherwise
+// swap scion-token for a symlink to any root-readable file (or a hardlink
+// to one) and have root read that file's contents back and forward them to
+// the Hub as if they were the agent's bearer token.
 func ReadTokenFile() string {
-	data, err := os.ReadFile(TokenFilePath())
+	token, err := readTokenFileGuarded(TokenFilePath())
 	if err != nil {
 		return ""
 	}
-	token := strings.TrimSpace(string(data))
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return ""
 	}
 	return token
 }
 
-// OutboundMessage is the payload for sending an agent-to-human outbound message.
-type OutboundMessage struct {
-	Recipient   string            `json:"recipient,omitempty"`
-	RecipientID string            `json:"recipient_id,omitempty"`
-	Msg         string            `json:"msg"`
-	Type        string            `json:"type,omitempty"`
-	Urgent      bool              `json:"urgent,omitempty"`
-	Visibility  string            `json:"visibility,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-}
-
-// SendOutboundMessage sends an outbound message from the agent to a human inbox.
-// Posts to POST /api/v1/agents/{agentID}/outbound-message using the agent token.
-// No retries — this is a best-effort fire-and-forget call.
-func (c *Client) SendOutboundMessage(ctx context.Context, msg OutboundMessage) error {
-	if !c.IsConfigured() {
-		return fmt.Errorf("hub client not configured")
-	}
-
-	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/outbound-message",
-		strings.TrimSuffix(c.hubURL, "/"), c.agentID)
-
-	body, err := json.Marshal(msg)
+// readTokenFileGuarded resolves path through the dirfd parent-directory
+// chain (so a symlink at any intermediate component, not just the leaf, is
+// refused) and refuses to read anything but a single-link regular file — a
+// hardlink to some unrelated file (Nlink>1) is refused instead of read.
+// This check always applies, on every runtime.
+//
+// When EnforceTokenFileOwnerChecks(true) has been called (substrate only —
+// see its doc comment), it additionally requires the owner to be root or
+// the containing directory's own owner, the only two legitimate states for
+// the token file: the host-side agent manager writes it before the
+// container starts (commonly as root or whatever uid the host process runs
+// as), and WriteTokenFile/ChownTokenFile hand it to the scion user
+// afterwards. O_NONBLOCK keeps a FIFO planted at the path from blocking
+// the open.
+func readTokenFileGuarded(path string) (string, error) {
+	dirFd, leaf, err := dirfd.OpenParentNoFollow(path)
 	if err != nil {
-		return fmt.Errorf("failed to marshal outbound message: %w", err)
+		return "", err
+	}
+	defer func() { _ = syscall.Close(dirFd) }()
+
+	var dirSt syscall.Stat_t
+	if err := syscall.Fstat(dirFd, &dirSt); err != nil {
+		return "", fmt.Errorf("failed to stat parent directory of %s: %w", path, err)
 	}
 
-	c.tokenMu.RLock()
-	currentToken := c.token
-	c.tokenMu.RUnlock()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	f, err := dirfd.OpenAt(dirFd, leaf, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	defer func() { _ = f.Close() }()
 
-	resp, err := c.client.Do(req)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return "", fmt.Errorf("failed to stat %s: %w", path, err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
+		return "", fmt.Errorf("refusing to read %s: not a single-link regular file", path)
+	}
+	if enforceTokenFileOwnerChecks.Load() && st.Uid != 0 && st.Uid != dirSt.Uid {
+		return "", fmt.Errorf("refusing to read %s: unexpected owner", path)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, tokenFileMaxBytes))
 	if err != nil {
-		return fmt.Errorf("failed to send outbound message: %w", err)
+		return "", fmt.Errorf("failed to read %s: %w", path, err)
 	}
-	respBody, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	return string(data), nil
 }
 
 // selfMessageRequest is the payload for delivering a message to the current agent
@@ -1508,9 +2219,8 @@ type selfMessageRequest struct {
 	StructuredMessage *messages.StructuredMessage `json:"structured_message"`
 }
 
-// SendSelfMessage delivers a structured message to the current agent via the
-// hub's inbound message endpoint. Unlike SendOutboundMessage (which targets
-// a human inbox), this delivers a message into the agent's own harness input.
+// SendSelfMessage delivers a structured message into the current agent's own
+// harness input via the hub's inbound message endpoint.
 // No retries — this is a best-effort fire-and-forget call.
 func (c *Client) SendSelfMessage(ctx context.Context, msg *messages.StructuredMessage) error {
 	if !c.IsConfigured() {
@@ -1535,7 +2245,7 @@ func (c *Client) SendSelfMessage(ctx context.Context, msg *messages.StructuredMe
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1630,7 +2340,7 @@ func (c *Client) FetchGCPToken(ctx context.Context, scopes []string) (*GCPAccess
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1674,7 +2384,7 @@ func (c *Client) FetchGCPIdentityToken(ctx context.Context, audience string) (st
 		return "", fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1728,7 +2438,7 @@ func (c *Client) RequestIdentityToken(ctx context.Context, audience string) (*Id
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1750,7 +2460,8 @@ func (c *Client) RequestIdentityToken(ctx context.Context, audience string) (*Id
 }
 
 // AgentSelf is the subset of Hub agent fields returned by GetSelf.
-// It covers the Tier 2 fields needed by `scion whoami --full`.
+// It covers the Tier 2 fields needed by `scion whoami --full`, plus the
+// creator attribution the Stop hook uses to address assistant replies.
 type AgentSelf struct {
 	Phase       string            `json:"phase,omitempty"`
 	Activity    string            `json:"activity,omitempty"`
@@ -1758,11 +2469,17 @@ type AgentSelf struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Ancestry    []string          `json:"ancestry,omitempty"`
 	TaskSummary string            `json:"taskSummary,omitempty"`
+	// MessageMode is the agent's effective message mode (none, lineage,
+	// branch, project, hub) as stored on the Hub.
+	MessageMode string `json:"messageMode,omitempty"`
+	// CreatedBy is the ID of the principal (user or agent) that created
+	// this agent.
+	CreatedBy string `json:"createdBy,omitempty"`
 }
 
 // GetSelf fetches the current agent's metadata from the Hub API.
 // It calls GET /api/v1/agents/{agentID} and decodes only the fields
-// needed for `scion whoami --full`. Returns an error if the Hub is
+// in AgentSelf. Returns an error if the Hub is
 // unreachable or returns a non-2xx status.
 func (c *Client) GetSelf(ctx context.Context) (*AgentSelf, error) {
 	if !c.IsConfigured() {
@@ -1781,7 +2498,7 @@ func (c *Client) GetSelf(ctx context.Context) (*AgentSelf, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1863,7 +2580,7 @@ func (c *Client) FetchSecrets(ctx context.Context, keys []string) (*SecretFetchR
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

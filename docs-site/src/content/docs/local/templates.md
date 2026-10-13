@@ -95,6 +95,8 @@ scion start my-review --type code-reviewer --harness-config gemini
 
 # Provision without starting (writes the agent dir + prompt.md for later)
 scion create my-review my task... --type code-reviewer
+# ...then start it
+scion start my-review
 ```
 
 `--type` also accepts an **absolute path** or a **remote URI**, so you can run a template straight from a repository without importing it first:
@@ -132,7 +134,7 @@ To ensure consistent and reliable agent execution across the platform, Scion enf
 - **What it is:** Scion automatically loads all Markdown files from an embedded boilerplate filesystem (`mandatory_boilerplate/`) and **prepends** them directly to the final `agent_instructions` file inside the agent's home directory.
 - **Why it exists:** This guarantees that every provisioned agent — regardless of template, role, or harness choice — is seeded with critical platform contracts before starting.
 - **Embedded contents:**
-  - **Workspace Orientation:** Clear explanations of `SCION_WORKSPACE_MODE` (`shared-plain`, `worktree-per-agent`, `clone-per-agent`), `SCION_WORKSPACE_GIT`, and how directories/shared volumes are mounted.
+  - **Workspace Orientation:** Clear explanations of `SCION_WORKSPACE_MODE` (`shared-plain`, `worktree-per-agent`, `clone-per-agent`, `empty-per-agent`), `SCION_WORKSPACE_GIT`, and how directories/shared volumes are mounted.
   - **Agent Status Signals:** Exact protocols directing the agent to explicitly declare its execution states via `sciontool status` (e.g. `sciontool status ask_user "<question>"`, `sciontool status blocked "<reason>"`, or `sciontool status task_completed "<task>"`). This prevents false stall timeouts, handles notifications routing, and tracks progress.
 - **Template Isolation:** Because this preamble is injected programmatically by the Hub or CLI, it cannot be overridden, removed, or bypassed by custom templates, securing baseline platform behaviors across all agents.
 
@@ -205,7 +207,7 @@ Scion ships a built-in **`team-creation`** skill for generating coordinated mult
 
 ## Built-in vs custom templates
 
-- **`default`** — the built-in template shipped inside the Scion binary. It seeds common `home/` dotfiles and the baseline `agents.md` status-signaling instructions, and it is the base layer every other template inherits. It is **protected** — it cannot be deleted. Use `scion templates update-default` to refresh it from the binary (`--force` to overwrite an existing copy).
+- **`default`** — the built-in template shipped inside the Scion binary. It seeds common `home/` dotfiles and the baseline `agents.md` status-signaling instructions, and it is the base layer every other template inherits. Your local copy is protected: `scion templates delete` refuses to delete the local `default`, and `scion templates update-default` refreshes it from the binary (`--force` to overwrite an existing copy). The Hub copy can be deleted, and a deleted Hub copy is not re-created when the Hub restarts; see [Recovering a deleted built-in](/scion/reference/harness-settings/#recovering-a-deleted-built-in) to bring it back.
 - **Custom templates** — anything you create, clone, or import. They live in one of two scopes.
 
 ### Template locations & resolution order
@@ -309,22 +311,48 @@ scion templates pull code-reviewer --to .scion/templates/code-reviewer
 scion templates status
 ```
 
-`sync` is content-aware: it hashes files and uploads only what changed, and templates carry a content hash for traceability (visible in `scion templates list`, `scion templates show`, and the Web UI). 
+`sync` is content-aware: it hashes files and uploads only what changed, and templates carry a content hash for traceability (visible in `scion templates list`, `scion templates show`, and the Web UI). Syncing an existing template mirrors the local directory: files deleted locally are removed from the Hub copy, and sync lists them as it removes them.
+
+On the Hub, a template's files are stored as content-addressed blobs, and each commit swaps the template's file manifest in one compare-and-swap step. If another commit changes the same template first, the losing commit gets `409 template_conflict` and nothing is written; `scion templates sync` re-diffs against the new version and retries once (see the [API Reference](/scion/reference/api/)). Templates stored in the older layout keep working and move to blobs on their next commit. Blobs that are no longer referenced by any template are removed by a background collector after a grace period (24 hours by default), so an agent download that started from an older version still finds its files.
 
 Beyond the CLI, project templates are a **fully managed Hub-level resource** with full CRUD, SDK, and Web UI support. A connected Hub can import a whole repository of templates server-side via the **Load Templates** action in the Web UI, and imported templates can be browsed, edited, and deleted directly within the dashboard.
+
+### Refreshing a Hub template from its source
+
+A template the Hub imported from a GitHub folder URL remembers that **source URL**, and can be refreshed from it later. A refresh replaces the template's files with the current content of the source folder (a full overwrite, no merge):
+
+```bash
+# Refresh one Hub template from its stored source URL
+scion templates update code-reviewer
+
+# Refresh from a different GitHub folder; it becomes the stored source URL if the refresh succeeds
+scion templates update code-reviewer --url https://github.com/myorg/templates/tree/main/code-reviewer
+
+# Refresh every Hub template that has a GitHub source URL
+scion templates update --all
+
+# Choose a scope when the same name exists in several
+scion templates update code-reviewer --scope project
+```
+
+Inside a project, `templates update` considers global and user templates plus the current project's templates (use `--project` to pick another project); outside a project it considers every template you can see. A failed refresh makes the command exit non-zero, in both text and JSON output.
+
+Refreshing works only for sources in a public GitHub repository: a folder on a branch (`https://github.com/<owner>/<repo>/tree/<branch>/<path>`), a branch's root (`https://github.com/<owner>/<repo>/tree/<branch>`), or `https://github.com/<owner>/<repo>[/<path>]` on branch `main`. As a `--url` override, a bare repository URL (`https://github.com/<owner>/<repo>` or `github.com/<owner>/<repo>`) is read as that repository's `.scion/templates` folder on branch `main`, the same as when importing. Folder names may contain letters, digits, spaces and `.` `_` `@` `+` `-`, and branch names letters, digits and `.` `_` `-`. Built-in templates and templates created without a source URL cannot be refreshed: `--all` skips them, and the Web UI does not offer a refresh for them. The Hub checks the source URL each time, refuses URLs that include a username or password, and limits how large the download and the extracted folder may be and how many entries the folder may contain (directories count toward this limit as well as files). A refresh writes only into the named template, even when the source folder holds several: it uses the one folder named after the template's name or slug, refuses a source with none or more than one such folder, and never creates a new template. A refresh does not touch harness-configs: a `harness-configs/` folder inside the template's source is stored as part of the template's files, but no Hub harness-config is created or updated from it. It needs the same permission as importing a template into that scope. With `--all`, each template's refresh has its own time limit.
+
+The Web UI offers the same action as **Refresh from Source** on a template's detail page, and **Refresh All from Source** on the templates list, which refreshes a few templates at a time. The detail page shows the stored source without any username or password; sources that are not web URLs are shown as "non-web source".
 
 For the condensed command list, see the [CLI reference](/scion/reference/cli/#template-management).
 
 ## Harness-configs
 
-A **harness-config** is the counterpart to a template: it holds the runtime *mechanics* a template deliberately omits, so roles stay harness-agnostic. Harness-configs live in `~/.scion/harness-configs/` (global) or `.scion/harness-configs/` (project) and contain:
+A **harness-config** is the counterpart to a template: it holds the runtime *mechanics* a template deliberately omits, so roles stay harness-agnostic. Harness-configs live in `~/.scion/harness-configs/` (global), `.scion/harness-configs/` (project), or a template's own `harness-configs/<name>/` directory (see [precedence](/scion/reference/harness-settings/#managing-harness-configs)). Each contains:
 
 - `config.yaml` — runtime parameters (container image, model aliases, auth type).
 - `home/` — base files copied into the agent's home directory (e.g. `.claude.json`, `.gemini/settings.json`).
 
 ### Model size aliases
 
-Templates should express model choice with abstract **size aliases** — `small`, `medium`, `large`, `extra-large` (`xl`) — rather than provider model names. Each harness-config maps those aliases to real models:
+Templates should express model choice with abstract **size aliases** — `small`, `medium`, `large`, `extra-large` — rather than provider model names. The shorthand tiers `s`, `m`, `l`, and `xl` are accepted too, case-insensitively (so `L` means `large`). Each harness-config maps those aliases to real models:
 
 ```yaml
 # ~/.scion/harness-configs/claude/config.yaml
@@ -349,7 +377,7 @@ model_aliases:
 A template that sets `model: large` then resolves to `opus` under Claude and `gemini-pro` under Gemini — the same role, portable across harnesses. Concrete model names still pass through unchanged (for backward compatibility) but tie the template to one harness.
 
 :::note
-Model aliases are resolved by the Hub before they are stored in the agent's `AppliedConfig` and injected as the `SCION_MODEL` environment variable. This ensures harness provision scripts receive the fully resolved concrete model name (such as `gemini-pro`) rather than an unresolved alias.
+Model aliases are resolved by the Hub before they are stored in the agent's `AppliedConfig` and injected as the `SCION_MODEL` environment variable. This ensures harness provision scripts receive the fully resolved concrete model name (such as `gemini-pro`) rather than an unresolved alias. The Hub keeps a harness-config's `model_aliases` and `model` on every write path, so tier picks resolve correctly whether an agent is created, edited, or restarted. As a fallback, harness provision scripts resolve any size alias that still reaches them through `SCION_MODEL` with the shared `scion_harness.resolve_model` helper.
 :::
 
 ### Customizing and creating variants

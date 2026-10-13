@@ -17,17 +17,52 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"gopkg.in/yaml.v3"
 )
+
+// ErrTemplateNotFound marks a template resolution failure where the named
+// template does not exist in any searched location (project or global
+// template directories). Wrapped into the returned error so callers (e.g.
+// the runtime broker's create/provision handlers) can classify an
+// unresolvable name as a client-facing 4xx naming the resource, instead of
+// folding it into a generic 5xx (ptone/scion#1316 fault 3).
+var ErrTemplateNotFound = errors.New("template not found")
+
+// TemplateNotFoundError is the typed form of ErrTemplateNotFound
+// (errors.Is(err, ErrTemplateNotFound) still matches). Error() keeps the
+// full diagnostic text, which can name broker filesystem paths; Name is the
+// display-safe template name for client-facing messages (ptone/scion#3113).
+type TemplateNotFoundError struct {
+	// Name is FriendlyTemplateName of the reference that did not resolve:
+	// a plain name, an absolute path's base name, or "" when the only
+	// identifier is a content hash.
+	Name string
+	msg  string
+}
+
+// NewTemplateNotFoundError returns a TemplateNotFoundError for ref whose
+// Error() is msg (the caller's full diagnostic text, without the
+// sentinel's own text, which Error() appends).
+func NewTemplateNotFoundError(ref, msg string) *TemplateNotFoundError {
+	return &TemplateNotFoundError{Name: FriendlyTemplateName(ref), msg: msg}
+}
+
+func (e *TemplateNotFoundError) Error() string { return e.msg + ": " + ErrTemplateNotFound.Error() }
+func (e *TemplateNotFoundError) Unwrap() error { return ErrTemplateNotFound }
 
 type Template struct {
 	Name  string
@@ -124,12 +159,36 @@ func (t *Template) LoadConfig() (*api.ScionConfig, error) {
 		return nil, fmt.Errorf("invalid mcp_servers config in %s: %w", configPath, err)
 	}
 
+	if err := cfg.CloneDepth.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config in %s: %w", configPath, err)
+	}
+
 	return &cfg, nil
 }
 
 // unmarshalYAMLNormalized parses YAML into a ScionConfig, normalizing
 // top-level hyphenated keys to underscored keys. This allows template
 // authors to use either `harness-config` or `harness_config` style keys.
+// ParseScionAgentConfig decodes scion-agent config bytes the same way
+// Template.LoadConfig does (hyphenated top-level YAML keys normalized), without
+// running LoadConfig's volume/service validation. name selects the format:
+// ".yaml"/".yml" suffixes are parsed as YAML, anything else as JSON. Used by
+// the Hub to read template configs straight from storage.
+func ParseScionAgentConfig(name string, data []byte) (*api.ScionConfig, error) {
+	var cfg api.ScionConfig
+	ext := filepath.Ext(name)
+	if ext == ".yaml" || ext == ".yml" {
+		if err := unmarshalYAMLNormalized(data, &cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse YAML config %s: %w", name, err)
+		}
+		return &cfg, nil
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON config %s: %w", name, err)
+	}
+	return &cfg, nil
+}
+
 func unmarshalYAMLNormalized(data []byte, cfg *api.ScionConfig) error {
 	var node yaml.Node
 	if err := yaml.Unmarshal(data, &node); err != nil {
@@ -158,27 +217,6 @@ func normalizeYAMLMappingKeys(node *yaml.Node) {
 			}
 		}
 	}
-}
-
-func LoadProjectKubernetesConfig() (*api.KubernetesConfig, error) {
-	path, err := GetProjectKubernetesConfigPath()
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var cfg api.KubernetesConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
 }
 
 func FindTemplate(name string) (*Template, error) {
@@ -210,7 +248,7 @@ func FindTemplateWithContext(ctx context.Context, name string) (*Template, error
 	// 1. Check if name is an absolute path
 	if filepath.IsAbs(name) {
 		if info, err := os.Stat(name); err == nil && info.IsDir() {
-			return &Template{Name: filepath.Base(name), Path: name}, nil
+			return &Template{Name: templateNameFromDir(name), Path: name}, nil
 		}
 		return nil, fmt.Errorf("template path %s not found or not a directory", name)
 	}
@@ -250,7 +288,7 @@ func FindTemplateInScope(name, scope string) *Template {
 	switch scope {
 	case "global":
 		dir, err = GetGlobalTemplatesDir()
-	case "project", "grove":
+	case "project":
 		dir, err = GetProjectTemplatesDir()
 	default:
 		return nil
@@ -268,9 +306,39 @@ func FindTemplateInScope(name, scope string) *Template {
 	return nil
 }
 
+// templateNameFromDir derives a template name from a template directory path.
+// A content-addressed cache directory is named after the template's content
+// hash, which is not a template name, so it yields "".
+func templateNameFromDir(dir string) string {
+	base := filepath.Base(dir)
+	if isTemplateHashName(base) {
+		return ""
+	}
+	return base
+}
+
+// templateHashPattern matches a content hash in any letter case, with or
+// without the "sha256:" prefix. transfer.IsContentHash only accepts the
+// lowercase, prefixed form the cache writes today; this broader match is
+// local to display-name derivation so an unprefixed or uppercase digest (a
+// legacy or externally produced hash) is never shown as a template name
+// either (ptone/scion#3113).
+var templateHashPattern = regexp.MustCompile(`(?i)^(sha256:)?[0-9a-f]{64}$`)
+
+// isTemplateHashName reports whether s is a content hash rather than a
+// template name: the prefixed form cache directories use today, or any
+// other letter case or the bare 64-hex digest (templateHashPattern).
+// transfer.IsContentHash is a strict subset of templateHashPattern; it is
+// kept on purpose, only to tie this check to the cache's canonical hash
+// form, so a change to that form is reflected here too.
+func isTemplateHashName(s string) bool {
+	return transfer.IsContentHash(s) || templateHashPattern.MatchString(s)
+}
+
 // FriendlyTemplateName converts a raw template reference (cache path, URI, or
 // simple name) to a human-friendly short name suitable for display.
-// Simple names pass through unchanged; absolute paths return filepath.Base;
+// Simple names pass through unchanged; absolute paths return filepath.Base,
+// except that a content-hash cache directory or a bare content hash yields "";
 // remote URIs are handled by DeriveTemplateName.
 func FriendlyTemplateName(ref string) string {
 	if ref == "" {
@@ -280,7 +348,10 @@ func FriendlyTemplateName(ref string) string {
 		return DeriveTemplateName(ref)
 	}
 	if filepath.IsAbs(ref) {
-		return filepath.Base(ref)
+		return templateNameFromDir(ref)
+	}
+	if isTemplateHashName(ref) {
+		return ""
 	}
 	return ref
 }
@@ -299,16 +370,33 @@ func DeriveTemplateName(uri string) string {
 		return parts.Repo
 	}
 
-	// For archive URLs, extract filename without extension
-	if isArchiveURL(uri) {
-		base := filepath.Base(uri)
-		// Remove common extensions
-		for _, ext := range []string{".tar.gz", ".tgz", ".zip"} {
-			if len(base) > len(ext) && base[len(base)-len(ext):] == ext {
-				return base[:len(base)-len(ext)]
-			}
+	// For HTTP(S) URLs, use the last element of the URL path only: the
+	// query (e.g. a signed-URL token) and any userinfo never become part of
+	// the name, since it is shown to users (ptone/scion#3113).
+	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") {
+		u, err := url.Parse(uri)
+		if err != nil {
+			return "remote"
 		}
-		return base
+		if u.Path == "" {
+			if host := u.Hostname(); host != "" {
+				return host
+			}
+			return "remote"
+		}
+		// EscapedPath, not Path: the name keeps the reference's own
+		// percent-encoding, so an encoded "/" or control character
+		// (a%2Fb, a%0Ab) is never decoded into the displayed name.
+		base := path.Base(u.EscapedPath())
+		if base == "/" || base == "." || base == ".." {
+			return "remote"
+		}
+		return trimArchiveExt(base)
+	}
+
+	// For archive paths, extract filename without extension
+	if isArchiveURL(uri) {
+		return trimArchiveExt(filepath.Base(uri))
 	}
 
 	// For rclone paths, use the last path component
@@ -326,6 +414,16 @@ func DeriveTemplateName(uri string) string {
 
 	// Fallback: use "remote"
 	return "remote"
+}
+
+// trimArchiveExt removes a .tar.gz, .tgz or .zip extension from base.
+func trimArchiveExt(base string) string {
+	for _, ext := range []string{".tar.gz", ".tgz", ".zip"} {
+		if len(base) > len(ext) && base[len(base)-len(ext):] == ext {
+			return base[:len(base)-len(ext)]
+		}
+	}
+	return base
 }
 
 // GetTemplateChain returns a list of templates in inheritance order (base first).
@@ -369,9 +467,9 @@ func FindTemplateInProjectPath(name, projectPath string) (*Template, error) {
 	}
 	if filepath.IsAbs(name) {
 		if info, err := os.Stat(name); err == nil && info.IsDir() {
-			return &Template{Name: filepath.Base(name), Path: name}, nil
+			return &Template{Name: templateNameFromDir(name), Path: name}, nil
 		}
-		return nil, fmt.Errorf("template path %s not found or not a directory", name)
+		return nil, NewTemplateNotFoundError(name, fmt.Sprintf("template path %s not found or not a directory", name))
 	}
 
 	// Check project-specific templates directory (in-repo .scion/templates/ for git projects)
@@ -390,7 +488,7 @@ func FindTemplateInProjectPath(name, projectPath string) (*Template, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("template %s not found", name)
+	return nil, NewTemplateNotFoundError(name, fmt.Sprintf("template %s not found", name))
 }
 
 // findOrHydrateDefaultTemplate resolves the default template, seeding it from the
@@ -826,9 +924,6 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	if override.Kubernetes != nil {
 		result.Kubernetes = mergeKubernetesConfig(result.Kubernetes, override.Kubernetes)
 	}
-	if override.Docker != nil {
-		result.Docker = mergeDockerConfig(result.Docker, override.Docker)
-	}
 	if override.Resources != nil {
 		result.Resources = MergeResourceSpec(result.Resources, override.Resources)
 	}
@@ -856,6 +951,9 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	}
 	if override.MaxDuration != "" {
 		result.MaxDuration = override.MaxDuration
+	}
+	if override.CloneDepth != "" {
+		result.CloneDepth = override.CloneDepth
 	}
 	if override.Hub != nil {
 		if result.Hub == nil {
@@ -885,6 +983,9 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	}
 	if override.ExplicitWorkspace {
 		result.ExplicitWorkspace = true
+	}
+	if override.EmptyPerAgentWorkspace {
+		result.EmptyPerAgentWorkspace = true
 	}
 	if override.Branch != "" {
 		result.Branch = override.Branch
@@ -953,124 +1054,6 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	return &result
 }
 
-// CloneDockerConfig returns a deep copy of a DockerConfig.
-func CloneDockerConfig(d *api.DockerConfig) *api.DockerConfig {
-	if d == nil {
-		return nil
-	}
-	res := &api.DockerConfig{}
-	if d.NvidiaGPU != nil {
-		v := *d.NvidiaGPU
-		res.NvidiaGPU = &v
-	}
-	if d.Privileged != nil {
-		v := *d.Privileged
-		res.Privileged = &v
-	}
-	if d.Networks != nil {
-		res.Networks = append([]string(nil), d.Networks...)
-	}
-	if d.Devices != nil {
-		res.Devices = append([]string(nil), d.Devices...)
-	}
-	if d.Labels != nil {
-		res.Labels = make(map[string]string, len(d.Labels))
-		for k, v := range d.Labels {
-			res.Labels[k] = v
-		}
-	}
-	return res
-}
-
-func mergeDockerConfig(base, override *api.DockerConfig) *api.DockerConfig {
-	if override == nil {
-		return base
-	}
-
-	if base == nil {
-		base = &api.DockerConfig{}
-	}
-
-	result := *base
-
-	if override.NvidiaGPU != nil {
-		v := *override.NvidiaGPU
-		result.NvidiaGPU = &v
-	}
-
-	if override.Privileged != nil {
-		v := *override.Privileged
-		result.Privileged = &v
-	}
-
-	// Networks: Profile networks are required attachments and must be retained.
-	// Perform union of base and override networks with deduplication, preserving order.
-	if len(base.Networks) > 0 || len(override.Networks) > 0 {
-		seen := make(map[string]struct{}, len(base.Networks)+len(override.Networks))
-		var mergedNets []string
-		for _, net := range base.Networks {
-			if net == "" {
-				continue
-			}
-			if _, exists := seen[net]; !exists {
-				seen[net] = struct{}{}
-				mergedNets = append(mergedNets, net)
-			}
-		}
-		for _, net := range override.Networks {
-			if net == "" {
-				continue
-			}
-			if _, exists := seen[net]; !exists {
-				seen[net] = struct{}{}
-				mergedNets = append(mergedNets, net)
-			}
-		}
-		result.Networks = mergedNets
-	}
-
-	// Devices: Profile device grants are required and must be retained. Docker
-	// accepts both host device mappings and CDI selectors (for example,
-	// nvidia.com/gpu=all) through repeated --device arguments.
-	if len(base.Devices) > 0 || len(override.Devices) > 0 {
-		seen := make(map[string]struct{}, len(base.Devices)+len(override.Devices))
-		var mergedDevices []string
-		for _, device := range base.Devices {
-			if device == "" {
-				continue
-			}
-			if _, exists := seen[device]; !exists {
-				seen[device] = struct{}{}
-				mergedDevices = append(mergedDevices, device)
-			}
-		}
-		for _, device := range override.Devices {
-			if device == "" {
-				continue
-			}
-			if _, exists := seen[device]; !exists {
-				seen[device] = struct{}{}
-				mergedDevices = append(mergedDevices, device)
-			}
-		}
-		result.Devices = mergedDevices
-	}
-
-	// Labels: deterministic map merge where override keys overwrite base keys.
-	if len(base.Labels) > 0 || len(override.Labels) > 0 {
-		mergedLabels := make(map[string]string, len(base.Labels)+len(override.Labels))
-		for k, v := range base.Labels {
-			mergedLabels[k] = v
-		}
-		for k, v := range override.Labels {
-			mergedLabels[k] = v
-		}
-		result.Labels = mergedLabels
-	}
-
-	return &result
-}
-
 func mergeKubernetesConfig(base, override *api.KubernetesConfig) *api.KubernetesConfig {
 	if override == nil {
 		return base
@@ -1093,6 +1076,9 @@ func mergeKubernetesConfig(base, override *api.KubernetesConfig) *api.Kubernetes
 	}
 	if override.ServiceAccountName != "" {
 		result.ServiceAccountName = override.ServiceAccountName
+	}
+	if override.PriorityClassName != "" {
+		result.PriorityClassName = override.PriorityClassName
 	}
 	if override.Resources != nil {
 		if result.Resources == nil {
@@ -1117,6 +1103,10 @@ func mergeKubernetesConfig(base, override *api.KubernetesConfig) *api.Kubernetes
 	}
 	if override.SharedDirSize != "" {
 		result.SharedDirSize = override.SharedDirSize
+	}
+	if override.SafeToEvict != nil {
+		v := *override.SafeToEvict
+		result.SafeToEvict = &v
 	}
 
 	return &result
@@ -1277,12 +1267,18 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 				result.Filter.Sampling.Default = override.Filter.Sampling.Default
 			}
 			if override.Filter.Sampling.Rates != nil {
-				if result.Filter.Sampling.Rates == nil {
-					result.Filter.Sampling.Rates = make(map[string]float64)
+				// Build a fresh map: result.Filter.Sampling is only a
+				// shallow copy of base, so writing into its Rates would
+				// mutate the base config (for example a shared settings or
+				// hub default object) and leak rates between agents.
+				rates := make(map[string]float64, len(result.Filter.Sampling.Rates)+len(override.Filter.Sampling.Rates))
+				for k, v := range result.Filter.Sampling.Rates {
+					rates[k] = v
 				}
 				for k, v := range override.Filter.Sampling.Rates {
-					result.Filter.Sampling.Rates[k] = v
+					rates[k] = v
 				}
+				result.Filter.Sampling.Rates = rates
 			}
 		}
 	}

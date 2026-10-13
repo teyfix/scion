@@ -34,6 +34,7 @@ import (
 )
 
 func TestParseAgentMessageTopic(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		topic     string
@@ -54,10 +55,9 @@ func TestParseAgentMessageTopic(t *testing.T) {
 			agentSlug: "code-reviewer",
 		},
 		{
-			name:      "legacy grove topic",
-			topic:     "scion.grove.my-project-123.agent.coder.messages",
-			projectID: "my-project-123",
-			agentSlug: "coder",
+			name:    "legacy grove topic",
+			topic:   "scion.grove.my-project-123.agent.coder.messages",
+			wantErr: true,
 		},
 		{
 			name:    "too few segments",
@@ -106,6 +106,7 @@ func TestParseAgentMessageTopic(t *testing.T) {
 }
 
 func TestHandleBrokerInbound_RejectsNonRunningAgent(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		phase       state.Phase
@@ -162,7 +163,7 @@ func TestHandleBrokerInbound_RejectsNonRunningAgent(t *testing.T) {
 				Updated:   time.Now(),
 			}
 			require.NoError(t, s.CreateProject(ctx, project))
-			srv.createProjectMembersGroup(ctx, project)
+			srv.seedProjectCreatorMembership(ctx, project)
 			msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
 
 			// Create agent with the specified phase and project message mode
@@ -217,6 +218,7 @@ func TestHandleBrokerInbound_RejectsNonRunningAgent(t *testing.T) {
 }
 
 func TestHandleBrokerInbound_ConversationResolution(t *testing.T) {
+	t.Parallel()
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -244,7 +246,7 @@ func TestHandleBrokerInbound_ConversationResolution(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroup(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 	msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
 
 	// Create a running agent with project message mode.
@@ -394,6 +396,7 @@ func TestHandleBrokerInbound_ConversationResolution(t *testing.T) {
 // AC-8 regression case for each platform surface: external_ref present with
 // empty surface must be rejected at the broker edge.
 func TestHandleBrokerInbound_ConversationResolution_PerPlugin_Regression(t *testing.T) {
+	t.Parallel()
 	surfaces := []struct {
 		name        string
 		externalRef string
@@ -433,7 +436,7 @@ func TestHandleBrokerInbound_ConversationResolution_PerPlugin_Regression(t *test
 				Updated:   time.Now(),
 			}
 			require.NoError(t, s.CreateProject(ctx, project))
-			srv.createProjectMembersGroup(ctx, project)
+			srv.seedProjectCreatorMembership(ctx, project)
 			msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
 
 			agent := &store.Agent{
@@ -483,6 +486,7 @@ func TestHandleBrokerInbound_ConversationResolution_PerPlugin_Regression(t *test
 }
 
 func TestHandleBrokerInbound_AllowsRunningAgent(t *testing.T) {
+	t.Parallel()
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -510,7 +514,7 @@ func TestHandleBrokerInbound_AllowsRunningAgent(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroup(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 	msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
 
 	// Create a running agent with project message mode.
@@ -559,6 +563,7 @@ func TestHandleBrokerInbound_AllowsRunningAgent(t *testing.T) {
 // TestHandleBrokerInbound_AgentSenderDenied verifies that agent-prefixed
 // senders are denied.
 func TestHandleBrokerInbound_AgentSenderDenied(t *testing.T) {
+	t.Parallel()
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -614,9 +619,113 @@ func TestHandleBrokerInbound_AgentSenderDenied(t *testing.T) {
 	assert.Equal(t, ErrCodeMessageDenied, errResp.Error.Code)
 }
 
+// TestHandleBrokerInbound_ConvResolutionFailure_WriteDenyOff verifies that when
+// conversation resolution fails and write-deny is OFF (the default), the handler
+// completes without panicking and the message still dispatches (fail-open).
+//
+// Before the fix, convResult was nil on the error path and the trailing log.Info
+// dereferenced convResult.ConversationID, causing a nil-pointer panic.
+func TestHandleBrokerInbound_ConvResolutionFailure_WriteDenyOff(t *testing.T) {
+	t.Parallel()
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	// Set a webChatStore so that WithKeyTopicLookup is injected into the
+	// resolve call. The stub embeds the interface; only the topic-lookup
+	// codepath is reached, and it fails before any method is called because
+	// the external_ref is intentionally malformed ("thread:bad" has only
+	// two colon-separated parts instead of the required three).
+	srv.SetWebChatStore(&stubWebChatStore{})
+
+	// Write-deny is OFF by default (no operational settings loaded).
+	// Verify the precondition so the test breaks loudly if the default changes.
+	require.False(t, srv.writeDenyEnabled(), "precondition: write-deny must be OFF")
+
+	user := &store.User{
+		ID:          tid("user-conv-fail"),
+		Email:       "conv-fail@example.com",
+		DisplayName: "Conv Fail User",
+		Role:        store.UserRoleMember,
+		Status:      "active",
+		Created:     time.Now(),
+	}
+	require.NoError(t, s.CreateUser(ctx, user))
+	ensureHubMembership(ctx, s, user.ID)
+
+	project := &store.Project{
+		ID:        tid("proj-conv-fail"),
+		Slug:      "conv-fail-proj",
+		Name:      "Conv Failure Test Project",
+		OwnerID:   user.ID,
+		CreatedBy: user.ID,
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+	srv.seedProjectCreatorMembership(ctx, project)
+	// The user already has a built-in project-owner membership from
+	// seedProjectCreatorMembership (which grants a role binding for the
+	// project creator). Only the explicit agent.message permission is
+	// needed — avoid a duplicate built-in membership grant.
+	msgAuthzGrantAgentMessage(t, s, user.ID, project.ID)
+
+	agent := &store.Agent{
+		ID:           tid("agent-conv-fail"),
+		Slug:         "conv-fail-agent",
+		Name:         "Conv Fail Agent",
+		ProjectID:    project.ID,
+		Phase:        string(state.PhaseRunning),
+		MessageMode:  store.MessageModeProject,
+		StateVersion: 1,
+		Created:      time.Now(),
+		Updated:      time.Now(),
+	}
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	topic := "scion.project." + project.ID + ".agent." + agent.Slug + ".messages"
+	payload := inboundMessageRequest{
+		Topic: topic,
+		Message: &messages.StructuredMessage{
+			Version:   messages.Version,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Channel:   "discord",
+			Sender:    "user:" + user.Email,
+			Recipient: "agent:" + agent.Slug,
+			Msg:       "hello from fail-open path",
+			Type:      messages.TypeInstruction,
+		},
+		// Surface + ExternalRef triggers conversation resolution.
+		// "thread:bad" is intentionally malformed (2 parts, not 3) so
+		// ResolveOrCreateConversationByKey returns (nil, error).
+		Surface:     "discord",
+		ExternalRef: "thread:bad",
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/broker/inbound", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(contextWithBrokerIdentity(req.Context(), NewBrokerIdentity("test-broker")))
+
+	rec := httptest.NewRecorder()
+
+	// The handler must not panic. Before the fix the nil convResult
+	// dereference in the log.Info call caused a panic here.
+	require.NotPanics(t, func() {
+		srv.mux.ServeHTTP(rec, req)
+	})
+
+	// Fail-open: the message proceeds to dispatch. No dispatcher is wired
+	// in the test server, so we expect 503 Service Unavailable — proving
+	// the handler continued past the failed resolution.
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code,
+		"fail-open path must reach dispatch (503 = no dispatcher in test)")
+}
+
 // TestHandleBrokerInbound_UnmappedExternalSenderDenied verifies that an
 // unmapped external-channel sender (e.g. "discord:someuser") is denied.
 func TestHandleBrokerInbound_UnmappedExternalSenderDenied(t *testing.T) {
+	t.Parallel()
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -669,4 +778,399 @@ func TestHandleBrokerInbound_UnmappedExternalSenderDenied(t *testing.T) {
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, ErrCodeMessageDenied, errResp.Error.Code)
+}
+
+// TestHandleBrokerInbound_CrossChannelDM_AdvancesSenderReadState: a human
+// posting into a web-visible agent DM from a non-web channel (e.g. Discord)
+// must not see their own message as unread when they later open that same
+// DM in native web chat. The v2 DM last-message watermark and the sender's
+// v2 read state must both advance — the legacy Wave-1 TouchThread watermark
+// is a different mechanism and does not feed the v2 unread computation
+// (LastMessageID != LastReadMessageID).
+func TestHandleBrokerInbound_CrossChannelDM_AdvancesSenderReadState(t *testing.T) {
+	t.Parallel()
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	db := openTestMemorySQLite(t, "sqlite")
+	wcs := NewWebChatStore(db, "sqlite")
+	require.NoError(t, wcs.Init())
+	srv.SetWebChatStore(wcs)
+	srv.SetDispatcher(&brokerMockDispatcher{})
+
+	// Assert the watermarks at the exact moment PublishUserMessage is
+	// called, not after the handler returns: asserting only after-the-fact
+	// cannot distinguish "advanced before publish" (correct — the sender's
+	// own client refetches unread state on this event) from "advanced after
+	// publish" (both leave the same final state).
+	spy := &readStateAtPublishSpy{wcs: wcs}
+	srv.SetEventPublisher(spy)
+
+	user := &store.User{
+		ID:          tid("user-xchan-dm"),
+		Email:       "xchan-dm@example.com",
+		DisplayName: "Cross Channel User",
+		Role:        store.UserRoleMember,
+		Status:      "active",
+		Created:     time.Now(),
+	}
+	require.NoError(t, s.CreateUser(ctx, user))
+	ensureHubMembership(ctx, s, user.ID)
+
+	project := &store.Project{
+		ID:        tid("proj-xchan-dm"),
+		Slug:      "xchan-dm-proj",
+		Name:      "Cross Channel DM Test Project",
+		OwnerID:   user.ID,
+		CreatedBy: user.ID,
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+	srv.seedProjectCreatorMembership(ctx, project)
+	msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
+
+	agent := &store.Agent{
+		ID:           tid("agent-xchan-dm"),
+		Slug:         "xchan-agent",
+		Name:         "Cross Channel Agent",
+		ProjectID:    project.ID,
+		Phase:        string(state.PhaseRunning),
+		MessageMode:  store.MessageModeProject,
+		StateVersion: 1,
+		Created:      time.Now(),
+		Updated:      time.Now(),
+	}
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	// The web DM key for this agent+user pair — the same key native web chat
+	// uses to view this conversation and to compute its unread state.
+	dmKey := "dm:agent:" + agent.ID + ":user:" + user.ID
+
+	topic := "scion.project." + project.ID + ".agent." + agent.Slug + ".messages"
+	payload := inboundMessageRequest{
+		Topic: topic,
+		Message: &messages.StructuredMessage{
+			Version:   messages.Version,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Channel:   "discord",
+			Sender:    "user:" + user.Email,
+			Recipient: "agent:" + agent.Slug,
+			Msg:       "hello from discord",
+			Type:      messages.TypeInstruction,
+			ThreadID:  dmKey,
+		},
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/broker/inbound", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(contextWithBrokerIdentity(req.Context(), NewBrokerIdentity("test-broker")))
+
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	// Find the persisted message to get its server-assigned ID.
+	msgs, err := s.ListMessages(ctx, store.MessageFilter{ThreadID: dmKey}, store.ListOptions{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, msgs.Items, 1, "expected exactly one persisted message for the DM key")
+	persisted := msgs.Items[0]
+	assert.Equal(t, user.ID, persisted.SenderID)
+
+	// The v2 DM watermark must already point at this message...
+	dms, err := wcs.ListDMs(ctx, user.ID)
+	require.NoError(t, err)
+	require.Len(t, dms, 1, "expected the DM registry row to exist for the sender")
+	assert.Equal(t, persisted.ID, dms[0].LastMessageID,
+		"DM last-message watermark was not advanced for the cross-channel sender")
+
+	// ...and the sender's own v2 read state must already be caught up to it,
+	// so native web chat never renders this DM as unread for the person who
+	// just sent it (albeit from Discord).
+	rs, err := wcs.GetReadState(ctx, user.ID, dmKey)
+	require.NoError(t, err)
+	require.NotNil(t, rs, "sender read state was not set for the cross-channel message")
+	assert.Equal(t, persisted.ID, rs.LastReadMessageID,
+		"sender read watermark was not advanced for the cross-channel message — would show unread in web chat")
+
+	// The load-bearing assertion: both watermarks were already current at
+	// the moment of publish, not merely by the time the test got around to
+	// checking after the handler returned.
+	require.True(t, spy.called, "PublishUserMessage was never called")
+	assert.Equal(t, persisted.ID, spy.lastMessageIDAtPublish,
+		"DM last-message watermark at publish time = %q, want %q", spy.lastMessageIDAtPublish, persisted.ID)
+	assert.False(t, spy.hasUnreadAtPublish,
+		"computed hasUnread at publish time = true, want false — cross-channel self-send would flash/stick unread")
+}
+
+// TestHandleBrokerInbound_MentionCoAddressees verifies that when a broker
+// plugin sends mention_co_addressees metadata, the hub reads it and applies
+// CoAddressees/IsMention to the delivery envelope (additive mention routing).
+func TestHandleBrokerInbound_MentionCoAddressees(t *testing.T) {
+	t.Parallel()
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	// Wire a recording dispatcher so the handler can complete the full
+	// dispatch→persist→200 path instead of returning 503.
+	dispatcher := &recordingDispatcher{}
+	srv.SetDispatcher(dispatcher)
+
+	// Enable the conversation envelope switch so the handler enters the
+	// RenderDeliveryText path and populates DeliveryText with co-addressee
+	// attribution (writeDenyEnabled() must return true).
+	enableWriteDenySwitch(t, srv)
+
+	// Separate owner and sender to avoid built-in membership conflicts.
+	owner := &store.User{
+		ID:          tid("owner-co-addr"),
+		Email:       "co-addr-owner@example.com",
+		DisplayName: "CoAddr Owner",
+		Role:        store.UserRoleMember,
+		Status:      "active",
+		Created:     time.Now(),
+	}
+	require.NoError(t, s.CreateUser(ctx, owner))
+	ensureHubMembership(ctx, s, owner.ID)
+
+	user := &store.User{
+		ID:          tid("user-co-addr"),
+		Email:       "co-addr@example.com",
+		DisplayName: "CoAddr User",
+		Role:        store.UserRoleMember,
+		Status:      "active",
+		Created:     time.Now(),
+	}
+	require.NoError(t, s.CreateUser(ctx, user))
+	ensureHubMembership(ctx, s, user.ID)
+
+	project := &store.Project{
+		ID:        tid("proj-co-addr"),
+		Slug:      "co-addr-proj",
+		Name:      "CoAddr Test Project",
+		OwnerID:   owner.ID,
+		CreatedBy: owner.ID,
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+	srv.seedProjectCreatorMembership(ctx, project)
+	msgAuthzAddProjectMember(t, s, user.ID, project.ID, project.Slug, store.GroupMemberRoleMember)
+	// project-member role does not include agent.message (removed in R3);
+	// grant it explicitly so the co-addressee sender is authorized.
+	msgAuthzGrantAgentMessage(t, s, user.ID, project.ID)
+
+	// Create two agents: primary (coder) and secondary (reviewer).
+	primaryAgent := &store.Agent{
+		ID:           tid("agent-co-primary"),
+		Slug:         "coder",
+		Name:         "Coder Agent",
+		ProjectID:    project.ID,
+		Phase:        string(state.PhaseRunning),
+		MessageMode:  store.MessageModeProject,
+		StateVersion: 1,
+		Created:      time.Now(),
+		Updated:      time.Now(),
+	}
+	require.NoError(t, s.CreateAgent(ctx, primaryAgent))
+
+	secondaryAgent := &store.Agent{
+		ID:           tid("agent-co-secondary"),
+		Slug:         "reviewer",
+		Name:         "Reviewer Agent",
+		ProjectID:    project.ID,
+		Phase:        string(state.PhaseRunning),
+		MessageMode:  store.MessageModeProject,
+		StateVersion: 1,
+		Created:      time.Now(),
+		Updated:      time.Now(),
+	}
+	require.NoError(t, s.CreateAgent(ctx, secondaryAgent))
+
+	senderRef := "user:" + user.Email
+
+	t.Run("primary with co-addressees accepted", func(t *testing.T) {
+		topic := "scion.project." + project.ID + ".agent." + primaryAgent.Slug + ".messages"
+		coAddressees, _ := json.Marshal([]string{"coder", "reviewer"})
+
+		payload := inboundMessageRequest{
+			Topic: topic,
+			Message: &messages.StructuredMessage{
+				Version:   messages.Version,
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Channel:   "discord",
+				Sender:    senderRef,
+				Recipient: "agent:" + primaryAgent.Slug,
+				Msg:       "check this PR",
+				Type:      messages.TypeInstruction,
+				Metadata: map[string]string{
+					"discord_channel_id":    "ch-123",
+					"project_id":            project.ID,
+					"mention_co_addressees": string(coAddressees),
+				},
+			},
+		}
+		body, err := json.Marshal(payload)
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/broker/inbound", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(contextWithBrokerIdentity(req.Context(), NewBrokerIdentity("test-broker")))
+
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+
+		// ── Status: full 200 success (dispatch + persist completed). ──
+		require.Equal(t, http.StatusOK, rec.Code,
+			"primary with co-addressees should succeed; got %d: %s", rec.Code, rec.Body.String())
+
+		// Verify response body confirms delivery to the primary agent.
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["delivered"], "response should confirm delivery")
+		assert.Equal(t, primaryAgent.ID, resp["agentId"], "response should reference primary agent")
+
+		// ── Dispatch assertions: the dispatcher received the message. ──
+		calls := dispatcher.getCalls()
+		require.NotEmpty(t, calls, "dispatcher should have recorded at least one call")
+		lastCall := calls[len(calls)-1]
+		assert.Equal(t, primaryAgent.Slug, lastCall.Agent.Slug,
+			"dispatch target should be the primary agent (coder)")
+		assert.Equal(t, "check this PR", lastCall.Message,
+			"dispatched message body should match")
+
+		// The structured message should carry co-addressee rendering in
+		// DeliveryText (rendered by RenderDeliveryText when the envelope
+		// switch is ON — enabled above via enableWriteDenySwitch).
+		require.NotNil(t, lastCall.StructuredMessage,
+			"dispatcher should receive a non-nil StructuredMessage")
+		require.NotEmpty(t, lastCall.StructuredMessage.DeliveryText,
+			"DeliveryText must be populated — envelope switch is ON")
+
+		// Structurally parse the delivery envelope JSON to verify
+		// co-addressee attribution — not substring matching.
+		primaryEnv := parseCoAddrEnvelope(t, lastCall.StructuredMessage.DeliveryText)
+		assert.ElementsMatch(t, []string{"agent:coder", "agent:reviewer"}, primaryEnv.To,
+			"envelope To should list exactly the two co-addressees")
+		assert.Equal(t, "message", primaryEnv.Type,
+			"primary (instruction) envelope type should be 'message'")
+
+		// ── Persistence: the message was stored. ──
+		msgs, err := s.ListMessages(ctx, store.MessageFilter{
+			AgentID: primaryAgent.ID,
+		}, store.ListOptions{Limit: 10})
+		require.NoError(t, err)
+		require.NotEmpty(t, msgs.Items, "message should be persisted in the store")
+		persisted := msgs.Items[0]
+		assert.Equal(t, senderRef, persisted.Sender, "persisted sender should match")
+		assert.Equal(t, "agent:"+primaryAgent.Slug, persisted.Recipient, "persisted recipient should match")
+		assert.Equal(t, messages.TypeInstruction, persisted.Type, "persisted type should be instruction")
+		assert.Equal(t, "discord", persisted.Channel, "persisted channel should match")
+	})
+
+	t.Run("mention with co-addressees accepted", func(t *testing.T) {
+		topic := "scion.project." + project.ID + ".agent." + secondaryAgent.Slug + ".messages"
+		coAddressees, _ := json.Marshal([]string{"coder", "reviewer"})
+
+		// Record dispatcher call count before this subtest.
+		callsBefore := len(dispatcher.getCalls())
+
+		payload := inboundMessageRequest{
+			Topic: topic,
+			Message: &messages.StructuredMessage{
+				Version:   messages.Version,
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Channel:   "discord",
+				Sender:    senderRef,
+				Recipient: "agent:" + secondaryAgent.Slug,
+				Msg:       "check this PR",
+				Type:      messages.TypeMention,
+				Metadata: map[string]string{
+					"discord_channel_id":    "ch-123",
+					"project_id":            project.ID,
+					"mention_co_addressees": string(coAddressees),
+					"mention_source":        "agent:coder",
+					"mention_position":      "body",
+				},
+			},
+		}
+		body, err := json.Marshal(payload)
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/broker/inbound", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(contextWithBrokerIdentity(req.Context(), NewBrokerIdentity("test-broker")))
+
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+
+		// ── Status: full 200 success. ──
+		require.Equal(t, http.StatusOK, rec.Code,
+			"mention with co-addressees should succeed; got %d: %s", rec.Code, rec.Body.String())
+
+		// Verify response body confirms delivery to the secondary agent.
+		var resp map[string]interface{}
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, true, resp["delivered"], "response should confirm delivery")
+		assert.Equal(t, secondaryAgent.ID, resp["agentId"], "response should reference secondary agent (reviewer)")
+
+		// ── Dispatch assertions: the dispatcher received the mention. ──
+		callsAfter := dispatcher.getCalls()
+		require.Greater(t, len(callsAfter), callsBefore,
+			"dispatcher should have recorded a new call for the mention")
+		mentionCall := callsAfter[len(callsAfter)-1]
+		assert.Equal(t, secondaryAgent.Slug, mentionCall.Agent.Slug,
+			"dispatch target should be the secondary agent (reviewer)")
+
+		// The structured message should carry mention-type co-addressee
+		// rendering with both agents listed in the delivery envelope.
+		require.NotNil(t, mentionCall.StructuredMessage,
+			"dispatcher should receive a non-nil StructuredMessage")
+		require.NotEmpty(t, mentionCall.StructuredMessage.DeliveryText,
+			"DeliveryText must be populated — envelope switch is ON")
+
+		// Structurally parse the delivery envelope JSON.
+		mentionEnv := parseCoAddrEnvelope(t, mentionCall.StructuredMessage.DeliveryText)
+		assert.ElementsMatch(t, []string{"agent:coder", "agent:reviewer"}, mentionEnv.To,
+			"mention envelope To should list exactly the two co-addressees")
+		// Mention-type messages set IsMention=true in the render input,
+		// which changes the envelope type to "mention".
+		assert.Equal(t, "mention", mentionEnv.Type,
+			"mention envelope type should be 'mention', not 'message'")
+
+		// ── Persistence: the mention message was stored. ──
+		msgs, err := s.ListMessages(ctx, store.MessageFilter{
+			AgentID: secondaryAgent.ID,
+		}, store.ListOptions{Limit: 10})
+		require.NoError(t, err)
+		require.NotEmpty(t, msgs.Items, "mention message should be persisted in the store")
+		persisted := msgs.Items[0]
+		assert.Equal(t, senderRef, persisted.Sender, "persisted sender should match")
+		assert.Equal(t, "agent:"+secondaryAgent.Slug, persisted.Recipient, "persisted recipient should match")
+		assert.Equal(t, messages.TypeMention, persisted.Type, "persisted type should be mention")
+		assert.Equal(t, "discord", persisted.Channel, "persisted channel should match")
+	})
+}
+
+// coAddrEnvelope is a minimal struct for structurally verifying co-addressee
+// attribution in DeliveryText. Mirrors the json tags of
+// messaging.DeliveryEnvelope without importing the full type.
+// Reuses extractEnvelopeJSON from handlers_outbound_def171_test.go.
+type coAddrEnvelope struct {
+	To   []string `json:"to"`
+	Type string   `json:"type"`
+}
+
+// parseCoAddrEnvelope extracts and parses the JSON body from a rendered
+// DeliveryText using the shared extractEnvelopeJSON helper.
+func parseCoAddrEnvelope(t *testing.T, deliveryText string) coAddrEnvelope {
+	t.Helper()
+	jsonStr := extractEnvelopeJSON(t, deliveryText)
+	var env coAddrEnvelope
+	require.NoError(t, json.Unmarshal([]byte(jsonStr), &env),
+		"failed to unmarshal envelope JSON: %s", jsonStr)
+	return env
 }

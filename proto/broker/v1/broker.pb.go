@@ -37,29 +37,29 @@ const (
 
 // StructuredMessage mirrors pkg/messages.StructuredMessage.
 type StructuredMessage struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Version       int32                  `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
-	Timestamp     string                 `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	Sender        string                 `protobuf:"bytes,3,opt,name=sender,proto3" json:"sender,omitempty"`
-	SenderId      string                 `protobuf:"bytes,4,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`
-	Recipient     string                 `protobuf:"bytes,5,opt,name=recipient,proto3" json:"recipient,omitempty"`
-	RecipientId   string                 `protobuf:"bytes,6,opt,name=recipient_id,json=recipientId,proto3" json:"recipient_id,omitempty"`
-	Recipients    string                 `protobuf:"bytes,7,opt,name=recipients,proto3" json:"recipients,omitempty"`
-	Msg           string                 `protobuf:"bytes,8,opt,name=msg,proto3" json:"msg,omitempty"`
-	Type          string                 `protobuf:"bytes,9,opt,name=type,proto3" json:"type,omitempty"`
-	Plain         bool                   `protobuf:"varint,10,opt,name=plain,proto3" json:"plain,omitempty"`
-	Raw           bool                   `protobuf:"varint,11,opt,name=raw,proto3" json:"raw,omitempty"`
-	Urgent        bool                   `protobuf:"varint,12,opt,name=urgent,proto3" json:"urgent,omitempty"`
-	Broadcasted   bool                   `protobuf:"varint,13,opt,name=broadcasted,proto3" json:"broadcasted,omitempty"`
-	ObserverOnly  bool                   `protobuf:"varint,14,opt,name=observer_only,json=observerOnly,proto3" json:"observer_only,omitempty"`
-	Status        string                 `protobuf:"bytes,15,opt,name=status,proto3" json:"status,omitempty"`
-	Attachments   []string               `protobuf:"bytes,16,rep,name=attachments,proto3" json:"attachments,omitempty"`
-	Metadata      map[string]string      `protobuf:"bytes,17,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Channel       string                 `protobuf:"bytes,18,opt,name=channel,proto3" json:"channel,omitempty"`
-	ThreadId      string                 `protobuf:"bytes,19,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
-	Visibility    string                 `protobuf:"bytes,20,opt,name=visibility,proto3" json:"visibility,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Version        int32                  `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Timestamp      string                 `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Sender         string                 `protobuf:"bytes,3,opt,name=sender,proto3" json:"sender,omitempty"`
+	SenderId       string                 `protobuf:"bytes,4,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`
+	Recipient      string                 `protobuf:"bytes,5,opt,name=recipient,proto3" json:"recipient,omitempty"`
+	RecipientId    string                 `protobuf:"bytes,6,opt,name=recipient_id,json=recipientId,proto3" json:"recipient_id,omitempty"`
+	Recipients     string                 `protobuf:"bytes,7,opt,name=recipients,proto3" json:"recipients,omitempty"`
+	Msg            string                 `protobuf:"bytes,8,opt,name=msg,proto3" json:"msg,omitempty"`
+	Type           string                 `protobuf:"bytes,9,opt,name=type,proto3" json:"type,omitempty"`
+	Plain          bool                   `protobuf:"varint,10,opt,name=plain,proto3" json:"plain,omitempty"`
+	Urgent         bool                   `protobuf:"varint,12,opt,name=urgent,proto3" json:"urgent,omitempty"`
+	Broadcasted    bool                   `protobuf:"varint,13,opt,name=broadcasted,proto3" json:"broadcasted,omitempty"`
+	ObserverOnly   bool                   `protobuf:"varint,14,opt,name=observer_only,json=observerOnly,proto3" json:"observer_only,omitempty"`
+	Status         string                 `protobuf:"bytes,15,opt,name=status,proto3" json:"status,omitempty"`
+	Attachments    []string               `protobuf:"bytes,16,rep,name=attachments,proto3" json:"attachments,omitempty"`
+	Metadata       map[string]string      `protobuf:"bytes,17,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Channel        string                 `protobuf:"bytes,18,opt,name=channel,proto3" json:"channel,omitempty"`
+	ThreadId       string                 `protobuf:"bytes,19,opt,name=thread_id,json=threadId,proto3" json:"thread_id,omitempty"`
+	ConversationId string                 `protobuf:"bytes,21,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	DeliveryText   string                 `protobuf:"bytes,22,opt,name=delivery_text,json=deliveryText,proto3" json:"delivery_text,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *StructuredMessage) Reset() {
@@ -162,13 +162,6 @@ func (x *StructuredMessage) GetPlain() bool {
 	return false
 }
 
-func (x *StructuredMessage) GetRaw() bool {
-	if x != nil {
-		return x.Raw
-	}
-	return false
-}
-
 func (x *StructuredMessage) GetUrgent() bool {
 	if x != nil {
 		return x.Urgent
@@ -225,9 +218,16 @@ func (x *StructuredMessage) GetThreadId() string {
 	return ""
 }
 
-func (x *StructuredMessage) GetVisibility() string {
+func (x *StructuredMessage) GetConversationId() string {
 	if x != nil {
-		return x.Visibility
+		return x.ConversationId
+	}
+	return ""
+}
+
+func (x *StructuredMessage) GetDeliveryText() string {
+	if x != nil {
+		return x.DeliveryText
 	}
 	return ""
 }
@@ -772,7 +772,7 @@ var File_broker_v1_broker_proto protoreflect.FileDescriptor
 
 const file_broker_v1_broker_proto_rawDesc = "" +
 	"\n" +
-	"\x16broker/v1/broker.proto\x12\x0fscion.broker.v1\"\xaa\x05\n" +
+	"\x16broker/v1/broker.proto\x12\x0fscion.broker.v1\"\xe3\x05\n" +
 	"\x11StructuredMessage\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x05R\aversion\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\tR\ttimestamp\x12\x16\n" +
@@ -786,8 +786,7 @@ const file_broker_v1_broker_proto_rawDesc = "" +
 	"\x03msg\x18\b \x01(\tR\x03msg\x12\x12\n" +
 	"\x04type\x18\t \x01(\tR\x04type\x12\x14\n" +
 	"\x05plain\x18\n" +
-	" \x01(\bR\x05plain\x12\x10\n" +
-	"\x03raw\x18\v \x01(\bR\x03raw\x12\x16\n" +
+	" \x01(\bR\x05plain\x12\x16\n" +
 	"\x06urgent\x18\f \x01(\bR\x06urgent\x12 \n" +
 	"\vbroadcasted\x18\r \x01(\bR\vbroadcasted\x12#\n" +
 	"\robserver_only\x18\x0e \x01(\bR\fobserverOnly\x12\x16\n" +
@@ -795,13 +794,13 @@ const file_broker_v1_broker_proto_rawDesc = "" +
 	"\vattachments\x18\x10 \x03(\tR\vattachments\x12L\n" +
 	"\bmetadata\x18\x11 \x03(\v20.scion.broker.v1.StructuredMessage.MetadataEntryR\bmetadata\x12\x18\n" +
 	"\achannel\x18\x12 \x01(\tR\achannel\x12\x1b\n" +
-	"\tthread_id\x18\x13 \x01(\tR\bthreadId\x12\x1e\n" +
-	"\n" +
-	"visibility\x18\x14 \x01(\tR\n" +
-	"visibility\x1a;\n" +
+	"\tthread_id\x18\x13 \x01(\tR\bthreadId\x12'\n" +
+	"\x0fconversation_id\x18\x15 \x01(\tR\x0econversationId\x12#\n" +
+	"\rdelivery_text\x18\x16 \x01(\tR\fdeliveryText\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x94\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\v\x10\fJ\x04\b\x14\x10\x15R\x03rawR\n" +
+	"visibility\"\x94\x01\n" +
 	"\x10ConfigureRequest\x12E\n" +
 	"\x06config\x18\x01 \x03(\v2-.scion.broker.v1.ConfigureRequest.ConfigEntryR\x06config\x1a9\n" +
 	"\vConfigEntry\x12\x10\n" +

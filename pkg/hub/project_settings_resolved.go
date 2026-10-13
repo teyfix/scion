@@ -59,7 +59,7 @@ import (
 // hub has no default for this" and "this build could not determine it". The
 // distinction is real in this codebase and is not hypothetical:
 //
-//   - In file/SQLite mode there is no OperationalSettings at all, so no
+//   - On a hub with no OperationalSettings at all, no
 //     agent_defaults document can be read. Every key backed by that section is
 //     genuinely UNKNOWN, not absent.
 //   - Six of the eight opsettings.AgentDefaultsSettings fields are non-pointer
@@ -157,9 +157,11 @@ type hubDefaultSource int
 
 const (
 	// hubSourceNone: no hub-level counterpart exists for this setting.
-	// opsettings.AgentDefaultsSettings has exactly eight fields, enumerated in
-	// full, so this is a measured structural fact rather than an unsearched
-	// one — which is why these keys may report ABSENT rather than UNKNOWN.
+	// Every resolvedSettingDescriptors entry with this source names a field of
+	// opsettings.AgentDefaultsSettings (or another hub source) that was
+	// checked and does not exist, so this is a measured structural fact rather
+	// than an unsearched one — which is why these keys may report ABSENT
+	// rather than UNKNOWN.
 	hubSourceNone hubDefaultSource = iota
 
 	// hubSourceAgentDefaults: the opsettings "agent_defaults" section document.
@@ -249,7 +251,7 @@ var resolvedSettingDescriptors = map[string]resolvedSettingDescriptor{
 	projectSettingDefaultThinkingLevel: {
 		source:            hubSourceAgentDefaults,
 		path:              []string{"default_thinking_level"},
-		absentWhenMissing: true, // *int with omitempty; 0 is the clear sentinel and deletes the key, so absence is unambiguous
+		absentWhenMissing: true, // *int with omitempty; a clear (null) deletes the key and 0 is rejected, so absence is unambiguous
 	},
 	projectSettingTelemetryEnabled: {
 		source: hubSourceTelemetryDefault,
@@ -280,9 +282,18 @@ var resolvedSettingDescriptors = map[string]resolvedSettingDescriptor{
 
 	// Default GCP identity
 	projectSettingDefaultGCPIdentityMode: {
-		source: hubSourceNone,
+		source:            hubSourceAgentDefaults,
+		path:              []string{"default_gcp_identity_mode"},
+		absentWhenMissing: false, // string, "" dropped by omitempty
 	},
 	projectSettingDefaultGCPIdentitySAID: {
+		source:            hubSourceAgentDefaults,
+		path:              []string{"default_gcp_identity_service_account_id"},
+		absentWhenMissing: false, // string, "" dropped by omitempty
+	},
+	// No hub-level per-profile default exists; the hub default is the
+	// single default_gcp_identity_service_account_id above.
+	projectSettingDefaultGCPIdentitySAIDByProfile: {
 		source: hubSourceNone,
 	},
 
@@ -342,7 +353,7 @@ func (s *Server) handleProjectSettingsResolved(w http.ResponseWriter, r *http.Re
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -623,7 +634,7 @@ func isJSONNull(raw json.RawMessage) bool {
 func (s *Server) hubAgentDefaultsDoc() (map[string]json.RawMessage, bool) {
 	ops := s.GetOperationalSettings()
 	if ops == nil {
-		// File/SQLite mode: the agent_defaults section does not exist as a
+		// No OperationalSettings: the agent_defaults section does not exist as a
 		// document here. A missing hint must never fail the request.
 		return nil, false
 	}

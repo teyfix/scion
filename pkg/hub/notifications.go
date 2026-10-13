@@ -17,6 +17,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -24,9 +25,11 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -35,16 +38,22 @@ import (
 // notification subscriptions, stores notification records, and dispatches
 // messages to subscriber agents.
 type NotificationDispatcher struct {
-	store           store.Store
-	events          EventPublisher
-	getDispatcher   func() AgentDispatcher // lazy getter; dispatcher may be set after startup
-	log             *slog.Logger
-	messageLog      *slog.Logger        // dedicated message audit logger (nil = disabled)
-	channelRegistry *ChannelRegistry    // external notification channels (nil = disabled)
-	brokerProxy     *MessageBrokerProxy // broker plugin proxy (nil = no broker, use ChannelRegistry)
-	stopCh          chan struct{}
-	stopOnce        sync.Once
-	wg              sync.WaitGroup
+	store            store.Store
+	events           EventPublisher
+	getDispatcher    func() AgentDispatcher // lazy getter; dispatcher may be set after startup
+	log              *slog.Logger
+	messageLog       *slog.Logger        // dedicated message audit logger (nil = disabled)
+	brokerProxy      *MessageBrokerProxy // broker plugin proxy (nil = no broker, use ChannelRegistry)
+	writeDenyEnabled func() bool         // G2 write-deny switch callback (nil = OFF)
+	stopCh           chan struct{}
+	stopOnce         sync.Once
+	wg               sync.WaitGroup
+
+	// channelRegistryFn returns the external notification channel registry
+	// in use (nil fn or nil registry = disabled). The Server sets it so a
+	// registry rebuilt from saved settings is used without restarting the
+	// dispatcher (ptone/scion#3904).
+	channelRegistryFn func() *ChannelRegistry
 }
 
 // NewNotificationDispatcher creates a new NotificationDispatcher.
@@ -69,16 +78,17 @@ func (nd *NotificationDispatcher) SetBrokerProxy(p *MessageBrokerProxy) {
 	nd.brokerProxy = p
 }
 
-// Start subscribes to agent status and deletion events and spawns goroutines to process them.
+// Start subscribes to agent status events and spawns a goroutine to process
+// them. DELETED notifications are not driven by the agent.deleted event: the
+// delete engine resolves them before the row changes and delivers them after
+// (ResolveDeletedNotifications, design ptone/scion#2483 §2.3).
 func (nd *NotificationDispatcher) Start() {
 	statusCh, unsubStatus := nd.events.Subscribe("project.>.agent.status")
-	deletedCh, unsubDeleted := nd.events.Subscribe("project.>.agent.deleted")
 
 	nd.wg.Add(1)
 	go func() {
 		defer nd.wg.Done()
 		defer unsubStatus()
-		defer unsubDeleted()
 		for {
 			select {
 			case evt, ok := <-statusCh:
@@ -86,11 +96,6 @@ func (nd *NotificationDispatcher) Start() {
 					return
 				}
 				nd.handleEvent(evt)
-			case evt, ok := <-deletedCh:
-				if !ok {
-					return
-				}
-				nd.handleDeletedEvent(evt)
 			case <-nd.stopCh:
 				return
 			}
@@ -193,66 +198,105 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 	}
 }
 
-// handleDeletedEvent processes an agent deletion event.
-// It fires DELETED notifications before the cascade delete removes subscriptions.
-func (nd *NotificationDispatcher) handleDeletedEvent(evt Event) {
-	var deletedEvt AgentDeletedEvent
-	if err := json.Unmarshal(evt.Data, &deletedEvt); err != nil {
-		nd.log.Error("Failed to unmarshal agent deleted event", "error", err)
-		return
+// pendingDeletedNotification is one DELETED notification resolved before an
+// agent's row changes, to be persisted and delivered after it (design
+// ptone/scion#2483 §2.3).
+type pendingDeletedNotification struct {
+	sub   store.NotificationSubscription
+	agent store.Agent // snapshot of the watched agent, taken before the delete
+}
+
+// ResolveDeletedNotifications resolves the DELETED notifications for agent
+// from a snapshot taken before the delete finalizes. It only reads (the
+// agent- and project-scoped subscriptions); nothing is persisted or sent.
+// Persist and deliver with DeliverDeletedNotifications, only after the row
+// change succeeded: a hard delete cascades both the subscriptions and the
+// agent's notification rows (CompositeStore.DeleteAgent), so resolving
+// afterwards would find nothing, and persisting before would lose the rows.
+//
+// Subscriptions are deduplicated by subscriber, and only those whose
+// triggers match DELETED are kept.
+func (nd *NotificationDispatcher) ResolveDeletedNotifications(ctx context.Context, agent *store.Agent) []pendingDeletedNotification {
+	if nd == nil || agent == nil || agent.ID == "" {
+		return nil
 	}
-
-	if deletedEvt.AgentID == "" {
-		return
-	}
-
-	ctx := context.Background()
-
-	// Collect subscriptions from both scopes
-	agentSubs, err := nd.store.GetNotificationSubscriptions(ctx, deletedEvt.AgentID)
+	agentSubs, err := nd.store.GetNotificationSubscriptions(ctx, agent.ID)
 	if err != nil {
-		nd.log.Error("Failed to get agent notification subscriptions for deleted event",
-			"agent_id", deletedEvt.AgentID, "error", err)
+		nd.log.Error("Failed to get agent notification subscriptions for deleted agent",
+			"agent_id", agent.ID, "error", err)
 		agentSubs = nil
 	}
-
-	projectSubs, err := nd.store.GetNotificationSubscriptionsByProjectScope(ctx, deletedEvt.ProjectID)
-	if err != nil {
-		nd.log.Error("Failed to get project notification subscriptions for deleted event",
-			"projectID", deletedEvt.ProjectID, "error", err)
-		projectSubs = nil
+	var projectSubs []store.NotificationSubscription
+	if agent.ProjectID != "" {
+		projectSubs, err = nd.store.GetNotificationSubscriptionsByProjectScope(ctx, agent.ProjectID)
+		if err != nil {
+			nd.log.Error("Failed to get project notification subscriptions for deleted agent",
+				"projectID", agent.ProjectID, "error", err)
+			projectSubs = nil
+		}
 	}
 
 	allSubs := append(agentSubs, projectSubs...)
-	if len(allSubs) == 0 {
-		return
-	}
-
-	// Deduplicate by subscriber and fire DELETED notifications
 	seen := make(map[string]bool)
+	var pending []pendingDeletedNotification
 	for i := range allSubs {
-		sub := &allSubs[i]
-
+		sub := allSubs[i]
 		dedupeKey := sub.SubscriberType + ":" + sub.SubscriberID
-		if seen[dedupeKey] {
+		if seen[dedupeKey] || !sub.MatchesActivity("DELETED") {
 			continue
 		}
-
-		if !sub.MatchesActivity("DELETED") {
-			continue
-		}
-
 		seen[dedupeKey] = true
-
-		// Build a synthetic status event for storeAndDispatch
-		statusEvt := AgentStatusEvent{
-			AgentID:   deletedEvt.AgentID,
-			ProjectID: deletedEvt.ProjectID,
-			Phase:     "stopped",
-			Activity:  "DELETED",
-		}
-		nd.storeAndDispatch(ctx, sub, statusEvt)
+		pending = append(pending, pendingDeletedNotification{sub: sub, agent: *agent})
 	}
+	return pending
+}
+
+// DeliverDeletedNotifications persists and delivers notifications resolved by
+// ResolveDeletedNotifications. It runs in the background on its own context,
+// so a stalled subscriber (the per-subscriber broker retry is up to 30s)
+// never holds up the delete engine or lets its lease lapse. The returned
+// channel is closed when every notification has been handled (for tests).
+func (nd *NotificationDispatcher) DeliverDeletedNotifications(ctx context.Context, pending []pendingDeletedNotification) <-chan struct{} {
+	done := make(chan struct{})
+	if nd == nil || len(pending) == 0 {
+		close(done)
+		return done
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		defer close(done)
+		for i := range pending {
+			nd.deliverDeletedNotification(ctx, &pending[i])
+		}
+	}()
+	return done
+}
+
+// deliverDeletedNotification persists and delivers one resolved DELETED
+// notification. A panic is recovered per item, so it cannot drop the
+// remaining subscribers' notifications.
+func (nd *NotificationDispatcher) deliverDeletedNotification(ctx context.Context, p *pendingDeletedNotification) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			nd.log.Error("DELETED notification delivery panicked",
+				"agent_id", p.agent.ID, "subscriptionID", p.sub.ID, "panic", fmt.Sprint(rec))
+		}
+	}()
+	evt := AgentStatusEvent{
+		AgentID:   p.agent.ID,
+		ProjectID: p.agent.ProjectID,
+		Phase:     "stopped",
+		Activity:  "DELETED",
+		// The agent is gone: no delete view (explicit null on the wire).
+		Deletion: nil,
+	}
+	// storeAndDispatch's stale-event check is intentionally skipped. It
+	// drops re-reported statuses older than the subscription, judged by the
+	// agent's last activity. A DELETED event is never a re-report: the
+	// delete is happening now, after any subscription that exists. An idle
+	// agent's last activity can predate a newer subscription, so the check
+	// would wrongly drop the event.
+	nd.storeAndDispatchForAgent(ctx, &p.sub, evt, &p.agent)
 }
 
 // storeAndDispatch creates a notification record and dispatches it to the subscriber.
@@ -287,6 +331,13 @@ func (nd *NotificationDispatcher) storeAndDispatch(ctx context.Context, sub *sto
 		}
 	}
 
+	nd.storeAndDispatchForAgent(ctx, sub, evt, agent)
+}
+
+// storeAndDispatchForAgent persists a notification for evt and dispatches it
+// to the subscriber, using agent as the watched agent (it is not re-read, so
+// it also works from a snapshot of an agent that has since been deleted).
+func (nd *NotificationDispatcher) storeAndDispatchForAgent(ctx context.Context, sub *store.NotificationSubscription, evt AgentStatusEvent, agent *store.Agent) {
 	// Use activity for matching/display; fall back to phase when activity is empty.
 	effectiveStatus := evt.Activity
 	if effectiveStatus == "" {
@@ -324,13 +375,29 @@ func (nd *NotificationDispatcher) storeAndDispatch(ctx context.Context, sub *sto
 		nd.log.Info("Notification dispatched to user via SSE",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
 
-		// Persist an inbox message for the web UI.
-		nd.createInboxMessage(ctx, sub, notif, agent)
-
-		// Route through the broker so external integrations (Telegram,
-		// Discord) receive state-change messages as rich cards.
-		if nd.brokerProxy != nil {
-			nd.dispatchToBroker(ctx, sub, notif, agent.ID, agent.Slug)
+		// Persist exactly one inbox message for the web UI (ptone/scion#1906).
+		// With a broker configured, the broker's deliverToUser subscription
+		// persists the published message and emits the user.message SSE
+		// event, so writing the inbox row here as well duplicated the DM.
+		//
+		// Trade-off: the fallback below writes the row only when the
+		// publish provably did not reach that subscriber (see
+		// dispatchToBroker); anything ambiguous is treated as delivered, so
+		// we prefer a possibly missing row over a duplicate. The remaining
+		// loss windows are a full subscriber buffer and an asynchronous
+		// deliverToUser store failure; both are logged with the
+		// notification ID, and neither is retried.
+		if nd.persistsViaInbox(sub) {
+			nd.createInboxMessage(ctx, sub, notif, agent)
+			if nd.brokerProxy != nil {
+				// Federated corner (see persistsViaInbox): deliverToUser
+				// will refuse to persist, but plugins still get the card.
+				_ = nd.publishToBroker(ctx, sub, notif, agent)
+			}
+		} else if !nd.dispatchToBroker(ctx, sub, notif, agent) {
+			// Nothing reached the broker's persisting subscriber; fall back
+			// so the notification is not lost from the inbox.
+			nd.createInboxMessage(ctx, sub, notif, agent)
 		}
 
 		// Channel registry is a fallback for deployments without a broker.
@@ -384,10 +451,26 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 	structuredMsg.RecipientID = subscriber.ID
 	structuredMsg.Status = strings.ToUpper(notif.Status)
 
+	// Phase 9f: render delivery envelope for notification dispatches.
+	// No persisted row and no conversation exist for agent-to-agent
+	// state-change notifications, so MessageID and ConvResult are
+	// honestly absent.
+	if nd.writeDenyEnabled != nil && nd.writeDenyEnabled() {
+		var ts time.Time
+		if t, err := time.Parse(time.RFC3339, structuredMsg.Timestamp); err == nil {
+			ts = t
+		}
+		structuredMsg.DeliveryText = messaging.RenderDeliveryText(messaging.RenderDeliveryInput{
+			ConvResult: nil,
+			Msg:        structuredMsg,
+			CreatedAt:  ts,
+		})
+	}
+
 	retryCtx, retryCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer retryCancel()
 
-	if err := dispatchWithBrokerRetry(retryCtx, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
+	if err := dispatchWithBrokerRetry(retryCtx, nd.messageLog, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
 		nd.log.Error("Failed to dispatch notification to agent",
 			"subscriberID", sub.SubscriberID, "error", err)
 	} else {
@@ -400,8 +483,10 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 				"agent_name", subscriber.Name,
 				"project_id", subscriber.ProjectID,
 				"notification_id", notif.ID,
+				// The record was written before dispatch; this outcome
+				// line carries no record fields or content.
+				logging.AttrLogKind, logging.LogKindEvent,
 			}
-			logAttrs = append(logAttrs, structuredMsg.LogAttrs()...)
 			nd.messageLog.Debug("notification message dispatched", logAttrs...)
 		}
 	}
@@ -424,7 +509,8 @@ func notificationMessageType(status string) string {
 // channels. This is fire-and-forget; errors are logged but do not affect the
 // notification pipeline.
 func (nd *NotificationDispatcher) dispatchToChannels(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, watchedAgentID, watchedSlug string) {
-	if nd.channelRegistry == nil || nd.channelRegistry.Len() == 0 {
+	cr := nd.currentChannelRegistry()
+	if cr == nil || cr.Len() == 0 {
 		return
 	}
 
@@ -439,46 +525,107 @@ func (nd *NotificationDispatcher) dispatchToChannels(ctx context.Context, sub *s
 	structuredMsg.RecipientID = sub.SubscriberID
 	structuredMsg.Status = strings.ToUpper(notif.Status)
 
-	nd.channelRegistry.Dispatch(ctx, structuredMsg)
+	cr.Dispatch(ctx, structuredMsg)
 }
 
-// dispatchToBroker publishes a user notification through the message broker proxy
-// so a broker plugin can render it (e.g., as a rich interactive card in a chat app).
-// This is fire-and-forget; errors are logged but do not affect the notification pipeline.
-func (nd *NotificationDispatcher) dispatchToBroker(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, watchedAgentID, watchedSlug string) {
+// currentChannelRegistry returns the notification channel registry to
+// dispatch to, or nil.
+func (nd *NotificationDispatcher) currentChannelRegistry() *ChannelRegistry {
+	if nd.channelRegistryFn == nil {
+		return nil
+	}
+	return nd.channelRegistryFn()
+}
+
+// persistsViaInbox reports whether the notifier itself must write the inbox
+// row for sub. Without a broker it always does. With a broker, the broker's
+// deliverToUser persists the published message instead — except for a
+// federated (non-UUID) subscriber while G2 write-deny is ON: deliverToUser
+// cannot resolve a DM conversation for a non-UUID principal and, under
+// write-deny, drops the message, whereas createInboxMessage carries the G2
+// exemption for exactly this population. The rule is canPersistUserDM,
+// shared with deliverToUser.
+func (nd *NotificationDispatcher) persistsViaInbox(sub *store.NotificationSubscription) bool {
+	if nd.brokerProxy == nil {
+		return true
+	}
+	return !canPersistUserDM(sub.SubscriberID, nd.writeDenyEnabled != nil && nd.writeDenyEnabled())
+}
+
+// notificationMessageBody picks the body for a user notification message.
+// Actionable notifications carry the agent's current message (the raw
+// question); everything else uses the formatted notification text. Shared by
+// the inbox and broker paths so whichever one persists stores the same body.
+func notificationMessageBody(notif *store.Notification, agent *store.Agent) string {
+	if agent.Message != "" && strings.EqualFold(notif.Status, "WAITING_FOR_INPUT") {
+		return agent.Message
+	}
+	return notif.Message
+}
+
+// dispatchToBroker publishes a user notification through the message broker
+// proxy, whose user-message subscription persists it and emits the SSE event.
+// The subscription is ensured first: it is otherwise only created on agent
+// lifecycle events, and a publish with no subscriber would lose the inbox row.
+// Returns false when the publish definitely did not reach that subscriber, so
+// the caller can persist directly instead.
+func (nd *NotificationDispatcher) dispatchToBroker(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, agent *store.Agent) bool {
+	if !nd.brokerProxy.subscribeProjectUserMessages(sub.ProjectID) {
+		// No persisting subscriber (proxy stopped, Subscribe failed, or no
+		// inprocess spoke): plugins still get the card, the caller writes
+		// the row.
+		_ = nd.publishToBroker(ctx, sub, notif, agent)
+		return false
+	}
+	return !inProcessPublishFailed(nd.publishToBroker(ctx, sub, notif, agent))
+}
+
+// inProcessPublishFailed reports whether err proves the hub's inprocess
+// subscribers did not receive the message. A failing plugin spoke
+// (FanOutEventBus joins non-observer spoke errors) does not count: inproc
+// already queued the message for deliverToUser, and falling back would write
+// a second row. A full subscriber buffer is ambiguous (another subscriber
+// may be the one that dropped), so it is not proof either.
+func inProcessPublishFailed(err error) bool {
+	if err == nil || errors.Is(err, eventbus.ErrSubscriberBufferFull) {
+		return false
+	}
+	// ErrEventBusClosed alone covers a bare InProcessEventBus.
+	return errors.Is(err, eventbus.ErrInProcessPublish) || errors.Is(err, eventbus.ErrEventBusClosed)
+}
+
+// publishToBroker publishes the notification on the user-message topic so a
+// broker plugin can render it (e.g., as a rich interactive card in a chat app).
+// Errors are logged and returned; they do not affect the notification pipeline.
+func (nd *NotificationDispatcher) publishToBroker(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, agent *store.Agent) error {
 	msgType := notificationMessageType(notif.Status)
 	structuredMsg := messages.NewNotification(
-		"agent:"+watchedSlug,
+		"agent:"+agent.Slug,
 		"user:"+sub.SubscriberID,
-		notif.Message,
+		notificationMessageBody(notif, agent),
 		msgType,
 	)
-	structuredMsg.SenderID = watchedAgentID
+	structuredMsg.SenderID = agent.ID
 	structuredMsg.RecipientID = sub.SubscriberID
 	structuredMsg.Status = strings.ToUpper(notif.Status)
 
-	if err := nd.brokerProxy.PublishUserMessage(ctx, sub.ProjectID, sub.SubscriberID, structuredMsg); err != nil {
+	if err := nd.brokerProxy.PublishUserMessage(withNotificationID(ctx, notif.ID), sub.ProjectID, sub.SubscriberID, structuredMsg); err != nil {
 		nd.log.Error("Failed to dispatch notification through broker",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID, "error", err)
-	} else {
-		nd.log.Info("Notification dispatched to user via broker",
-			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+		return err
 	}
+	nd.log.Info("Notification dispatched to user via broker",
+		"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+	return nil
 }
 
 // createInboxMessage persists an inbox Message for a user notification so
 // that it appears in the user's message feed alongside agent conversations.
-// This is the non-broker path; when a broker is present, the broker's
-// deliverToUser callback handles message persistence instead.
+// This is the non-broker path (see persistsViaInbox); when a broker is
+// present, the broker's deliverToUser callback handles persistence instead.
 func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, agent *store.Agent) {
 	msgType := notificationMessageType(notif.Status)
-
-	// Use the agent's current message (the raw question/status text) for
-	// actionable notifications; fall back to the formatted notification message.
-	msgBody := notif.Message
-	if agent.Message != "" && strings.EqualFold(notif.Status, "WAITING_FOR_INPUT") {
-		msgBody = agent.Message
-	}
+	msgBody := notificationMessageBody(notif, agent)
 
 	storeMsg := &store.Message{
 		ID:          api.NewUUID(),
@@ -490,19 +637,36 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 		Msg:         msgBody,
 		Type:        msgType,
 		AgentID:     agent.ID,
-		CreatedAt:   time.Now(),
+		// This persist *is* the delivery; Ent defaults dispatch_state to
+		// "pending" if left unset (nc-promote-busy).
+		DispatchState: store.MessageDispatchDispatched,
+		CreatedAt:     time.Now(),
 	}
 
 	// Phase 5 dual-write: resolve-or-create DM conversation for inbox notification messages.
+	//
+	// G2 EXCEPTION — federated subscriber skip stays non-fatal.
 	// SubscriberID may be a slug or federated identity rather than a UUID;
-	// DMConversationKey requires valid UUIDs for both parties.
+	// DMConversationKey requires valid UUIDs for both parties. Denying here
+	// means federated users stop receiving notifications entirely. The
+	// federated population is counted by the G1 attribution report and blocks
+	// the flip at the OPERATOR level; it must not deny per-request.
 	if _, parseErr := uuid.Parse(sub.SubscriberID); parseErr != nil {
-		nd.log.Warn("skipping DM conversation resolution for inbox message: subscriber ID not a UUID",
+		nd.log.Warn("skipping DM conversation resolution for inbox message: subscriber ID not a UUID (federated subscriber — G2 exempt)",
 			"subscriber_id", sub.SubscriberID, "notification_id", notif.ID)
 	} else {
-		convResult := messaging.ResolveOrCreateDMConversation(ctx, nd.store, nd.store, nd.log,
+		convResult, convErr := messaging.ResolveOrCreateDMConversation(ctx, nd.store, nd.store, nd.log,
 			"agent", agent.ID, "user", sub.SubscriberID)
-		if convResult != nil {
+		if convErr != nil {
+			if nd.writeDenyEnabled != nil && nd.writeDenyEnabled() {
+				messaging.WriteDenialMetrics.Inc("notif.inbox")
+				nd.log.Error("conversation resolution failed for inbox notification",
+					"notification_id", notif.ID, "subscriber_id", sub.SubscriberID, "error", convErr)
+				return
+			}
+			nd.log.Warn("conversation resolution failed for inbox notification (write-deny OFF, continuing)",
+				"notification_id", notif.ID, "subscriber_id", sub.SubscriberID, "error", convErr)
+		} else {
 			storeMsg.ConversationID = convResult.ConversationID
 		}
 	}
@@ -513,255 +677,14 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 		return
 	}
 
-	nd.events.PublishUserMessage(ctx, storeMsg)
+	nd.events.PublishUserMessage(ctx, storeMsg, nil, nil)
 	nd.log.Debug("Inbox message created for notification",
 		"notificationID", notif.ID, "messageID", storeMsg.ID, "subscriberID", sub.SubscriberID)
 }
 
-// ---------------------------------------------------------------------------
-// Chat notification triggers (W6): human mention + DM received
-// ---------------------------------------------------------------------------
-
-// ChatNotificationStatus constants for chat-specific notification triggers.
-const (
-	ChatNotificationMention    = "MENTION"
-	ChatNotificationDMReceived = "DM_RECEIVED"
-)
-
-// PresenceChecker reports whether a user has active presence (i.e. is
-// currently viewing the chat UI). When a user is actively present, DM
-// notifications are suppressed to avoid interrupting them.
-//
-// The server satisfies this with its PresenceManager (see
-// serverPresenceChecker). A nil PresenceChecker (or the NoOpPresenceChecker)
-// treats every user as absent, which means DM notifications always fire —
-// the conservative default.
-type PresenceChecker interface {
-	// IsUserActive returns true if the user is actively present
-	// (heartbeat within the presence window).
-	IsUserActive(userID string) bool
-}
-
-// NoOpPresenceChecker always returns false (user is not active).
-// Used as the default when no presence source is wired in.
-type NoOpPresenceChecker struct{}
-
-// IsUserActive always returns false — the user is assumed absent.
-func (NoOpPresenceChecker) IsUserActive(_ string) bool { return false }
-
-// ChatNotifier creates notifications for chat events (human mentions,
-// DM received) using the existing notification pipeline (SSE publish +
-// store). It is wired into the Server at startup and called from the
-// send path in handlers_chat_v2.go.
-type ChatNotifier struct {
-	store        store.Store
-	events       EventPublisher
-	webChatStore WebChatStore
-	presence     PresenceChecker
-	log          *slog.Logger
-}
-
-// NewChatNotifier creates a ChatNotifier. If presence is nil, a
-// NoOpPresenceChecker is used (DM notifications always fire).
-func NewChatNotifier(s store.Store, events EventPublisher, wcs WebChatStore, presence PresenceChecker, log *slog.Logger) *ChatNotifier {
-	if presence == nil {
-		presence = NoOpPresenceChecker{}
-	}
-	return &ChatNotifier{
-		store:        s,
-		events:       events,
-		webChatStore: wcs,
-		presence:     presence,
-		log:          log,
-	}
-}
-
-// ChatMessageContext describes the chat message that triggered a notification.
-// It travels with the notification onto the SSE event, where the client uses
-// it to title the browser notification, tag it per conversation, route a click
-// to the right conversation, and suppress notifications for its own messages.
-//
-// It replaces what was a growing list of positional string parameters; at
-// eight strings a transposed pair compiles cleanly and misroutes silently.
-type ChatMessageContext struct {
-	// SenderID is the UUID of the user who sent the message.
-	SenderID string
-	// SenderName is the sender's display name, falling back to their email.
-	SenderName string
-	// ConversationKey is the topic UUID, or the dm:<...> key for a DM.
-	ConversationKey string
-	// ConversationName is the human-readable thread name. Empty for DMs.
-	ConversationName string
-	// Preview is the raw message text; it is truncated before use.
-	Preview string
-	// ProjectID is the project UUID; empty for user-to-user DMs.
-	ProjectID string
-}
-
-// NotifyMention creates a notification for a human user who was @mentioned
-// in a thread or DM. It respects the muted flag on the conversation.
-func (cn *ChatNotifier) NotifyMention(ctx context.Context, mentionedUserID string, msg ChatMessageContext) {
-	if cn == nil || cn.webChatStore == nil {
-		return
-	}
-	senderName, conversationKey := msg.SenderName, msg.ConversationKey
-
-	// Respect muted flag.
-	muted, err := cn.webChatStore.IsConversationMuted(ctx, mentionedUserID, conversationKey)
-	if err != nil {
-		cn.log.Error("Failed to check muted state for mention notification",
-			"userID", mentionedUserID, "conversationKey", conversationKey, "error", err)
-		return
-	}
-	if muted {
-		cn.log.Debug("Skipping mention notification — conversation muted",
-			"userID", mentionedUserID, "conversationKey", conversationKey)
-		return
-	}
-
-	message := formatChatNotification(ChatNotificationMention, senderName, msg.ConversationName, msg.Preview)
-
-	notif := cn.buildChatNotification(mentionedUserID, ChatNotificationMention, message, msg.ProjectID)
-
-	if err := cn.store.CreateNotification(ctx, notif); err != nil {
-		cn.log.Error("Failed to create mention notification",
-			"userID", mentionedUserID, "error", err)
-		return
-	}
-
-	cn.events.PublishChatNotification(ctx, notif, msg)
-	cn.log.Info("Mention notification created",
-		"notificationID", notif.ID, "mentionedUser", mentionedUserID,
-		"sender", senderName, "conversationKey", conversationKey)
-}
-
-// NotifyDMReceived creates a notification for a user who received a DM.
-// Notifications are skipped when:
-//   - the conversation is muted
-//   - the recipient has active presence (W5 integration)
-func (cn *ChatNotifier) NotifyDMReceived(ctx context.Context, recipientUserID string, msg ChatMessageContext) {
-	if cn == nil || cn.webChatStore == nil {
-		return
-	}
-	senderName, conversationKey := msg.SenderName, msg.ConversationKey
-
-	// Respect muted flag.
-	muted, err := cn.webChatStore.IsConversationMuted(ctx, recipientUserID, conversationKey)
-	if err != nil {
-		cn.log.Error("Failed to check muted state for DM notification",
-			"userID", recipientUserID, "conversationKey", conversationKey, "error", err)
-		return
-	}
-	if muted {
-		cn.log.Debug("Skipping DM notification — conversation muted",
-			"userID", recipientUserID, "conversationKey", conversationKey)
-		return
-	}
-
-	// Skip if recipient has active presence (they're already viewing chat).
-	if cn.presence.IsUserActive(recipientUserID) {
-		cn.log.Debug("Skipping DM notification — user has active presence",
-			"userID", recipientUserID, "conversationKey", conversationKey)
-		return
-	}
-
-	// F2: resolve agent display name. After the B5 auth-derivation
-	// override, the broker path sets SenderName to the raw UUID (the
-	// agent ID). Resolve it to the human-readable Name (preferred) or
-	// Slug (fallback) for the notification text. The guard ensures we
-	// only look up when SenderName IS the UUID — other callers
-	// (handlers_agent_messaging.go:353, handlers_chat_v2.go:1293)
-	// already pass a proper label and must not be clobbered. This also
-	// avoids a pointless GetAgent call on the user-to-user DM path.
-	// On lookup failure, fall back to the current label — display
-	// resolution must never drop a notification.
-	if msg.SenderID != "" && msg.SenderName == msg.SenderID {
-		if agent, err := cn.store.GetAgent(ctx, msg.SenderID); err == nil {
-			if agent.Name != "" {
-				senderName = agent.Name
-			} else if agent.Slug != "" {
-				senderName = agent.Slug
-			}
-		}
-	}
-
-	message := formatChatNotification(ChatNotificationDMReceived, senderName, "", msg.Preview)
-
-	notif := cn.buildChatNotification(recipientUserID, ChatNotificationDMReceived, message, msg.ProjectID)
-
-	if err := cn.store.CreateNotification(ctx, notif); err != nil {
-		cn.log.Error("Failed to create DM notification",
-			"userID", recipientUserID, "error", err)
-		return
-	}
-
-	// A DM has no thread name; make sure a stale one cannot ride along.
-	// Also propagate the resolved slug (if any) so the SSE event payload
-	// carries the human-readable name, not the raw UUID.
-	dmMsg := msg
-	dmMsg.SenderName = senderName
-	dmMsg.ConversationName = ""
-	cn.events.PublishChatNotification(ctx, notif, dmMsg)
-	cn.log.Info("DM notification created",
-		"notificationID", notif.ID, "recipient", recipientUserID,
-		"sender", senderName, "conversationKey", conversationKey)
-}
-
-// buildChatNotification creates a store.Notification for chat events.
-func (cn *ChatNotifier) buildChatNotification(
-	subscriberID, status, message, projectID string,
-) *store.Notification {
-	nilUUID := uuid.Nil.String()
-	effectiveProjectID := projectID
-	if effectiveProjectID == "" {
-		effectiveProjectID = nilUUID
-	}
-	return &store.Notification{
-		ID:             api.NewUUID(),
-		SubscriptionID: nilUUID,
-		AgentID:        nilUUID,
-		ProjectID:      effectiveProjectID,
-		SubscriberType: store.SubscriberTypeUser,
-		SubscriberID:   subscriberID,
-		Status:         status,
-		Message:        message,
-		CreatedAt:      time.Now(),
-	}
-}
-
-// maxChatPreview bounds the message text carried in a notification, in runes.
-const maxChatPreview = 100
-
-// truncateChatPreview bounds a message preview for notification display.
-// Rune-based so a multi-byte character is never split down the middle.
-//
-// Shared by the formatted message and the structured event payload: the two
-// must show the same amount of the message, or the tray row and the browser
-// popup disagree about where the text stops.
-func truncateChatPreview(messagePreview string) string {
-	runes := []rune(messagePreview)
-	if len(runes) > maxChatPreview {
-		return string(runes[:maxChatPreview]) + "…"
-	}
-	return messagePreview
-}
-
-// formatChatNotification formats a notification message for chat triggers.
-func formatChatNotification(trigger, senderName, conversationName, messagePreview string) string {
-	preview := truncateChatPreview(messagePreview)
-
-	switch trigger {
-	case ChatNotificationMention:
-		if conversationName != "" {
-			return fmt.Sprintf("@%s mentioned you in #%s: %s", senderName, conversationName, preview)
-		}
-		return fmt.Sprintf("@%s mentioned you: %s", senderName, preview)
-	case ChatNotificationDMReceived:
-		return fmt.Sprintf("%s sent you a message: %s", senderName, preview)
-	default:
-		return fmt.Sprintf("Chat notification from %s: %s", senderName, preview)
-	}
-}
+// Chat messages (mentions, DMs) do not create notification rows: the
+// bell carries agent events only. Clients derive chat alerts from the
+// chat SSE stream (chat message and read-state events) instead.
 
 // formatNotificationMessage formats a notification message based on agent state and status.
 func formatNotificationMessage(agent *store.Agent, status string) string {

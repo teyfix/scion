@@ -23,6 +23,18 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 )
 
+// internalMetadataKeys lists metadata keys that are platform-internal and
+// should not appear in the new-format delivery envelope. These are either
+// represented as first-class envelope fields or are implementation details.
+var internalMetadataKeys = map[string]bool{
+	"system_category":  true,
+	"__attachments":    true,
+	"mention_source":   true,
+	"mention_position": true,
+	"channel":          true,
+	"thread_id":        true,
+}
+
 // MapLegacyType maps an old type enum value (and optional system_category
 // metadata) to the new split taxonomy: kind, intent, and event body.
 //
@@ -44,6 +56,11 @@ func MapLegacyType(oldType, systemCategory string, hasAddressee bool) (MessageKi
 
 	case messages.TypeChat:
 		intent := IntentInform
+		return KindText, &intent, nil
+
+	case messages.TypeReply:
+		// A reply to an agent is still a request, same as TypeInstruction.
+		intent := IntentRequest
 		return KindText, &intent, nil
 
 	case messages.TypeAssistantReply:
@@ -92,8 +109,19 @@ func mapSystemCategory(category string) *EventBody {
 		return &EventBody{Type: EventScheduleFired}
 	case messages.SystemCategoryPortForward:
 		return &EventBody{Type: EventPortExposed}
+	case messages.SystemCategoryArtifactReview:
+		return &EventBody{Type: EventArtifactReview}
 	case messages.SystemCategoryDeliveryFailed:
 		return &EventBody{Type: EventDeliveryFailed}
+	case messages.SystemCategoryDeliveryDeferred:
+		// O-c (p2a-r2 review): design agent-reincarnate §3.7's deferred
+		// notice (publishDeliveryDeferred) is not a failure — the message
+		// was saved, not dropped — but there is no dedicated EventType for
+		// it. Reuse EventDeliveryFailed's type with a distinct Status so
+		// the category round-trips instead of falling to default (which
+		// would both warn and silently reclassify it as
+		// agent.state-changed).
+		return &EventBody{Type: EventDeliveryFailed, Status: "DELIVERY_DEFERRED"}
 	default:
 		slog.Warn("unknown system_category, defaulting to agent.state-changed",
 			"system_category", category)
@@ -117,13 +145,18 @@ func MapLegacyDeliveryArtifact(oldType string) *AddressedVia {
 	}
 }
 
+// PersistedIdentity carries real identifiers from the persisted message row.
+// Empty string means the value is absent and must be omitted, never fabricated.
+type PersistedIdentity struct {
+	MessageID string // the persisted store row's ID; "" means OMIT
+	ReplyToID string // a real reply target; "" means OMIT
+}
+
 // MapLegacyEnvelope converts a legacy StructuredMessage into the new Message
-// and Addressee types. The conversion is best-effort: fields that have no
-// direct equivalent are mapped to the closest semantic match.
-//
-// The returned message ID is synthesised from the timestamp if no other
-// identifier is available in the old format.
-func MapLegacyEnvelope(old *messages.StructuredMessage) (*Message, []Addressee, error) {
+// and Addressee types. The ident parameter supplies real identifiers from the
+// persisted message row; empty strings are treated as absent and the
+// corresponding fields are omitted rather than fabricated.
+func MapLegacyEnvelope(old *messages.StructuredMessage, ident PersistedIdentity) (*Message, []Addressee, error) {
 	if old == nil {
 		return nil, nil, fmt.Errorf("cannot convert nil StructuredMessage")
 	}
@@ -134,6 +167,14 @@ func MapLegacyEnvelope(old *messages.StructuredMessage) (*Message, []Addressee, 
 	// Map type to new taxonomy.
 	systemCategory := old.Metadata["system_category"]
 	kind, intent, event := MapLegacyType(old.Type, systemCategory, hasAddressee)
+
+	// Human-to-human replies should be inform, not request.
+	// MapLegacyType maps TypeReply to IntentRequest (correct for agent
+	// recipients), but human-to-human replies are informational.
+	if old.Type == messages.TypeReply && !strings.HasPrefix(old.Recipient, "agent:") {
+		inform := IntentInform
+		intent = &inform
+	}
 
 	// Enrich event body from old fields where possible.
 	if event != nil {
@@ -161,21 +202,15 @@ func MapLegacyEnvelope(old *messages.StructuredMessage) (*Message, []Addressee, 
 		attachments = append(attachments, AttachmentRef{Path: path})
 	}
 
-	// Map visibility.
-	vis := mapLegacyVisibility(old.Visibility)
-
-	// Synthesise a message ID from the timestamp (old format has no ID field).
-	msgID := fmt.Sprintf("legacy-%s", old.Timestamp)
-
-	// Map thread to reply-to (best-effort).
+	// Use real identifiers from the persisted row. Empty means omit.
 	var replyToID *string
-	if old.ThreadID != "" {
-		tid := old.ThreadID
-		replyToID = &tid
+	if ident.ReplyToID != "" {
+		r := ident.ReplyToID
+		replyToID = &r
 	}
 
 	msg := &Message{
-		ID:          msgID,
+		ID:          ident.MessageID,
 		ReplyToID:   replyToID,
 		From:        from,
 		Kind:        kind,
@@ -183,21 +218,46 @@ func MapLegacyEnvelope(old *messages.StructuredMessage) (*Message, []Addressee, 
 		Event:       event,
 		Body:        old.Msg,
 		Attachments: attachments,
-		Visibility:  vis,
+		Urgent:      old.Urgent,
 		CreatedAt:   createdAt,
 	}
 
+	// Copy client-supplied metadata, filtering out internal keys that are
+	// either represented as first-class envelope fields (mention_source,
+	// mention_position, channel, thread_id, system_category) or are
+	// platform-specific implementation details (__attachments).
+	if len(old.Metadata) > 0 {
+		filtered := make(map[string]string)
+		for k, v := range old.Metadata {
+			if internalMetadataKeys[k] {
+				continue
+			}
+			filtered[k] = v
+		}
+		if len(filtered) > 0 {
+			msg.Metadata = filtered
+		}
+	}
+
 	// Build addressees.
-	addrs := buildAddressees(old, msgID)
+	addrs := buildAddressees(old, ident.MessageID)
 
 	return msg, addrs, nil
 }
 
 // buildPrincipalRef constructs a PrincipalRef from old sender/senderID fields.
 // The old format has name (e.g. "user:alice", "agent:builder") and id (a raw
-// UUID or a prefixed ref). When id is a raw identifier without a colon, the
-// kind prefix is derived from name so the result is a valid PrincipalRef.
+// UUID or a prefixed ref). When name is already a valid PrincipalRef (has a
+// "kind:" prefix with a non-empty id part), it is preferred over the raw id so
+// that human-readable slugs and emails are preserved in the delivery envelope.
+// The id parameter is used only as a fallback when name is absent or invalid.
 func buildPrincipalRef(name, id string) PrincipalRef {
+	// Prefer name when it is already a valid PrincipalRef (kind:value with
+	// non-empty value after the colon).
+	if idx := strings.IndexByte(name, ':'); idx > 0 && idx < len(name)-1 {
+		return PrincipalRef(name)
+	}
+
 	if id != "" {
 		// If id is already a valid PrincipalRef (contains colon), use directly.
 		if strings.Contains(id, ":") {
@@ -286,18 +346,6 @@ func buildAddressees(old *messages.StructuredMessage, msgID string) []Addressee 
 	return addrs
 }
 
-// mapLegacyVisibility converts a legacy visibility string to the new Visibility type.
-func mapLegacyVisibility(old string) Visibility {
-	switch old {
-	case messages.VisibilityVerbose:
-		return VisibilityVerbose
-	case messages.VisibilityFull:
-		return VisibilityFull
-	default:
-		return VisibilityNormal
-	}
-}
-
 // NewEnvelopeToLegacy converts a new Message and its Addressees back to the
 // old StructuredMessage format. This supports backward compatibility during the
 // transition period for code that still reads the old format.
@@ -310,9 +358,11 @@ func NewEnvelopeToLegacy(msg *Message, addrs []Addressee) *messages.StructuredMe
 	}
 
 	old := &messages.StructuredMessage{
-		Version:   messages.Version,
-		Timestamp: msg.CreatedAt.UTC().Format(time.RFC3339),
-		Msg:       msg.Body,
+		Version:        messages.Version,
+		Timestamp:      msg.CreatedAt.UTC().Format(time.RFC3339),
+		Msg:            msg.Body,
+		ConversationID: msg.ConversationID,
+		Urgent:         msg.Urgent,
 	}
 
 	// Map From to sender fields.
@@ -322,12 +372,6 @@ func NewEnvelopeToLegacy(msg *Message, addrs []Addressee) *messages.StructuredMe
 	// Map kind/intent/event back to old type.
 	old.Type = mapNewTypeToLegacy(msg)
 
-	// Map visibility.
-	old.Visibility = string(msg.Visibility)
-	if old.Visibility == string(VisibilityNormal) {
-		old.Visibility = "" // old format uses empty for normal
-	}
-
 	// Map attachments.
 	for _, a := range msg.Attachments {
 		old.Attachments = append(old.Attachments, a.Path)
@@ -336,7 +380,7 @@ func NewEnvelopeToLegacy(msg *Message, addrs []Addressee) *messages.StructuredMe
 	// Map metadata from event body.
 	if msg.Event != nil {
 		old.Metadata = make(map[string]string)
-		if cat := eventTypeToSystemCategory(msg.Event.Type); cat != "" {
+		if cat := eventTypeToSystemCategory(msg.Event); cat != "" {
 			old.Metadata["system_category"] = cat
 		}
 		if msg.Event.Status != "" {
@@ -381,10 +425,8 @@ func mapNewTypeToLegacy(msg *Message) string {
 		case IntentQuestion:
 			return messages.TypeInputNeeded
 		case IntentInform:
-			// Check if sender is an agent — old format distinguished assistant-reply.
-			if msg.From.PrincipalKind() == "agent" {
-				return messages.TypeAssistantReply
-			}
+			// Never assistant-reply: that type is retired and only appears
+			// on historical rows, whatever the sender.
 			return messages.TypeChat
 		default:
 			return messages.TypeChat
@@ -398,7 +440,7 @@ func mapNewTypeToLegacy(msg *Message) string {
 			return messages.TypeStateChange
 		case EventAgentInputNeeded:
 			return messages.TypeInputNeeded
-		case EventScheduleFired, EventPortExposed, EventDeliveryFailed:
+		case EventScheduleFired, EventPortExposed, EventDeliveryFailed, EventArtifactReview:
 			return messages.TypeSystem
 		default:
 			return messages.TypeStateChange
@@ -408,14 +450,28 @@ func mapNewTypeToLegacy(msg *Message) string {
 	}
 }
 
-// eventTypeToSystemCategory maps an EventType back to the old system_category.
-func eventTypeToSystemCategory(et EventType) string {
-	switch et {
+// eventTypeToSystemCategory maps an EventBody back to the old system_category.
+// Takes the full body, not just the Type, because O-c (p2a-r2 review) reuses
+// EventDeliveryFailed's Type for the deferred notice (there is no dedicated
+// EventType for it) and distinguishes it only by Status — without checking
+// Status here, a deferred notice would round-trip back to
+// SystemCategoryDeliveryFailed and lose the distinction mapSystemCategory
+// made on the way in.
+func eventTypeToSystemCategory(body *EventBody) string {
+	if body == nil {
+		return ""
+	}
+	switch body.Type {
 	case EventScheduleFired:
 		return messages.SystemCategoryScheduler
 	case EventPortExposed:
 		return messages.SystemCategoryPortForward
+	case EventArtifactReview:
+		return messages.SystemCategoryArtifactReview
 	case EventDeliveryFailed:
+		if body.Status == "DELIVERY_DEFERRED" {
+			return messages.SystemCategoryDeliveryDeferred
+		}
 		return messages.SystemCategoryDeliveryFailed
 	default:
 		return ""

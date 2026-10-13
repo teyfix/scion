@@ -99,6 +99,54 @@ set the Hub admin to a human email. The deployer SA is granted IAP access
 automatically, but Hub admin is seeded from the deployer identity by default.
 :::
 
+### Instance service account
+
+Create a dedicated service account for the Instance rather than using the
+default Compute Engine SA. The default SA has overly broad permissions and
+uses a `@developer.gserviceaccount.com` email format that, while supported,
+is not recommended for production use.
+
+```bash
+export SA_NAME="scion-instance"
+
+gcloud iam service-accounts create $SA_NAME \
+  --display-name="Scion Hub Instance" \
+  --project=$PROJECT_ID
+
+export SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+```
+
+Grant the minimum roles the Instance needs:
+
+| Role | Why |
+|------|-----|
+| `roles/storage.admin` | Read/write workspace storage backends |
+| `roles/iam.serviceAccountAdmin` | Manage hub-minted service accounts for agents (see the note below) |
+| `roles/iam.serviceAccountTokenCreator` | Mint short-lived tokens for agent GCP identity (assign mode) |
+| `roles/aiplatform.user` | Vertex AI inference (if using Gemini-based agents) |
+
+```bash
+for ROLE in roles/storage.admin roles/iam.serviceAccountAdmin \
+            roles/iam.serviceAccountTokenCreator roles/aiplatform.user; do
+  gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="${ROLE}"
+done
+```
+
+`roles/iam.serviceAccountAdmin` applies to every service account in the
+project, not only the ones the Hub mints. In a project shared with other
+workloads or other hubs, the Instance service account can therefore change IAM
+policy on those accounts too. Granting it this way assumes one hub per GCP
+project, in a project that holds no other privileged service accounts. If you
+run more than one hub in the same project, leave the role out and grant
+minting access separately, for example from a dedicated project; without it
+the Hub cannot mint service accounts. For the HA tier, see
+`scripts/cloudrun/README.md`.
+
+Pass the service account to the deploy command with `--service-account $SA_EMAIL`
+(see [Section 1](#1-deploy)).
+
 ### Container image
 
 The deploy requires a pre-built **omni image** — a single image containing the Hub
@@ -163,6 +211,7 @@ A single command creates the Instance, enables IAP, and verifies the perimeter:
   --name my-scion-hub \
   --project $PROJECT_ID \
   --region us-east4 \
+  --service-account $SA_EMAIL \
   --image us-central1-docker.pkg.dev/YOUR_PROJECT/scion/scion-omni:YOUR_TAG
 ```
 
@@ -194,7 +243,7 @@ Instance is open to the internet with only Hub session auth in front of it.
 | `--cpu` | `4` | CPU allocation |
 | `--memory` | `8Gi` | Memory allocation |
 | `--admin-email` | deployer's gcloud account | Override the Hub admin email |
-| `--service-account` | (default compute SA) | GCP service account for the Instance |
+| `--service-account` | (default compute SA) | GCP service account for the Instance. A [custom SA](#instance-service-account) is strongly recommended. |
 | `--image-registry` | derived from `--image` | Override the image registry the broker uses to pull agent images |
 
 ---
@@ -210,7 +259,8 @@ https://my-scion-hub-PROJECT_NUMBER.us-east4.run.app
 1. **IAP challenge** — Google sign-in. Use the email that was bound as the IAP user
    during deploy (your gcloud account, or the `--admin-email` value).
 2. **Hub access** — After sign-in you land directly in the Hub. There is no
-   second login. The deployer is automatically seeded as the first admin.
+   second login. The deployer is automatically seeded as the first admin and
+   receives the super-admin role binding needed for full admin UI access.
 
 :::tip[Granting access to other users]
 IAP access is region-scoped, not per-instance. To add another user:
@@ -327,6 +377,41 @@ To change the Instance size:
   --image us-central1-docker.pkg.dev/YOUR_PROJECT/scion/scion-omni:YOUR_TAG
 ```
 
+### Set the agent cap after deploying
+
+The Hub's `max_agents_per_broker` limit defaults to **100** hub-wide, which is above
+the measured ceiling of both Instance sizes above and does not by itself protect a
+single-node deployment. Right after deploying, lower it to about **16** — safely
+under the 4 CPU/8 GiB idle ceiling — from **Admin → Quotas** in the web UI, or with:
+
+```bash
+# PUT replaces the whole limit definition, so fetch the current one first and
+# only change defaultValue — omitting name gets 400 "name is required";
+# omitting resourceType or unit gets 403 (system limit); omitting description
+# is accepted but erases it.
+curl "$HUB_URL/api/v1/admin/limits/$LIMIT_ID" -H "Authorization: Bearer $TOKEN"
+
+curl -X PUT "$HUB_URL/api/v1/admin/limits/$LIMIT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "max_agents_per_broker",
+        "resourceType": "agent",
+        "unit": "count",
+        "description": "Maximum concurrently live agents per runtime broker (crash-prevention ceiling, ptone/scion#1303)",
+        "defaultValue": 16
+      }'
+```
+
+(`$LIMIT_ID` comes from `GET /api/v1/admin/limits`; the `description` above is
+the value the Hub seeds — check the `GET` response in case it has been edited.)
+This is the hub-wide default; to set a different cap for one broker, use that
+broker's `maxAgents` setting instead — see [Broker
+Settings](/scion/reference/api/#broker-settings-apiv1runtime-brokersidsettings).
+If you deploy at 8 CPU/32 GiB instead, scale the cap proportionally, keeping
+the same margin below that tier's measured ceiling — not up to it; see
+[Sizing](#4-sizing) above.
+
 ---
 
 ## 5. Durability
@@ -348,6 +433,8 @@ This is a deliberate design trade for fast, cheap, disposable deployments — no
 oversight. Treat the Instance as a workspace, not as infrastructure. If you need
 durable workspaces, use the [VM (GCE) path](/scion/hosted/single-node/hub-setup-gce/)
 or the [HA tier](/scion/hosted/ha/overview/).
+
+<span id="overloading-the-instance-destroys-all-work"></span>
 
 :::danger[Overloading the Instance destroys all work]
 If too many agents are started on one Instance, the container is terminated. The

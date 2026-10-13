@@ -16,8 +16,19 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
 	"net/http"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -47,6 +58,8 @@ const (
 	// Default GCP identity
 	projectSettingDefaultGCPIdentityMode = "scion.io/default-gcp-identity-mode"
 	projectSettingDefaultGCPIdentitySAID = "scion.io/default-gcp-identity-service-account-id"
+	// JSON object: broker profile name -> registered SA ID.
+	projectSettingDefaultGCPIdentitySAIDByProfile = "scion.io/default-gcp-identity-service-account-id-by-profile"
 
 	// Default resource spec (flat keys)
 	projectSettingDefaultResourcesCPUReq = "scion.io/default-resources-cpu-request"
@@ -106,13 +119,16 @@ const (
 // that a future system marker is not silently propagated into clones.
 //
 // One scion.dev/ label is excluded: store.LabelWorkspaceMode
-// ("scion.dev/workspace-mode") is NOT copied. It is derived for the new project
-// from the clone request and the new project's git remote, by the same
-// validation the create path applies (handlers_projects_core.go), which sets it
-// only when there is a git remote and the mode is one of the two valid values.
-// Copying it raw would bypass that check and let a clone carry a workspace mode
-// inconsistent with its own remote, which IsSharedWorkspace() and
-// IsWorktreePerAgent() would then evaluate against mismatched state.
+// ("scion.dev/workspace-mode") is NOT copied raw. deriveCloneWorkspaceMode
+// (project_workspace_mode.go) re-derives it from the source's label: the mode
+// is kept only when store.ValidateWorkspaceMode accepts it for the clone's
+// git-ness (after any gitRemote override) and dropped otherwise, so a non-git
+// per-agent template stays empty-per-agent and becomes clone-per-agent with a
+// git remote, while e.g. worktree-per-agent on a non-git clone is dropped. A
+// legacy raw "empty-per-agent" label is normalised to "per-agent" only on a
+// non-git source. Copying it raw would let a clone carry a workspace mode
+// inconsistent with its own remote, which SharingMode() and its callers would
+// then evaluate against mismatched state.
 //
 // Finally, do not try to "complete" this list from hubclient.ProjectSettings.
 // That struct also carries Bucket, Runtimes, Harnesses and Profiles, which the
@@ -137,6 +153,7 @@ var projectSettingKeys = []string{
 	// Default GCP identity
 	projectSettingDefaultGCPIdentityMode,
 	projectSettingDefaultGCPIdentitySAID,
+	projectSettingDefaultGCPIdentitySAIDByProfile,
 
 	// Default resource spec (flat keys)
 	projectSettingDefaultResourcesCPUReq,
@@ -206,34 +223,48 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request, p
 			return
 		}
 
-		var req hubclient.ProjectSettings
-		if err := readJSON(r, &req); err != nil {
+		if r.Body == nil {
+			BadRequest(w, "Invalid request body: empty request body")
+			return
+		}
+		// Read whole because it is decoded twice (mergeProjectSettingsPut).
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSettingsBodySize))
+		if err != nil {
+			BadRequest(w, "Invalid request body: "+err.Error())
+			return
+		}
+		merged, present, err := mergeProjectSettingsPut(projectSettingsFromAnnotations(project), body)
+		if err != nil {
 			BadRequest(w, "Invalid request body: "+err.Error())
 			return
 		}
 
-		if req.DefaultThinkingLevel != nil {
-			if tl := *req.DefaultThinkingLevel; tl < 0 || tl > 100 {
+		// Validation runs on the merged result. A field the request does
+		// not carry keeps its stored value and is not re-validated, so a
+		// stored value that has since gone stale does not block an
+		// unrelated partial update.
+		if present[projectSettingsFieldThinkingLevel] && merged.DefaultThinkingLevel != nil {
+			if tl := *merged.DefaultThinkingLevel; tl < 0 || tl > 100 {
 				BadRequest(w, "thinking_level must be between 0 and 100")
 				return
 			}
 		}
 
-		if req.MaxAgentRole != "" && !ValidAgentRole(AgentRole(req.MaxAgentRole)) {
+		if present[projectSettingsFieldMaxAgentRole] && merged.MaxAgentRole != "" && !ValidAgentRole(AgentRole(merged.MaxAgentRole)) {
 			BadRequest(w, "maxAgentRole must be one of none, readonly, baseline, full")
 			return
 		}
 
-		if req.DefaultAgentRole != "" && !ValidAgentRole(AgentRole(req.DefaultAgentRole)) {
+		if present[projectSettingsFieldDefaultAgentRole] && merged.DefaultAgentRole != "" && !ValidAgentRole(AgentRole(merged.DefaultAgentRole)) {
 			BadRequest(w, "defaultAgentRole must be one of none, readonly, baseline, full")
 			return
 		}
 
-		if !s.validateDefaultGCPIdentity(w, ctx, project.ID, &req) {
+		if !s.validateDefaultGCPIdentity(w, ctx, project, merged, present) {
 			return
 		}
 
-		applyProjectSettingsToAnnotations(project, &req)
+		applyProjectSettingsToAnnotations(project, merged)
 
 		if err := s.store.UpdateProject(ctx, project); err != nil {
 			writeErrorFromErr(w, err, "")
@@ -263,17 +294,53 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request, p
 // default back into the silent-block path. That residue is deliberately not
 // handled here — it is tracked separately against the consumption site, because
 // no amount of write-time validation can subsume it.
-func (s *Server) validateDefaultGCPIdentity(w http.ResponseWriter, ctx context.Context, projectID string, req *hubclient.ProjectSettings) bool {
+func (s *Server) validateDefaultGCPIdentity(w http.ResponseWriter, ctx context.Context, project *store.Project, merged *hubclient.ProjectSettings, present map[string]bool) bool {
+	// block is accepted as a default for every project, including one bound
+	// to Kubernetes brokers: those brokers run a block agent as the
+	// configured block KSA, or the namespace default KSA, with no GCP
+	// identity granted by Scion (ptone/scion#4067). A broker older than that
+	// support still refuses block at dispatch; the docs tell operators to
+	// upgrade brokers before setting a block default, rather than the hub
+	// gating on a broker version it does not track.
+
+	// The per-profile map is validated only when the request replaces it;
+	// a kept map was validated when it was saved.
+	if present[projectSettingsFieldGCPIdentitySAIDByProfile] {
+		if !s.validateProfileDefaultSAIDs(w, ctx, project, merged.DefaultGCPIdentityServiceAccountIDByProfile) {
+			return false
+		}
+	}
+
+	// The project-wide mode and service account are checked together, on
+	// their merged values, whenever the request changes either one: a
+	// request that sets only the mode is checked against the stored
+	// service account, and one that clears only the service account is
+	// checked against the stored mode. A request that touches neither
+	// leaves the stored pair as it is and does not re-validate it.
+	if !present[projectSettingsFieldGCPIdentityMode] && !present[projectSettingsFieldGCPIdentitySAID] {
+		return true
+	}
+
 	// mode=assign with no service account is the same defect wearing different
 	// clothes: the consumption path falls straight through to block.
-	if req.DefaultGCPIdentityMode == store.GCPMetadataModeAssign && req.DefaultGCPIdentityServiceAccountID == "" {
+	if merged.DefaultGCPIdentityMode == store.GCPMetadataModeAssign && merged.DefaultGCPIdentityServiceAccountID == "" {
 		BadRequest(w, "default GCP identity mode 'assign' requires a service account; set defaultGCPIdentityServiceAccountID or choose another mode")
 		return false
 	}
 
 	// Empty means clear. Clearing must always be permitted — it is the
 	// operator's only escape from a value that has since gone bad.
-	if req.DefaultGCPIdentityServiceAccountID == "" {
+	if merged.DefaultGCPIdentityServiceAccountID == "" {
+		return true
+	}
+
+	// The service account itself is checked only when this request sets
+	// it, or selects assign, which is what makes it apply. A request that
+	// moves the mode away from assign (or clears it) leaves the stored
+	// account unused, so a stored account that has since gone bad must not
+	// block that escape either.
+	if !present[projectSettingsFieldGCPIdentitySAID] &&
+		merged.DefaultGCPIdentityMode != store.GCPMetadataModeAssign {
 		return true
 	}
 
@@ -282,15 +349,33 @@ func (s *Server) validateDefaultGCPIdentity(w http.ResponseWriter, ctx context.C
 	// enumerate other projects' service account IDs by watching which ones fail
 	// differently. "Does not exist" and "exists but is not yours" are one answer.
 	//
-	// The literal moved to msgSANotAvailableInProject — same string, no wire
-	// change here — because the agent create and PATCH paths had NOT followed
-	// this rule and now do. Three copies of a string whose entire value is that
-	// they match is three chances to stop matching.
+	// The check itself lives in validateProjectDefaultSAID, shared with the
+	// per-profile map.
+	return s.validateProjectDefaultSAID(w, ctx, project, merged.DefaultGCPIdentityServiceAccountID, "the project default")
+}
+
+// validateProjectDefaultSAID checks that saID names a service account that
+// is reachable from project and verified: the same conditions the create
+// path's default rungs (resolveDefaultSAAssignmentCore) test, so a saved
+// default applies. what names the setting in the not-verified message. It
+// writes the error response itself and returns false when the caller must
+// stop.
+func (s *Server) validateProjectDefaultSAID(w http.ResponseWriter, ctx context.Context, project *store.Project, saID, what string) bool {
+	// See validateDefaultGCPIdentity: not-found and not-reachable share one
+	// message so the endpoint is not an existence oracle.
+	//
+	// This helper shares the msgSANotAvailableInProject literal with the agent
+	// create and PATCH paths, so the project default, each per-profile default,
+	// agent create and agent PATCH all give the same message text. Separate
+	// copies of a string whose entire value is that they match would be
+	// separate chances to stop matching.
 	const notAvailable = msgSANotAvailableInProject
 
-	sa, err := s.store.GetGCPServiceAccount(ctx, req.DefaultGCPIdentityServiceAccountID)
+	sa, err := s.store.GetGCPServiceAccount(ctx, saID)
 	if err != nil {
-		if err == store.ErrNotFound {
+		// errors.Is, as on agent create and PATCH: a wrapped ErrNotFound must
+		// get the same answer as the not-reachable case below, not a 404.
+		if errors.Is(err, store.ErrNotFound) {
 			BadRequest(w, notAvailable)
 			return false
 		}
@@ -298,19 +383,270 @@ func (s *Server) validateDefaultGCPIdentity(w http.ResponseWriter, ctx context.C
 		return false
 	}
 
-	if !sa.ReachableFromProject(projectID) {
+	if !sa.ReachableFromProject(project.ID) {
 		BadRequest(w, notAvailable)
 		return false
 	}
 
 	// Safe to be specific: this service account is already readable by this
 	// caller, so naming its state discloses nothing they cannot already see.
-	if !sa.Verified {
-		BadRequest(w, "GCP service account is not verified; verify it before setting it as the project default")
+	if !gcpServiceAccountVerified(sa) {
+		writeError(w, http.StatusBadRequest, ErrCodeIdentityNotVerified,
+			"GCP service account is not verified; verify it before setting it as "+what+". "+
+				identityVerifyRemedy(sa.Scope), nil)
 		return false
 	}
 
 	return true
+}
+
+// Bounds on the per-profile default service account map. Profile names are
+// not checked against the profiles brokers report (a broker may be offline
+// when the setting is saved); they only have to look like a profile name.
+const (
+	maxProfileDefaultSAEntries = 64
+	maxProfileDefaultNameLen   = 63
+)
+
+// profileDefaultNamePattern is the accepted profile-name charset: letters,
+// digits, '-' and '_', starting with a letter or digit, at most
+// maxProfileDefaultNameLen characters. Dots are excluded because settings
+// loading splits dotted profile names.
+var profileDefaultNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+
+// validateProfileDefaultSAIDs checks every entry of the per-profile default
+// service account map: at most maxProfileDefaultSAEntries entries, a profile
+// name matching profileDefaultNamePattern, and a service account that passes
+// validateProjectDefaultSAID. A nil or empty map is always accepted
+// (nil keeps the stored map, empty clears it).
+func (s *Server) validateProfileDefaultSAIDs(w http.ResponseWriter, ctx context.Context, project *store.Project, byProfile map[string]string) bool {
+	if len(byProfile) > maxProfileDefaultSAEntries {
+		BadRequest(w, fmt.Sprintf("defaultGCPIdentityServiceAccountIDByProfile: at most %d entries are allowed", maxProfileDefaultSAEntries))
+		return false
+	}
+	profiles := make([]string, 0, len(byProfile))
+	for profile := range byProfile {
+		profiles = append(profiles, profile)
+	}
+	// Sorted so the first reported error is deterministic.
+	sort.Strings(profiles)
+	for _, profile := range profiles {
+		saID := byProfile[profile]
+		if !profileDefaultNamePattern.MatchString(profile) {
+			BadRequest(w, fmt.Sprintf("defaultGCPIdentityServiceAccountIDByProfile: profile name %q is invalid; use 1-%d letters, digits, '-' or '_', starting with a letter or digit", profile, maxProfileDefaultNameLen))
+			return false
+		}
+		if saID == "" {
+			BadRequest(w, fmt.Sprintf("defaultGCPIdentityServiceAccountIDByProfile[%s]: a service account ID is required; remove the entry to clear it", profile))
+			return false
+		}
+		if !s.validateProjectDefaultSAID(w, ctx, project, saID, fmt.Sprintf("the default for profile %q", profile)) {
+			return false
+		}
+	}
+	return true
+}
+
+// profileDefaultSAIDsFromAnnotations decodes the per-profile default service
+// account annotation. A missing, empty or malformed value yields nil (the
+// annotation is written only by setProfileDefaultSAIDsAnnotation, so a
+// malformed value means a hand edit; it is logged and ignored).
+func profileDefaultSAIDsFromAnnotations(annotations map[string]string) map[string]string {
+	raw := annotations[projectSettingDefaultGCPIdentitySAIDByProfile]
+	if raw == "" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		slog.Warn("ignoring malformed per-profile default GCP service account annotation",
+			"annotation", projectSettingDefaultGCPIdentitySAIDByProfile, "error", err)
+		return nil
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// setProfileDefaultSAIDsAnnotation stores m as the per-profile default
+// service account annotation, or deletes the annotation when m is empty.
+func setProfileDefaultSAIDsAnnotation(annotations map[string]string, m map[string]string) {
+	if annotations == nil {
+		// Callers initialize the map; nothing can be stored without one.
+		return
+	}
+	if len(m) == 0 {
+		delete(annotations, projectSettingDefaultGCPIdentitySAIDByProfile)
+		return
+	}
+	// encoding/json sorts map keys, so the stored value is stable.
+	b, err := json.Marshal(m)
+	if err != nil {
+		// A map[string]string always marshals; keep the stored value rather
+		// than writing a partial one.
+		return
+	}
+	annotations[projectSettingDefaultGCPIdentitySAIDByProfile] = string(b)
+}
+
+// isKubernetesRuntimeType reports whether a BrokerProfile.Type names the
+// Kubernetes runtime, under any spelling the runtime factory accepts
+// (pkg/runtime/factory.go): "kubernetes" itself, the "k8s" alias, and
+// "remote" (normalized to "kubernetes" before dispatch). Phase 1
+// (pkg/runtimebroker/start_context.go, ptone/scion#2338) classifies by this
+// same string set, checked against the resolved runtime's Name() rather than
+// a stored profile field, so the two cannot drift on which spellings count.
+//
+// A profile's Type is the profile's resolved runtime type: the explicit
+// `type:` of the runtime entry the profile's `runtime:` field references,
+// else that entry's key (cmd/broker.go buildBrokerProfiles and
+// cmd/server_broker.go buildStoreBrokerProfiles, the same rule as the
+// broker's /info in pkg/runtimebroker/handlers.go). So `runtimes.gke-prod:
+// {type: kubernetes}` referenced by `runtime: gke-prod` reports Type
+// "kubernetes", and a key spelled "docker" with `type: kubernetes` reports
+// "kubernetes" too. Profile names are never inspected. A record registered
+// by an older broker, or by a broker that could not load its settings,
+// still carries the runtime key as Type and is classified by that key, as
+// before, until the broker registers again.
+func isKubernetesRuntimeType(t string) bool {
+	switch t {
+	case "kubernetes", "k8s", "remote":
+		return true
+	default:
+		return false
+	}
+}
+
+// JSON field names of hubclient.ProjectSettings that the PUT handler refers
+// to by name. TestMergeProjectSettingsPut_EveryField checks them against the
+// struct tags.
+const (
+	projectSettingsFieldThinkingLevel            = "defaultThinkingLevel"
+	projectSettingsFieldTelemetryEnabled         = "telemetryEnabled"
+	projectSettingsFieldAutoExposePortsEnabled   = "autoExposePortsEnabled"
+	projectSettingsFieldMaxAgentRole             = "maxAgentRole"
+	projectSettingsFieldDefaultAgentRole         = "defaultAgentRole"
+	projectSettingsFieldGCPIdentityMode          = "defaultGCPIdentityMode"
+	projectSettingsFieldGCPIdentitySAID          = "defaultGCPIdentityServiceAccountID"
+	projectSettingsFieldGCPIdentitySAIDByProfile = "defaultGCPIdentityServiceAccountIDByProfile"
+)
+
+// projectSettingsNullClearsFields are the fields for which JSON null clears
+// the stored value instead of keeping it. Each is tri-state: false or 0 is
+// a real stored value, unset means "inherit the hub default", and there is
+// no empty value that could express the reset.
+var projectSettingsNullClearsFields = map[string]bool{
+	projectSettingsFieldThinkingLevel:          true,
+	projectSettingsFieldTelemetryEnabled:       true,
+	projectSettingsFieldAutoExposePortsEnabled: true,
+}
+
+// mergeProjectSettingsPut applies a project settings PUT body to the stored
+// settings and returns the merged result, plus the set of fields (by JSON
+// name) the body replaced.
+//
+// The PUT has merge semantics, field by field:
+//
+//   - A field absent from the body keeps its stored value.
+//   - A field set to JSON null also keeps its stored value, except the
+//     tri-state fields in projectSettingsNullClearsFields, where null clears.
+//   - A field set to its empty value clears it: "" for strings, 0 for
+//     defaultMaxTurns and defaultMaxModelCalls, {} for
+//     defaultGCPIdentityServiceAccountIDByProfile and defaultResources.
+//   - Any other value replaces the stored value. Object-valued fields
+//     (defaultResources, the per-profile map) are replaced as a whole, not
+//     merged key by key.
+//
+// Field names are matched as encoding/json matches them when it decodes the
+// same body into the struct: exactly, or else under Unicode case folding.
+// Two keys that name the same field are rejected. The merge walks the struct by
+// reflection, so a field added to hubclient.ProjectSettings gets the same
+// rule without further code here.
+func mergeProjectSettingsPut(stored *hubclient.ProjectSettings, body []byte) (*hubclient.ProjectSettings, map[string]bool, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, nil, err
+	}
+	var req hubclient.ProjectSettings
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, nil, err
+	}
+	merged := *stored
+	mv := reflect.ValueOf(&merged).Elem()
+	rv := reflect.ValueOf(req)
+	t := mv.Type()
+	names := make([]string, t.NumField())
+	for i := range names {
+		names[i] = serializedJSONFieldName(t.Field(i))
+	}
+
+	// Map each body key to the field encoding/json decodes it into. Keys
+	// are visited in sorted order so a duplicate is reported the same way
+	// every time. Two keys naming one field would make the result depend
+	// on map iteration order, so they are refused. Unknown keys are
+	// ignored, as the decoder ignores them.
+	byField := make(map[int]string, len(raw))
+	for _, k := range slices.Sorted(maps.Keys(raw)) {
+		i := projectSettingsFieldIndex(names, k)
+		if i < 0 {
+			continue
+		}
+		if prev, dup := byField[i]; dup {
+			return nil, nil, fmt.Errorf("duplicate field %q: keys %q and %q both name it", names[i], prev, k)
+		}
+		byField[i] = k
+	}
+
+	present := make(map[string]bool, len(byField))
+	for i, k := range byField {
+		// encoding/json stores map values without surrounding whitespace,
+		// so the shared isJSONNull literal check is exact here.
+		if isJSONNull(raw[k]) {
+			if !projectSettingsNullClearsFields[names[i]] {
+				continue
+			}
+			mv.Field(i).Set(reflect.Zero(t.Field(i).Type))
+		} else {
+			mv.Field(i).Set(rv.Field(i))
+		}
+		present[names[i]] = true
+	}
+	return &merged, present, nil
+}
+
+// projectSettingsFieldIndex returns the index in names of the field a body
+// key decodes into, or -1 for an unknown key. Like encoding/json, it
+// prefers an exact match and otherwise matches under Unicode case folding
+// (strings.EqualFold), so a key such as "defaultMaxTurn\u017f" (long s)
+// names defaultMaxTurns here exactly as it does for the decoder.
+func projectSettingsFieldIndex(names []string, key string) int {
+	for i, name := range names {
+		if name != "" && name == key {
+			return i
+		}
+	}
+	for i, name := range names {
+		if name != "" && strings.EqualFold(name, key) {
+			return i
+		}
+	}
+	return -1
+}
+
+// serializedJSONFieldName returns the JSON name of an exported struct field, or ""
+// when the field is not serialized.
+func serializedJSONFieldName(f reflect.StructField) string {
+	if !f.IsExported() {
+		return ""
+	}
+	tag := f.Tag.Get("json")
+	if tag == "-" {
+		return ""
+	}
+	if name, _, _ := strings.Cut(tag, ","); name != "" {
+		return name
+	}
+	return f.Name
 }
 
 // projectSettingsFromAnnotations reads project settings from the project's annotations map.
@@ -329,7 +665,9 @@ func projectSettingsFromAnnotations(project *store.Project) *hubclient.ProjectSe
 			settings.DefaultThinkingLevel = &n
 		}
 	}
-	settings.ActiveProfile = project.Annotations[projectSettingActiveProfile]
+	if v := project.Annotations[projectSettingActiveProfile]; v != "" {
+		settings.ActiveProfile = &v
+	}
 
 	if val, ok := project.Annotations[projectSettingTelemetryEnabled]; ok {
 		if b, err := strconv.ParseBool(val); err == nil {
@@ -359,6 +697,7 @@ func projectSettingsFromAnnotations(project *store.Project) *hubclient.ProjectSe
 	// Default GCP identity
 	settings.DefaultGCPIdentityMode = project.Annotations[projectSettingDefaultGCPIdentityMode]
 	settings.DefaultGCPIdentityServiceAccountID = project.Annotations[projectSettingDefaultGCPIdentitySAID]
+	settings.DefaultGCPIdentityServiceAccountIDByProfile = profileDefaultSAIDsFromAnnotations(project.Annotations)
 
 	// Default resources (flat annotation keys)
 	res := projectResourcesFromAnnotations(project.Annotations)
@@ -396,7 +735,11 @@ func projectResourcesFromAnnotations(annotations map[string]string) *hubclient.P
 	return res
 }
 
-// applyProjectSettingsToAnnotations writes project settings into the project's annotations map.
+// applyProjectSettingsToAnnotations writes project settings into the
+// project's annotations map. settings is the complete desired state (the PUT
+// handler passes the result of mergeProjectSettingsPut): an empty value
+// deletes the annotation. The active profile and the per-profile service
+// account map are the exceptions, kept when nil.
 func applyProjectSettingsToAnnotations(project *store.Project, settings *hubclient.ProjectSettings) {
 	if project.Annotations == nil {
 		project.Annotations = make(map[string]string)
@@ -411,7 +754,12 @@ func applyProjectSettingsToAnnotations(project *store.Project, settings *hubclie
 	} else {
 		delete(project.Annotations, projectSettingDefaultThinkingLevel)
 	}
-	setOrDelete(project.Annotations, projectSettingActiveProfile, settings.ActiveProfile)
+	// The active profile is kept when nil: the web settings page does not
+	// send it, and a save there must not wipe it (ptone/scion#3383). An
+	// explicit empty string clears it.
+	if settings.ActiveProfile != nil {
+		setOrDelete(project.Annotations, projectSettingActiveProfile, *settings.ActiveProfile)
+	}
 
 	if settings.TelemetryEnabled != nil {
 		project.Annotations[projectSettingTelemetryEnabled] = strconv.FormatBool(*settings.TelemetryEnabled)
@@ -428,6 +776,11 @@ func applyProjectSettingsToAnnotations(project *store.Project, settings *hubclie
 	// Default GCP identity
 	setOrDelete(project.Annotations, projectSettingDefaultGCPIdentityMode, settings.DefaultGCPIdentityMode)
 	setOrDelete(project.Annotations, projectSettingDefaultGCPIdentitySAID, settings.DefaultGCPIdentityServiceAccountID)
+	// The per-profile map is kept when nil: the web settings page does not
+	// send it, and a save there must not wipe it. An empty object clears it.
+	if settings.DefaultGCPIdentityServiceAccountIDByProfile != nil {
+		setProfileDefaultSAIDsAnnotation(project.Annotations, settings.DefaultGCPIdentityServiceAccountIDByProfile)
+	}
 
 	// Default agent limits
 	setOrDeleteInt(project.Annotations, projectSettingDefaultMaxTurns, settings.DefaultMaxTurns)
@@ -530,8 +883,8 @@ func applyProjectDefaults(ac *store.AgentAppliedConfig, project *store.Project) 
 	// broker-local defaults for a hub-created agent — and it degrades
 	// gracefully: resolveManagerForOpts returns the default manager when
 	// ResolveRuntime errors, so a stale annotation cannot fail dispatch.
-	if ac.Profile == "" && settings.ActiveProfile != "" {
-		ac.Profile = settings.ActiveProfile
+	if ac.Profile == "" && settings.ActiveProfile != nil && *settings.ActiveProfile != "" {
+		ac.Profile = *settings.ActiveProfile
 	}
 
 	// Check if there are any project limit/resource defaults to apply

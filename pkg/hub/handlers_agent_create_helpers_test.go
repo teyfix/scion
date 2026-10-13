@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -60,7 +59,7 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 		assert.Equal(t, "packages/web", agent.AppliedConfig.Workspace,
 			"relative workspace should not be overwritten by hub-managed path")
@@ -74,7 +73,7 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 		assert.Equal(t, "/absolute/path", agent.AppliedConfig.Workspace,
 			"absolute workspace should be preserved as user override")
@@ -88,7 +87,7 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 		expectedPath, err := hubManagedProjectPath(slug)
 		require.NoError(t, err)
@@ -416,7 +415,7 @@ func TestMergeInjectedSkills_ProgenyDeduplication(t *testing.T) {
 	// Count how many times the base URI appears — should be exactly 1.
 	count := 0
 	for _, ref := range agent.AppliedConfig.InlineConfig.Skills {
-		if skillBaseURI(ref.URI) == "scion://shared-skill" {
+		if api.SkillBaseURI(ref.URI) == "scion://shared-skill" {
 			count++
 		}
 	}
@@ -495,29 +494,28 @@ func TestMergeSkillRefs_VersionConflictWarnAndWin(t *testing.T) {
 }
 
 // =============================================================================
-// skillBaseURI unit tests
+// api.SkillBaseURI keying in the hub
 // =============================================================================
 
-func TestSkillBaseURI_StripVersion(t *testing.T) {
-	cases := []struct {
-		uri      string
-		expected string
-	}{
-		{"scion://my-skill@1.0", "scion://my-skill"},
-		{"scion://my-skill@2.3.4", "scion://my-skill"},
-		{"scion://my-skill", "scion://my-skill"},
-		{"scion://org/my-skill@1.0", "scion://org/my-skill"},
-		{"https://example.com/skills/my-skill@1.0", "https://example.com/skills/my-skill"},
-		{"https://example.com/skills/my-skill", "https://example.com/skills/my-skill"},
-		{"scion://my-skill@latest", "scion://my-skill"},
-		{"", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.uri, func(t *testing.T) {
-			got := skillBaseURI(tc.uri)
-			assert.Equal(t, tc.expected, got)
-		})
-	}
+// TestMergeSkillRefs_KeysLikeBroker checks that the hub keys skill URIs with
+// userinfo or a query by the same rule as the runtime broker (ptone/scion#4179):
+// an "@" outside the last path segment is not a version specifier.
+func TestMergeSkillRefs_KeysLikeBroker(t *testing.T) {
+	// Two different skills on the same host with userinfo stay separate.
+	result := mergeSkillRefs(
+		[]api.SkillReference{{URI: "skill://u@host/a"}},
+		[]api.SkillReference{{URI: "skill://u@host/b"}},
+	)
+	require.Len(t, result, 2, "skills behind the same userinfo must not share a key")
+
+	// Two versions of one skill whose query holds an "@" collapse to one entry,
+	// and the higher-precedence version wins.
+	result = mergeSkillRefs(
+		[]api.SkillReference{{URI: "gh://o/r/s@v1?token=a@b"}},
+		[]api.SkillReference{{URI: "gh://o/r/s@v2?token=a@b"}},
+	)
+	require.Len(t, result, 1, "versions of one skill must share a key despite '@' in the query")
+	assert.Equal(t, "gh://o/r/s@v2?token=a@b", result[0].URI)
 }
 
 // =============================================================================
@@ -578,7 +576,7 @@ func TestPopulateAgentConfig_PreStartHook_HubFallback(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, hubHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -605,7 +603,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectOverridesHub(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, projectHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho project\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -625,7 +623,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectOnly(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, projectHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho project\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -636,7 +634,7 @@ func TestPopulateAgentConfig_PreStartHook_NoneStagesNothing(t *testing.T) {
 	srv, _, project := setupPreStartHookStampingTest(t)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookScript)
@@ -666,7 +664,7 @@ func TestPopulateAgentConfig_PreStartHook_ArchivedProjectHookFallsBackToHub(t *t
 	require.NoError(t, s.DeleteProjectPreStartHook(t.Context(), projectHook.ID, project.ID))
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, hubHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -702,7 +700,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectLookupErrorStagesNothing(t *tes
 	srv.store = &failingProjectHookStore{Store: s, err: errors.New("database is locked")}
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookID,
 		"an ambiguous project lookup error must not fall back to the hub hook")
@@ -746,7 +744,7 @@ func TestPopulateAgentConfig_ProjectHookArchivedBySecondCreate_FallsBackToHub(t 
 
 	// The live project hook wins; the archived one is never staged.
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 	assert.Equal(t, second.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho second\n", agent.AppliedConfig.ProjectPreStartHookScript)
 
@@ -757,7 +755,7 @@ func TestPopulateAgentConfig_ProjectHookArchivedBySecondCreate_FallsBackToHub(t 
 
 	// With no project hook left, the hub fallback resumes.
 	next := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), next, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), next, project, nil))
 	assert.Equal(t, hubHook.ID, next.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", next.AppliedConfig.ProjectPreStartHookScript)
 	assert.NotContains(t, next.AppliedConfig.ProjectPreStartHookScript, "echo first")
@@ -779,7 +777,7 @@ func TestPopulateAgentConfig_PreStartHook_PreStampedIDPreserved(t *testing.T) {
 	agent.AppliedConfig.ProjectPreStartHookID = "preset-hook-id"
 	agent.AppliedConfig.ProjectPreStartHookScript = "#!/bin/sh\necho preset\n"
 
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, "preset-hook-id", agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho preset\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -1356,420 +1354,5 @@ func TestHasAnyKey_NoProgenyForDirectAgent(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, found,
 			"direct agent should not find secrets via progeny resolution")
-	})
-}
-
-func TestPopulateAgentConfig_DockerTemplateDefaults(t *testing.T) {
-	srv, _ := testServer(t)
-	ctx := context.Background()
-	project := &store.Project{
-		ID:   tid("proj-docker"),
-		Slug: "proj-docker",
-	}
-
-	newBool := func(b bool) *bool { return &b }
-
-	t.Run("template privileged true defaults into inline config when unset", func(t *testing.T) {
-		template := &store.Template{
-			ID:   tid("tmpl-priv"),
-			Slug: "tmpl-priv",
-			Config: &store.TemplateConfig{
-				Docker: &api.DockerConfig{
-					Privileged: newBool(true),
-				},
-			},
-		}
-
-		agent := &store.Agent{
-			ID:            tid("agent-1"),
-			AppliedConfig: &store.AgentAppliedConfig{},
-		}
-
-		srv.populateAgentConfig(ctx, agent, project, template)
-
-		require.NotNil(t, agent.AppliedConfig.InlineConfig)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
-		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged)
-
-		// Verify no aliasing between template and agent inline config
-		*template.Config.Docker.Privileged = false
-		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
-			"agent inline config must not alias template Docker config")
-	})
-
-	t.Run("template devices default into inline config without aliasing", func(t *testing.T) {
-		template := &store.Template{
-			ID:   tid("tmpl-devices"),
-			Slug: "tmpl-devices",
-			Config: &store.TemplateConfig{
-				Docker: &api.DockerConfig{
-					Devices: []string{"nvidia.com/gpu=all"},
-				},
-			},
-		}
-
-		agent := &store.Agent{
-			ID:            tid("agent-devices"),
-			AppliedConfig: &store.AgentAppliedConfig{},
-		}
-
-		srv.populateAgentConfig(ctx, agent, project, template)
-
-		require.NotNil(t, agent.AppliedConfig.InlineConfig)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
-		assert.Equal(t, []string{"nvidia.com/gpu=all"}, agent.AppliedConfig.InlineConfig.Docker.Devices)
-
-		template.Config.Docker.Devices[0] = "mutated"
-		assert.Equal(t, []string{"nvidia.com/gpu=all"}, agent.AppliedConfig.InlineConfig.Docker.Devices,
-			"agent inline config must not alias template Docker devices")
-	})
-
-	t.Run("explicit inline false overrides template true", func(t *testing.T) {
-		template := &store.Template{
-			ID:   tid("tmpl-priv"),
-			Slug: "tmpl-priv",
-			Config: &store.TemplateConfig{
-				Docker: &api.DockerConfig{
-					Privileged: newBool(true),
-				},
-			},
-		}
-
-		agent := &store.Agent{
-			ID: tid("agent-2"),
-			AppliedConfig: &store.AgentAppliedConfig{
-				InlineConfig: &api.ScionConfig{
-					Docker: &api.DockerConfig{
-						Privileged: newBool(false),
-					},
-				},
-			},
-		}
-
-		srv.populateAgentConfig(ctx, agent, project, template)
-
-		require.NotNil(t, agent.AppliedConfig.InlineConfig)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
-		assert.False(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
-			"explicit inline false must override template true")
-	})
-
-	t.Run("explicit inline true overrides template false", func(t *testing.T) {
-		template := &store.Template{
-			ID:   tid("tmpl-unpriv"),
-			Slug: "tmpl-unpriv",
-			Config: &store.TemplateConfig{
-				Docker: &api.DockerConfig{
-					Privileged: newBool(false),
-				},
-			},
-		}
-
-		agent := &store.Agent{
-			ID: tid("agent-3"),
-			AppliedConfig: &store.AgentAppliedConfig{
-				InlineConfig: &api.ScionConfig{
-					Docker: &api.DockerConfig{
-						Privileged: newBool(true),
-					},
-				},
-			},
-		}
-
-		srv.populateAgentConfig(ctx, agent, project, template)
-
-		require.NotNil(t, agent.AppliedConfig.InlineConfig)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker)
-		require.NotNil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
-		assert.True(t, *agent.AppliedConfig.InlineConfig.Docker.Privileged,
-			"explicit inline true must override template false")
-	})
-
-	t.Run("template without docker leaves inline config unset", func(t *testing.T) {
-		template := &store.Template{
-			ID:     tid("tmpl-nodocker"),
-			Slug:   "tmpl-nodocker",
-			Config: &store.TemplateConfig{},
-		}
-
-		agent := &store.Agent{
-			ID:            tid("agent-4"),
-			AppliedConfig: &store.AgentAppliedConfig{},
-		}
-
-		srv.populateAgentConfig(ctx, agent, project, template)
-
-		if agent.AppliedConfig.InlineConfig != nil && agent.AppliedConfig.InlineConfig.Docker != nil {
-			assert.Nil(t, agent.AppliedConfig.InlineConfig.Docker.Privileged)
-		}
-	})
-}
-
-func TestBuildAppliedConfig_RequireGPU(t *testing.T) {
-	srv, _ := testServer(t)
-
-	// When RequireGPU is true
-	req := CreateAgentRequest{
-		RequireGPU: true,
-		Task:       "run training",
-	}
-	ac := srv.buildAppliedConfig(req, "test-harness", "alice", AgentRoleBaseline)
-	assert.True(t, ac.RequireGPU)
-
-	// When RequireGPU is false
-	reqFalse := CreateAgentRequest{
-		RequireGPU: false,
-		Task:       "run build",
-	}
-	acFalse := srv.buildAppliedConfig(reqFalse, "test-harness", "alice", AgentRoleBaseline)
-	assert.False(t, acFalse.RequireGPU)
-}
-
-func TestResolveRuntimeBroker_RequireGPU_Explicit(t *testing.T) {
-	srv, s := testServer(t)
-	ctx := contextWithIdentity(context.Background(), NewDevUser(DevUserConfig{
-		Username:    "dev",
-		DisplayName: "Dev User",
-		Email:       "dev@localhost",
-	}))
-
-	gpuBroker := &store.RuntimeBroker{
-		ID:     tid("gpu-broker"),
-		Name:   "GPU Broker",
-		Slug:   "gpu-broker",
-		Status: store.BrokerStatusOnline,
-		Capabilities: &store.BrokerCapabilities{
-			NvidiaGPU: true,
-		},
-	}
-	require.NoError(t, s.CreateRuntimeBroker(ctx, gpuBroker))
-
-	noGpuBroker := &store.RuntimeBroker{
-		ID:     tid("nogpu-broker"),
-		Name:   "No GPU Broker",
-		Slug:   "nogpu-broker",
-		Status: store.BrokerStatusOnline,
-		Capabilities: &store.BrokerCapabilities{
-			NvidiaGPU: false,
-		},
-	}
-	require.NoError(t, s.CreateRuntimeBroker(ctx, noGpuBroker))
-
-	project := &store.Project{
-		ID:   tid("gpu-proj"),
-		Slug: "gpu-proj",
-		Name: "GPU Project",
-	}
-	require.NoError(t, s.CreateProject(ctx, project))
-
-	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   gpuBroker.ID,
-		BrokerName: gpuBroker.Name,
-		Status:     store.BrokerStatusOnline,
-	}))
-	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   noGpuBroker.ID,
-		BrokerName: noGpuBroker.Name,
-		Status:     store.BrokerStatusOnline,
-	}))
-
-	t.Run("explicit broker with GPU succeeds", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, gpuBroker.ID, project, true)
-		assert.NoError(t, err)
-		assert.Equal(t, gpuBroker.ID, brokerID)
-	})
-
-	t.Run("explicit broker without GPU returns 422 ErrCodeBrokerLacksGPU", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, noGpuBroker.ID, project, true)
-		assert.ErrorIs(t, err, ErrBrokerLacksGPU)
-		assert.Empty(t, brokerID)
-		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
-
-		var resp ErrorResponse
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-		assert.Equal(t, ErrCodeBrokerLacksGPU, resp.Error.Code)
-	})
-
-	t.Run("auto-linking broker with GPU succeeds", func(t *testing.T) {
-		unlinkedGPUBroker := &store.RuntimeBroker{
-			ID:     tid("unlinked-gpu"),
-			Name:   "Unlinked GPU",
-			Slug:   "unlinked-gpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: true,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, unlinkedGPUBroker))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, unlinkedGPUBroker.ID, project, true)
-		assert.NoError(t, err)
-		assert.Equal(t, unlinkedGPUBroker.ID, brokerID)
-	})
-
-	t.Run("auto-linking broker without GPU returns 422 ErrCodeBrokerLacksGPU", func(t *testing.T) {
-		unlinkedNoGPUBroker := &store.RuntimeBroker{
-			ID:     tid("unlinked-nogpu"),
-			Name:   "Unlinked No GPU",
-			Slug:   "unlinked-nogpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: false,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, unlinkedNoGPUBroker))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, unlinkedNoGPUBroker.ID, project, true)
-		assert.ErrorIs(t, err, ErrBrokerLacksGPU)
-		assert.Empty(t, brokerID)
-		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
-
-		var resp ErrorResponse
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-		assert.Equal(t, ErrCodeBrokerLacksGPU, resp.Error.Code)
-	})
-}
-
-func TestResolveRuntimeBroker_RequireGPU_AutoSelect(t *testing.T) {
-	ctx := contextWithIdentity(context.Background(), NewDevUser(DevUserConfig{
-		Username:    "dev",
-		DisplayName: "Dev User",
-		Email:       "dev@localhost",
-	}))
-
-	t.Run("single provider without GPU returns error when GPU required", func(t *testing.T) {
-		srv, s := testServer(t)
-		broker := &store.RuntimeBroker{
-			ID:     tid("single-nogpu"),
-			Name:   "Single No GPU",
-			Slug:   "single-nogpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: false,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
-		project := &store.Project{ID: tid("single-nogpu-proj"), Slug: "single-nogpu-proj", Name: "Single No GPU Proj"}
-		require.NoError(t, s.CreateProject(ctx, project))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: broker.ID, BrokerName: broker.Name, Status: store.BrokerStatusOnline,
-		}))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
-		assert.Error(t, err)
-		assert.Empty(t, brokerID)
-		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
-	})
-
-	t.Run("single provider with GPU is auto-selected when GPU required", func(t *testing.T) {
-		srv, s := testServer(t)
-		broker := &store.RuntimeBroker{
-			ID:     tid("single-gpu"),
-			Name:   "Single GPU",
-			Slug:   "single-gpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: true,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
-		project := &store.Project{ID: tid("single-gpu-proj"), Slug: "single-gpu-proj", Name: "Single GPU Proj"}
-		require.NoError(t, s.CreateProject(ctx, project))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: broker.ID, BrokerName: broker.Name, Status: store.BrokerStatusOnline,
-		}))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
-		assert.NoError(t, err)
-		assert.Equal(t, broker.ID, brokerID)
-	})
-
-	t.Run("multiple providers with only one GPU broker auto-selects the GPU broker", func(t *testing.T) {
-		srv, s := testServer(t)
-		gpuBroker := &store.RuntimeBroker{
-			ID:     tid("multi-gpu"),
-			Name:   "Multi GPU",
-			Slug:   "multi-gpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: true,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, gpuBroker))
-
-		cpuBroker := &store.RuntimeBroker{
-			ID:     tid("multi-cpu"),
-			Name:   "Multi CPU",
-			Slug:   "multi-cpu",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: false,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, cpuBroker))
-
-		project := &store.Project{ID: tid("multi-proj"), Slug: "multi-proj", Name: "Multi Proj"}
-		require.NoError(t, s.CreateProject(ctx, project))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: gpuBroker.ID, BrokerName: gpuBroker.Name, Status: store.BrokerStatusOnline,
-		}))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: cpuBroker.ID, BrokerName: cpuBroker.Name, Status: store.BrokerStatusOnline,
-		}))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
-		assert.NoError(t, err)
-		assert.Equal(t, gpuBroker.ID, brokerID)
-	})
-
-	t.Run("multiple providers with multiple GPU brokers requires explicit selection", func(t *testing.T) {
-		srv, s := testServer(t)
-		gpu1 := &store.RuntimeBroker{
-			ID:     tid("multi-gpu-1"),
-			Name:   "Multi GPU 1",
-			Slug:   "multi-gpu-1",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: true,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, gpu1))
-
-		gpu2 := &store.RuntimeBroker{
-			ID:     tid("multi-gpu-2"),
-			Name:   "Multi GPU 2",
-			Slug:   "multi-gpu-2",
-			Status: store.BrokerStatusOnline,
-			Capabilities: &store.BrokerCapabilities{
-				NvidiaGPU: true,
-			},
-		}
-		require.NoError(t, s.CreateRuntimeBroker(ctx, gpu2))
-
-		project := &store.Project{ID: tid("multi-gpu-proj"), Slug: "multi-gpu-proj", Name: "Multi GPU Proj"}
-		require.NoError(t, s.CreateProject(ctx, project))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: gpu1.ID, BrokerName: gpu1.Name, Status: store.BrokerStatusOnline,
-		}))
-		require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-			ProjectID: project.ID, BrokerID: gpu2.ID, BrokerName: gpu2.Name, Status: store.BrokerStatusOnline,
-		}))
-
-		w := httptest.NewRecorder()
-		brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project, true)
-		assert.Error(t, err)
-		assert.Empty(t, brokerID)
-		assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
 	})
 }

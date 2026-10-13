@@ -45,6 +45,14 @@
       "description": "Maximum number of LLM model API calls before the agent is stopped.",
       "x-since": "1"
     },
+    "clone_depth": {
+      "oneOf": [
+        { "type": "string", "pattern": "^(|full|[1-9][0-9]{0,8})$" },
+        { "type": "integer", "minimum": 1, "maximum": 999999999 },
+        { "type": "null" }
+      ],
+      "description": "Git clone depth for a clone-per-agent workspace: \"full\" for a full (non-shallow) clone, or an integer N from 1 to 999999999 for a clone of depth N. Overrides any profiles.<name>.clone_depth. Unset (absent, null or \"\") keeps the profile value, else the default shallow (depth 1) clone."
+    },
     "max_duration": {
       "type": "string",
       "pattern": "^[0-9]+(s|m|h)$",
@@ -102,7 +110,7 @@
     },
     "hub": {
       "type": "object",
-      "description": "Hub connection settings override for this agent/template. Takes highest priority over grove and server settings.",
+      "description": "Hub connection settings override for this agent/template. Takes highest priority over project and server settings.",
       "properties": {
         "endpoint": {
           "type": "string",
@@ -140,6 +148,21 @@
         "namespace": { "type": "string" },
         "runtimeClassName": { "type": "string" },
         "serviceAccountName": { "type": "string" },
+        "priorityClassName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+          "description": "PriorityClass name (DNS-1123 subdomain) applied to the agent pod's spec.priorityClassName, or the empty string for unset. The PriorityClass must already exist on the cluster; Scion does not create one. Overrides any runtimes.<name>.priority_class_name default."
+        },
+        "safeToEvict": {
+          "type": "boolean",
+          "description": "Kubernetes only. false adds the cluster-autoscaler.kubernetes.io/safe-to-evict: \"false\" annotation to the agent pod (on GKE Autopilot this requests extended run duration). true is accepted and adds nothing. Overrides any profiles.<name>.safe_to_evict or runtimes.<name>.safe_to_evict default."
+        },
+        "imagePullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"],
+          "description": "Kubernetes image pull policy. Overrides any Hub settings harness_configs.<name>.image_pull_policy default."
+        },
         "resources": {
           "type": "object",
           "properties": {
@@ -154,36 +177,6 @@
           }
         }
       }
-    },
-    "docker": {
-      "type": "object",
-      "description": "Docker runtime configuration.",
-      "properties": {
-        "nvidia_gpu": {
-          "type": "boolean",
-          "description": "Override NVIDIA device attachment. False removes inherited NVIDIA CDI and host device grants; true uses configured NVIDIA devices or defaults to nvidia.com/gpu=all. Omit to inherit. Does not restrict privileged containers or external Docker wrappers."
-        },
-        "privileged": {
-          "type": "boolean",
-          "description": "Run the Docker container in privileged mode."
-        },
-        "networks": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Custom Docker networks to join."
-        },
-        "devices": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "description": "Docker device mappings or CDI selectors to grant to the container."
-        },
-        "labels": {
-          "type": "object",
-          "additionalProperties": { "type": "string" },
-          "description": "Custom Docker container labels."
-        }
-      },
-      "additionalProperties": false
     }
   },
   "$defs": {

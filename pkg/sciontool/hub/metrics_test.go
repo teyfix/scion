@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,103 +16,80 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestReportMetricsRejectsInvalidSessionBeforeRequest(t *testing.T) {
-	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestCount++
-		w.WriteHeader(http.StatusCreated)
+func TestClient_ReportMetrics(t *testing.T) {
+	attempts := 0
+	var received MetricsPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/v1/agents/agent-123/metrics", r.URL.Path)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		assert.Equal(t, "test-token", r.Header.Get("X-Scion-Agent-Token"))
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if attempts == 1 {
+			http.Error(w, "retry", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}))
-	t.Cleanup(server.Close)
+	defer server.Close()
 
-	now := time.Now().UTC()
-	valid := MetricsPayload{
-		Session: SessionMetrics{
-			ID:        "session-1",
-			StartedAt: now.Format(time.RFC3339),
-			EndedAt:   now.Add(time.Minute).Format(time.RFC3339),
-		},
-	}
-	tests := []struct {
-		name    string
-		mutate  func(*MetricsPayload)
-		wantErr string
-	}{
-		{
-			name: "missing session ID",
-			mutate: func(payload *MetricsPayload) {
-				payload.Session.ID = " "
-			},
-			wantErr: "session.id is required",
-		},
-		{
-			name: "zero session start time",
-			mutate: func(payload *MetricsPayload) {
-				payload.Session.StartedAt = time.Time{}.UTC().Format(time.RFC3339)
-			},
-			wantErr: "session.started_at must be a non-zero RFC3339 timestamp",
-		},
-		{
-			name: "malformed session start time",
-			mutate: func(payload *MetricsPayload) {
-				payload.Session.StartedAt = "not-a-time"
-			},
-			wantErr: "session.started_at must be a non-zero RFC3339 timestamp",
-		},
-		{
-			name: "session end precedes start",
-			mutate: func(payload *MetricsPayload) {
-				payload.Session.EndedAt = now.Add(-time.Minute).Format(time.RFC3339)
-			},
-			wantErr: "session.ended_at cannot be before session.started_at",
-		},
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	client.retryBaseDelay = time.Millisecond
+	payload := MetricsPayload{
+		Type:    "agent_metrics",
+		AgentID: "agent-123",
+		Session: SessionMetrics{ID: "session-1"},
+		Tokens:  TokenMetrics{Input: 12, Output: 7},
 	}
 
-	client := NewClientWithConfig(server.URL, "token", "agent-1")
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			payload := valid
-			tc.mutate(&payload)
-			err := client.ReportMetrics(context.Background(), payload)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("ReportMetrics error = %v, want containing %q", err, tc.wantErr)
-			}
-		})
-	}
-
-	if requestCount != 0 {
-		t.Fatalf("invalid payloads made %d HTTP requests, want 0", requestCount)
-	}
+	require.NoError(t, client.ReportMetrics(context.Background(), payload))
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, payload, received)
 }
 
-func TestReportMetricsAcceptsValidLifecycleSession(t *testing.T) {
-	requestCount := 0
+func TestClient_ReportMetricsDoesNotRetryClientErrors(t *testing.T) {
+	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestCount++
-		w.WriteHeader(http.StatusCreated)
+		attempts++
+		http.Error(w, "bad metrics", http.StatusBadRequest)
 	}))
-	t.Cleanup(server.Close)
+	defer server.Close()
 
-	now := time.Now().UTC()
-	payload := MetricsPayload{
-		Session: SessionMetrics{
-			ID:        "session-1",
-			StartedAt: now.Format(time.RFC3339),
-			EndedAt:   now.Add(time.Minute).Format(time.RFC3339),
-		},
-	}
-	client := NewClientWithConfig(server.URL, "token", "agent-1")
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	client.retryBaseDelay = time.Millisecond
 
-	if err := client.ReportMetrics(context.Background(), payload); err != nil {
-		t.Fatalf("ReportMetrics: %v", err)
-	}
-	if requestCount != 1 {
-		t.Fatalf("valid payload made %d HTTP requests, want 1", requestCount)
-	}
+	err := client.ReportMetrics(context.Background(), MetricsPayload{Session: SessionMetrics{ID: "session-1"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hub returned error 400: bad metrics")
+	assert.Equal(t, 1, attempts)
+}
+
+func TestClient_ReportMetricsWithoutSessionIDIsNotSent(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+
+	err := client.ReportMetrics(context.Background(), MetricsPayload{AgentID: "agent-123"})
+	require.Error(t, err)
+	assert.EqualError(t, err, "session metrics not sent: summary has no session ID")
+	assert.Equal(t, 0, attempts)
 }

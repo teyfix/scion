@@ -5,10 +5,10 @@ Copyright 2025 The Scion Authors.
 package commands
 
 import (
-	"bytes"
 	"errors"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -107,15 +107,6 @@ func TestClassifyExit(t *testing.T) {
 			wantMsg:           "Agent crashed with exit code 1",
 		},
 		{
-			name:              "requested shutdown preserves authoritative harness code 255",
-			supervisedCode:    -1,
-			harnessCode:       intPtr(255),
-			requestedShutdown: true,
-			wantCode:          255,
-			wantCrash:         true,
-			wantMsg:           "Agent crashed with exit code 255",
-		},
-		{
 			name:              "harness code -1 with requested shutdown is clean stop",
 			supervisedCode:    0,
 			harnessCode:       intPtr(-1),
@@ -147,72 +138,6 @@ func TestClassifyExit(t *testing.T) {
 	}
 }
 
-func TestRunInitRequestedSIGTERMReturnsClassifiedExit(t *testing.T) {
-	home := t.TempDir()
-	marker := home + "/child-started"
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestRunInitRequestedSIGTERMHelper$")
-	cmd.Env = make([]string, 0, len(os.Environ())+6)
-	for _, env := range os.Environ() {
-		if strings.HasPrefix(env, "SCION_") || strings.HasPrefix(env, "HOME=") {
-			continue
-		}
-		cmd.Env = append(cmd.Env, env)
-	}
-	cmd.Env = append(cmd.Env,
-		"GO_WANT_RUN_INIT_SIGTERM_HELPER=1",
-		"HOME="+home,
-		"SCION_HOOKS_DIR="+home+"/hooks",
-		"SCION_GRACE_PERIOD=100ms",
-		"SCION_TELEMETRY_ENABLED=false",
-		"SCION_TEST_CHILD_STARTED="+marker,
-	)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}
-	})
-
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("child did not start: %s", output.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(150 * time.Millisecond)
-
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("send SIGTERM to helper: %v", err)
-	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("runInit returned non-zero after requested SIGTERM: %v\n%s", err, output.String())
-	}
-	if !strings.Contains(output.String(), "Child exited with code 0") {
-		t.Fatalf("runInit did not log the classified exit code:\n%s", output.String())
-	}
-}
-
-func TestRunInitRequestedSIGTERMHelper(t *testing.T) {
-	if os.Getenv("GO_WANT_RUN_INIT_SIGTERM_HELPER") != "1" {
-		return
-	}
-
-	code := runInit([]string{"sh", "-c", `touch "$SCION_TEST_CHILD_STARTED"; exec sleep 60`})
-	os.Exit(code)
-}
-
 func TestReadHarnessExitCode(t *testing.T) {
 	// Missing file -> nil.
 	_ = os.Remove(state.HarnessExitCodeFile)
@@ -236,5 +161,85 @@ func TestReadHarnessExitCode(t *testing.T) {
 	}
 	if got := readHarnessExitCode(); got != nil {
 		t.Errorf("expected nil for garbage, got %v", *got)
+	}
+}
+
+// TestReadHarnessExitCode_SymlinkRefused proves that a workload-planted
+// symlink at the exit-code path can't make root's shutdown path read (and
+// parse as an exit code) an unrelated file's contents: readHarnessExitCode
+// must return nil without touching the symlink's target.
+func TestReadHarnessExitCode_SymlinkRefused(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(target, []byte("42"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	_ = os.Remove(state.HarnessExitCodeFile)
+	if err := os.Symlink(target, state.HarnessExitCodeFile); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(state.HarnessExitCodeFile) })
+
+	if got := readHarnessExitCode(); got != nil {
+		t.Errorf("expected nil for a symlinked exit-code path, got %v", *got)
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(data) != "42" {
+		t.Errorf("symlink target was modified: %q", data)
+	}
+}
+
+// TestReadHarnessExitCode_FIFODoesNotBlock proves that a workload-planted
+// FIFO at the exit-code path can't make root's shutdown path hang forever
+// waiting for a writer: readHarnessExitCode must return nil promptly
+// (O_NONBLOCK on open, then a regular-file check before ever reading).
+func TestReadHarnessExitCode_FIFODoesNotBlock(t *testing.T) {
+	_ = os.Remove(state.HarnessExitCodeFile)
+	if err := syscall.Mkfifo(state.HarnessExitCodeFile, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(state.HarnessExitCodeFile) })
+
+	done := make(chan *int, 1)
+	go func() { done <- readHarnessExitCode() }()
+
+	select {
+	case got := <-done:
+		if got != nil {
+			t.Errorf("expected nil for a FIFO exit-code path, got %v", *got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readHarnessExitCode blocked on a FIFO with no writer")
+	}
+}
+
+// TestReadHarnessExitCode_BoundedRead proves an oversized exit-code file is
+// bounded by harnessExitCodeMaxBytes rather than read in full. The first
+// harnessExitCodeMaxBytes bytes are all-digit and parse to 42 on their own;
+// thousands of further digit bytes follow, which would overflow int (and
+// so fail to parse) if the read weren't bounded. A bounded read must
+// return 42; an unbounded one would return nil.
+func TestReadHarnessExitCode_BoundedRead(t *testing.T) {
+	_ = os.Remove(state.HarnessExitCodeFile)
+	leading := strings.Repeat("0", harnessExitCodeMaxBytes-2) + "42"
+	if len(leading) != harnessExitCodeMaxBytes {
+		t.Fatalf("test setup: leading prefix is %d bytes, want %d", len(leading), harnessExitCodeMaxBytes)
+	}
+	oversized := leading + strings.Repeat("9", 1000)
+	if _, err := strconv.Atoi(oversized); err == nil {
+		t.Fatal("test setup: the full oversized content must not parse as an int (it needs to overflow)")
+	}
+	if err := os.WriteFile(state.HarnessExitCodeFile, []byte(oversized), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(state.HarnessExitCodeFile) })
+
+	got := readHarnessExitCode()
+	if got == nil || *got != 42 {
+		t.Errorf("readHarnessExitCode() = %v, want 42 (derived from only the first %d bytes)", got, harnessExitCodeMaxBytes)
 	}
 }

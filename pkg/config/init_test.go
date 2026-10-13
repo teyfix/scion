@@ -52,6 +52,10 @@ func TestGetDefaultSettingsData_OSSpecific(t *testing.T) {
 }
 
 func TestGetDefaultSettingsDataYAML_OSSpecific(t *testing.T) {
+	// Make every candidate available so the result does not depend on the
+	// host's installed runtimes. On macOS detection then picks podman first.
+	mockRuntimeDetectionMulti(t, map[string]bool{"podman": true, "docker": true, "container": true})
+
 	data, err := GetDefaultSettingsDataYAML()
 	if err != nil {
 		t.Fatalf("GetDefaultSettingsDataYAML failed: %v", err)
@@ -69,7 +73,7 @@ func TestGetDefaultSettingsDataYAML_OSSpecific(t *testing.T) {
 
 	expectedRuntime := "docker"
 	if runtime.GOOS == "darwin" {
-		expectedRuntime = "container"
+		expectedRuntime = "podman"
 	}
 
 	if localProfile.Runtime != expectedRuntime {
@@ -230,12 +234,8 @@ server:
 	}
 }
 
-func TestGenerateProjectIDForDir_NoGitRepo(t *testing.T) {
-	// Create a non-git directory
-	tmpDir := t.TempDir()
-
-	// GenerateProjectIDForDir should return a UUID
-	id := GenerateProjectIDForDir(tmpDir)
+func TestGenerateProjectID(t *testing.T) {
+	id := GenerateProjectID()
 	if id == "" {
 		t.Error("expected non-empty project ID")
 	}
@@ -248,7 +248,7 @@ func TestGenerateProjectIDForDir_NoGitRepo(t *testing.T) {
 
 func TestIsInsideProject(t *testing.T) {
 	// Unset Hub context to avoid synthetic project root detection
-	for _, e := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL", "SCION_GROVE_ID", "SCION_PROJECT_ID"} {
+	for _, e := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL", "SCION_PROJECT_ID"} {
 		if val, ok := os.LookupEnv(e); ok {
 			_ = os.Unsetenv(e)
 			defer func() { _ = os.Setenv(e, val) }()
@@ -998,7 +998,7 @@ func TestInitMachine_PreservesSettings(t *testing.T) {
 
 func TestWriteProjectSettings_V1PlacesProjectIDUnderHub(t *testing.T) {
 	tmpDir := t.TempDir()
-	projectID := "test-grove-id-abc123"
+	projectID := "test-project-id-abc123"
 
 	err := writeProjectSettings(tmpDir, "/tmp/project", projectID, InitProjectOpts{SkipRuntimeCheck: true})
 	if err != nil {
@@ -1217,7 +1217,7 @@ func TestInitMachine_CloudRunSandbox_EffectiveSettings_Task92(t *testing.T) {
 
 // TestDefaultSandboxBin_MatchesLiteral pins config's unexported
 // defaultSandboxBin against the same literal that
-// TestSandboxBinConstantSync_Task92 (in the external config_test package)
+// TestSandboxBinConstantSync_Task92 (in pkg/runtime)
 // pins runtime.DefaultSandboxBin against. Together these two tests catch
 // drift in either direction. (O5)
 func TestDefaultSandboxBin_MatchesLiteral(t *testing.T) {

@@ -16,24 +16,31 @@ package runtime
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/rand/v2"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
-	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
+	"golang.org/x/sync/singleflight"
 )
 
 type DockerRuntime struct {
-	Command               string
-	Host                  string
-	instanceAuthorityPath string
-	authenticatedBrokerID func() (string, error)
+	Command string
+	Host    string
+
+	// listGroup collapses concurrent List calls into a single `docker ps`
+	// exec. Every caller (PTY lookup, message delivery, heartbeat) issues
+	// the exact same command regardless of labelFilter — filtering happens
+	// afterward in Go — so there is never a reason to run it twice at once.
+	// Its zero value is ready to use.
+	listGroup singleflight.Group
 }
 
 func NewDockerRuntime() *DockerRuntime {
@@ -51,22 +58,10 @@ func (r *DockerRuntime) ExecUser() string {
 }
 
 func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, error) {
-	// Serialize file and variable secrets into an env-var blob for
-	// container-side staging by sciontool init (stateless broker support).
-	if len(config.ResolvedSecrets) > 0 {
-		encoded, err := serializeSecrets(util.GetHomeDir(config.UnixUsername), config.ResolvedSecrets)
-		if err != nil {
-			return "", fmt.Errorf("failed to serialize secrets: %w", err)
-		}
-		if encoded != "" {
-			config.Env = append(config.Env, StagedSecretEnvVar+"="+encoded)
-		}
+	if err := prepareContainerSecretEnv(&config); err != nil {
+		return "", err
 	}
-
-	// Inject GCP telemetry credential path if the well-known secret is present
-	if credPath := findGCPTelemetryCredentialPath(config.ResolvedSecrets, util.GetHomeDir(config.UnixUsername)); credPath != "" {
-		config.Env = append(config.Env, telemetryGCPCredentialsEnvVar+"="+credPath)
-	}
+	config.RuntimeName = r.Name()
 
 	args, err := buildCommonRunArgs(config)
 	if err != nil {
@@ -76,10 +71,6 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	// sciontool already handles PID 1 responsibilities (zombie reaping, signal forwarding),
 	// so we don't use --init to avoid competing init processes.
 	newArgs := []string{"run", "-t"}
-
-	if config.Privileged {
-		newArgs = append(newArgs, "--privileged")
-	}
 
 	// Apply resource constraints from config.
 	//
@@ -98,44 +89,47 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	// cgroup-version half of the probe is missing. That probe is deliberately
 	// not implemented here. Until it lands, affected deployments must opt out
 	// via `runtime.enforce_resource_defaults: false`.
-	if config.Resources != nil {
-		if config.Resources.Limits.Memory != "" {
-			bytes, err := util.ParseMemory(config.Resources.Limits.Memory)
-			if err != nil {
-				return "", fmt.Errorf("invalid memory limit %q: %w", config.Resources.Limits.Memory, err)
-			}
-			newArgs = append(newArgs, "--memory", util.FormatMemoryForDocker(bytes))
-		}
-		if config.Resources.Requests.Memory != "" {
-			bytes, err := util.ParseMemory(config.Resources.Requests.Memory)
-			if err != nil {
-				return "", fmt.Errorf("invalid memory request %q: %w", config.Resources.Requests.Memory, err)
-			}
-			newArgs = append(newArgs, "--memory-reservation", util.FormatMemoryForDocker(bytes))
-		}
-		if config.Resources.Limits.CPU != "" {
-			cores, err := util.ParseCPU(config.Resources.Limits.CPU)
-			if err != nil {
-				return "", fmt.Errorf("invalid cpu limit %q: %w", config.Resources.Limits.CPU, err)
-			}
-			newArgs = append(newArgs, "--cpus", util.FormatCPU(cores))
-		}
+	newArgs, err = appendContainerResourceArgs(newArgs, config.Resources)
+	if err != nil {
+		return "", err
 	}
+
+	newArgs = appendSharedDirGroupArgs(newArgs, config, "docker", true)
 
 	newArgs = append(newArgs, args[1:]...)
 
 	WriteRuntimeDebugFile(config, r.Command, newArgs)
 
+	// Async-launch gate immediately before the container create (design
+	// t1-async-create-v11.md §3.8.3); a no-op on the synchronous path.
+	hooks := config.launchHooks()
+	if err := hooks.checkpoint(ctx, CheckpointStepLaunching); err != nil {
+		return "", err
+	}
 	out, err := runSimpleCommand(ctx, r.Command, newArgs...)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The caller gave up while the daemon may still have been
+			// creating/starting the container. Clean up any partial result
+			// instead of leaking it. See ptone/scion#1886.
+			rollbackCancelledCreate(r.Command, config.Name, config.Labels[api.LabelRunID])
+			return "", ctx.Err()
+		}
 		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
 	}
 
-	return strings.TrimSpace(out), nil
+	// Run returns the whole trimmed output, as before; only the launch
+	// handle is restricted to a well-formed container ID line.
+	id := strings.TrimSpace(out)
+	reportContainerCreated(hooks, config.Name, out)
+	return id, nil
 }
 
-func (r *DockerRuntime) Stop(ctx context.Context, id string) error {
-	out, err := runSimpleCommand(ctx, r.Command, "stop", id)
+// Stop stops the container ref.ID. As with Delete, the engine container ID
+// is already unique per run, so ref.RunID needs no further check here; run
+// targeting is enforced by the caller resolving the ID from List.
+func (r *DockerRuntime) Stop(ctx context.Context, ref RunRef) error {
+	out, err := runSimpleCommand(ctx, r.Command, "stop", ref.ID)
 	if err != nil && out != "" {
 		// Include runtime's stderr output in the error so callers can match
 		// on messages like "not running" or "No such container".
@@ -144,8 +138,11 @@ func (r *DockerRuntime) Stop(ctx context.Context, id string) error {
 	return err
 }
 
-func (r *DockerRuntime) Delete(ctx context.Context, id string) error {
-	_, err := runSimpleCommand(ctx, r.Command, "rm", "-f", id)
+// Delete removes the container ref.ID. The engine container ID is already
+// unique per run, so ref.RunID needs no further check here; run targeting is
+// enforced by the caller resolving the ID from List.
+func (r *DockerRuntime) Delete(ctx context.Context, ref RunRef) error {
+	_, err := runSimpleCommand(ctx, r.Command, "rm", "-f", ref.ID)
 	return err
 }
 
@@ -157,103 +154,60 @@ type dockerListOutput struct {
 	Labels string `json:"Labels"`
 }
 
-type dockerInspectRuntimeFacts struct {
-	ID         string `json:"id"`
-	Privileged bool   `json:"privileged"`
-	Devices    []struct {
-		PathOnHost        string `json:"PathOnHost"`
-		PathInContainer   string `json:"PathInContainer"`
-		CgroupPermissions string `json:"CgroupPermissions"`
-	} `json:"devices"`
-	DeviceRequests []struct {
-		Driver       string     `json:"Driver"`
-		DeviceIDs    []string   `json:"DeviceIDs"`
-		Capabilities [][]string `json:"Capabilities"`
-	} `json:"deviceRequests"`
-}
+// dockerListFormat renders exactly the fields in dockerListOutput as JSON.
+//
+// Do not replace this with "{{json .}}": that template references every
+// container field, including .Size, which makes the Docker CLI request
+// size=1 from the daemon. Computing sizes walks every container's overlay
+// filesystem (snapshotter.Usage) and fails the whole `docker ps` call when a
+// file disappears mid-walk, which is routine for agent containers with busy
+// /tmp directories. See ptone/scion#1867.
+const dockerListFormat = `{"ID":{{json .ID}},"Names":{{json .Names}},"Status":{{json .Status}},"Image":{{json .Image}},"Labels":{{json .Labels}}}`
 
-func dockerFactsHaveNvidiaGPU(facts dockerInspectRuntimeFacts) bool {
-	for _, device := range facts.Devices {
-		if strings.Contains(strings.ToLower(device.PathOnHost), "nvidia") ||
-			strings.Contains(strings.ToLower(device.PathInContainer), "nvidia") {
-			return true
-		}
-	}
-	for _, request := range facts.DeviceRequests {
-		driver := strings.ToLower(request.Driver)
-		if driver == "nvidia" {
-			return true
-		}
-		for _, id := range request.DeviceIDs {
-			if strings.HasPrefix(strings.ToLower(id), "nvidia.com/gpu=") {
-				return true
-			}
-		}
-		for _, capabilitySet := range request.Capabilities {
-			for _, capability := range capabilitySet {
-				if strings.EqualFold(capability, "gpu") {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// populateRuntimeFacts records what Docker actually applied to each container.
-// These are observed facts rather than requested settings: wrappers around the
-// Docker CLI may add --privileged or GPU device requests after Scion builds the
-// command line, so only inspection can report the effective runtime state.
-func (r *DockerRuntime) populateRuntimeFacts(ctx context.Context, agents []api.AgentInfo) {
-	if len(agents) == 0 {
-		return
-	}
-
-	args := []string{
-		"inspect",
-		"--format",
-		`{"id":{{json .Id}},"privileged":{{json .HostConfig.Privileged}},"devices":{{json .HostConfig.Devices}},"deviceRequests":{{json .HostConfig.DeviceRequests}}}`,
-	}
-	for i := range agents {
-		args = append(args, agents[i].ContainerID)
-	}
-
-	out, err := exec.CommandContext(ctx, r.Command, args...).CombinedOutput()
-	if err != nil {
-		util.Debugf("docker inspect runtime facts failed: %v", err)
-		return
-	}
-
-	byID := make(map[string]dockerInspectRuntimeFacts, len(agents))
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		var facts dockerInspectRuntimeFacts
-		if err := json.Unmarshal([]byte(line), &facts); err != nil || facts.ID == "" {
-			continue
-		}
-		byID[facts.ID] = facts
-	}
-
-	for i := range agents {
-		facts, ok := byID[agents[i].ContainerID]
-		if !ok {
-			continue
-		}
-		privileged := facts.Privileged
-		nvidiaGPU := dockerFactsHaveNvidiaGPU(facts)
-		agents[i].Privileged = &privileged
-		agents[i].NvidiaGPU = &nvidiaGPU
-	}
-}
+// Bounded retry/backoff for `docker ps`. Even with the size-free format
+// (dockerListFormat, see #1867/#1888) `docker ps` can still fail
+// intermittently — a busy daemon, a momentarily locked overlay snapshot,
+// etc. These failures are typically transient, and List has ~20 callers
+// (PTY attach, message delivery, heartbeat) that previously hard-failed on
+// the first error. See #1864.
+const (
+	dockerListMaxAttempts    = 3
+	dockerListInitialBackoff = 150 * time.Millisecond
+	dockerListBackoffMult    = 3.0
+	// dockerListJitter is the +/- fraction applied to each backoff so that
+	// concurrent callers retrying after the same failure don't all land on
+	// the daemon at once.
+	dockerListJitter = 0.2
+	// dockerListGroupTimeout bounds the detached context the singleflight
+	// group's shared exec runs under (see List below). It comfortably covers
+	// dockerListMaxAttempts worth of retries and backoff plus exec time, so a
+	// slow-but-successful `docker ps` isn't cut off before every joined
+	// caller would have given up on their own.
+	dockerListGroupTimeout = 10 * time.Second
+)
 
 func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
-	args := []string{"ps", "-a", "--no-trunc", "--format", "{{json .}}"}
-	cmd := exec.CommandContext(ctx, r.Command, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("docker ps failed: %w", err)
+	// Use DoChan rather than Do: Do would run the shared exec under
+	// whichever caller's ctx happens to start the call, so that caller
+	// cancelling would abort docker ps for every other caller collapsed into
+	// it. Instead the shared exec runs on its own detached-but-bounded
+	// context, and each caller selects between the shared result and its own
+	// ctx.Done().
+	resultCh := r.listGroup.DoChan("ps", func() (any, error) {
+		groupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dockerListGroupTimeout)
+		defer cancel()
+		return r.execListWithRetry(groupCtx)
+	})
+
+	var out []byte
+	select {
+	case res := <-resultCh:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		out = res.Val.([]byte)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("docker ps failed: %w", ctx.Err())
 	}
 
 	var agents []api.AgentInfo
@@ -276,26 +230,7 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 		}
 
 		// Filter by labels if requested
-		match := true
-		for k, v := range labelFilter {
-			actual := labels[k]
-			// Fallback for project labels
-			if actual == "" {
-				switch k {
-				case projectcompat.LabelProject:
-					actual = projectcompat.ProjectNameFromLabels(labels)
-				case projectcompat.LabelProjectID:
-					actual = projectcompat.ProjectIDFromLabels(labels)
-				case projectcompat.LabelProjectPath:
-					actual = projectcompat.ProjectPathFromLabels(labels)
-				}
-			}
-
-			if actual != v {
-				match = false
-				break
-			}
-		}
+		match := LabelsMatchFilter(labels, labelFilter)
 
 		if match {
 			// Prefer the scion.name label (slugified) over Docker container name
@@ -305,6 +240,7 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 			}
 			info := api.AgentInfo{
 				ContainerID:     d.ID,
+				RunID:           labels[api.LabelRunID],
 				Name:            agentName,
 				ContainerStatus: d.Status,
 				Phase:           phaseFromContainerStatus(d.Status),
@@ -314,9 +250,9 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 				Template:        labels["scion.template"],
 				HarnessConfig:   labels["scion.harness_config"],
 				HarnessAuth:     labels["scion.harness_auth"],
-				Project:         projectcompat.ProjectNameFromLabels(labels),
-				ProjectID:       projectcompat.ProjectIDFromLabels(labels),
-				ProjectPath:     projectcompat.ProjectPathFromLabels(labels),
+				Project:         projectkeys.ProjectNameFromLabels(labels),
+				ProjectID:       projectkeys.ProjectIDFromLabels(labels),
+				ProjectPath:     projectkeys.ProjectPathFromLabels(labels),
 				Runtime:         r.Name(),
 			}
 			if code, ok := ExitCodeFromContainerStatus(d.Status); ok {
@@ -330,9 +266,46 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 		}
 	}
 
-	r.populateRuntimeFacts(ctx, agents)
-
 	return agents, nil
+}
+
+// execListWithRetry runs `docker ps` for List, retrying transient failures
+// with jittered backoff. It gives up immediately once ctx is done (including
+// the last attempt reaching the deadline), since a retry cannot outlive its
+// caller's context anyway.
+func (r *DockerRuntime) execListWithRetry(ctx context.Context) ([]byte, error) {
+	args := []string{"ps", "-a", "--no-trunc", "--format", dockerListFormat}
+
+	var lastErr error
+	backoff := dockerListInitialBackoff
+	for attempt := 1; attempt <= dockerListMaxAttempts; attempt++ {
+		cmd := exec.CommandContext(ctx, r.Command, args...)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+		lastErr = fmt.Errorf("docker ps failed: %w", err)
+
+		if attempt == dockerListMaxAttempts || ctx.Err() != nil {
+			break
+		}
+
+		jitter := 1 + dockerListJitter*(2*rand.Float64()-1)
+		sleep := time.Duration(float64(backoff) * jitter)
+		runtimeLog().Debug("docker ps failed, retrying", "attempt", attempt, "max_attempts", dockerListMaxAttempts, "backoff", sleep, "error", err)
+
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("docker ps failed: %w", ctx.Err())
+		case <-timer.C:
+		}
+
+		backoff = time.Duration(float64(backoff) * dockerListBackoffMult)
+	}
+
+	return nil, lastErr
 }
 
 func (r *DockerRuntime) GetLogs(ctx context.Context, id string) (string, error) {
@@ -346,16 +319,7 @@ func (r *DockerRuntime) Attach(ctx context.Context, id string) error {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	var agent *api.AgentInfo
-	for _, a := range agents {
-		// Match by full container ID, short ID (12 chars), or name (with or without leading slash)
-		if a.ContainerID == id || (len(id) >= 12 && strings.HasPrefix(a.ContainerID, id)) || (len(a.ContainerID) >= 12 && strings.HasPrefix(id, a.ContainerID)) ||
-			a.Name == id || a.Name == "/"+id || strings.TrimPrefix(a.Name, "/") == id {
-			agent = &a
-			break
-		}
-	}
-
+	agent := findContainerAgent(agents, id)
 	if agent == nil {
 		return fmt.Errorf("agent '%s' container not found, it may have exited and been removed", id)
 	}
@@ -371,7 +335,35 @@ func (r *DockerRuntime) Attach(ctx context.Context, id string) error {
 	_, _ = runSimpleCommand(ctx, r.Command, "exec", "--user", "scion",
 		agent.ContainerID, "tmux", "set-option", "-g", "window-size", "latest")
 
-	return runInteractiveCommand(r.Command, "exec", "-it", "--user", "scion", agent.ContainerID, "tmux", "attach", "-t", "scion")
+	args := append([]string{"exec", "-it"}, ExecDetachKeysArgs(r.Command)...)
+	return runInteractiveCommand(r.Command, append(args, "--user", "scion", agent.ContainerID, "tmux", "attach", "-t", "scion")...)
+}
+
+// dockerExecDetachKeys is the --detach-keys value used for docker exec of a
+// tmux attach. docker cannot turn detach keys off (an empty value means "use
+// the default"), so this moves them to a rarely typed sequence. docker holds
+// back a lone Ctrl-\ until the next key arrives, and the full sequence ends
+// the exec (the tmux session keeps running).
+const dockerExecDetachKeys = "ctrl-\\,ctrl-^"
+
+// ExecDetachKeysArgs returns the --detach-keys flag for an interactive
+// "<runtime> exec -it ... tmux attach", or nil for runtimes that don't take
+// one. By default docker and podman reserve Ctrl-p Ctrl-q for detaching. They
+// hold back every Ctrl-p until the next key arrives, and Ctrl-p is a common
+// history key in agent CLIs. Detaching from an attach session is tmux's job
+// (Ctrl-b d), so podman gets an empty sequence, which disables its detach
+// keys, and docker gets dockerExecDetachKeys, a rarely typed sequence (docker
+// cannot disable them). Matching is on the binary's
+// base name, so other runtimes (and test adapters) get no extra flag.
+func ExecDetachKeysArgs(runtimeCmd string) []string {
+	switch filepath.Base(runtimeCmd) {
+	case "docker":
+		return []string{"--detach-keys=" + dockerExecDetachKeys}
+	case "podman":
+		return []string{"--detach-keys="}
+	default:
+		return nil
+	}
 }
 
 func (r *DockerRuntime) ImageExists(ctx context.Context, image string) (bool, error) {
@@ -406,7 +398,14 @@ func (r *DockerRuntime) RemoveImage(ctx context.Context, image string) error {
 }
 
 func (r *DockerRuntime) PullImage(ctx context.Context, image string) error {
-	return runInteractiveCommand(r.Command, "pull", image)
+	out, err := runSimpleCommand(ctx, r.Command, "pull", image)
+	if err != nil {
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			return fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+		}
+		return fmt.Errorf("pull %q: %w", image, err)
+	}
+	return nil
 }
 
 func (r *DockerRuntime) Sync(ctx context.Context, id string, direction SyncDirection) error {
@@ -415,56 +414,14 @@ func (r *DockerRuntime) Sync(ctx context.Context, id string, direction SyncDirec
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	var agent *api.AgentInfo
-	for _, a := range agents {
-		// Match by full container ID, short ID (12 chars), or name (with or without leading slash)
-		if a.ContainerID == id || (len(id) >= 12 && strings.HasPrefix(a.ContainerID, id)) || (len(a.ContainerID) >= 12 && strings.HasPrefix(id, a.ContainerID)) ||
-			a.Name == id || a.Name == "/"+id || strings.TrimPrefix(a.Name, "/") == id {
-			agent = &a
-			break
-		}
-	}
-
+	agent := findContainerAgent(agents, id)
 	if agent == nil {
 		return fmt.Errorf("agent '%s' container not found", id)
 	}
 
 	// Check for GCS volumes
-	if val, ok := agent.Labels["scion.gcs_volumes"]; ok && val != "" {
-		decoded, err := base64.StdEncoding.DecodeString(val)
-		if err != nil {
-			return fmt.Errorf("failed to decode gcs volume info: %w", err)
-		}
-
-		type gcsVolInfo struct {
-			Source string `json:"source"`
-			Target string `json:"target"`
-			Bucket string `json:"bucket"`
-			Prefix string `json:"prefix"`
-		}
-		var vols []gcsVolInfo
-		if err := json.Unmarshal(decoded, &vols); err != nil {
-			return fmt.Errorf("failed to parse gcs volume info: %w", err)
-		}
-
-		for _, v := range vols {
-			if v.Source == "" {
-				continue
-			}
-			switch direction {
-			case SyncTo:
-				if err := gcp.SyncToGCS(ctx, v.Source, v.Bucket, v.Prefix); err != nil {
-					return fmt.Errorf("failed to sync to GCS: %w", err)
-				}
-			case SyncFrom:
-				if err := gcp.SyncFromGCS(ctx, v.Bucket, v.Prefix, v.Source); err != nil {
-					return fmt.Errorf("failed to sync from GCS: %w", err)
-				}
-			default:
-				return fmt.Errorf("sync direction must be specified for GCS volumes")
-			}
-		}
-		return nil
+	if encoded := agent.Labels["scion.gcs_volumes"]; encoded != "" {
+		return syncGCSVolumes(ctx, encoded, direction)
 	}
 
 	// Docker runtime uses bind mounts for normal volumes, so sync is automatic/noop
@@ -478,7 +435,22 @@ func (r *DockerRuntime) Exec(ctx context.Context, id string, cmd []string) (stri
 		id = resolveContainerID(agents, id)
 	}
 	args := append([]string{"exec", "--user", "scion", id}, cmd...)
-	return runSimpleCommand(ctx, r.Command, args...)
+	out, err := runSimpleCommand(ctx, r.Command, args...)
+	// A container removed after the lookup above must surface as
+	// ErrContainerNotFound, not as the command's exit (ptone/scion#3655).
+	return out, dockerExecNotFound.classifyExecErr(ctx, err, out, id, r.List)
+}
+
+// ExecWithStdin runs cmd inside the container with stdin piped from the
+// given reader. The -i flag is required for `docker exec` to attach stdin;
+// without it, data written to stdin never reaches the container even though
+// os/exec has a Stdin set on the outer `docker` process. See #1355.
+func (r *DockerRuntime) ExecWithStdin(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
+	if agents, err := r.List(ctx, nil); err == nil {
+		id = resolveContainerID(agents, id)
+	}
+	args := append([]string{"exec", "-i", "--user", "scion", id}, cmd...)
+	return runSimpleCommandWithStdin(ctx, stdin, r.Command, args...)
 }
 
 // GetWorkspacePath returns the host path to the container's /workspace mount.

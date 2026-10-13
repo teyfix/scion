@@ -170,14 +170,14 @@ func newMockHubServer(t *testing.T, projectID string, templates []map[string]int
 	return server, &deleteCalled
 }
 
-// setupHubProject creates a grove directory with settings pointing to the given hub endpoint.
+// setupHubProject creates a project directory with settings pointing to the given hub endpoint.
 func setupHubProject(t *testing.T, home, endpoint, projectID string) string {
 	t.Helper()
-	groveDir := filepath.Join(home, "project", ".scion")
-	require.NoError(t, os.MkdirAll(groveDir, 0755))
+	projectDir := filepath.Join(home, "project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
 
 	settings := map[string]interface{}{
-		"grove_id": projectID,
+		"project_id": projectID,
 		"hub": map[string]interface{}{
 			"enabled":  true,
 			"endpoint": endpoint,
@@ -185,9 +185,9 @@ func setupHubProject(t *testing.T, home, endpoint, projectID string) string {
 	}
 	data, err := json.Marshal(settings)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(groveDir, "settings.json"), data, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "settings.json"), data, 0644))
 
-	return groveDir
+	return projectDir
 }
 
 func TestRunTemplateDelete_HubOnly_AutoConfirm(t *testing.T) {
@@ -208,7 +208,7 @@ func TestRunTemplateDelete_HubOnly_AutoConfirm(t *testing.T) {
 	// Create empty local templates so FindTemplate doesn't find anything
 	require.NoError(t, os.MkdirAll(filepath.Join(tmpHome, ".scion", "templates"), 0755))
 
-	projectID := "grove-test-123"
+	projectID := "project-test-123"
 	templateID := "hub-tpl-456"
 
 	server, deleteCalled := newMockHubServer(t, projectID, []map[string]interface{}{
@@ -245,7 +245,7 @@ func TestRunTemplateDelete_Both_AutoConfirm(t *testing.T) {
 
 	templateDir := createTestTemplate(t, tmpHome, "both-tpl")
 
-	projectID := "grove-test-789"
+	projectID := "project-test-789"
 	templateID := "hub-both-456"
 
 	server, deleteCalled := newMockHubServer(t, projectID, []map[string]interface{}{
@@ -294,7 +294,10 @@ func TestRunTemplateDelete_NoHub_Flag(t *testing.T) {
 
 func TestRunTemplateSync_RequiresArgOrAll(t *testing.T) {
 	// Calling sync with no args and no --all should error
-	err := runTemplateSync(nil, []string{})
+	cmd := &cobra.Command{}
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("all", false, "")
+	err := templateSyncArgs(cmd, []string{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "requires a template name argument or --all flag")
 }
@@ -305,7 +308,7 @@ func TestRunTemplateSync_AllAndArgConflict(t *testing.T) {
 	cmd.Flags().String("name", "", "")
 	cmd.Flags().Bool("all", true, "")
 
-	err := runTemplateSync(cmd, []string{"some-template"})
+	err := templateSyncArgs(cmd, []string{"some-template"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot specify both a template name and --all")
 }
@@ -316,7 +319,7 @@ func TestRunTemplateSync_AllAndNameConflict(t *testing.T) {
 	cmd.Flags().String("name", "custom-name", "")
 	cmd.Flags().Bool("all", true, "")
 
-	err := runTemplateSync(cmd, []string{})
+	err := templateSyncArgs(cmd, []string{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot use --name with --all")
 }
@@ -398,7 +401,7 @@ func TestRunTemplateSync_UpdatesExistingTemplate(t *testing.T) {
 	// Create a local template
 	createTestTemplate(t, tmpHome, "update-tpl")
 
-	projectID := "grove-update-123"
+	projectID := "project-update-123"
 
 	// Hub server returns an existing template with a different hash
 	server := newMockHubServerForSync(t, projectID, []map[string]interface{}{

@@ -24,13 +24,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 )
 
 const (
-	defaultAgentCacheTTL = 5 * time.Minute
-	defaultDBPath        = "slack.db"
-	dedupTTL             = 5 * time.Minute
+	defaultDBPath = "slack.db"
+	dedupTTL      = 5 * time.Minute
 )
 
 // SlackConfig holds Slack-specific configuration parsed from the plugin config map.
@@ -41,6 +40,11 @@ type SlackConfig struct {
 	SocketMode    bool
 	ListenAddress string
 	DBPath        string
+
+	// RoutedInboundEnabled controls whether ordinary user messages use the
+	// centralized /api/v1/broker/inbound/routed endpoint instead of legacy
+	// /api/v1/broker/inbound. Default false; enable only against an upgraded hub.
+	RoutedInboundEnabled bool
 }
 
 // inboundPayload is the JSON body sent to the hub API inbound endpoint.
@@ -49,25 +53,59 @@ type inboundPayload struct {
 	Message *messages.StructuredMessage `json:"message"`
 }
 
+// routedInboundPayload is the JSON body sent to the hub routed inbound endpoint.
+type routedInboundPayload struct {
+	ProjectID    string                      `json:"project_id"`
+	DefaultAgent string                      `json:"default_agent,omitempty"`
+	Surface      string                      `json:"surface,omitempty"`
+	ExternalRef  string                      `json:"external_ref,omitempty"`
+	ParentRef    string                      `json:"parent_ref,omitempty"`
+	Message      *messages.StructuredMessage `json:"message"`
+}
+
+// routedInboundResult is the success response from the hub routed endpoint.
+type routedInboundResult struct {
+	Delivered    bool   `json:"delivered"`
+	PrimaryAgent string `json:"primary_agent"`
+}
+
 // hubError represents a structured error returned by the hub API.
 type hubError struct {
 	StatusCode int
 	Code       string `json:"code"`
 	Message    string `json:"message"`
+	// ResourceType and DeniedAction are set on a denied request when the hub
+	// names what was denied (e.g. "agent" and "list").
+	ResourceType string `json:"-"`
+	DeniedAction string `json:"-"`
 }
 
 func (e *hubError) Error() string {
 	return fmt.Sprintf("hub error %d (%s): %s", e.StatusCode, e.Code, e.Message)
 }
 
-func (e *hubError) userFacingMessage() string {
+// userFacingMessage returns the text shown for a failed message delivery.
+// email is the sender's linked Scion account email, or "" when unknown.
+func (e *hubError) userFacingMessage(email string) string {
 	switch e.Code {
 	case "agent_not_found":
 		return "Target agent not found. Use `/scion agents` to see available agents."
 	case "forbidden":
+		if e.isStaleAccountLink() {
+			return staleAccountLinkText
+		}
 		return "You don't have permission to message this agent."
+	case "message_denied":
+		if email == "" {
+			return "Your Scion account doesn't have permission to message this agent. Ask a project owner."
+		}
+		return fmt.Sprintf("Your Scion account (%s) doesn't have permission to message this agent. Ask a project owner.", email)
 	case "broker_auth_failed", "unauthorized":
 		return "Authentication error — please contact an administrator."
+	case "transport_error":
+		return "Message delivery could not be confirmed — the service may be temporarily unavailable."
+	case "local_error":
+		return "Failed to prepare your message for delivery. Please try again or contact an administrator."
 	default:
 		return "Failed to deliver message. Please try again or contact an administrator."
 	}
@@ -85,6 +123,10 @@ func parseHubError(resp *http.Response) *hubError {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
+			Details struct {
+				ResourceType string `json:"resource_type"`
+				DeniedAction string `json:"denied_action"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Error.Code == "" {
@@ -94,6 +136,8 @@ func parseHubError(resp *http.Response) *hubError {
 	}
 	he.Code = envelope.Error.Code
 	he.Message = envelope.Error.Message
+	he.ResourceType = envelope.Error.Details.ResourceType
+	he.DeniedAction = envelope.Error.Details.DeniedAction
 	return he
 }
 
@@ -126,7 +170,6 @@ type SlackBroker struct {
 
 	events *eventServer
 
-	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string
 
 	config *SlackConfig
@@ -140,12 +183,11 @@ func NewBroker(log *slog.Logger) *SlackBroker {
 		log = slog.Default()
 	}
 	return &SlackBroker{
-		subs:          make(map[string]bool),
-		sentIDs:       make(map[string]time.Time),
-		log:           log,
-		pluginName:    "slack",
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
-		agentCacheTTL: defaultAgentCacheTTL,
+		subs:       make(map[string]bool),
+		sentIDs:    make(map[string]time.Time),
+		log:        log,
+		pluginName: "slack",
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -224,17 +266,14 @@ func (b *SlackBroker) Configure(config map[string]string) error {
 			b.store = store
 		}
 
-		if v, ok := config["agent_cache_ttl"]; ok && v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return fmt.Errorf("invalid agent_cache_ttl: %w", err)
-			}
-			b.agentCacheTTL = d
+		if v, ok := config["routed_inbound_enabled"]; ok {
+			cfg.RoutedInboundEnabled = v == "true" || v == "1"
 		}
 
 		b.log.Info("Slack broker phase 1 configured",
 			"socket_mode", cfg.SocketMode,
 			"db_path", cfg.DBPath,
+			"routed_inbound_enabled", cfg.RoutedInboundEnabled,
 		)
 	}
 
@@ -250,14 +289,16 @@ func (b *SlackBroker) Configure(config map[string]string) error {
 		}
 
 		b.events = &eventServer{
-			client:         b.client,
-			socketClient:   b.socketClient,
-			signingSecret:  b.config.SigningSecret,
-			log:            b.log,
-			store:          b.store,
-			hubClient:      b.hubClient,
-			registration:   b.registration,
-			deliverInbound: b.deliverInbound,
+			client:               b.client,
+			socketClient:         b.socketClient,
+			signingSecret:        b.config.SigningSecret,
+			log:                  b.log,
+			store:                b.store,
+			hubClient:            b.hubClient,
+			registration:         b.registration,
+			deliverInbound:       b.deliverInbound,
+			deliverRoutedInbound: b.deliverRoutedInbound,
+			routedInboundEnabled: b.config.RoutedInboundEnabled,
 			onBotUserID: func(id string) {
 				b.mu.Lock()
 				b.botUserID = id
@@ -279,7 +320,7 @@ func (b *SlackBroker) Configure(config map[string]string) error {
 				if hc == nil {
 					continue
 				}
-				if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
+				if err := hc.RequestSubscription(projectkeys.AllProjectsPattern()); err != nil {
 					b.log.Warn("Failed to request bootstrap subscription", "error", err)
 					continue
 				}
@@ -383,8 +424,10 @@ func (b *SlackBroker) Publish(ctx context.Context, topic string, msg *messages.S
 
 	projectID, agentSlug := parseTopicComponents(topic)
 
+	// Discard the retired end-of-turn assistant-reply mirror; an older hub
+	// may still forward it.
 	if msg.Type == messages.TypeAssistantReply {
-		b.log.Debug("Filtering assistant-reply message")
+		b.log.Debug("Discarding retired assistant-reply message")
 		return nil
 	}
 
@@ -718,54 +761,90 @@ func (b *SlackBroker) deliverInbound(topic string, msg *messages.StructuredMessa
 	return nil
 }
 
-// --- Agent cache ---
-
-func (b *SlackBroker) getProjectAgents(ctx context.Context, projectID string) []string {
+// deliverRoutedInbound sends a message to the hub's centralized routed inbound
+// endpoint. This endpoint handles mention extraction and multi-agent dispatch
+// on the hub side, replacing the legacy topic-based single-agent delivery.
+func (b *SlackBroker) deliverRoutedInbound(projectID, defaultAgent string, msg *messages.StructuredMessage) (*routedInboundResult, *hubError) {
 	b.mu.RLock()
-	store := b.store
-	hubClient := b.hubClient
-	ttl := b.agentCacheTTL
+	hubURL := b.hubURL
+	hmacKey := b.hmacKey
+	brokerID := b.brokerID
+	pluginName := b.pluginName
 	b.mu.RUnlock()
 
-	if store == nil {
-		return nil
+	if hubURL == "" {
+		b.log.Debug("No hub URL configured, dropping routed inbound message",
+			"project_id", projectID)
+		return nil, nil
 	}
 
-	cached, err := store.GetProjectAgents(ctx, projectID)
+	payload := routedInboundPayload{
+		ProjectID:    projectID,
+		DefaultAgent: defaultAgent,
+		Message:      msg,
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		b.log.Warn("Failed to read agent cache", "project_id", projectID, "error", err)
-	}
-	if cached != nil && time.Since(cached.RefreshedAt) < ttl {
-		return cached.AgentSlugs
+		b.log.Error("Failed to marshal routed inbound message", "error", err)
+		return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
 	}
 
-	if hubClient == nil {
-		if cached != nil {
-			return cached.AgentSlugs
-		}
-		return nil
-	}
-
-	agents, err := hubClient.ListAgents(ctx, projectID)
+	routedURL := hubURL + "/api/v1/broker/inbound/routed"
+	req, err := http.NewRequest("POST", routedURL, bytes.NewReader(body))
 	if err != nil {
-		b.log.Warn("Failed to refresh agent list from hub", "project_id", projectID, "error", err)
-		if cached != nil {
-			return cached.AgentSlugs
+		b.log.Error("Failed to create routed inbound request", "error", err)
+		return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Plugin-Name", pluginName)
+
+	if brokerID != "" && hmacKey != "" {
+		if err := signInboundRequest(req, brokerID, hmacKey); err != nil {
+			b.log.Error("Failed to sign routed inbound request", "error", err)
+			return nil, &hubError{Code: "local_error", Message: "Failed to prepare message for delivery."}
 		}
-		return nil
 	}
 
-	slugs := agentSlugs(agents)
-	saveErr := store.SetProjectAgents(ctx, &ProjectAgents{
-		ProjectID:   projectID,
-		AgentSlugs:  slugs,
-		RefreshedAt: time.Now(),
-	})
-	if saveErr != nil {
-		b.log.Warn("Failed to cache agents", "project_id", projectID, "error", saveErr)
+	// Use a longer timeout for routed requests: the hub may fan out to up to
+	// 11 recipients sequentially (30s each), plus preparation overhead.
+	client := &http.Client{Timeout: 6 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		b.log.Error("Failed to deliver routed inbound message",
+			"error", err, "project_id", projectID)
+		// Surface transport failures to the user. Do NOT advise retry —
+		// a timeout has uncertain delivery (the hub may have received and
+		// processed the request before the client gave up).
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		he := parseHubError(resp)
+		b.log.Error("Hub rejected routed inbound message",
+			"status", resp.StatusCode, "code", he.Code, "message", he.Message,
+			"project_id", projectID, "default_agent", defaultAgent)
+		return nil, he
 	}
 
-	return slugs
+	// Parse success response to extract primary_agent for context tracking.
+	// Treat read or decode errors as uncertain delivery: return nil result
+	// with an uncertain-result hubError so the caller never saves context
+	// from a partially populated struct.
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		b.log.Error("Failed to read routed inbound response body",
+			"error", readErr, "project_id", projectID)
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	var result routedInboundResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		b.log.Error("Failed to decode routed inbound response",
+			"error", err, "project_id", projectID)
+		return nil, &hubError{Code: "transport_error", Message: "Message delivery could not be confirmed — the service may be temporarily unavailable."}
+	}
+	return &result, nil
 }
 
 // --- Routing helpers ---
@@ -807,16 +886,16 @@ func (b *SlackBroker) resolveRecipientChannels(ctx context.Context, recipient, p
 // --- Topic parsing ---
 
 func parseTopicComponents(topic string) (projectID, agentSlug string) {
-	parsed, err := projectcompat.ParseTopic(topic)
+	parsed, err := projectkeys.ParseTopic(topic)
 	if err == nil {
 		projectID = parsed.ProjectID
-		if parsed.Kind == projectcompat.TopicKindAgent {
+		if parsed.Kind == projectkeys.TopicKindAgent {
 			agentSlug = parsed.Actor
 		}
 	} else {
 		parts := strings.Split(topic, ".")
 		for i, part := range parts {
-			if (part == "grove" || part == "project") && i+1 < len(parts) {
+			if part == "project" && i+1 < len(parts) {
 				projectID = parts[i+1]
 			}
 			if part == "agent" && i+1 < len(parts) {
@@ -943,12 +1022,4 @@ func generateRequestID() string {
 	b := make([]byte, 12)
 	crand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func agentSlugs(agents []AgentInfo) []string {
-	slugs := make([]string, len(agents))
-	for i, a := range agents {
-		slugs[i] = a.Slug
-	}
-	return slugs
 }

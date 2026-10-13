@@ -28,6 +28,8 @@ import { apiFetch, extractApiError } from '../../client/api.js';
 import { getDenialMessage } from '../../shared/message-mode.js';
 import type { Message } from '../../shared/types.js';
 import './json-browser.js';
+import { formatInstant, formatInstantWithZone } from '../../utils/time.js';
+import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 
 interface MessageLogEntry {
   timestamp: string;
@@ -58,12 +60,32 @@ interface ParsedMessage {
   timestamp: string;
   insertId: string;
   raw: MessageLogEntry | null;
+  /** Sender's project ID for cross-project provenance. */
+  senderProjectId?: string | undefined;
+  /** Recipient's project ID for cross-project provenance. */
+  recipientProjectId?: string | undefined;
+  /** Whether this message crossed project boundaries. */
+  crossProject?: boolean | undefined;
 }
 
 const MAX_BUFFER = 500;
 
+/**
+ * Reports whether a message log entry is a message record. Lifecycle and
+ * bookkeeping entries (tagged log_kind=event, or carrying neither a sender
+ * nor a recipient) are not listed.
+ */
+function isMessageRecord(entry: MessageLogEntry, parsed: ParsedMessage): boolean {
+  const kind = entry.labels?.['log_kind'] ?? entry.jsonPayload?.['log_kind'];
+  if (kind === 'event') return false;
+  return parsed.sender !== '' || parsed.recipient !== '';
+}
+
 @customElement('scion-agent-message-viewer')
 export class ScionAgentMessageViewer extends LitElement {
+  /** Re-renders timestamps and date dividers when the display zone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
   @property()
   agentId = '';
 
@@ -112,6 +134,13 @@ export class ScionAgentMessageViewer extends LitElement {
    */
   @property()
   broadcastUrl = '';
+
+  /**
+   * Current project ID, used to detect cross-project messages.
+   * When set, messages from/to a different project get a cross-project badge.
+   */
+  @property()
+  projectId = '';
 
   @state() private messages: ParsedMessage[] = [];
   @state() private entryMap = new Map<string, ParsedMessage>();
@@ -164,6 +193,16 @@ export class ScionAgentMessageViewer extends LitElement {
     }
     .compose-input sl-input::part(base) {
       font-size: 0.875rem;
+    }
+
+    /* This local override replaces the app-wide --sl-input-font-size-*
+       variable with a fixed value, which would otherwise defeat the
+       pointer:coarse 16px floor (see pkg/hub/web.go / web/index.html) on
+       touch — re-floor it here too, desktop unchanged. */
+    @media (pointer: coarse) {
+      .compose-input sl-input::part(base) {
+        font-size: max(16px, 0.875rem);
+      }
     }
     .compose-actions {
       display: flex;
@@ -327,6 +366,13 @@ export class ScionAgentMessageViewer extends LitElement {
       background: var(--scion-warning-50, #fffbeb);
       color: var(--scion-warning-700, #b45309);
     }
+    .badge-cross-project {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.1875rem;
+      background: var(--sl-color-success-100, #dcfce7);
+      color: var(--sl-color-success-700, #15803d);
+    }
 
     .msg-body {
       font-size: 0.8125rem;
@@ -422,10 +468,25 @@ export class ScionAgentMessageViewer extends LitElement {
             this.mergeHubMessages(items);
             return;
           }
+        } else if (hubRes.status >= 400 && hubRes.status < 500) {
+          // DEF-128a: A 4xx is the hub answering, not failing. Surface the
+          // error instead of falling through to the Cloud Logging fallback.
+          // Without this guard, a 409 (conversation not resolved) silently
+          // escalates the viewer to the unscoped Cloud Logging path.
+          const errData = (await hubRes.json().catch(() => ({}))) as {
+            error?: { message?: string };
+            message?: string;
+          };
+          throw new Error(
+            (errData.error as { message?: string })?.message ||
+              errData.message ||
+              `HTTP ${hubRes.status}`
+          );
         }
       }
 
       // Fallback: Cloud Logging proxy (for pre-migration records or when Hub is unavailable).
+      // Only reached on network errors or 5xx — never on 4xx (DEF-128a).
       // Skipped when Cloud Logging is unavailable — the /message-logs endpoint returns 501
       // in that case, which would turn an empty hub-store result into a user-facing error
       // instead of the intended "No messages found" empty state.
@@ -465,6 +526,12 @@ export class ScionAgentMessageViewer extends LitElement {
     const direction: 'sent' | 'received' =
       !this.agentId || msg.senderId === this.agentId ? 'sent' : 'received';
 
+    // Cross-project detection: if either project ID differs from the current project
+    const crossProject =
+      !!this.projectId &&
+      ((!!msg.senderProjectId && msg.senderProjectId !== this.projectId) ||
+        (!!msg.recipientProjectId && msg.recipientProjectId !== this.projectId));
+
     return {
       sender: msg.sender,
       recipient: msg.recipient,
@@ -476,6 +543,9 @@ export class ScionAgentMessageViewer extends LitElement {
       timestamp: msg.createdAt,
       insertId: `hub:${msg.id}`,
       raw: null,
+      senderProjectId: msg.senderProjectId,
+      recipientProjectId: msg.recipientProjectId,
+      crossProject,
     };
   }
 
@@ -538,6 +608,14 @@ export class ScionAgentMessageViewer extends LitElement {
     // The actual message body is in payload['message_content'].
     const body = (payload['message_content'] as string) || '';
 
+    // Cross-project provenance from log labels
+    const senderProjectId = labels['sender_project_id'] || undefined;
+    const recipientProjectId = labels['recipient_project_id'] || undefined;
+    const crossProject =
+      !!this.projectId &&
+      ((!!senderProjectId && senderProjectId !== this.projectId) ||
+        (!!recipientProjectId && recipientProjectId !== this.projectId));
+
     return {
       sender,
       recipient,
@@ -549,13 +627,18 @@ export class ScionAgentMessageViewer extends LitElement {
       timestamp: entry.timestamp,
       insertId: entry.insertId,
       raw: entry,
+      senderProjectId,
+      recipientProjectId,
+      crossProject,
     };
   }
 
   private mergeEntries(newEntries: MessageLogEntry[]): void {
     for (const entry of newEntries) {
       if (!this.entryMap.has(entry.insertId)) {
-        this.entryMap.set(entry.insertId, this.parseEntry(entry));
+        const parsed = this.parseEntry(entry);
+        if (!isMessageRecord(entry, parsed)) continue;
+        this.entryMap.set(entry.insertId, parsed);
       }
     }
 
@@ -589,7 +672,7 @@ export class ScionAgentMessageViewer extends LitElement {
     // UserMessageEvent payload (hub store record) per message.
     this.eventSource.addEventListener('message', (event: Event) => {
       try {
-        const msg = JSON.parse((event as MessageEvent).data) as Message;
+        const msg = JSON.parse((event as MessageEvent<string>).data) as Message;
         this.mergeHubMessages([msg]);
       } catch {
         // Skip unparseable entries
@@ -600,7 +683,7 @@ export class ScionAgentMessageViewer extends LitElement {
     // when explicitly opted in): emits "log" events with raw log entries.
     this.eventSource.addEventListener('log', (event: Event) => {
       try {
-        const entry = JSON.parse((event as MessageEvent).data) as MessageLogEntry;
+        const entry = JSON.parse((event as MessageEvent<string>).data) as MessageLogEntry;
         this.mergeEntries([entry]);
       } catch {
         // Skip unparseable entries
@@ -873,24 +956,16 @@ export class ScionAgentMessageViewer extends LitElement {
     let lastDate = '';
 
     for (const msg of this.messages) {
-      const d = new Date(msg.timestamp);
-      const dateStr = d.toLocaleDateString('en', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
+      // Date divider and row time in the effective display zone (24-hour);
+      // the divider names the zone.
+      const dateStr = formatInstantWithZone(msg.timestamp, 'date');
 
       if (dateStr !== lastDate) {
         lastDate = dateStr;
         rows.push(html`<div class="date-divider">${dateStr}</div>`);
       }
 
-      const timeStr = d.toLocaleTimeString('en', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      });
+      const timeStr = formatInstant(msg.timestamp, 'time-seconds');
       const isExpanded = this.expandedIds.has(msg.insertId);
 
       const dirIcon = msg.direction === 'sent' ? 'box-arrow-up-right' : 'box-arrow-in-down-left';
@@ -899,6 +974,7 @@ export class ScionAgentMessageViewer extends LitElement {
       const fromLabel = msg.sender || 'unknown';
       const toLabel = msg.recipient || 'unknown';
 
+      // prettier-ignore
       rows.push(html`
         <div class="message-row" @click=${() => this.toggleExpand(msg.insertId)}>
           <div class="msg-direction ${msg.direction}">
@@ -910,6 +986,11 @@ export class ScionAgentMessageViewer extends LitElement {
               <sl-icon name="arrow-right" class="msg-arrow" style="font-size:0.6875rem"></sl-icon>
               <span class="msg-target">${toLabel}</span>
               <div class="msg-badges">
+                ${msg.crossProject
+                  ? html`<span class="msg-badge badge-cross-project"
+                      ><sl-icon name="globe" style="font-size:0.625rem"></sl-icon> cross-project</span
+                    >`
+                  : nothing}
                 ${msg.msgType
                   ? html`<span class="msg-badge badge-type">${msg.msgType}</span>`
                   : nothing}
@@ -947,6 +1028,11 @@ export class ScionAgentMessageViewer extends LitElement {
       broadcasted: msg.broadcasted,
       message: msg.body,
     };
+    if (msg.crossProject) {
+      detail['crossProject'] = true;
+      if (msg.senderProjectId) detail['senderProjectId'] = msg.senderProjectId;
+      if (msg.recipientProjectId) detail['recipientProjectId'] = msg.recipientProjectId;
+    }
     if (msg.raw) {
       if (msg.raw.labels && Object.keys(msg.raw.labels).length > 0) {
         detail['labels'] = msg.raw.labels;

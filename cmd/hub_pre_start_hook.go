@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/spf13/cobra"
@@ -151,17 +151,7 @@ func init() {
 // HubPreStartHookService. Unlike project hooks, no project ID is involved:
 // hub hooks live at the hub scope and require hub administrator privileges.
 func resolveHubHookClient() (hubclient.HubPreStartHookService, error) {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	_, client, err := loadHubClient()
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +207,7 @@ func runHubHookList(cmd *cobra.Command, args []string) error {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "ID\tSLUG\tNAME\tSTATUS\tCREATED")
 	for _, h := range list.Hooks {
-		created := h.Created.Format("2006-01-02")
+		created := clitime.Format(h.Created, clitime.Date)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.ID, h.Slug, h.Name, h.Status, created)
 	}
 	return tw.Flush()
@@ -262,8 +252,8 @@ func runHubHookShow(cmd *cobra.Command, args []string) error {
 	if hook.Description != "" {
 		fmt.Printf("Description: %s\n", hook.Description)
 	}
-	fmt.Printf("Created:     %s\n", hook.Created.Format(time.RFC3339))
-	fmt.Printf("Updated:     %s\n", hook.Updated.Format(time.RFC3339))
+	fmt.Printf("Created:     %s\n", clitime.Format(hook.Created, clitime.Full))
+	fmt.Printf("Updated:     %s\n", clitime.Format(hook.Updated, clitime.Full))
 	fmt.Println("Script:")
 	fmt.Println(strings.Repeat("-", 60))
 	fmt.Println(hook.Script)

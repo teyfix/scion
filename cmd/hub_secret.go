@@ -15,15 +15,14 @@
 package cmd
 
 import (
-	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/spf13/cobra"
@@ -143,7 +142,8 @@ to list secrets at different scopes.
 Examples:
   scion hub secret list                    # List all user secrets
   scion hub secret list --project          # List project secrets
-  scion hub secret list --json             # Output as JSON`,
+  scion hub secret list --json             # Output as JSON (metadata only)
+  scion hub secret list --format json      # Same, via the global flag`,
 	Args: cobra.NoArgs,
 	RunE: runSecretList,
 }
@@ -163,7 +163,7 @@ Examples:
   scion hub secret update API_KEY --type variable
   scion hub secret update API_KEY --allow-progeny
   scion hub secret update --project API_KEY --description "Project key"`,
-	Args: cobra.ExactArgs(1),
+	Args: secretUpdateArgs,
 	RunE: runSecretUpdate,
 }
 
@@ -198,11 +198,6 @@ func init() {
 		cmd.Flags().StringVar(&secretProjectScope, "project", "", "Project scope (bare flag infers current project, or use --project=<name|id>)")
 		cmd.Flags().Lookup("project").NoOptDefVal = scopeInferSentinel
 
-		cmd.Flags().StringVar(&secretProjectScope, "grove", "", "Deprecated alias for --project")
-		cmd.Flags().Lookup("grove").NoOptDefVal = scopeInferSentinel
-		_ = cmd.Flags().MarkDeprecated("grove", "use --project instead")
-		_ = cmd.Flags().MarkHidden("grove")
-
 		cmd.Flags().StringVar(&secretBrokerScope, "broker", "", "Broker scope (bare flag infers current broker, or use --broker=<name|id>)")
 		cmd.Flags().Lookup("broker").NoOptDefVal = scopeInferSentinel
 	}
@@ -230,7 +225,6 @@ func init() {
 func resolveSecretScope(cmd *cobra.Command, settings *config.Settings) (scope, scopeID string, err error) {
 	scopeSet := cmd.Flags().Changed("scope")
 	projectSet := cmd.Flags().Changed("project")
-	projectAliasSet := cmd.Flags().Changed("grove")
 	brokerSet := cmd.Flags().Changed("broker")
 
 	// Enforce mutual exclusivity
@@ -238,14 +232,14 @@ func resolveSecretScope(cmd *cobra.Command, settings *config.Settings) (scope, s
 	if scopeSet {
 		setCount++
 	}
-	if projectSet || projectAliasSet {
+	if projectSet {
 		setCount++
 	}
 	if brokerSet {
 		setCount++
 	}
 	if setCount > 1 {
-		return "", "", fmt.Errorf("cannot specify more than one of --scope, --project, and --broker")
+		return "", "", newUsageError("cannot specify more than one of --scope, --project, and --broker")
 	}
 
 	if scopeSet {
@@ -255,11 +249,11 @@ func resolveSecretScope(cmd *cobra.Command, settings *config.Settings) (scope, s
 		case "user", "":
 			return "user", "", nil
 		default:
-			return "", "", fmt.Errorf("invalid --scope value %q: must be 'hub' or 'user'", secretScope)
+			return "", "", newUsageError("invalid --scope value %q: must be 'hub' or 'user'", secretScope)
 		}
 	}
 
-	if projectSet || projectAliasSet {
+	if projectSet {
 		scope = "project"
 		projectVal := secretProjectScope
 		if projectVal == scopeInferSentinel {
@@ -311,10 +305,10 @@ func runSecretSet(cmd *cobra.Command, args []string) error {
 
 	// Validate key
 	if key == "" {
-		return fmt.Errorf("key cannot be empty")
+		return newUsageError("key cannot be empty")
 	}
 	if strings.ContainsAny(key, "= \t\n") {
-		return fmt.Errorf("key cannot contain spaces, tabs, newlines, or '='")
+		return newUsageError("key cannot contain spaces, tabs, newlines, or '='")
 	}
 
 	// Handle @filename prefix for file secrets: read file content and base64-encode
@@ -355,33 +349,11 @@ func runSecretSet(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveSecretScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveSecretScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	req := &hubclient.SetSecretRequest{
 		Value:   value,
@@ -421,107 +393,98 @@ func runSecretSet(cmd *cobra.Command, args []string) error {
 }
 
 func runSecretGet(cmd *cobra.Command, args []string) error {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
+	if len(args) != 1 {
+		return runSecretList(cmd, nil)
 	}
 
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveSecretScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveSecretScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
+	key := args[0]
+	opts := &hubclient.SecretScopeOptions{
+		Scope:   scope,
+		ScopeID: scopeID,
+	}
+
+	secret, err := client.Secrets().Get(ctx, key, opts)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get secret: %w", err)
 	}
 
-	// If key is provided, get specific secret metadata
-	if len(args) == 1 {
-		key := args[0]
-		opts := &hubclient.SecretScopeOptions{
-			Scope:   scope,
-			ScopeID: scopeID,
-		}
-
-		secret, err := client.Secrets().Get(ctx, key, opts)
-		if err != nil {
-			return fmt.Errorf("failed to get secret: %w", err)
-		}
-
-		if secretOutputJSON {
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			return enc.Encode(secret)
-		}
-
-		fmt.Printf("Secret: %s\n", secret.Key)
-		fmt.Printf("  Scope:   %s\n", secret.Scope)
-		typeLabel := secret.SecretType
-		if typeLabel == "" {
-			typeLabel = "environment"
-		}
-		fmt.Printf("  Type:    %s\n", typeLabel)
-		if secret.Target != "" && secret.Target != secret.Key {
-			fmt.Printf("  Target:  %s\n", secret.Target)
-		}
-		if secret.SecretRef != "" {
-			fmt.Printf("  Ref:     %s\n", secret.SecretRef)
-		}
-		fmt.Printf("  Version: %d\n", secret.Version)
-		fmt.Printf("  Created: %s\n", secret.Created.Format(time.RFC3339))
-		fmt.Printf("  Updated: %s\n", secret.Updated.Format(time.RFC3339))
-		if secret.Description != "" {
-			fmt.Printf("  Description: %s\n", secret.Description)
-		}
-		return nil
+	if wantJSON(secretOutputJSON) {
+		return outputJSON(secret)
 	}
 
-	// No key provided, delegate to list
-	return runSecretList(cmd, nil)
+	fmt.Printf("Secret: %s\n", secret.Key)
+	fmt.Printf("  Scope:   %s\n", secret.Scope)
+	typeLabel := secret.SecretType
+	if typeLabel == "" {
+		typeLabel = "environment"
+	}
+	fmt.Printf("  Type:    %s\n", typeLabel)
+	if secret.Target != "" && secret.Target != secret.Key {
+		fmt.Printf("  Target:  %s\n", secret.Target)
+	}
+	if secret.SecretRef != "" {
+		fmt.Printf("  Ref:     %s\n", secret.SecretRef)
+	}
+	fmt.Printf("  Version: %d\n", secret.Version)
+	fmt.Printf("  Created: %s\n", clitime.Format(secret.Created, clitime.Full))
+	fmt.Printf("  Updated: %s\n", clitime.Format(secret.Updated, clitime.Full))
+	if secret.Description != "" {
+		fmt.Printf("  Description: %s\n", secret.Description)
+	}
+	return nil
+}
+
+// secretListItem is the JSON shape of one row of "scion hub secret list".
+// It carries the same metadata the table shows and never a secret value.
+type secretListItem struct {
+	Key          string    `json:"key"`
+	Type         string    `json:"type"`
+	AllowProgeny bool      `json:"allowProgeny"`
+	Version      int       `json:"version"`
+	Updated      time.Time `json:"updated"`
+}
+
+// secretListOutput is the JSON shape of "scion hub secret list".
+type secretListOutput struct {
+	Scope   string           `json:"scope"`
+	Secrets []secretListItem `json:"secrets"`
+}
+
+func newSecretListOutput(scope string, secrets []hubclient.Secret) secretListOutput {
+	out := secretListOutput{Scope: scope, Secrets: make([]secretListItem, 0, len(secrets))}
+	for _, s := range secrets {
+		out.Secrets = append(out.Secrets, secretListItem{
+			Key:          s.Key,
+			Type:         secretTypeLabel(s.SecretType),
+			AllowProgeny: s.AllowProgeny,
+			Version:      s.Version,
+			Updated:      s.Updated,
+		})
+	}
+	return out
+}
+
+// secretTypeLabel returns the displayed secret type, defaulting to
+// "environment" when the Hub leaves it empty.
+func secretTypeLabel(t string) string {
+	if t == "" {
+		return "environment"
+	}
+	return t
 }
 
 func runSecretList(cmd *cobra.Command, _ []string) error {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveSecretScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveSecretScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	opts := &hubclient.ListSecretOptions{
 		Scope:   scope,
@@ -533,10 +496,8 @@ func runSecretList(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to list secrets: %w", err)
 	}
 
-	if secretOutputJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(resp)
+	if wantJSON(secretOutputJSON) {
+		return outputJSON(newSecretListOutput(scope, resp.Secrets))
 	}
 
 	if len(resp.Secrets) == 0 {
@@ -546,50 +507,46 @@ func runSecretList(cmd *cobra.Command, _ []string) error {
 
 	fmt.Printf("Secrets (scope: %s):\n", scope)
 	fmt.Printf("%-30s  %-12s  %-8s  %-8s  %s\n", "KEY", "TYPE", "PROGENY", "VERSION", "UPDATED")
-	fmt.Printf("%-30s  %-12s  %-8s  %-8s  %s\n", "------------------------------", "------------", "--------", "--------", "-------------------")
+	fmt.Printf("%-30s  %-12s  %-8s  %-8s  %s\n", "------------------------------", "------------", "--------", "--------", "-----------------------")
 	for _, s := range resp.Secrets {
-		typeLabel := s.SecretType
-		if typeLabel == "" {
-			typeLabel = "environment"
-		}
+		typeLabel := secretTypeLabel(s.SecretType)
 		progenyLabel := "-"
 		if s.AllowProgeny {
 			progenyLabel = "\u2713"
 		}
-		fmt.Printf("%-30s  %-12s  %-8s  v%-7d  %s\n", truncate(s.Key, 30), typeLabel, progenyLabel, s.Version, s.Updated.Format("2006-01-02 15:04:05"))
+		fmt.Printf("%-30s  %-12s  %-8s  v%-7d  %s\n", truncate(s.Key, 30), typeLabel, progenyLabel, s.Version, clitime.Format(s.Updated, clitime.Full))
 	}
 
 	return nil
 }
 
-func runSecretUpdate(cmd *cobra.Command, args []string) error {
-	key := args[0]
-
-	// Validate key
-	if key == "" {
+// secretUpdateArgs is hub secret update's Args validator: exactly one
+// non-empty KEY, at least one metadata flag, and valid --injection-mode /
+// --type values. It runs before root's PersistentPreRunE, so these errors
+// keep the usage block (ptone/scion#2859).
+func secretUpdateArgs(cmd *cobra.Command, args []string) error {
+	if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+		return err
+	}
+	if args[0] == "" {
 		return fmt.Errorf("key cannot be empty")
 	}
 
 	// Check that at least one metadata flag is provided
-	descChanged := cmd.Flags().Changed("description")
-	injectionChanged := cmd.Flags().Changed("injection-mode")
-	typeChanged := cmd.Flags().Changed("type")
-	targetChanged := cmd.Flags().Changed("target")
-	progenyChanged := cmd.Flags().Changed("allow-progeny")
-
-	if !descChanged && !injectionChanged && !typeChanged && !targetChanged && !progenyChanged {
+	if !cmd.Flags().Changed("description") && !cmd.Flags().Changed("injection-mode") &&
+		!cmd.Flags().Changed("type") && !cmd.Flags().Changed("target") && !cmd.Flags().Changed("allow-progeny") {
 		return fmt.Errorf("at least one metadata flag must be provided (--description, --injection-mode, --type, --target, --allow-progeny)")
 	}
 
 	// Validate injection-mode if provided
 	injectionMode, _ := cmd.Flags().GetString("injection-mode")
-	if injectionChanged && injectionMode != "always" && injectionMode != "as_needed" {
+	if cmd.Flags().Changed("injection-mode") && injectionMode != "always" && injectionMode != "as_needed" {
 		return fmt.Errorf("injection-mode must be \"always\" or \"as_needed\"")
 	}
 
 	// Validate type if provided
-	secretTypeVal, _ := cmd.Flags().GetString("type")
-	if typeChanged {
+	if cmd.Flags().Changed("type") {
+		secretTypeVal, _ := cmd.Flags().GetString("type")
 		switch secretTypeVal {
 		case "environment", "variable", "file":
 			// valid
@@ -597,34 +554,26 @@ func runSecretUpdate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("type must be one of: environment, variable, file")
 		}
 	}
+	return nil
+}
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
+func runSecretUpdate(cmd *cobra.Command, args []string) error {
+	key := args[0]
 
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
+	// Arguments and flags were validated by secretUpdateArgs.
+	descChanged := cmd.Flags().Changed("description")
+	injectionChanged := cmd.Flags().Changed("injection-mode")
+	typeChanged := cmd.Flags().Changed("type")
+	targetChanged := cmd.Flags().Changed("target")
+	progenyChanged := cmd.Flags().Changed("allow-progeny")
+	injectionMode, _ := cmd.Flags().GetString("injection-mode")
+	secretTypeVal, _ := cmd.Flags().GetString("type")
 
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveSecretScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveSecretScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	req := &hubclient.UpdateSecretMetaRequest{
 		Scope:   scope,
@@ -667,33 +616,11 @@ func runSecretUpdate(cmd *cobra.Command, args []string) error {
 func runSecretClear(cmd *cobra.Command, args []string) error {
 	key := args[0]
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveSecretScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveSecretScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	opts := &hubclient.SecretScopeOptions{
 		Scope:   scope,

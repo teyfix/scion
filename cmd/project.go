@@ -39,8 +39,8 @@ var initImageRegistry string
 // projectCmd represents the project command
 var projectCmd = &cobra.Command{
 	Use:     "project",
-	Aliases: []string{"grove", "group"},
-	Short:   "Manage scion projects (formerly groves)",
+	Aliases: []string{"group", "projects"},
+	Short:   "Manage scion projects",
 	Long:    `A project is the grouping construct for a set of agents. The .scion folder represents a project.`,
 }
 
@@ -183,7 +183,7 @@ With --global, it initializes in the user's home folder.`,
 			// Git project: read projectID from file, save to in-repo settings
 			projectID, _ = config.ReadProjectID(targetDir)
 			if projectID == "" {
-				projectID = config.GenerateProjectIDForDir(filepath.Dir(targetDir))
+				projectID = config.GenerateProjectID()
 			}
 			if err := config.UpdateSetting(targetDir, "project_id", projectID, false); err != nil {
 				if !isJSONOutput() {
@@ -385,8 +385,8 @@ func getLocalBrokerInfo(settings *config.Settings) (brokerID, brokerName string)
 		}
 	}
 
-	// Get hostname for display
-	brokerName, _ = os.Hostname()
+	// Get the broker name for display: the configured name, else the hostname
+	brokerName = config.LocalBrokerName("")
 	if brokerName == "" {
 		if brokerID != "" && len(brokerID) >= 8 {
 			brokerName = brokerID[:8]
@@ -405,20 +405,20 @@ func promptImageRegistry() string {
 		return ""
 	}
 
-	fmt.Println()
-	fmt.Println("Scion runs agents in containers. You need to build and push container images")
-	fmt.Println("to a registry you control before starting agents.")
-	fmt.Println()
-	fmt.Println("  See: image-build/README.md for build instructions")
-	fmt.Println("  Quick start: image-build/scripts/build-images.sh --registry <registry> --push")
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Scion runs agents in containers. You need to build and push container images")
+	fmt.Fprintln(os.Stderr, "to a registry you control before starting agents.")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  See: image-build/README.md for build instructions")
+	fmt.Fprintln(os.Stderr, "  Quick start: image-build/scripts/build-images.sh --registry <registry> --push")
+	fmt.Fprintln(os.Stderr)
 
 	if !util.IsTerminal() {
 		return ""
 	}
 
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Image registry path (e.g., ghcr.io/myorg) — enter to skip: ")
+	fmt.Fprint(os.Stderr, "Image registry path (e.g., ghcr.io/myorg) — enter to skip: ")
 	input, err := reader.ReadString('\n')
 	if err != nil {
 		return ""

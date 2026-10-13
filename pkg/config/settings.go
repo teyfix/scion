@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"gopkg.in/yaml.v3"
 )
@@ -61,7 +61,6 @@ type ProfileConfig struct {
 	Volumes          []api.VolumeMount          `json:"volumes,omitempty" yaml:"volumes,omitempty" koanf:"volumes"`
 	Resources        *api.ResourceSpec          `json:"resources,omitempty" yaml:"resources,omitempty" koanf:"resources"`
 	HarnessOverrides map[string]HarnessOverride `json:"harness_overrides,omitempty" yaml:"harness_overrides,omitempty" koanf:"harness_overrides"`
-	Docker           *api.DockerConfig          `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 }
 
 // BucketConfig defines settings for cloud storage bucket persistence.
@@ -131,7 +130,8 @@ type HubClientConfig struct {
 }
 
 type CLIConfig struct {
-	// AutoHelp indicates whether to print usage help on every error.
+	// AutoHelp indicates whether to print the usage block after an argument or
+	// flag error.
 	AutoHelp *bool  `json:"autohelp,omitempty" yaml:"autohelp,omitempty" koanf:"autohelp"`
 	Mode     string `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
 }
@@ -556,20 +556,10 @@ func UpdateSetting(projectPath string, key string, value string, global bool) er
 		}
 		// Resolve through GetProjectConfigDir so that git projects with split
 		// storage write to the external config dir (~/.scion/project-configs/…)
-		// — the same location LoadSettingsKoanf reads from.
+		// — the same location LoadSettingsKoanf reads from. This also
+		// migrates a project's legacy id file to its canonical name as a
+		// side effect, via ReadProjectID.
 		dir = GetProjectConfigDir(projectPath)
-
-		// Phase 5: Migrate .scion/grove-id to project-id if it exists.
-		// This ensures that subsequent reads prefer the new filename.
-		if projectPath != "" {
-			legacyIDFile := filepath.Join(projectPath, projectcompat.GroveIDFile)
-			projectIDFile := filepath.Join(projectPath, projectcompat.ProjectIDFile)
-			if _, err := os.Stat(legacyIDFile); err == nil {
-				if _, err := os.Stat(projectIDFile); os.IsNotExist(err) {
-					_ = os.Rename(legacyIDFile, projectIDFile)
-				}
-			}
-		}
 	}
 
 	// Find existing settings file (YAML or JSON)
@@ -586,8 +576,12 @@ func UpdateSetting(projectPath string, key string, value string, global bool) er
 			// Legacy format detected — auto-migrate to v1 before updating
 			fmt.Fprintf(os.Stderr, "Warning: settings file %s uses legacy format. Auto-migrating to v1 schema.\n", existingPath)
 			fmt.Fprintf(os.Stderr, "  You can also run 'scion config migrate' to migrate manually.\n")
-			if _, err := MigrateSettingsFile(dir, false); err != nil {
+			result, err := MigrateSettingsFile(dir, false)
+			if err != nil {
 				return fmt.Errorf("auto-migration of legacy settings failed: %w\n  Run 'scion config migrate' to migrate manually", err)
+			}
+			for _, w := range result.Warnings {
+				fmt.Fprintf(os.Stderr, "  Migration warning: %s\n", w)
 			}
 			return UpdateVersionedSetting(dir, key, value)
 		}
@@ -598,10 +592,10 @@ func UpdateSetting(projectPath string, key string, value string, global bool) er
 }
 
 func GetSettingValue(s *Settings, key string) (string, error) {
-	if projectcompat.IsProjectIDConfigKey(key) {
+	if projectkeys.IsProjectIDConfigKey(key) {
 		return s.ProjectID, nil
 	}
-	if projectcompat.IsHubProjectIDConfigKey(key) {
+	if projectkeys.IsHubProjectIDConfigKey(key) {
 		if s.Hub != nil {
 			return s.Hub.ProjectID, nil
 		}
@@ -861,7 +855,13 @@ func (s *Settings) IsHubLocalOnly() bool {
 }
 
 // DeleteHubConnection removes a hub connection entry from settings at the specified scope.
-// It loads the existing settings file, removes the named connection, and saves.
+// It edits the existing settings file in place, so every other key survives:
+// v1-only keys such as server and image_registry in an unversioned file, and
+// the whole content of a versioned file (ptone/scion#3497). A JSON file is
+// converted to settings.yaml, as before. A missing file is left missing.
+//
+// It does not take LockSettingsFile, as before; a caller that needs the
+// read-modify-write serialised holds the lock around the call.
 func DeleteHubConnection(projectPath string, name string, global bool) error {
 	var dir string
 	if global {
@@ -880,51 +880,5 @@ func DeleteHubConnection(projectPath string, name string, global bool) error {
 		dir = GetProjectConfigDir(projectPath)
 	}
 
-	existingPath := GetSettingsPath(dir)
-	targetPath := filepath.Join(dir, "settings.yaml")
-
-	var current Settings
-	if existingPath != "" {
-		data, err := os.ReadFile(existingPath)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if err == nil {
-			if filepath.Ext(existingPath) == ".json" {
-				if err := util.UnmarshalJSONC(data, &current); err != nil {
-					return fmt.Errorf("failed to parse existing settings at %s: %w", existingPath, err)
-				}
-			} else {
-				if err := yaml.Unmarshal(data, &current); err != nil {
-					return fmt.Errorf("failed to parse existing settings at %s: %w", existingPath, err)
-				}
-			}
-		}
-	}
-
-	if current.HubConnections != nil {
-		delete(current.HubConnections, name)
-		// Clean up empty map
-		if len(current.HubConnections) == 0 {
-			current.HubConnections = nil
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return err
-	}
-	newData, err := yaml.Marshal(current)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(targetPath, newData, 0644); err != nil {
-		return err
-	}
-
-	// If we migrated from JSON, remove the old JSON file
-	if existingPath != "" && existingPath != targetPath && filepath.Ext(existingPath) == ".json" {
-		_ = os.Remove(existingPath)
-	}
-
-	return nil
+	return deleteHubConnectionFromFile(dir, name)
 }

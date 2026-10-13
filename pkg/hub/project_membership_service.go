@@ -17,11 +17,12 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -52,6 +53,19 @@ type ProjectMembershipService struct {
 	authz   *AuthzService
 	logger  *slog.Logger
 	nowFunc func() time.Time
+
+	// onMembershipLoss, when set, is called after a transaction that wrote
+	// a membership loss check commits, so the check is processed right away
+	// (ptone/scion#3433). The hub server sets it; the reconciler processes
+	// the check regardless.
+	onMembershipLoss func()
+}
+
+// notifyMembershipLoss runs the post-commit membership loss callback.
+func (svc *ProjectMembershipService) notifyMembershipLoss() {
+	if svc != nil && svc.onMembershipLoss != nil {
+		svc.onMembershipLoss()
+	}
 }
 
 // NewProjectMembershipService creates a new ProjectMembershipService.
@@ -72,19 +86,10 @@ func NewProjectMembershipService(
 // caller's context (and transaction, if any). Unlike the fire-and-forget
 // emitMutationAudit, this returns an error so the caller can roll back.
 func (svc *ProjectMembershipService) createAuditRecord(ctx context.Context, txStore store.Store, record *store.MutationAuditRecord) error {
-	// Populate actor identity from context if not already set.
-	if record.ActorPrincipalKind == "" || record.ActorPrincipalID == "" {
-		identity := GetIdentityFromContext(ctx)
-		if identity != nil {
-			record.ActorPrincipalKind = identity.Type()
-			record.ActorPrincipalID = identity.ID()
-			credential := GetCredentialContextFromContext(ctx)
-			if credential.Kind != "" {
-				record.ActorCredentialID = credential.ID
-				record.ActorCredentialType = string(credential.Kind)
-			}
-		}
-	}
+	// E.2a: consolidated actor/credential-snapshot/correlation helper (plan
+	// §3.3), replacing this function's own copy of the extraction logic.
+	// ApplyActor only fills fields the caller has not already set explicitly.
+	auditActorFromContext(ctx).ApplyActor(record)
 	if record.Timestamp.IsZero() {
 		record.Timestamp = svc.nowFunc()
 	}
@@ -134,6 +139,10 @@ type MembershipRequest struct {
 
 	// Transfer fields — the target user who will become the new owner.
 	NewOwnerID string
+
+	// LossTrigger names the event recorded on the membership loss check a
+	// remove writes (ptone/scion#3433). Empty means member_remove.
+	LossTrigger store.MembershipLossTrigger
 }
 
 // MembershipDecision captures the governance outcome.
@@ -142,6 +151,12 @@ type MembershipDecision struct {
 	DenialCode string
 	Reason     string
 	HTTPStatus int
+	// Details carries structured denial context (e.g. roleDefinitionId,
+	// requiredPermission, currentRoleDefinitionIds) for the PUT/DELETE
+	// principal endpoints (ptone/scion#2529 P1). Additive: nil for every
+	// existing call site, which keeps AddMember/UpdateMemberRole/RemoveMember
+	// responses byte-identical.
+	Details map[string]interface{}
 }
 
 // MembershipResult is the outcome of a successful membership mutation.
@@ -169,6 +184,11 @@ func (svc *ProjectMembershipService) projectEffectiveRole(ctx context.Context, u
 	// 1. Direct user bindings.
 	directBindings, err := svc.store.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
 	if err != nil {
+		return ""
+	}
+	// Unclamped reads: apply the test identity clamps (fail closed: no
+	// role on a kind-read error).
+	if directBindings, err = clampBindingsForUser(ctx, svc.store, svc.authz, userID, directBindings); err != nil {
 		return ""
 	}
 
@@ -208,6 +228,9 @@ func (svc *ProjectMembershipService) projectEffectiveRole(ctx context.Context, u
 			principals = append(principals, store.PrincipalRef{Type: store.RoleBindingPrincipalGroup, ID: gid})
 		}
 		groupBindings, err := svc.store.ListRoleBindingsForPrincipals(ctx, principals, nil, nil)
+		if err == nil {
+			groupBindings, err = clampBindingsForUser(ctx, svc.store, svc.authz, userID, groupBindings)
+		}
 		if err == nil {
 			for _, rb := range groupBindings {
 				if rb.ScopeType != store.RoleScopeProject || rb.ScopeID != projectID {
@@ -259,6 +282,10 @@ func (svc *ProjectMembershipService) projectEffectiveRoleFromStore(ctx context.C
 	if err != nil {
 		return "", fmt.Errorf("list direct bindings for actor %s: %w", userID, err)
 	}
+	// Unclamped reads (the tx store): apply the test identity clamps.
+	if directBindings, err = clampBindingsForUser(ctx, s, svc.authz, userID, directBindings); err != nil {
+		return "", fmt.Errorf("test identity clamp for actor %s: %w", userID, err)
+	}
 
 	rdCache := make(map[string]*store.RoleDefinition)
 	getRoleDef := func(rdID string) (*store.RoleDefinition, error) {
@@ -302,6 +329,9 @@ func (svc *ProjectMembershipService) projectEffectiveRoleFromStore(ctx context.C
 		if err != nil {
 			return "", fmt.Errorf("list group bindings: %w", err)
 		}
+		if groupBindings, err = clampBindingsForUser(ctx, s, svc.authz, userID, groupBindings); err != nil {
+			return "", fmt.Errorf("test identity clamp for actor %s: %w", userID, err)
+		}
 		for _, rb := range groupBindings {
 			if rb.ScopeType != store.RoleScopeProject || rb.ScopeID != projectID {
 				continue
@@ -327,11 +357,25 @@ func (svc *ProjectMembershipService) projectEffectiveRoleFromStore(ctx context.C
 // project-owner binding using the provided (transactional) store.
 // R5 O-1: returns an error so callers can distinguish "not owner" from "store
 // failure" and surface 500 instead of a misleading 403.
+//
+// Fail-closed defence in depth: the five in-transaction "only direct project
+// owners" refusals (AddMember x2, UpdateMemberRole x2, RemoveMember x1) pair
+// this check with an actorRole of project-owner. With valid data that
+// combination cannot occur: projectEffectiveRoleFromStore takes project-owner
+// only from direct bindings, the store rejects group and agent project-owner
+// bindings, and only one project-scoped project-owner role definition can
+// exist. The branches are kept on purpose. They can still be reached when a
+// direct owner binding expires between the two independent svc.nowFunc()
+// reads, and they guard against future group or derived ownership. Their
+// pins reach them through the pinNoDirectOwnerStore test seam.
 func (svc *ProjectMembershipService) isActorDirectOwnerFromStore(ctx context.Context, s store.Store, userID, projectID string) (bool, error) {
 	now := svc.nowFunc()
 	bindings, err := s.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
 	if err != nil {
 		return false, fmt.Errorf("list bindings for owner check %s: %w", userID, err)
+	}
+	if bindings, err = clampBindingsForUser(ctx, s, svc.authz, userID, bindings); err != nil {
+		return false, fmt.Errorf("test identity clamp for owner check %s: %w", userID, err)
 	}
 	ownerRD, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
 	if err != nil {
@@ -446,6 +490,14 @@ func (svc *ProjectMembershipService) actorHasHubRoleBindingAuthorityTx(ctx conte
 	if err != nil {
 		return false, fmt.Errorf("list bindings for hub authority: %w", err)
 	}
+	// This read is unclamped (the tx store, not the authorization
+	// service's), so apply the test-identity grant clamp: a test identity
+	// never holds hub-level role-binding authority beyond member. A
+	// kind-read error fails closed.
+	bindings, err = clampTestIdentityBindings(ctx, tx, svc.authz, principals, bindings)
+	if err != nil {
+		return false, fmt.Errorf("test identity clamp for hub authority: %w", err)
+	}
 
 	// 3. Filter to system-scoped, active bindings and check permissions.
 	for _, b := range bindings {
@@ -453,10 +505,7 @@ func (svc *ProjectMembershipService) actorHasHubRoleBindingAuthorityTx(ctx conte
 			continue
 		}
 		// Activation window check.
-		if b.NotBefore != nil && now.Before(*b.NotBefore) {
-			continue
-		}
-		if b.ExpiresAt != nil && now.After(*b.ExpiresAt) {
+		if !isBindingActive(b, now) {
 			continue
 		}
 		rd, rdErr := tx.GetRoleDefinition(ctx, b.RoleDefinitionID)
@@ -524,6 +573,10 @@ func isSystemCaller(ctx context.Context) bool {
 //
 // System callers (marked via WithSystemCaller) bypass the credential
 // check but are logged.
+//
+// Membership mutations are session-only with the GOV_PENDING reason: a
+// credential-kind refusal carries the session-only details
+// (session_only_gate.go) in MembershipDecision.Details.
 func (svc *ProjectMembershipService) checkMembershipCredential(ctx context.Context, actorID string) *MembershipDecision {
 	// Trusted internal callers bypass the credential gate.
 	if isSystemCaller(ctx) {
@@ -539,6 +592,7 @@ func (svc *ProjectMembershipService) checkMembershipCredential(ctx context.Conte
 			DenialCode: ErrCodeMembershipCredentialInsufficient,
 			Reason:     "membership mutations require an interactive session credential",
 			HTTPStatus: 403,
+			Details:    sessionOnlyDenialDetails(authzop.ReasonGovernancePending),
 		}
 	}
 
@@ -549,6 +603,7 @@ func (svc *ProjectMembershipService) checkMembershipCredential(ctx context.Conte
 			DenialCode: ErrCodeMembershipCredentialInsufficient,
 			Reason:     fmt.Sprintf("membership mutations require an interactive session; credential kind %q is not allowed", cred.Kind),
 			HTTPStatus: 403,
+			Details:    sessionOnlyDenialDetails(authzop.ReasonGovernancePending),
 		}
 	}
 
@@ -598,12 +653,7 @@ func (svc *ProjectMembershipService) checkGovernance(ctx context.Context, req Me
 		if svc.actorHasHubRoleBindingAuthority(ctx, req.Actor.ID(), req.Op) {
 			return MembershipDecision{Allowed: true}
 		}
-		return MembershipDecision{
-			Allowed:    false,
-			DenialCode: ErrCodeRoleAssignmentForbidden,
-			Reason:     "actor has no project role",
-			HTTPStatus: 403,
-		}
+		return *noProjectRoleDecision()
 	}
 
 	// The governance matrix from CT1 D5:
@@ -676,6 +726,35 @@ func isProtectedRole(role string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Role kind
+// ---------------------------------------------------------------------------
+
+// roleKindBuiltIn and roleKindCustom are the only two values projectRoleKind
+// returns. Review r2 R2-6: N1 centralised the derivation in projectRoleKind,
+// but the "builtin"/"custom" string literals it returns were still
+// hand-typed at every comparison and default site; a typo there would
+// compile. These constants are that single spelling.
+const (
+	roleKindBuiltIn = "builtin"
+	roleKindCustom  = "custom"
+)
+
+// projectRoleKind returns roleKindBuiltIn or roleKindCustom for a
+// project-scoped role name, for the additive roleKind response field
+// (ptone/scion#2529 P1). N1 (review r1): this was previously inlined at four
+// call sites
+// (list/add/projectMemberEnricher.group in handlers_project_members.go, plus the
+// audit code in project_membership_set.go); extracted here so there is
+// exactly one definition of "builtin" vs "custom" for display and audit
+// purposes.
+func projectRoleKind(roleName string) string {
+	if store.IsBuiltInProjectMembershipRole(roleName) {
+		return roleKindBuiltIn
+	}
+	return roleKindCustom
+}
+
+// ---------------------------------------------------------------------------
 // Principal eligibility
 // ---------------------------------------------------------------------------
 
@@ -685,6 +764,21 @@ func isProtectedRole(role string) bool {
 //   - project-admin: direct user or group (D3 approved)
 //   - project-member: user, agent, or group
 func principalEligibleForRole(principalType, roleName string) bool {
+	// L4 (review r1): the custom-role branch is reached only for a role name
+	// explicitly known NOT to be built-in — not as the switch's default. A
+	// name that reaches the switch below without matching any case (e.g. an
+	// unanticipated built-in role added to the registry but not here) fails
+	// closed instead of silently falling through to the permissive
+	// user/group rule meant for custom roles.
+	if !store.IsBuiltInProjectMembershipRole(roleName) {
+		// Custom project-scoped roles (ptone/scion#2529 D1, ruling "block"):
+		// user and group only. A custom binding on an agent is a delegation
+		// grant and stays hub-gated via /admin/role-bindings. This is the
+		// one eligibility switch for custom roles; no other call site may
+		// special-case principal type for custom-role eligibility.
+		return principalType == store.RoleBindingPrincipalUser ||
+			principalType == store.RoleBindingPrincipalGroup
+	}
 	switch roleName {
 	case store.ProjectRoleOwner:
 		return principalType == store.RoleBindingPrincipalUser
@@ -697,6 +791,9 @@ func principalEligibleForRole(principalType, roleName string) bool {
 			principalType == store.RoleBindingPrincipalAgent ||
 			principalType == store.RoleBindingPrincipalGroup
 	default:
+		// Fail closed: IsBuiltInProjectMembershipRole said this name is
+		// built-in, but it matches none of the cases above. Should not
+		// happen; if it ever does, refuse rather than guess.
 		return false
 	}
 }
@@ -718,7 +815,7 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 	if err != nil {
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "role definition not found", HTTPStatus: 400}
 	}
-	if !validProjectRoles[roleDef.Name] {
+	if !store.IsBuiltInProjectMembershipRole(roleDef.Name) {
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "forbidden", Reason: "invalid project role: " + roleDef.Name, HTTPStatus: 400}
 	}
 	if roleDef.ScopeType != store.RoleScopeProject {
@@ -749,15 +846,35 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 			RoleDefinitionID: req.RoleDefID,
 			ScopeType:        store.RoleScopeProject,
 			ScopeID:          req.ProjectID,
+			GranteeType:      req.PrincipalType,
+			GranteeID:        req.PrincipalID,
 		})
 		if !delDecision.Allowed {
-			return nil, &MembershipDecision{
-				Allowed:    false,
-				DenialCode: ErrCodeTargetRoleProtected,
-				Reason:     "actor cannot delegate the requested role: " + delDecision.Reason,
-				HTTPStatus: 403,
-			}
+			return nil, canDelegateRefusal(roleDef, delDecision.Reason)
 		}
+	}
+
+	// Principal address: a user must be an email or a well-formed user ID,
+	// an agent a well-formed agent ID, as on members PUT
+	// (ptone/scion#3478). Checked once the actor is authorized; the
+	// canonical spelling is stored.
+	principalID, ok := canonicalMemberPrincipalID(req.PrincipalType, req.PrincipalID)
+	if !ok {
+		return nil, &MembershipDecision{
+			Allowed:    false,
+			DenialCode: ErrCodeInvalidRequest,
+			Reason:     memberPrincipalAddressMessage(req.PrincipalType, req.PrincipalID),
+			HTTPStatus: 400,
+		}
+	}
+	req.PrincipalID = principalID
+
+	// Project members groups cannot be granted roles. Checked after the
+	// actor is authorized (so the refusal is only visible to callers who may
+	// manage this project) and before the transaction: the marker
+	// annotations cannot be changed through the API.
+	if isProjectMembersGroupPrincipal(ctx, svc.store, req.PrincipalType, req.PrincipalID) {
+		return nil, projectMembersGroupPrincipalDecision(req.PrincipalID)
 	}
 
 	// R3-1 + O-1: acquire project lock and check existing bindings inside the
@@ -805,7 +922,7 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 			if hasHubAuth {
 				hubOverride = true
 			} else {
-				return fmt.Errorf("governance:%d:%s", 403, "actor has no project role (re-evaluated under lock)")
+				return asGovernanceDenial(*noProjectRoleUnderLockDecision())
 			}
 		}
 		if !hubOverride {
@@ -815,10 +932,11 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 				return fmt.Errorf("owner lookup failed under lock: %w", ownerErr)
 			}
 			if !svc.isOperationPermitted(actorRole, req.Op, roleDef.Name) {
-				return fmt.Errorf("governance:%d:%s", 403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, roleDef.Name))
+				return governanceDenial(403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, roleDef.Name))
 			}
+			// Fail-closed defence in depth; see isActorDirectOwnerFromStore.
 			if requiresDirectOwner(roleDef.Name) && !actorIsDirectOwner {
-				return fmt.Errorf("governance:%d:%s", 403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
+				return governanceDenial(403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
 			}
 		}
 
@@ -848,11 +966,11 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 			if req.CreateOnly {
 				if oldRoleDef.Name == roleDef.Name && len(existingBindings) == 1 {
 					// Exact duplicate built-in — conflict, not false success.
-					return fmt.Errorf("governance:%d:%s", 409,
+					return governanceDenial(409,
 						fmt.Sprintf("principal already has built-in membership role %q in this project", oldRoleDef.Name))
 				}
 				// Different built-in — conflict naming the existing role.
-				return fmt.Errorf("governance:%d:%s", 409,
+				return governanceDenial(409,
 					fmt.Sprintf("principal already has built-in membership role %q in this project; use the project membership endpoint to change roles", oldRoleDef.Name))
 			}
 
@@ -870,23 +988,37 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 					if isProtectedRole(oldRoleDef.Name) {
 						reason = "target role is protected: " + reason
 					}
-					return fmt.Errorf("governance:%d:%s", 403, reason)
+					return governanceDenial(403, reason)
 				}
+				// Fail-closed defence in depth; see isActorDirectOwnerFromStore.
 				if requiresDirectOwner(oldRoleDef.Name) && !actorIsDirectOwner {
-					return fmt.Errorf("governance:%d:%s", 403, "only direct project owners can manage admin and owner roles")
+					return governanceDenial(403, "only direct project owners can manage admin and owner roles")
 				}
 			}
-			// Last-owner guard for demotions.
-			if oldRoleDef.Name == store.ProjectRoleOwner && roleDef.Name != store.ProjectRoleOwner {
-				if primary.PrincipalType == store.RoleBindingPrincipalUser {
-					if err := svc.enforceLastOwnerTx(ctx, tx, req.ProjectID); err != nil {
-						return err
-					}
+			// Last-owner guard for demotions (ptone/scion#2769): note
+			// whether a usable owner binding is being replaced, then check
+			// the post-state after the replacement.
+			// One instant for the pre-state and post-state checks.
+			now := svc.nowFunc()
+			var demotedOwners []*store.RoleBinding
+			removedUsable := false
+			if roleDef.Name != store.ProjectRoleOwner {
+				var oErr error
+				if demotedOwners, oErr = ownerBindingsAmong(ctx, tx, existingBindings); oErr != nil {
+					return oErr
+				}
+				if removedUsable, oErr = anyUsableOwnerBinding(ctx, tx, demotedOwners, now); oErr != nil {
+					return fmt.Errorf("cannot verify usable owner: %w", oErr)
 				}
 			}
 			replaced, rErr := svc.replaceBindingTx(ctx, tx, existingBindings, roleDef.ID, req.Actor.ID())
 			if rErr != nil {
 				return rErr
+			}
+			if len(demotedOwners) > 0 {
+				if err := enforceOwnerRemovalTx(ctx, tx, req.ProjectID, now, removedUsable); err != nil {
+					return err
+				}
 			}
 			if aErr := svc.createAuditRecord(ctx, tx, &store.MutationAuditRecord{
 				MutationType: "project_member_role_change",
@@ -940,11 +1072,15 @@ func (svc *ProjectMembershipService) AddMember(ctx context.Context, req Membersh
 		if txErr == store.ErrAlreadyExists {
 			return nil, &MembershipDecision{Allowed: false, DenialCode: "conflict", Reason: "this member already has this role in this project", HTTPStatus: 409}
 		}
+		if d := storeMembersGroupPrincipalDecision(txErr); d != nil {
+			return nil, d
+		}
 		if isLastOwnerError(txErr) {
 			return nil, lastOwnerDenial()
 		}
-		if govDenial := isGovernanceError(txErr); govDenial != nil {
-			return nil, govDenial
+		var gdErr *governanceDenialError
+		if errors.As(txErr, &gdErr) {
+			return nil, &gdErr.decision
 		}
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "internal_error", Reason: "failed to create binding: " + txErr.Error(), HTTPStatus: 500}
 	}
@@ -986,7 +1122,7 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 	if err != nil {
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "new role definition not found", HTTPStatus: 400}
 	}
-	if !validProjectRoles[newRoleDef.Name] {
+	if !store.IsBuiltInProjectMembershipRole(newRoleDef.Name) {
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "forbidden", Reason: "invalid project role: " + newRoleDef.Name, HTTPStatus: 400}
 	}
 	if newRoleDef.ScopeType != store.RoleScopeProject {
@@ -1001,6 +1137,11 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 			Reason:     fmt.Sprintf("role %q cannot be assigned to %s principals", newRoleDef.Name, existing.PrincipalType),
 			HTTPStatus: 400,
 		}
+	}
+	// A role change re-creates the binding, so it is refused for a project
+	// members group principal. Deleting the existing binding stays allowed.
+	if isProjectMembersGroupPrincipal(ctx, svc.store, existing.PrincipalType, existing.PrincipalID) {
+		return nil, projectMembersGroupPrincipalDecision(existing.PrincipalID)
 	}
 
 	// Governance: check both old and new target roles.
@@ -1023,14 +1164,11 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 				RoleDefinitionID: req.NewRoleDefID,
 				ScopeType:        store.RoleScopeProject,
 				ScopeID:          req.ProjectID,
+				GranteeType:      req.PrincipalType,
+				GranteeID:        req.PrincipalID,
 			})
 			if !delDecision.Allowed {
-				return nil, &MembershipDecision{
-					Allowed:    false,
-					DenialCode: ErrCodeTargetRoleProtected,
-					Reason:     "actor cannot delegate the new role: " + delDecision.Reason,
-					HTTPStatus: 403,
-				}
+				return nil, canDelegateRefusalFor(newRoleDef, "the new role", delDecision.Reason)
 			}
 		}
 	}
@@ -1043,6 +1181,14 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 	// R2-1: hub authority is re-evaluated inside the tx to close the TOCTOU window.
 	var created *store.RoleBinding
 	txErr := svc.store.WithTx(ctx, func(tx store.Store) error {
+		// A change that drops access_constraint.admin takes the
+		// admin-guard lock before the project lock, the order user
+		// delete uses.
+		if roleHasConstraintAdmin(oldRoleDef) && !roleHasConstraintAdmin(newRoleDef) {
+			if err := lockConstraintAdminGuard(ctx, tx); err != nil {
+				return err
+			}
+		}
 		// Acquire project-scoped membership lock.
 		if err := tx.LockProjectForMembership(ctx, req.ProjectID); err != nil {
 			return fmt.Errorf("lock project: %w", err)
@@ -1064,7 +1210,7 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 			if hasHubAuth {
 				hubOverride = true
 			} else {
-				return fmt.Errorf("governance:%d:%s", 403, "actor has no project role (re-evaluated under lock)")
+				return asGovernanceDenial(*noProjectRoleUnderLockDecision())
 			}
 		}
 
@@ -1072,7 +1218,7 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 		existing, err = tx.GetRoleBinding(ctx, req.BindingID)
 		if err != nil {
 			if err == store.ErrNotFound {
-				return fmt.Errorf("governance:%d:%s", 404, "binding not found (re-fetched under lock)")
+				return governanceDenial(404, "binding not found (re-fetched under lock)")
 			}
 			return fmt.Errorf("re-fetch binding: %w", err)
 		}
@@ -1090,27 +1236,40 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 				return fmt.Errorf("owner lookup failed under lock: %w", ownerErr)
 			}
 			if !svc.isOperationPermitted(actorRole, req.Op, oldRoleDef.Name) {
-				return fmt.Errorf("governance:%d:%s", 403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, oldRoleDef.Name))
+				return governanceDenial(403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, oldRoleDef.Name))
 			}
 			if oldRoleDef.Name != newRoleDef.Name {
 				if !svc.isOperationPermitted(actorRole, req.Op, newRoleDef.Name) {
-					return fmt.Errorf("governance:%d:%s", 403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, newRoleDef.Name))
+					return governanceDenial(403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, newRoleDef.Name))
 				}
 			}
+			// Fail-closed defence in depth; see isActorDirectOwnerFromStore.
 			if requiresDirectOwner(oldRoleDef.Name) && !actorIsDirectOwner {
-				return fmt.Errorf("governance:%d:%s", 403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
+				return governanceDenial(403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
 			}
+			// Fail-closed defence in depth; see isActorDirectOwnerFromStore.
 			if oldRoleDef.Name != newRoleDef.Name && requiresDirectOwner(newRoleDef.Name) && !actorIsDirectOwner {
-				return fmt.Errorf("governance:%d:%s", 403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
+				return governanceDenial(403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
 			}
 		}
 
-		// Last-owner guard (inside tx for serialization).
-		if oldRoleDef.Name == store.ProjectRoleOwner && newRoleDef.Name != store.ProjectRoleOwner {
-			if existing.PrincipalType == store.RoleBindingPrincipalUser {
-				if err := svc.enforceLastOwnerTx(ctx, tx, req.ProjectID); err != nil {
-					return err
-				}
+		// Last-owner guard (inside tx for serialization, ptone/scion#2769):
+		// note whether the demoted binding is a usable owner, then check the
+		// post-state after the delete and re-create below.
+		demotesOwner := oldRoleDef.Name == store.ProjectRoleOwner && newRoleDef.Name != store.ProjectRoleOwner
+		now := svc.nowFunc() // one instant for the pre-state and post-state checks
+		removedUsable := false
+		if demotesOwner {
+			if removedUsable, err = anyUsableOwnerBinding(ctx, tx, []*store.RoleBinding{existing}, now); err != nil {
+				return fmt.Errorf("cannot verify usable owner: %w", err)
+			}
+		}
+
+		// Constraint-admin lockout guard, shared with user suspend and
+		// delete.
+		if !roleHasConstraintAdmin(newRoleDef) {
+			if err := checkRoleBindingRemovalAdminLockout(ctx, tx, now, existing); err != nil {
+				return err
 			}
 		}
 
@@ -1132,6 +1291,17 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 		if err != nil {
 			return fmt.Errorf("create replacement binding: %w", err)
 		}
+		if demotesOwner {
+			if err := enforceOwnerRemovalTx(ctx, tx, req.ProjectID, now, removedUsable); err != nil {
+				return err
+			}
+		}
+		// A role change can end access (for example a role without agent
+		// read): re-evaluate the principal (ptone/scion#3433). A no-op
+		// when access continues.
+		if err := enqueueMembershipLossForPrincipalTx(ctx, tx, existing.PrincipalType, existing.PrincipalID, req.ProjectID, store.MembershipLossTriggerMemberRoleChange, auditActorFromContext(ctx)); err != nil {
+			return err
+		}
 		return svc.createAuditRecord(ctx, tx, &store.MutationAuditRecord{
 			MutationType: "project_member_role_change",
 			TargetType:   "project_membership",
@@ -1150,11 +1320,20 @@ func (svc *ProjectMembershipService) UpdateMemberRole(ctx context.Context, req M
 		if isLastOwnerError(txErr) {
 			return nil, lastOwnerDenial()
 		}
-		if govDenial := isGovernanceError(txErr); govDenial != nil {
-			return nil, govDenial
+		var gdErr *governanceDenialError
+		if errors.As(txErr, &gdErr) {
+			return nil, &gdErr.decision
+		}
+		if d := constraintAdminLockoutDecision(txErr); d != nil {
+			return nil, d
+		}
+		if d := storeMembersGroupPrincipalDecision(txErr); d != nil {
+			return nil, d
 		}
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "internal_error", Reason: "role change failed: " + txErr.Error(), HTTPStatus: 500}
 	}
+
+	svc.notifyMembershipLoss()
 
 	svc.logger.Info("project member role changed via service",
 		"project_id", req.ProjectID, "old_role", oldRoleDef.Name,
@@ -1207,6 +1386,13 @@ func (svc *ProjectMembershipService) RemoveMember(ctx context.Context, req Membe
 	// R4 O-1: re-evaluate actor authority and re-fetch target inside the lock.
 	// R2-1: hub authority is re-evaluated inside the tx to close the TOCTOU window.
 	txErr := svc.store.WithTx(ctx, func(tx store.Store) error {
+		// Removing a constraint-admin binding takes the admin-guard lock
+		// before the project lock, the order user delete uses.
+		if roleHasConstraintAdmin(roleDef) {
+			if err := lockConstraintAdminGuard(ctx, tx); err != nil {
+				return err
+			}
+		}
 		// Acquire project-scoped membership lock.
 		if err := tx.LockProjectForMembership(ctx, req.ProjectID); err != nil {
 			return fmt.Errorf("lock project: %w", err)
@@ -1228,7 +1414,7 @@ func (svc *ProjectMembershipService) RemoveMember(ctx context.Context, req Membe
 			if hasHubAuth {
 				hubOverride = true
 			} else {
-				return fmt.Errorf("governance:%d:%s", 403, "actor has no project role (re-evaluated under lock)")
+				return governanceDenial(403, "actor has no project role (re-evaluated under lock)")
 			}
 		}
 
@@ -1236,7 +1422,7 @@ func (svc *ProjectMembershipService) RemoveMember(ctx context.Context, req Membe
 		binding, err = tx.GetRoleBinding(ctx, req.BindingID)
 		if err != nil {
 			if err == store.ErrNotFound {
-				return fmt.Errorf("governance:%d:%s", 404, "binding not found (re-fetched under lock)")
+				return governanceDenial(404, "binding not found (re-fetched under lock)")
 			}
 			return fmt.Errorf("re-fetch binding: %w", err)
 		}
@@ -1250,27 +1436,53 @@ func (svc *ProjectMembershipService) RemoveMember(ctx context.Context, req Membe
 		// Hub-override actors bypass project governance matrix.
 		if !hubOverride {
 			if !svc.isOperationPermitted(actorRole, req.Op, roleDef.Name) {
-				return fmt.Errorf("governance:%d:%s", 403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, roleDef.Name))
+				return governanceDenial(403, fmt.Sprintf("actor role %q cannot %s target role %q (re-evaluated under lock)", actorRole, req.Op, roleDef.Name))
 			}
 			if requiresDirectOwner(roleDef.Name) {
 				actorIsDirectOwner, ownerErr := svc.isActorDirectOwnerFromStore(ctx, tx, req.Actor.ID(), req.ProjectID)
 				if ownerErr != nil {
 					return fmt.Errorf("owner lookup failed under lock: %w", ownerErr)
 				}
+				// Fail-closed defence in depth; see isActorDirectOwnerFromStore.
 				if !actorIsDirectOwner {
-					return fmt.Errorf("governance:%d:%s", 403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
+					return governanceDenial(403, "only direct project owners can manage admin and owner roles (re-evaluated under lock)")
 				}
 			}
 		}
 
-		// Last-owner guard (inside tx for serialization).
-		if roleDef.Name == store.ProjectRoleOwner && binding.PrincipalType == store.RoleBindingPrincipalUser {
-			if err := svc.enforceLastOwnerTx(ctx, tx, req.ProjectID); err != nil {
-				return err
+		// Last-owner guard (inside tx for serialization, ptone/scion#2769):
+		// note whether the removed binding is a usable owner, then check the
+		// post-state after the delete.
+		removesOwner := roleDef.Name == store.ProjectRoleOwner
+		now := svc.nowFunc() // one instant for the pre-state and post-state checks
+		removedUsable := false
+		if removesOwner {
+			if removedUsable, err = anyUsableOwnerBinding(ctx, tx, []*store.RoleBinding{binding}, now); err != nil {
+				return fmt.Errorf("cannot verify usable owner: %w", err)
 			}
 		}
 
+		// Constraint-admin lockout guard, shared with user suspend and
+		// delete.
+		if err := checkRoleBindingRemovalAdminLockout(ctx, tx, now, binding); err != nil {
+			return err
+		}
 		if err := tx.DeleteRoleBinding(ctx, req.BindingID); err != nil {
+			return err
+		}
+		if removesOwner {
+			if err := enforceOwnerRemovalTx(ctx, tx, req.ProjectID, now, removedUsable); err != nil {
+				return err
+			}
+		}
+		// Ask for the removed principal's standing to be re-evaluated
+		// (ptone/scion#3433): a user, or every transitive member user of a
+		// group principal.
+		lossTrigger := req.LossTrigger
+		if lossTrigger == "" {
+			lossTrigger = store.MembershipLossTriggerMemberRemove
+		}
+		if err := enqueueMembershipLossForPrincipalTx(ctx, tx, binding.PrincipalType, binding.PrincipalID, req.ProjectID, lossTrigger, auditActorFromContext(ctx)); err != nil {
 			return err
 		}
 		return svc.createAuditRecord(ctx, tx, &store.MutationAuditRecord{
@@ -1287,14 +1499,20 @@ func (svc *ProjectMembershipService) RemoveMember(ctx context.Context, req Membe
 		if isLastOwnerError(txErr) {
 			return nil, lastOwnerDenial()
 		}
-		if govDenial := isGovernanceError(txErr); govDenial != nil {
-			return nil, govDenial
+		var gdErr *governanceDenialError
+		if errors.As(txErr, &gdErr) {
+			return nil, &gdErr.decision
+		}
+		if d := constraintAdminLockoutDecision(txErr); d != nil {
+			return nil, d
 		}
 		if txErr == store.ErrNotFound {
 			return nil, &MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "binding not found", HTTPStatus: 404}
 		}
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "internal_error", Reason: txErr.Error(), HTTPStatus: 500}
 	}
+
+	svc.notifyMembershipLoss()
 
 	svc.logger.Info("project member removed via service",
 		"project_id", req.ProjectID, "binding_id", req.BindingID,
@@ -1338,13 +1556,24 @@ func (svc *ProjectMembershipService) TransferOwnership(ctx context.Context, req 
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "conflict", Reason: "cannot transfer ownership to yourself", HTTPStatus: 409}
 	}
 
-	// Verify new owner is a valid user.
+	// Verify new owner is a valid user. Only ErrNotFound is 400 not_found;
+	// any other lookup error is a store fault and gives 500, as in the
+	// in-transaction re-check below (D1 of ptone/scion#2769).
 	newOwner, err := svc.store.GetUser(ctx, req.NewOwnerID)
 	if err != nil {
-		return nil, &MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "target user not found", HTTPStatus: 400}
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, &MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "target user not found", HTTPStatus: 400}
+		}
+		return nil, &MembershipDecision{Allowed: false, DenialCode: "internal_error", Reason: "ownership transfer failed: look up target user: " + err.Error(), HTTPStatus: 500}
 	}
 	if newOwner.Status != "active" {
 		return nil, &MembershipDecision{Allowed: false, DenialCode: ErrCodePrincipalIneligible, Reason: "target user is not active", HTTPStatus: 400}
+	}
+	// An admin-kind test identity holds only its issuance binding: it is
+	// never made a project owner. The kind is read through
+	// kindForPrincipal; a read error or unrecognized kind refuses.
+	if denied := svc.refuseTestAdminNewOwner(ctx, newOwner); denied != nil {
+		return nil, denied
 	}
 
 	// Resolve role definitions.
@@ -1374,7 +1603,21 @@ func (svc *ProjectMembershipService) TransferOwnership(ctx context.Context, req 
 			return fmt.Errorf("owner lookup failed under lock: %w", ownerErr)
 		}
 		if !stillOwner {
-			return fmt.Errorf("governance:%d:%s", 403, "actor is no longer a direct project owner (re-evaluated under lock)")
+			return governanceDenial(403, "actor is no longer a direct project owner (re-evaluated under lock)")
+		}
+
+		// Re-check the new owner under the lock (ptone/scion#2769): the
+		// pre-check above ran outside the transaction, so a concurrent
+		// suspend or delete could have landed since.
+		txNewOwner, nuErr := tx.GetUser(ctx, req.NewOwnerID)
+		if nuErr != nil {
+			if errors.Is(nuErr, store.ErrNotFound) {
+				return asGovernanceDenial(MembershipDecision{Allowed: false, DenialCode: "not_found", Reason: "target user not found", HTTPStatus: 400})
+			}
+			return fmt.Errorf("re-check new owner under lock: %w", nuErr)
+		}
+		if txNewOwner.Status != store.UserStatusActive {
+			return asGovernanceDenial(MembershipDecision{Allowed: false, DenialCode: ErrCodePrincipalIneligible, Reason: "target user is not active", HTTPStatus: 400})
 		}
 
 		// Step 1: Give the new owner a project-owner binding (or replace existing).
@@ -1417,14 +1660,32 @@ func (svc *ProjectMembershipService) TransferOwnership(ctx context.Context, req 
 			}
 		}
 
-		// Post-state invariant: verify at least one active direct owner exists.
-		// This query runs inside the transaction so it sees the committed state.
-		ownerCount, countErr := svc.countActiveDirectOwnersFromStore(ctx, tx, req.ProjectID)
-		if countErr != nil {
-			return fmt.Errorf("post-state owner count: %w", countErr)
+		// Step 3: Point project.OwnerID at the new owner, so the old owner no
+		// longer gets access through the resource-owner relationship rule
+		// (ptone/scion#2554). Use the narrow writer, not a Get plus full-row
+		// UpdateProject: a full-row write can clobber a concurrent PATCH. The
+		// PATCH/transfer interleaving (a transfer landing inside a PATCH's
+		// read-then-write window) is pinned by
+		// TestUpdateProject_ConcurrentTransferOwnershipSurvives.
+		if upErr := tx.SetProjectOwnerID(ctx, req.ProjectID, req.NewOwnerID); upErr != nil {
+			return fmt.Errorf("update project owner: %w", upErr)
 		}
-		if ownerCount == 0 {
-			return fmt.Errorf("post-state invariant violation: zero active direct owners after transfer")
+
+		// Post-state invariant: at least one usable owner remains
+		// (ptone/scion#2769). This runs inside the transaction, so it reads
+		// the post-state; a violation is 409 last_owner, not 500.
+		hasUsable, uErr := projectHasUsableOwner(ctx, tx, req.ProjectID, svc.nowFunc(), "")
+		if uErr != nil {
+			return fmt.Errorf("post-state usable owner check: %w", uErr)
+		}
+		if !hasUsable {
+			return &lastOwnerError{projectID: req.ProjectID}
+		}
+
+		// Re-evaluate the previous owner (ptone/scion#3433); normally a
+		// no-op, since the previous owner stays a member.
+		if err := enqueueMembershipLossTx(ctx, tx, req.Actor.ID(), req.ProjectID, store.MembershipLossTriggerOwnershipTransfer, auditActorFromContext(ctx)); err != nil {
+			return err
 		}
 
 		// Audit record inside the same transaction.
@@ -1443,11 +1704,17 @@ func (svc *ProjectMembershipService) TransferOwnership(ctx context.Context, req 
 		})
 	})
 	if txErr != nil {
-		if govDenial := isGovernanceError(txErr); govDenial != nil {
-			return nil, govDenial
+		if isLastOwnerError(txErr) {
+			return nil, lastOwnerDenial()
+		}
+		var gdErr *governanceDenialError
+		if errors.As(txErr, &gdErr) {
+			return nil, &gdErr.decision
 		}
 		return nil, &MembershipDecision{Allowed: false, DenialCode: "internal_error", Reason: "ownership transfer failed: " + txErr.Error(), HTTPStatus: 500}
 	}
+
+	svc.notifyMembershipLoss()
 
 	svc.logger.Info("project ownership transferred via service",
 		"project_id", req.ProjectID,
@@ -1476,6 +1743,13 @@ type MembershipCapabilities struct {
 	CanManageOwners  bool     `json:"canManageOwners"`
 	CanTransfer      bool     `json:"canTransfer"`
 	Actions          []string `json:"actions"` // backward compat
+
+	// CanManageCustomRoles reports whether the actor may grant custom
+	// project roles (ptone/scion#2529). Additive field. It is decided by
+	// customRoleAuthorityFromStore (role_binding.create), the same function
+	// the members PUT uses, so the UI never infers custom-role authority
+	// from owner authority.
+	CanManageCustomRoles bool `json:"canManageCustomRoles"`
 }
 
 // ComputeCapabilities returns the membership capabilities for the given actor.
@@ -1508,6 +1782,17 @@ func (svc *ProjectMembershipService) ComputeCapabilities(ctx context.Context, us
 		caps.Actions = []string{"manage_members"}
 	default:
 		// Member or no role: read-only.
+	}
+
+	// Custom-role authority is not a function of the built-in role switched
+	// on above: it is a direct owner, or an actor with no project role who
+	// holds hub role_binding.create. Fail closed on a lookup error.
+	customAuth, err := svc.customRoleAuthorityFromStore(ctx, svc.store, userID, projectID, PermRoleBindingCreate)
+	if err != nil {
+		svc.logger.Warn("custom role authority lookup failed for capabilities (fail-closed)",
+			"user_id", userID, "project_id", projectID, "error", err)
+	} else {
+		caps.CanManageCustomRoles = customAuth.Allowed
 	}
 
 	return caps
@@ -1617,33 +1902,77 @@ func (svc *ProjectMembershipService) highestAuthorityBindingFromStore(ctx contex
 	return best
 }
 
-// enforceLastOwnerTx checks that at least two active direct owners exist,
-// reading from the provided (transactional) store. Returns an error if the
-// invariant would be violated so the surrounding transaction rolls back.
+// applyRolePlanTx applies one rolePlan's mutations inside an open
+// SetMemberRoles transaction (ptone/scion#2529 P1, project_membership_set.go):
+// every Remove is deleted, then every Create is created (D4 partial unique
+// index ordering: a stale not-yet-deleted binding row must not collide with
+// the new one). The new binding half of plan.BuiltInChange, if any, inherits
+// NotBefore/ExpiresAt from the old binding it replaces; every other create
+// uses notBefore/expiresAt as given.
 //
-// R2-R1: This MUST be called inside WithTx, not outside it. Reading owner
-// count outside a transaction creates a TOCTOU race where two concurrent
-// demotions both observe count=2 and both commit, leaving zero owners.
-func (svc *ProjectMembershipService) enforceLastOwnerTx(ctx context.Context, tx store.Store, projectID string) error {
-	count, err := svc.countActiveDirectOwnersFromStore(ctx, tx, projectID)
-	if err != nil {
-		return fmt.Errorf("cannot verify owner count: %w", err)
+// This is the ONLY place SetMemberRoles mutates role bindings, and it is a
+// purpose-named step — not a reusable forwarder — so the authzop mutation
+// catalog (catalog.go) can classify it as exactly what it is: the governed
+// delete-then-create step of the membership service's "set roles for
+// principal" engine (review r1 F3). By the time this is called,
+// SetMemberRoles has already run the credential gate and CanDelegate
+// pre-transaction, and has re-evaluated governance/custom-role authority —
+// including the F1 role_binding.* structural guard and an actor-authority-
+// change check (review r2 R2-2) — under the project lock inside this same
+// transaction, immediately before this call. This is the same ordering
+// AddMember/UpdateMemberRole/TransferOwnership use before replaceBindingTx
+// above. The last-owner check runs AFTER this call, inside the same
+// transaction: it is a post-state count over the full binding set (the
+// Remove/Create pairs this function just applied), and a violation rolls
+// back every mutation this call made, along with everything else in the
+// transaction (review r2 R2-1). A dedicated OperationID (e.g.
+// project.membership.set) is deferred: wiring one needs a route_metadata.go
+// entry, out of scope for P1 (ptone/scion#2529).
+//
+// Returns the created bindings keyed by role definition ID, for the caller's
+// audit rows and built-in-swap bookkeeping.
+func (svc *ProjectMembershipService) applyRolePlanTx(ctx context.Context, tx store.Store, plan rolePlan, principalType, principalID, projectID, createdBy string, notBefore, expiresAt *time.Time) (map[string]*store.RoleBinding, error) {
+	for _, b := range plan.Remove {
+		if err := tx.DeleteRoleBinding(ctx, b.ID); err != nil {
+			return nil, fmt.Errorf("delete binding %s: %w", b.ID, err)
+		}
 	}
-	if count <= 1 {
-		return &lastOwnerError{projectID: projectID}
+
+	created := make(map[string]*store.RoleBinding, len(plan.Create))
+	for _, d := range plan.Create {
+		nb := &store.RoleBinding{
+			RoleDefinitionID: d.ID,
+			PrincipalType:    principalType,
+			PrincipalID:      principalID,
+			ScopeType:        store.RoleScopeProject,
+			ScopeID:          projectID,
+			CreatedBy:        createdBy,
+			NotBefore:        notBefore,
+			ExpiresAt:        expiresAt,
+		}
+		if plan.BuiltInChange != nil && plan.BuiltInChange.New.ID == d.ID {
+			nb.NotBefore = plan.BuiltInChange.Old.NotBefore
+			nb.ExpiresAt = plan.BuiltInChange.Old.ExpiresAt
+		}
+		cb, err := tx.CreateRoleBinding(ctx, nb)
+		if err != nil {
+			return nil, fmt.Errorf("create binding for role %s: %w", d.ID, err)
+		}
+		created[d.ID] = cb
 	}
-	return nil
+	return created, nil
 }
 
-// lastOwnerError is returned by enforceLastOwnerTx when the last-owner
-// invariant would be violated. Callers can type-assert to produce the
-// appropriate denial response.
+// lastOwnerError is returned by enforceOwnerRemovalTx (and the transfer
+// post-state check) when the last-owner invariant would be violated. Callers
+// can type-assert to produce the appropriate denial response. The denial
+// code stays last_owner.
 type lastOwnerError struct {
 	projectID string
 }
 
 func (e *lastOwnerError) Error() string {
-	return "cannot remove or demote the last project owner — at least one active direct user owner must remain"
+	return "cannot remove or demote the last project owner — at least one usable (active, existing) owner must remain"
 }
 
 // isLastOwnerError returns true if the error is a last-owner invariant violation.
@@ -1652,80 +1981,31 @@ func isLastOwnerError(err error) bool {
 	return ok
 }
 
-// isGovernanceError checks whether a transaction error is a governance denial
-// produced by the in-tx re-evaluation helpers. Returns a MembershipDecision
-// if so.
-func isGovernanceError(err error) *MembershipDecision {
-	if err == nil {
-		return nil
-	}
-	msg := err.Error()
-	if !strings.HasPrefix(msg, "governance:") {
-		return nil
-	}
-	// Format: "governance:STATUS:REASON"
-	parts := strings.SplitN(msg, ":", 3)
-	if len(parts) < 3 {
-		return nil
-	}
-	status := 403
-	if _, scanErr := fmt.Sscanf(parts[1], "%d", &status); scanErr != nil {
-		status = 403
-	}
-	code := ErrCodeRoleAssignmentForbidden
-	switch status {
-	case 404:
-		code = "not_found"
-	case 409:
-		code = "conflict"
-	}
-	return &MembershipDecision{
-		Allowed:    false,
-		DenialCode: code,
-		Reason:     parts[2],
-		HTTPStatus: status,
-	}
-}
-
 // lastOwnerDenial converts a lastOwnerError into a MembershipDecision.
 func lastOwnerDenial() *MembershipDecision {
 	return &MembershipDecision{
 		Allowed:    false,
 		DenialCode: ErrCodeLastOwner,
-		Reason:     "cannot remove or demote the last project owner — at least one active direct user owner must remain",
+		Reason:     "cannot remove or demote the last project owner — at least one usable (active, existing) owner must remain",
 		HTTPStatus: 409,
 	}
 }
 
-// countActiveDirectOwners counts active direct-user project-owner bindings.
-// Uses the same activation semantics as isProjectOwner per CT1 D2.
-func (svc *ProjectMembershipService) countActiveDirectOwners(ctx context.Context, projectID string) (int, error) {
-	return svc.countActiveDirectOwnersFromStore(ctx, svc.store, projectID)
-}
-
-// countActiveDirectOwnersFromStore is like countActiveDirectOwners but uses
-// the provided store (which may be a transactional store).
-func (svc *ProjectMembershipService) countActiveDirectOwnersFromStore(ctx context.Context, s store.Store, projectID string) (int, error) {
-	bindings, err := s.ListRoleBindingsForScope(ctx, store.RoleScopeProject, projectID)
-	if err != nil {
-		return 0, err
+// constraintAdminLockoutDecision converts a constraint-admin lockout
+// refusal into a MembershipDecision with the code and status the user
+// suspend and delete paths return. It returns nil for any other error.
+func constraintAdminLockoutDecision(err error) *MembershipDecision {
+	var ge *GovernanceError
+	if !errors.As(err, &ge) || ge.Code != ErrCodeConstraintAdminLockout {
+		return nil
 	}
-	ownerRoleDef, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
-	if err != nil {
-		return 0, err
+	return &MembershipDecision{
+		Allowed:    false,
+		DenialCode: ge.Code,
+		Reason:     ge.Message,
+		HTTPStatus: governanceErrorStatus(ge.Code),
+		Details:    ge.Details,
 	}
-	now := svc.nowFunc()
-	count := 0
-	for _, b := range bindings {
-		if b.PrincipalType != store.RoleBindingPrincipalUser || b.RoleDefinitionID != ownerRoleDef.ID {
-			continue
-		}
-		if !isBindingActive(b, now) {
-			continue
-		}
-		count++
-	}
-	return count, nil
 }
 
 // higherProjectRole returns the higher-authority project role of the two.
@@ -1937,4 +2217,25 @@ func (svc *ProjectMembershipService) MigrateMultiRoleBindings(ctx context.Contex
 	}
 
 	return results, nil
+}
+
+// refuseTestAdminNewOwner refuses an ownership transfer to an admin-kind
+// test identity or a federated account (403), reading the kind through kindForPrincipal (the row's
+// own classification when no authorization service is wired). A read
+// error or an unrecognized kind refuses too.
+func (svc *ProjectMembershipService) refuseTestAdminNewOwner(ctx context.Context, newOwner *store.User) *MembershipDecision {
+	var k principalKind
+	var err error
+	if svc.authz != nil {
+		k, err = svc.authz.kindForPrincipal(ctx, newOwner.ID)
+	} else {
+		k, err = classifyUserKind(newOwner)
+	}
+	if err != nil || k.isTestAdmin() {
+		return &MembershipDecision{Allowed: false, DenialCode: "forbidden", Reason: testAdminGranteeReasonRefused, HTTPStatus: 403}
+	}
+	if k.isFederated() {
+		return &MembershipDecision{Allowed: false, DenialCode: "forbidden", Reason: federatedGranteeReasonRefused, HTTPStatus: 403}
+	}
+	return nil
 }

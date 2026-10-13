@@ -20,11 +20,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -37,79 +35,6 @@ import (
 // ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
-
-// spyEventPublisher embeds noopEventPublisher and records PublishUserMessage
-// and PublishChatNotification calls.
-type spyEventPublisher struct {
-	noopEventPublisher
-	mu          sync.Mutex
-	userMsgs    []*store.Message
-	chatNotifCh chan struct{} // optional; signalled on PublishChatNotification
-}
-
-func (s *spyEventPublisher) PublishUserMessage(_ context.Context, msg *store.Message) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.userMsgs = append(s.userMsgs, msg)
-}
-
-func (s *spyEventPublisher) getUserMessages() []*store.Message {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]*store.Message, len(s.userMsgs))
-	copy(out, s.userMsgs)
-	return out
-}
-
-func (s *spyEventPublisher) PublishChatNotification(_ context.Context, _ *store.Notification, _ ChatMessageContext) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.chatNotifCh != nil {
-		select {
-		case s.chatNotifCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// chatNotifFired reports whether PublishChatNotification was invoked.
-// Safe to call only when no concurrent goroutine can still call
-// PublishChatNotification (e.g. after the goroutine has been joined
-// or was never spawned).
-func (s *spyEventPublisher) chatNotifFired() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.chatNotifCh == nil {
-		return false
-	}
-	select {
-	case <-s.chatNotifCh:
-		return true
-	default:
-		return false
-	}
-}
-
-// stubWebChatStore embeds the WebChatStore interface so that only the
-// methods actually exercised need a real implementation. Unimplemented
-// methods panic with a nil-receiver dereference, which is the desired
-// signal in a test.
-type stubWebChatStore struct {
-	WebChatStore
-}
-
-func (s *stubWebChatStore) IsConversationMuted(_ context.Context, _, _ string) (bool, error) {
-	return false, nil
-}
-
-// createMessageFailStore wraps a real store and makes CreateMessage return an error.
-type createMessageFailStore struct {
-	store.Store
-}
-
-func (s *createMessageFailStore) CreateMessage(_ context.Context, _ *store.Message) error {
-	return errors.New("injected CreateMessage failure")
-}
 
 // ---------------------------------------------------------------------------
 // Site 1: messagebroker.go  deliverToUser
@@ -128,8 +53,8 @@ func TestDeliverToUser_SkipsPublishOnPersistFailure(t *testing.T) {
 	proxy := NewMessageBrokerProxy(b, failStore, spy, func() AgentDispatcher { return nil }, slog.Default())
 
 	msg := messages.NewInstruction("agent:agent-a", "user:bob", "hello")
-	msg.SenderID = "agent-uuid"
-	msg.RecipientID = "user-bob-id"
+	msg.SenderID = tid("agent-a")
+	msg.RecipientID = tid("user-bob")
 
 	proxy.deliverToUser(context.Background(), projectID, "user.user-bob-id.message", msg)
 
@@ -150,8 +75,8 @@ func TestDeliverToUser_PublishesOnPersistSuccess(t *testing.T) {
 	proxy := NewMessageBrokerProxy(b, realStore, spy, func() AgentDispatcher { return nil }, slog.Default())
 
 	msg := messages.NewInstruction("agent:agent-a", "user:bob", "hello")
-	msg.SenderID = "agent-uuid"
-	msg.RecipientID = "user-bob-id"
+	msg.SenderID = tid("agent-a")
+	msg.RecipientID = tid("user-bob")
 
 	proxy.deliverToUser(context.Background(), projectID, "user.user-bob-id.message", msg)
 
@@ -178,13 +103,12 @@ func TestHandleAgentMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Name:       "guard-agent",
-		Slug:       "guard-agent",
-		ProjectID:  project.ID,
-		Phase:      "running",
-		Runtime:    "managed",
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Name:      "guard-agent",
+		Slug:      "guard-agent",
+		ProjectID: project.ID,
+		Phase:     "running",
+		Runtime:   "managed",
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
@@ -196,7 +120,7 @@ func TestHandleAgentMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 
 	structuredMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "agent:" + agent.Slug,
 		Msg:       "test message",
 		Type:      messages.TypeInstruction,
@@ -207,7 +131,7 @@ func TestHandleAgentMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/message", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(contextWithIdentity(req.Context(),
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "user", "web")))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "user", "web")))
 
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, agent.ID)
@@ -232,13 +156,12 @@ func TestHandleAgentMessage_ResponseStatusNotDeliveredOnPersistFailure(t *testin
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Name:       "status-agent",
-		Slug:       "status-agent",
-		ProjectID:  project.ID,
-		Phase:      "running",
-		Runtime:    "managed",
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Name:      "status-agent",
+		Slug:      "status-agent",
+		ProjectID: project.ID,
+		Phase:     "running",
+		Runtime:   "managed",
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
@@ -250,7 +173,7 @@ func TestHandleAgentMessage_ResponseStatusNotDeliveredOnPersistFailure(t *testin
 
 	structuredMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "agent:" + agent.Slug,
 		Msg:       "test message",
 		Type:      messages.TypeInstruction,
@@ -261,7 +184,7 @@ func TestHandleAgentMessage_ResponseStatusNotDeliveredOnPersistFailure(t *testin
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/message", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(contextWithIdentity(req.Context(),
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "user", "web")))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "user", "web")))
 
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, agent.ID)
@@ -300,13 +223,12 @@ func TestHandleAgentMessage_PublishesOnPersistSuccess(t *testing.T) {
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Name:       "ok-agent",
-		Slug:       "ok-agent",
-		ProjectID:  project.ID,
-		Phase:      "running",
-		Runtime:    "managed",
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Name:      "ok-agent",
+		Slug:      "ok-agent",
+		ProjectID: project.ID,
+		Phase:     "running",
+		Runtime:   "managed",
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("CreateAgent: %v", err)
@@ -318,7 +240,7 @@ func TestHandleAgentMessage_PublishesOnPersistSuccess(t *testing.T) {
 
 	structuredMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "agent:" + agent.Slug,
 		Msg:       "test message",
 		Type:      messages.TypeInstruction,
@@ -329,7 +251,7 @@ func TestHandleAgentMessage_PublishesOnPersistSuccess(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/message", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(contextWithIdentity(req.Context(),
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "user", "web")))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "user", "web")))
 
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, agent.ID)
@@ -374,7 +296,6 @@ func TestHandleGroupMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, anchor); err != nil {
 		t.Fatalf("CreateAgent (anchor): %v", err)
@@ -386,7 +307,6 @@ func TestHandleGroupMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, target); err != nil {
 		t.Fatalf("CreateAgent (target): %v", err)
@@ -399,7 +319,7 @@ func TestHandleGroupMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 	// Message to group[agent:target,user:groupuser@example.com]
 	structuredMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "group[agent:target,user:groupuser@example.com]",
 		Msg:       "group message",
 		Type:      messages.TypeInstruction,
@@ -411,7 +331,7 @@ func TestHandleGroupMessage_SkipsPublishOnPersistFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+anchor.ID+"/message", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(contextWithIdentity(req.Context(),
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "user", "web")))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "user", "web")))
 
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, anchor.ID)
@@ -454,7 +374,6 @@ func TestHandleGroupMessage_PublishesOnPersistSuccess(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, anchor); err != nil {
 		t.Fatalf("CreateAgent (anchor2): %v", err)
@@ -466,7 +385,6 @@ func TestHandleGroupMessage_PublishesOnPersistSuccess(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, target); err != nil {
 		t.Fatalf("CreateAgent (target2): %v", err)
@@ -478,7 +396,7 @@ func TestHandleGroupMessage_PublishesOnPersistSuccess(t *testing.T) {
 
 	structuredMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "group[agent:target2,user:groupuser2@example.com]",
 		Msg:       "group message ok",
 		Type:      messages.TypeInstruction,
@@ -493,7 +411,7 @@ func TestHandleGroupMessage_PublishesOnPersistSuccess(t *testing.T) {
 	// authorizeAgentMessage passes — this test validates publish-on-persist,
 	// not message authorization.
 	req = req.WithContext(contextWithIdentity(req.Context(),
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "admin", "web")))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "admin", "web")))
 
 	rr := httptest.NewRecorder()
 	srv.handleAgentMessage(rr, req, anchor.ID)
@@ -530,7 +448,6 @@ func TestProcessMentions_SkipsPublishOnPersistFailure(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, primary); err != nil {
 		t.Fatalf("CreateAgent (primary): %v", err)
@@ -543,7 +460,6 @@ func TestProcessMentions_SkipsPublishOnPersistFailure(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, mentioned); err != nil {
 		t.Fatalf("CreateAgent (mentioned): %v", err)
@@ -555,7 +471,7 @@ func TestProcessMentions_SkipsPublishOnPersistFailure(t *testing.T) {
 
 	originalMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "agent:" + primary.Slug,
 		Msg:       "hello @mentioned",
 		Type:      messages.TypeInstruction,
@@ -566,9 +482,9 @@ func TestProcessMentions_SkipsPublishOnPersistFailure(t *testing.T) {
 	// Phase 3 msg-authz: inject admin identity so authorizeAgentMessage
 	// passes — this test validates publish-on-persist, not authorization.
 	ctx = contextWithIdentity(ctx,
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "admin", "web"))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "admin", "web"))
 
-	results := srv.processMentions(ctx, []string{"mentioned"}, primary, originalMsg)
+	results := srv.processMentions(ctx, []string{"mentioned"}, primary, originalMsg, "", "")
 
 	// The mention should still produce a result (dispatch may fail, but that's OK).
 	t.Logf("mention results: %+v", results)
@@ -600,7 +516,6 @@ func TestProcessMentions_PublishesOnPersistSuccess(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, primary); err != nil {
 		t.Fatalf("CreateAgent (primary2): %v", err)
@@ -613,7 +528,6 @@ func TestProcessMentions_PublishesOnPersistSuccess(t *testing.T) {
 		ProjectID:       project.ID,
 		Phase:           "running",
 		RuntimeBrokerID: "broker-1",
-		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, mentioned); err != nil {
 		t.Fatalf("CreateAgent (mentioned2): %v", err)
@@ -625,7 +539,7 @@ func TestProcessMentions_PublishesOnPersistSuccess(t *testing.T) {
 
 	originalMsg := &messages.StructuredMessage{
 		Sender:    "user:tester",
-		SenderID:  "user-id-1",
+		SenderID:  tid("user-tester"),
 		Recipient: "agent:" + primary.Slug,
 		Msg:       "hello @mentioned2",
 		Type:      messages.TypeInstruction,
@@ -636,9 +550,9 @@ func TestProcessMentions_PublishesOnPersistSuccess(t *testing.T) {
 	// Phase 3 msg-authz: inject admin identity so authorizeAgentMessage
 	// passes — this test validates publish-on-persist, not authorization.
 	ctx = contextWithIdentity(ctx,
-		NewAuthenticatedUser("user-id-1", "tester@example.com", "Tester", "admin", "web"))
+		NewAuthenticatedUser(tid("user-tester"), "tester@example.com", "Tester", "admin", "web"))
 
-	results := srv.processMentions(ctx, []string{"mentioned2"}, primary, originalMsg)
+	results := srv.processMentions(ctx, []string{"mentioned2"}, primary, originalMsg, "", "")
 	t.Logf("mention ok results: %+v", results)
 
 	// The publish MUST have fired because CreateMessage succeeded.
@@ -648,86 +562,44 @@ func TestProcessMentions_PublishesOnPersistSuccess(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Site 6: deliverToUser — W6 DM notification (NotifyDMReceived)
+// Site 6: deliverToUser — agent → human DM creates no notification row
 // ---------------------------------------------------------------------------
 
-// TestDeliverToUser_SkipsNotifyOnPersistFailure verifies that when
-// CreateMessage fails, the W6 NotifyDMReceived goroutine is never
-// spawned — and therefore PublishChatNotification is never called.
-//
-// Determinism: with the early-return fix, deliverToUser returns before
-// reaching the "go p.chatNotifier.NotifyDMReceived(...)" line. No
-// goroutine is launched, so there is no race to synchronise on; the
-// observation (zero PublishChatNotification calls) is checked after
-// deliverToUser returns synchronously.
-func TestDeliverToUser_SkipsNotifyOnPersistFailure(t *testing.T) {
+// TestDeliverToUser_NoDMNotificationRow verifies that an agent reply into a
+// DM still publishes the chat message event (the web derives chat alerts
+// from it) but no longer creates a DM_RECEIVED notification row.
+func TestDeliverToUser_NoDMNotificationRow(t *testing.T) {
 	realStore := newBrokerTestStore(t)
 	projectID := setupBrokerTestProject(t, realStore)
 	setupBrokerTestAgent(t, realStore, projectID, "agent-a", "running")
 
-	spy := &spyEventPublisher{chatNotifCh: make(chan struct{}, 1)}
-	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer func() { _ = b.Close() }()
-
-	failStore := &createMessageFailStore{Store: realStore}
-	proxy := NewMessageBrokerProxy(b, failStore, spy, func() AgentDispatcher { return nil }, slog.Default())
-
-	// Wire a ChatNotifier so the guard (p.chatNotifier != nil) would pass
-	// if execution ever reached it. The notifier uses the real store and a
-	// stub WebChatStore — but neither is exercised because the function
-	// returns before the notification path.
-	cn := NewChatNotifier(realStore, spy, &stubWebChatStore{}, nil, slog.Default())
-	proxy.chatNotifier = cn
-
-	// Craft a message that satisfies all four W6 guard conditions:
-	//   ThreadID starts with "dm:", RecipientID non-empty,
-	//   Sender starts with "agent:".
-	msg := messages.NewInstruction("agent:agent-a", "user:bob", "hello")
-	msg.SenderID = "agent-uuid"
-	msg.RecipientID = "user-bob-id"
-	msg.ThreadID = "dm:user:user-bob-id:agent:agent-uuid"
-
-	proxy.deliverToUser(context.Background(), projectID, "user.user-bob-id.message", msg)
-
-	// The goroutine was never spawned, so the channel must be empty.
-	if spy.chatNotifFired() {
-		t.Error("PublishChatNotification must not be called when CreateMessage fails")
-	}
-}
-
-// TestDeliverToUser_NotifiesOnPersistSuccess is a positive control:
-// when CreateMessage succeeds and the W6 conditions are met,
-// PublishChatNotification IS called (via the NotifyDMReceived goroutine).
-//
-// Determinism: NotifyDMReceived runs in a goroutine. We wait on a
-// buffered channel that the spy signals from PublishChatNotification,
-// with a generous timeout so CI is not flaky.
-func TestDeliverToUser_NotifiesOnPersistSuccess(t *testing.T) {
-	realStore := newBrokerTestStore(t)
-	projectID := setupBrokerTestProject(t, realStore)
-	setupBrokerTestAgent(t, realStore, projectID, "agent-a", "running")
-
-	spy := &spyEventPublisher{chatNotifCh: make(chan struct{}, 1)}
+	spy := &spyEventPublisher{}
 	b := eventbus.NewInProcessEventBus(slog.Default())
 	defer func() { _ = b.Close() }()
 
 	proxy := NewMessageBrokerProxy(b, realStore, spy, func() AgentDispatcher { return nil }, slog.Default())
 
-	cn := NewChatNotifier(realStore, spy, &stubWebChatStore{}, nil, slog.Default())
-	proxy.chatNotifier = cn
-
+	agentID := tid("agent-a")
+	userID := tid("user-bob")
+	dmKey, dmErr := messages.DMConversationKey("user", userID, "agent", agentID)
+	if dmErr != nil {
+		t.Fatalf("DMConversationKey: %v", dmErr)
+	}
 	msg := messages.NewInstruction("agent:agent-a", "user:bob", "hello")
-	msg.SenderID = "agent-uuid"
-	msg.RecipientID = "user-bob-id"
-	msg.ThreadID = "dm:user:user-bob-id:agent:agent-uuid"
+	msg.SenderID = agentID
+	msg.RecipientID = userID
+	msg.ThreadID = dmKey
 
-	proxy.deliverToUser(context.Background(), projectID, "user.user-bob-id.message", msg)
+	proxy.deliverToUser(context.Background(), projectID, "user."+userID+".message", msg)
 
-	// Wait for the goroutine to signal PublishChatNotification.
-	select {
-	case <-spy.chatNotifCh:
-		// success — notification was delivered
-	case <-time.After(5 * time.Second):
-		t.Error("PublishChatNotification was not called within timeout; expected W6 DM notification on persist success")
+	if msgs := spy.getUserMessages(); len(msgs) != 1 {
+		t.Errorf("expected 1 PublishUserMessage call, got %d", len(msgs))
+	}
+	notifs, err := realStore.GetNotifications(context.Background(), store.SubscriberTypeUser, userID, false)
+	if err != nil {
+		t.Fatalf("GetNotifications: %v", err)
+	}
+	if len(notifs) != 0 {
+		t.Errorf("agent DM reply must not create notification rows, got %d", len(notifs))
 	}
 }

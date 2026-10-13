@@ -52,14 +52,18 @@ Scion resolves settings in the following order (highest priority first):
 4.  **Global Settings**: `~/.scion/settings.yaml` (User level).
 5.  **Defaults**: System built-ins.
 
+## Unrecognized Key Warnings
+
+When loading settings files, Scion logs a warning for any unrecognized key it encounters. This helps catch typos (e.g., `telemtry` instead of `telemetry`) and outdated keys from earlier configuration schemas — without failing startup. The warnings appear in server or CLI startup output and do not prevent the rest of the configuration from loading normally.
+
 ## Migration
 
 To migrate legacy configuration files to the new schema v1 format:
 
 ```bash
-# Migrate general settings
+# Migrate legacy settings (a server.yaml next to a legacy settings.yaml is
+# merged under the server key)
 scion config migrate
-
-# Migrate server.yaml to settings.yaml
-scion config migrate --server
 ```
+
+A `server.yaml` next to a `settings.yaml` that already has `schema_version` is not merged automatically: copy its contents under a top-level `server:` key in `settings.yaml` and remove `server.yaml` (a `--server` flag is tracked in ptone/scion#3116).

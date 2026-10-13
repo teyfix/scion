@@ -24,12 +24,13 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type { PageData, Project, Capabilities } from '../../shared/types.js';
-import { can } from '../../shared/types.js';
+import { can, projectWorkspaceModeIcon } from '../../shared/types.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { stateManager } from '../../client/state.js';
 import { listPageStyles } from '../shared/resource-styles.js';
 import '../shared/git-remote-display.js';
 import type { ViewMode } from '../shared/view-toggle.js';
+import { navigateTo } from '../../client/navigation.js';
 import '../shared/view-toggle.js';
 
 @customElement('scion-page-projects')
@@ -84,6 +85,14 @@ export class ScionPageProjects extends LitElement {
         align-items: flex-start;
         justify-content: space-between;
         margin-bottom: 1rem;
+      }
+
+      /* The header's only child holds the name and the git remote. As a flex
+         item it defaults to min-width:auto and grows to fit a long unbroken
+         name or URL, pushing both past the card edge; min-width:0 lets it
+         shrink so the shared wrapping rules can break them instead. */
+      .project-header > div {
+        min-width: 0;
       }
 
       .project-path {
@@ -169,18 +178,18 @@ export class ScionPageProjects extends LitElement {
     }
 
     // Set SSE scope to dashboard (project summaries).
-    // This must happen before checking hydrated data because setScope clears
+    // This must happen before checking the store because setScope clears
     // state maps when the scope changes (e.g. from project-detail to dashboard).
     stateManager.setScope({ type: 'dashboard' });
 
-    // Use hydrated data from SSR if available, avoiding the initial fetch.
-    // Only trust it when scope was previously null (initial SSR page load);
-    // on client-side navigations the maps were just cleared by setScope above.
-    // Skip hydrated data when a scope filter is active — SSR data is unfiltered.
-    // Also require scope capabilities — without them the "New Project" button
-    // won't render, so we must fetch from the API to get them.
+    // Reuse the projects already in the store, avoiding the initial fetch,
+    // when the scope stayed dashboard (a client-side navigation from home);
+    // after a scope change the maps were just cleared above. Skip it when a
+    // scope filter is active. Also require scope capabilities — without them
+    // the "New Project" button won't render, so we must fetch from the API to
+    // get them.
     const hydratedProjects = stateManager.getProjects();
-    const hydratedCaps = stateManager.getScopeCapabilities();
+    const hydratedCaps = stateManager.getScopeCapabilities('project');
     if (hydratedProjects.length > 0 && hydratedCaps && this.projectScope === 'all') {
       this.projects = hydratedProjects;
       this.scopeCapabilities = hydratedCaps;
@@ -191,15 +200,12 @@ export class ScionPageProjects extends LitElement {
     }
 
     // Listen for real-time project updates
-    stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated as EventListener);
+    stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    stateManager.removeEventListener(
-      'projects-updated',
-      this.boundOnProjectsUpdated as EventListener
-    );
+    stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated);
   }
 
   private onProjectsUpdated(): void {
@@ -222,7 +228,7 @@ export class ScionPageProjects extends LitElement {
       if (!existing && this.projectScope !== 'all') {
         continue;
       }
-      const merged = { ...existing, ...project } as Project;
+      const merged = { ...existing, ...project };
       // Preserve _capabilities from existing state when the delta lacks them.
       if (!project._capabilities && existing?._capabilities) {
         merged._capabilities = existing._capabilities;
@@ -265,7 +271,7 @@ export class ScionPageProjects extends LitElement {
       // and so other pages sharing the same scope can reuse capabilities.
       stateManager.seedProjects(this.projects);
       if (this.scopeCapabilities) {
-        stateManager.seedScopeCapabilities(this.scopeCapabilities);
+        stateManager.seedScopeCapabilities('project', this.scopeCapabilities);
       }
     } catch (err) {
       console.error('Failed to load projects:', err);
@@ -435,8 +441,11 @@ export class ScionPageProjects extends LitElement {
     `;
   }
 
-  private renderProjectIcon() {
-    return html`<sl-icon name="folder-fill"></sl-icon>`;
+  private renderProjectIcon(project: Project) {
+    const { icon, label } = projectWorkspaceModeIcon(project);
+    return html`<sl-tooltip content=${label}
+      ><sl-icon class="workspace-mode-icon" name=${icon} label=${label}></sl-icon
+    ></sl-tooltip>`;
   }
 
   private renderLinkedBadge(project: Project) {
@@ -455,7 +464,8 @@ export class ScionPageProjects extends LitElement {
         <div class="project-header">
           <div>
             <h3 class="resource-name">
-              ${this.renderProjectIcon()} ${project.name}${this.renderLinkedBadge(project)}
+              ${this.renderProjectIcon(project)}
+              <span>${project.name}${this.renderLinkedBadge(project)}</span>
             </h3>
             <div class="project-path">
               <scion-git-remote-display
@@ -506,13 +516,12 @@ export class ScionPageProjects extends LitElement {
       <tr
         class="clickable"
         @click=${() => {
-          window.history.pushState({}, '', `/projects/${project.id}`);
-          window.dispatchEvent(new PopStateEvent('popstate'));
+          navigateTo(`/projects/${project.id}`);
         }}
       >
         <td>
           <span class="name-cell">
-            ${this.renderProjectIcon()} ${project.name}${this.renderLinkedBadge(project)}
+            ${this.renderProjectIcon(project)} ${project.name}${this.renderLinkedBadge(project)}
           </span>
         </td>
         <td class="mono-cell">

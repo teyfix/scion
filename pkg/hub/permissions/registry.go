@@ -16,8 +16,12 @@ package permissions
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/credentialmeta"
 )
 
 const (
@@ -37,6 +41,26 @@ const (
 	ResourceRoleBinding       = "role_binding"
 	ResourceScheduledEvent    = "scheduled_event"
 	ResourceAccessConstraint  = "access_constraint"
+	// ResourceSecret, ResourceEnvVar and ResourceSkillInjection are the
+	// material-delivery resource types (ptone/scion#2129): the typed target
+	// of an agent secret, stored environment variable or stored skill
+	// reference, as distinct from ResourceProject/ResourceSkill.
+	ResourceSecret         = "secret"
+	ResourceEnvVar         = "env_var"
+	ResourceSkillInjection = "skill_injection"
+	// ResourceArtifact is the artifact service's resource type
+	// (pkg/artifacts). Artifact permissions are checked in the hub's
+	// artifacts.Host adapter against the artifact's home project.
+	ResourceArtifact = "artifact"
+	// ResourceTestIdentity is the hub test identity collection
+	// (POST/GET /api/v1/test-identities).
+	ResourceTestIdentity = "test_identity"
+
+	// ResourceInbox and ResourceUserSkillInjection are self-scoped resource
+	// types: their records belong to one user and carry no project or hub
+	// target that a role binding could authorize. See TargetClassKindSelf.
+	ResourceInbox              = "inbox"
+	ResourceUserSkillInjection = "user_skill_injection"
 
 	ActionCreate         = "create"
 	ActionRead           = "read"
@@ -61,6 +85,47 @@ const (
 	ActionExecute        = "execute"
 	ActionMessage        = "message"
 	ActionSetMessageMode = "set_message_mode"
+	ActionLifecycle      = "lifecycle"
+	ActionCreateGlobal   = "create_global"
+	ActionAutoProvide    = "auto_provide"
+	// ActionDeliver and ActionUse distinguish launch-time material delivery
+	// from an agent's own runtime retrieval or token-mint request over the
+	// same or a related resource (ptone/scion#2129). Neither is a read-only
+	// action.
+	ActionDeliver = "deliver"
+	ActionUse     = "use"
+	// ActionWrite covers creating, changing and removing the holder's own
+	// self-scoped records.
+	ActionWrite = "write"
+	// ActionIssue covers issuing hub test identities.
+	ActionIssue = "issue"
+	// ActionIssueAdmin and ActionIssueSuperAdmin cover issuing the admin
+	// test identity kinds (test_hub_admin, test_super_admin).
+	ActionIssueAdmin      = "issue_admin"
+	ActionIssueSuperAdmin = "issue_super_admin"
+	// ActionDelegationCreate and ActionDelegationExchange are the agent
+	// delegation grant issuance and credential exchange actions
+	// (.design/agent-delegation.md §18.5).
+	ActionDelegationCreate   = "delegation_create"
+	ActionDelegationExchange = "delegation_exchange"
+	// ActionDelegationRevoke, ActionDelegationCredentialRevoke,
+	// ActionDelegationList and ActionDelegationRead are the agent delegation
+	// grant management actions (.design/agent-delegation.md §7, §18.5).
+	ActionDelegationRevoke           = "delegation_revoke"
+	ActionDelegationCredentialRevoke = "delegation_credential_revoke"
+	ActionDelegationList             = "delegation_list"
+	ActionDelegationRead             = "delegation_read"
+
+	// PermissionGCPServiceAccountUse is the gcp_service_account.use
+	// permission ID. Named so pkg/hub/authz.go's agent-scope handling for
+	// this one permission keys off a constant rather than a literal string.
+	// The Registry row below keeps its ID as the literal string, not this
+	// constant: pkg/hub/authzop/catalog_test.go reads registry.go as text
+	// and takes the first quoted string on each line starting with "{ID:"
+	// as that row's ID, so an identifier there would make it read the
+	// row's Description as the ID. TestMaterialPermissions_Registered pins
+	// the constant against the row.
+	PermissionGCPServiceAccountUse = "gcp_service_account.use"
 
 	UATScopeAgentManage         = "agent:manage"
 	UATScopeSkillManage         = "skill:manage"
@@ -102,37 +167,76 @@ type Permission struct {
 	Description    string
 	Enforcement    []string
 	NonRouteUse    []string
+	// Reserved marks a row that is part of the published vocabulary but
+	// that no code checks yet. It holds the reason. Every row must either
+	// declare a use (Enforcement or NonRouteUse) or be Reserved, never
+	// both, and nothing may grant a reserved permission: it carries no
+	// AgentScopes, no role holds it (custom role definitions are rejected
+	// by pkg/hub validateRolePermissionIDs), and it is left out of manage aliases
+	// and the scope options offered to users (UATScopeOptions). Its
+	// UATScope stays valid (UATValidScopes) so existing tokens that carry
+	// it keep working. TestPermissionRegistryRowsEnforcedOrReserved in
+	// pkg/hub enforces all of this. When code starts checking a reserved
+	// permission, clear Reserved and record the check in Enforcement. The
+	// permission then reaches super-admin automatically (allPermissionIDs
+	// takes every non-reserved row); granting it to any other role, agent
+	// scope bundle or picker is a separate, deliberate change.
+	Reserved string
+	// ExcludeFromManageAlias keeps this permission's UAT scope out of the
+	// resource's "<resource>:manage" convenience alias. Used for observation
+	// permissions (agent.attach, agent.port_access) that some project roles
+	// do not hold (owners/admins lack attach; members lack
+	// port_access), so that holders of those roles can still mint
+	// agent:manage tokens. The scope remains available for explicit selection.
+	ExcludeFromManageAlias bool
 }
 
 // Registry is the canonical permission/resource vocabulary for Hub authz.
 //
 // Phase 1A keeps existing handler-local enforcement; the Enforcement and
 // NonRouteUse fields record where each permission is currently consumed so drift
-// tests can fail when a public scope has no corresponding use.
+// tests can fail when a public scope has no corresponding use. A row nothing
+// consumes yet carries Reserved instead.
 var Registry = []Permission{
 	{ID: "agent.create", Resource: ResourceAgent, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "agent:create", AgentScopes: []string{"project:agent:create"}, Description: "Create agents", Enforcement: []string{"pkg/hub/authorize.go:authorizeAgentCreate", "pkg/hub/handlers_agents_core.go"}},
 	{ID: "agent.read", Resource: ResourceAgent, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "agent:read", Description: "Read agent status and metadata", Enforcement: []string{"pkg/hub/handlers_agents_core.go", "pkg/hub/authz.go"}},
 	{ID: "agent.list", Resource: ResourceAgent, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "agent:list", Description: "List agents in the project", Enforcement: []string{"pkg/hub/handlers_agents_core.go", "pkg/hub/authz.go"}},
 	{ID: "agent.update", Resource: ResourceAgent, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update agents", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
 	{ID: "agent.delete", Resource: ResourceAgent, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "agent:delete", AgentScopes: []string{"project:agent:lifecycle"}, Description: "Delete agents", Enforcement: []string{"pkg/hub/handlers_agents_core.go", "pkg/hub/handlers_agent_delete_authz_test.go"}},
-	{ID: "agent.attach", Resource: ResourceAgent, Action: ActionAttach, CapabilityKind: CapabilityResource, UATScope: "agent:attach", AgentScopes: []string{"project:agent:lifecycle"}, Description: "Attach to agent sessions", Enforcement: []string{"pkg/hub/authorize.go:authorizeAgentLifecycle", "pkg/hub/pty_handlers.go"}},
-	{ID: "agent.port_access", Resource: ResourceAgent, Action: ActionPortAccess, CapabilityKind: CapabilityResource, UATScope: "agent:port_access", Description: "Access agent forwarded ports", Enforcement: []string{"pkg/hub/port_forward_handlers.go"}},
+	{ID: "agent.attach", Resource: ResourceAgent, Action: ActionAttach, CapabilityKind: CapabilityResource, UATScope: "agent:attach", AgentScopes: []string{"project:agent:lifecycle"}, Description: "Attach to agent sessions (terminal, exec, env, reset-auth)", Enforcement: []string{"pkg/hub/authorize.go:authorizeAgentLifecycle", "pkg/hub/pty_handlers.go", "pkg/hub/authorize_agentkeys.go:authorizeAgentKeys"}, ExcludeFromManageAlias: true},
+	{ID: "agent.lifecycle", Resource: ResourceAgent, Action: ActionLifecycle, CapabilityKind: CapabilityResource, UATScope: "agent:lifecycle", AgentScopes: []string{"project:agent:lifecycle"}, Description: "Start, stop, suspend, restart, restore, and reincarnate agents", Enforcement: []string{"pkg/hub/authorize.go:authorizeAgentLifecycle", "pkg/hub/handlers_agents_core.go:handleAgentAction", "pkg/hub/handlers_agent_reincarnate.go:authorizeAgentReincarnate"}},
+	{ID: "agent.port_access", Resource: ResourceAgent, Action: ActionPortAccess, CapabilityKind: CapabilityResource, UATScope: "agent:port_access", Description: "Access agent forwarded ports", Enforcement: []string{"pkg/hub/port_forward_handlers.go"}, ExcludeFromManageAlias: true},
 	{ID: "agent.stop_all", Resource: ResourceAgent, Action: ActionStopAll, CapabilityKind: CapabilityScope, Description: "Stop all agents", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
 	{ID: "agent.message", Resource: ResourceAgent, Action: ActionMessage, CapabilityKind: CapabilityScope, UATScope: "agent:message", Description: "Send messages to agents", NonRouteUse: []string{"Phase 2: pkg/hub/authorize.go:authorizeAgentMessage"}},
-	{ID: "agent.set_message_mode", Resource: ResourceAgent, Action: ActionSetMessageMode, CapabilityKind: CapabilityResource, Description: "Change agent message mode", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
+	{ID: "agent.set_message_mode", Resource: ResourceAgent, Action: ActionSetMessageMode, CapabilityKind: CapabilityResource, AgentScopes: []string{"project:agent:set_message_mode"}, Description: "Change agent message mode", Enforcement: []string{"pkg/hub/handlers_agents_core.go"}},
+	{ID: "agent.grant_hub_mode", Resource: ResourceAgent, Action: "grant_hub_mode", CapabilityKind: CapabilityResource, Description: "Grant hub message mode (requires full role + hub mode for agent callers)", Enforcement: []string{"pkg/hub/authorize_message_mode_grant.go"}},
+	{ID: "agent.delegation.create", Resource: ResourceAgent, Action: ActionDelegationCreate, Description: "Issue an agent delegation grant to an agent the issuer controls", Enforcement: []string{"pkg/hub/handlers_agent_delegation.go:handleCreateAgentDelegation"}},
+	{ID: "agent.delegation.exchange", Resource: ResourceAgent, Action: ActionDelegationExchange, Description: "Exchange an agent delegation grant for a delegated credential (the bound agent, with its own agent token; no role binding is consulted)", Enforcement: []string{"pkg/hub/handlers_agent_delegation.go:handleExchangeAgentDelegation"}},
+	{ID: "agent.delegation.revoke", Resource: ResourceAgent, Action: ActionDelegationRevoke, Description: "Revoke an agent delegation grant: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
+	{ID: "agent.delegation.credential.revoke", Resource: ResourceAgent, Action: ActionDelegationCredentialRevoke, Description: "Revoke one delegated credential of an agent delegation grant: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
+	{ID: "agent.delegation.list", Resource: ResourceAgent, Action: ActionDelegationList, Description: "List agent delegation grants: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
+	{ID: "agent.delegation.read", Resource: ResourceAgent, Action: ActionDelegationRead, Description: "Read an agent delegation grant: on the hub for any grant, on a project for grants bounded to that project", Enforcement: []string{"pkg/hub/handlers_agent_delegation_manage.go:agentDelegationControlAllowed"}},
 
 	{ID: "project.create", Resource: ResourceProject, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
 	{ID: "project.read", Resource: ResourceProject, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "project:read", AgentScopes: []string{"project:read"}, Description: "Read project metadata", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go"}},
 	{ID: "project.update", Resource: ResourceProject, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "project:update", Description: "Update projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/authz.go"}},
 	{ID: "project.delete", Resource: ResourceProject, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
-	{ID: "project.manage", Resource: ResourceProject, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "project:manage", Description: "Manage project administration (RS1 membership operations)", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
+	{ID: "project.manage", Resource: ResourceProject, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "project:manage", Description: "Manage project administration (RS1 membership operations)", Enforcement: []string{"pkg/hub/handlers_projects_core.go", "pkg/hub/artifacts_host.go:func (h *artifactHost) MayGrantReview"}},
 	{ID: "project.register", Resource: ResourceProject, Action: ActionRegister, CapabilityKind: CapabilityResource, Description: "Register projects", Enforcement: []string{"pkg/hub/handlers_projects_core.go"}},
+	{ID: "project.set_messaging_policy", Resource: ResourceProject, Action: "set_messaging_policy", CapabilityKind: CapabilityResource, UATScope: "project:set_messaging_policy", Description: "Set project cross-project messaging policy (owner/admin only)", Enforcement: []string{"pkg/hub/project_messaging_policy.go"}},
+
+	{ID: "artifact.read", Resource: ResourceArtifact, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "artifact:read", AgentScopes: []string{"project:artifact:read"}, Description: "Read artifacts", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/read.go:PermissionRead"}},
+	{ID: "artifact.create", Resource: ResourceArtifact, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "artifact:create", AgentScopes: []string{"project:artifact:write"}, Description: "Publish artifacts", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/publish.go:PermissionCreate", "pkg/artifacts/versions.go:PermissionCreate"}},
+	{ID: "artifact.update", Resource: ResourceArtifact, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "artifact:update", Description: "Edit artifact metadata (title, key, expiry)", Reserved: "no artifact route checks artifact.update; PATCH on an artifact is gated by artifact.manage (canAdminister)"},
+	{ID: "artifact.delete", Resource: ResourceArtifact, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "artifact:delete", Description: "Delete artifacts", Reserved: "no artifact route checks artifact.delete; DELETE on an artifact is gated by artifact.manage (ptone/scion#4529)"},
+	{ID: "artifact.manage", Resource: ResourceArtifact, Action: ActionManage, CapabilityKind: CapabilityResource, UATScope: "artifact:manage", Description: "Manage artifact grants and share links", Enforcement: []string{"pkg/hub/artifacts_host.go:func (h *artifactHost) Authorize", "pkg/artifacts/links.go:func (s *Service) canAdminister", "pkg/artifacts/grants.go:func (s *Service) reviewGrantSubject", "pkg/artifacts/retire.go:func (s *Service) retireAuthority"}},
 
 	{ID: "skill.create", Resource: ResourceSkill, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "skill:create", Description: "Create skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.read", Resource: ResourceSkill, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "skill:read", Description: "Read skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.create_global", Resource: ResourceSkill, Action: ActionCreateGlobal, CapabilityKind: CapabilityScope, Description: "Create skills in the global (hub) catalog", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.read", Resource: ResourceSkill, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "skill:read", AgentScopes: []string{"project:read"}, Description: "Read skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.update", Resource: ResourceSkill, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "skill:update", Description: "Update skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 	{ID: "skill.delete", Resource: ResourceSkill, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "skill:delete", Description: "Delete skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
-	{ID: "skill.list", Resource: ResourceSkill, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "skill:list", Description: "List skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
+	{ID: "skill.list", Resource: ResourceSkill, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "skill:list", AgentScopes: []string{"project:read"}, Description: "List skills", Enforcement: []string{"pkg/hub/skill_handlers.go"}},
 
 	{ID: "template.create", Resource: ResourceTemplate, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "template:create", AgentScopes: []string{"project:template:write"}, Description: "Create templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
 	{ID: "template.read", Resource: ResourceTemplate, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "template:read", AgentScopes: []string{"project:read"}, Description: "Read templates", Enforcement: []string{"pkg/hub/template_handlers.go"}},
@@ -154,7 +258,7 @@ var Registry = []Permission{
 	{ID: "group.addMember", Resource: ResourceGroup, Action: ActionAddMember, CapabilityKind: CapabilityResource, UATScope: "group:addMember", Description: "Add group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
 	{ID: "group.removeMember", Resource: ResourceGroup, Action: ActionRemoveMember, CapabilityKind: CapabilityResource, UATScope: "group:removeMember", Description: "Remove group members", Enforcement: []string{"pkg/hub/handlers_groups.go"}},
 
-	{ID: "user.read", Resource: ResourceUser, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "user:read", Description: "Read users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
+	{ID: "user.read", Resource: ResourceUser, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "user:read", Description: "Read users", Enforcement: []string{"pkg/hub/handlers_users_core.go", "pkg/hub/handlers_users_provision.go:handleProvisionUser"}},
 	{ID: "user.update", Resource: ResourceUser, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 
 	{ID: "policy.create", Resource: ResourcePolicy, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create policies", Enforcement: []string{"pkg/hub/handlers_policies.go", "pkg/hub/route_metadata.go:requireAdmin"}},
@@ -163,11 +267,22 @@ var Registry = []Permission{
 	{ID: "policy.delete", Resource: ResourcePolicy, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete policies", Enforcement: []string{"pkg/hub/handlers_policies.go", "pkg/hub/route_metadata.go:requireAdmin"}},
 	{ID: "policy.list", Resource: ResourcePolicy, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List policies", Enforcement: []string{"pkg/hub/handlers_policies.go", "pkg/hub/route_metadata.go:requireAdmin"}},
 
-	{ID: "broker.create", Resource: ResourceBroker, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
+	// broker.create is a hub-level permission: registration is gated by an
+	// explicit hub-member role grant (seed.go hubMemberPermissionIDs), not by
+	// mere authentication. Its UAT selector "broker:create" is mintable only
+	// on a hub-boundary token (PermissionAllowedBoundaries). Registration is
+	// admitted for interactive sessions, dev credentials and hub-boundary
+	// UATs carrying broker:create, through the bearer gate
+	// (authorizeBrokerCreate).
+	{ID: "broker.create", Resource: ResourceBroker, Action: ActionCreate, CapabilityKind: CapabilityScope, UATScope: "broker:create", Description: "Create brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go:authorizeBrokerCreate", "pkg/hub/handlers_projects_core.go"}},
 	{ID: "broker.read", Resource: ResourceBroker, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "broker:read", Description: "Read brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.update", Resource: ResourceBroker, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.delete", Resource: ResourceBroker, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 	{ID: "broker.list", Resource: ResourceBroker, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "broker:list", Description: "List brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
+	// broker.auto_provide gates turning on a broker's auto-provide setting,
+	// which offers the broker to every project on the hub. It has no UAT
+	// selector, so a user access token never carries it.
+	{ID: "broker.auto_provide", Resource: ResourceBroker, Action: ActionAutoProvide, CapabilityKind: CapabilityScope, Description: "Offer a broker to every project (auto-provide)", Enforcement: []string{"pkg/hub/handlers_brokers.go:authorizeBrokerAutoProvide"}},
 	{ID: "broker.dispatch", Resource: ResourceBroker, Action: ActionDispatch, CapabilityKind: CapabilityResource, Description: "Dispatch through brokers", Enforcement: []string{"pkg/hub/handlers_brokers.go"}},
 
 	{ID: "gcp_service_account.create", Resource: ResourceGCPServiceAccount, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
@@ -176,38 +291,52 @@ var Registry = []Permission{
 	{ID: "gcp_service_account.list", Resource: ResourceGCPServiceAccount, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "gcp_service_account:list", Description: "List GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.verify", Resource: ResourceGCPServiceAccount, Action: ActionVerify, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:verify", Description: "Verify GCP service accounts", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
 	{ID: "gcp_service_account.mint", Resource: ResourceGCPServiceAccount, Action: ActionMint, CapabilityKind: CapabilityScope, Description: "Mint GCP service account tokens", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go"}},
-	{ID: "gcp_service_account.assign", Resource: ResourceGCPServiceAccount, Action: ActionAssign, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:assign", AgentScopes: []string{"project:agent:create"}, Description: "Assign GCP service accounts to agents", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go", "pkg/hub/authz.go"}},
+	// AgentScopes names project:agent:sa_assign only, its own agent scope
+	// distinct from project:agent:create (ptone/scion#2339): a ceiling that
+	// covers agent.create does not thereby cover this permission, and vice
+	// versa. authz.go's effectiveAgentScopes adds project:agent:sa_assign for
+	// a verified agent JWT signed before the split that holds
+	// project:agent:create, so such a token keeps authorizing this
+	// permission.
+	{ID: "gcp_service_account.assign", Resource: ResourceGCPServiceAccount, Action: ActionAssign, CapabilityKind: CapabilityResource, UATScope: "gcp_service_account:assign", AgentScopes: []string{"project:agent:sa_assign"}, Description: "Assign GCP service accounts to agents", Enforcement: []string{"pkg/hub/handlers_gcp_identity.go", "pkg/hub/authz.go"}},
 
 	// Hub resource type — hub-level administrative operations (Phase 2 D4 resolution)
 	{ID: "hub.settings.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read hub settings", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.settings.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update hub settings", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.config.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read server configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.config.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update server configuration", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.settings.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_settings:update", Description: "Update hub settings", Enforcement: []string{"pkg/hub/handlers_skills_injection.go:setHubInjectedSkills"}},
+	{ID: "hub.config.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_config:read", Description: "Read server configuration", Enforcement: []string{"pkg/hub/route_metadata.go:admin.serverConfig", "pkg/hub/admin_settings.go:handleAdminServerConfig"}},
+	{ID: "hub.config.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_config:update", Description: "Update server configuration", Enforcement: []string{"pkg/hub/admin_settings.go:handleAdminServerConfig", "pkg/hub/admin_settings.go:handleAdminServerConfigSectionReset"}},
 	{ID: "hub.maintenance.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Execute maintenance operations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.diagnostics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read diagnostics and logs", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.health.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read health summary", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.admin_mode.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read admin mode state", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.admin_mode.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update admin mode", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.integrations.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read integrations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.integrations.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update integrations", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.lifecycle_hooks.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read lifecycle hooks", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.lifecycle_hooks.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update lifecycle hooks", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.allow_list.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read allow list", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.allow_list.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update allow list", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.project_defaults.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read project defaults", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.project_defaults.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update project defaults", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.diagnostics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_diagnostics:read", Description: "Read diagnostics and logs", Enforcement: []string{"pkg/hub/route_metadata.go:admin.diagnostics.logs", "pkg/hub/route_metadata.go:admin.diagnostics.logsStream", "pkg/hub/route_metadata.go:admin.messaging.divergence", "pkg/hub/handlers_diagnostics.go:handleDiagnosticsLogsStream"}},
+	{ID: "hub.health.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_health:read", Description: "Read health summary", Enforcement: []string{"pkg/hub/route_metadata.go:admin.health.summary", "pkg/hub/route_metadata.go:admin.gcpQuota"}},
+	{ID: "hub.admin_mode.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read admin mode state", Enforcement: []string{"pkg/hub/route_metadata.go:admin.maintenance"}},
+	{ID: "hub.admin_mode.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update admin mode", NonRouteUse: []string{"PUT in pkg/hub/admin_mode.go:handleAdminMaintenance; the route guard checks hub.admin_mode.read"}},
+	{ID: "hub.integrations.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_integrations:read", Description: "Read integrations", Enforcement: []string{"pkg/hub/route_metadata.go:admin.integrations", "pkg/hub/route_metadata.go:admin.integrations.byName"}},
+	{ID: "hub.integrations.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_integrations:update", Description: "Update integration settings and restart integrations (install, update and credential settings need an interactive session)", Enforcement: []string{"pkg/hub/handlers_integrations.go:handleAdminIntegrationByName"}},
+	{ID: "hub.lifecycle_hooks.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_lifecycle_hooks:read", Description: "Read lifecycle hooks", Enforcement: []string{"pkg/hub/route_metadata.go:admin.lifecycleHooks", "pkg/hub/hub_pre_start_hook_handlers.go:isHubAdminIdentity"}},
+	{ID: "hub.lifecycle_hooks.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_lifecycle_hooks:update", Description: "Update lifecycle hooks", Enforcement: []string{"pkg/hub/handlers_lifecycle_hooks.go:handleAdminLifecycleHooks", "pkg/hub/hub_pre_start_hook_handlers.go:requireHubAdmin"}},
+	{ID: "hub.allow_list.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read allow list", Enforcement: []string{"pkg/hub/route_metadata.go:admin.allowList", "pkg/hub/route_metadata.go:admin.allowList.byEmail"}},
+	{ID: "hub.allow_list.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update allow list", NonRouteUse: []string{"writes in pkg/hub/admin_allow_list.go; the route guard checks hub.allow_list.read"}},
+	{ID: "hub.project_defaults.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_project_defaults:read", Description: "Read project defaults", Enforcement: []string{"pkg/hub/route_metadata.go:admin.projectDefaults"}},
+	{ID: "hub.project_defaults.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_project_defaults:update", Description: "Update project defaults", Enforcement: []string{"pkg/hub/admin_project_defaults.go:handleAdminProjectDefaults"}},
+	{ID: "hub.messaging.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_messaging:update", Description: "Update messaging switches", Enforcement: []string{"pkg/hub/route_metadata.go:admin.messaging", "pkg/hub/admin_messaging.go:handleAdminMessaging"}},
+	{ID: "hub.experiments.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_experiments:update", Description: "Read and update hub-wide experiment overrides", Enforcement: []string{"pkg/hub/route_metadata.go:admin.experiments", "pkg/hub/admin_experiments.go:handleAdminExperiments"}},
+	{ID: "hub.conduit_grant_keys.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Rotate the conduit grant signing key", Enforcement: []string{"pkg/hub/route_metadata.go:admin.conduit.grantKeys.rotate", "pkg/hub/conduit_grants.go:handleAdminConduitGrantKeyRotate"}},
 	{ID: "hub.auth_reset.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Reset all auth", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.scheduler.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read scheduler", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.scheduler.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_scheduler:read", Description: "Read scheduler", Enforcement: []string{"pkg/hub/route_metadata.go:admin.scheduler"}},
 	{ID: "hub.scheduler.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update scheduler", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.federation.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read federation config", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.federation.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update federation config", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.teams_manifest.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read teams manifest", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.teams_manifest.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update teams manifest", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.validate.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, Description: "Validate resources", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
-	{ID: "hub.github_app.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read GitHub app configuration", Enforcement: []string{"pkg/hub/route_metadata.go"}},
-	{ID: "hub.github_app.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update GitHub app configuration", Enforcement: []string{"pkg/hub/route_metadata.go"}},
-	{ID: "hub.metrics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read metrics dashboard", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "hub.federation.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read federation config", Reserved: "no route checks hub.federation.read"},
+	{ID: "hub.federation.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update federation config", Reserved: "no route checks hub.federation.update"},
+	{ID: "hub.teams_manifest.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_teams_manifest:read", Description: "Read teams manifest", Enforcement: []string{"pkg/hub/route_metadata.go:admin.integrations.teamsManifest"}},
+	{ID: "hub.teams_manifest.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, Description: "Update teams manifest", Reserved: "no route checks hub.teams_manifest.update; the teams manifest route checks hub.teams_manifest.read"},
+	{ID: "hub.validate.execute", Resource: ResourceHub, Action: ActionExecute, CapabilityKind: CapabilityScope, UATScope: "hub_validate:execute", Description: "Validate resources", Enforcement: []string{"pkg/hub/route_metadata.go:admin.validateResources"}},
+	{ID: "hub.github_app.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:read", Description: "Read GitHub app configuration", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.config.read", "pkg/hub/route_metadata.go:githubApp.installations.list", "pkg/hub/route_metadata.go:githubApp.installations.read"}},
+	{ID: "hub.github_app.update", Resource: ResourceHub, Action: ActionUpdate, CapabilityKind: CapabilityScope, UATScope: "hub_github_app:update", Description: "Manage GitHub App installations, discover and sync permissions (configuration updates need an interactive session)", Enforcement: []string{"pkg/hub/route_metadata.go:githubApp.installations.create", "pkg/hub/route_metadata.go:githubApp.installations.update", "pkg/hub/route_metadata.go:githubApp.installations.delete", "pkg/hub/route_metadata.go:githubApp.installations.discover", "pkg/hub/route_metadata.go:githubApp.syncPermissions"}},
+	{ID: "hub.metrics.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, UATScope: "hub_metrics:read", Description: "Read metrics dashboard", Enforcement: []string{"pkg/hub/route_metadata.go:admin.metricsDashboard", "pkg/hub/route_metadata.go:admin.metricsDashboard.legacy"}},
+	{ID: "hub.env_vars.read", Resource: ResourceHub, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "List hub-level environment variables (read only; excludes secrets)", Enforcement: []string{"pkg/hub/handlers_env_secrets.go:listEnvVars"}},
 	{ID: "hub.audit.read", Resource: ResourceHub, Action: ActionManage, CapabilityKind: CapabilityNone, Description: "Explain authorization decisions for other principals (super-admin only)", NonRouteUse: []string{"audit_authz.go explain-for-other-principal gate"}},
+	{ID: "test_identity.issue", Resource: ResourceTestIdentity, Action: ActionIssue, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue", Description: "Issue short-lived synthetic member or viewer test identities (only when the hub runs with --enable-test-identities)", Enforcement: []string{"pkg/hub/route_metadata.go:testIdentities.create", "pkg/hub/route_metadata.go:testIdentities.list", "pkg/hub/route_metadata.go:testIdentities.token", "pkg/hub/route_metadata.go:testIdentities.webLoginCode", "pkg/hub/route_metadata.go:testIdentities.delete", "pkg/hub/route_metadata.go:testIdentityDelegations.create", "pkg/hub/route_metadata.go:testIdentityDelegations.list", "pkg/hub/route_metadata.go:testIdentityDelegations.revoke", "pkg/hub/handlers_test_identities.go:testIdentityCaller", "pkg/hub/handlers_test_identity_delegations.go:testIdentityDelegationCaller"}},
+	{ID: "test_identity.issue_admin", Resource: ResourceTestIdentity, Action: ActionIssueAdmin, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue_admin", Description: "Issue short-lived test identities holding an expiring hub-admin role (only on hubs started with the test admin gate); held only by super-admin", Enforcement: []string{"pkg/hub/route_metadata.go:testIdentities.admin.create", "pkg/hub/route_metadata.go:testIdentities.admin.revokeAll", "pkg/hub/handlers_test_admin_identities.go:testAdminIssuer"}},
+	{ID: "test_identity.issue_super_admin", Resource: ResourceTestIdentity, Action: ActionIssueSuperAdmin, CapabilityKind: CapabilityScope, UATScope: "test_identity:issue_super_admin", Description: "Issue short-lived test identities holding an expiring super-admin role (refused until the admin tier's policy phase)", Reserved: "no role holds it until admin tier phase A2: test super-admin issuance answers 404 while its gate is refused, and testAdminIssuer's capability check therefore never admits a caller"},
 
 	// Quota management (Phase 2B — Limits/Quotas)
 	{ID: "quota.read", Resource: ResourceQuota, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read limit definitions, entitlements, and usage", Enforcement: []string{"pkg/hub/handlers_quota.go"}},
@@ -229,29 +358,75 @@ var Registry = []Permission{
 	{ID: "access_constraint.read", Resource: ResourceAccessConstraint, Action: ActionRead, CapabilityKind: CapabilityScope, Description: "Read access constraints", Enforcement: []string{"pkg/hub/handlers_access_constraints.go"}},
 
 	// Scheduled event / recurring schedule permissions (project-scoped)
-	{ID: "scheduled_event.read", Resource: ResourceScheduledEvent, Action: ActionRead, CapabilityKind: CapabilityResource, Description: "Read a scheduled event", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
-	{ID: "scheduled_event.list", Resource: ResourceScheduledEvent, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List scheduled events", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
+	{ID: "scheduled_event.read", Resource: ResourceScheduledEvent, Action: ActionRead, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:read", Description: "Read a scheduled event", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
+	{ID: "scheduled_event.list", Resource: ResourceScheduledEvent, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "scheduled_event:list", Description: "List scheduled events", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
 	{ID: "scheduled_event.create", Resource: ResourceScheduledEvent, Action: ActionCreate, CapabilityKind: CapabilityScope, Description: "Create a scheduled event", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
-	{ID: "scheduled_event.delete", Resource: ResourceScheduledEvent, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Cancel a scheduled event or delete a schedule", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
-	{ID: "scheduled_event.update", Resource: ResourceScheduledEvent, Action: ActionUpdate, CapabilityKind: CapabilityResource, Description: "Update a recurring schedule", Enforcement: []string{"pkg/hub/handlers_schedules.go"}},
+	{ID: "scheduled_event.delete", Resource: ResourceScheduledEvent, Action: ActionDelete, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:delete", Description: "Cancel a scheduled event or delete a schedule", Enforcement: []string{"pkg/hub/handlers_scheduled_events.go", "pkg/hub/handlers_schedules.go"}},
+	{ID: "scheduled_event.update", Resource: ResourceScheduledEvent, Action: ActionUpdate, CapabilityKind: CapabilityResource, UATScope: "scheduled_event:update", Description: "Update, pause or resume a recurring schedule (a user access token may only pause)", Enforcement: []string{"pkg/hub/handlers_schedules.go"}},
 
 	// Extensions to existing resource types (Phase 2 D4 resolution)
-	{ID: "user.invite", Resource: ResourceUser, Action: ActionInvite, CapabilityKind: CapabilityScope, UATScope: "user:invite", Description: "Invite users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.invite", Resource: ResourceUser, Action: ActionInvite, CapabilityKind: CapabilityScope, UATScope: "user:invite", Description: "Invite users", Enforcement: []string{"pkg/hub/handlers_users_provision.go:handleProvisionUser"}, NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 	{ID: "user.suspend", Resource: ResourceUser, Action: ActionSuspend, CapabilityKind: CapabilityResource, Description: "Suspend users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 	{ID: "user.promote", Resource: ResourceUser, Action: ActionPromote, CapabilityKind: CapabilityResource, Description: "Promote or demote users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
 	{ID: "user.delete", Resource: ResourceUser, Action: ActionDelete, CapabilityKind: CapabilityResource, Description: "Delete users", Enforcement: []string{"pkg/hub/handlers_users_core.go"}},
-	{ID: "user.list", Resource: ResourceUser, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "user:list", Description: "List users", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
+	{ID: "user.list", Resource: ResourceUser, Action: ActionList, CapabilityKind: CapabilityScope, UATScope: "user:list", Description: "List users", Reserved: "no route checks user.list"},
 	{ID: "project.clone", Resource: ResourceProject, Action: ActionClone, CapabilityKind: CapabilityResource, UATScope: "project:clone", Description: "Clone projects", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 	{ID: "project.list", Resource: ResourceProject, Action: ActionList, CapabilityKind: CapabilityScope, Description: "List projects", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 	{ID: "skill.register", Resource: ResourceSkill, Action: ActionRegister, CapabilityKind: CapabilityScope, UATScope: "skill:register", Description: "Register skills in registries", NonRouteUse: []string{"Phase 2 D4 route guard conversion"}},
 
 	{ID: "agent.status_update", Resource: ResourceAgent, Action: "status_update", AgentScopes: []string{"agent:status:update"}, Description: "Update own agent status", NonRouteUse: []string{"agent token self-status endpoint"}},
-	{ID: "agent.log_append", Resource: ResourceAgent, Action: "log_append", AgentScopes: []string{"agent:log:append"}, Description: "Append own agent logs", NonRouteUse: []string{"agent token log append endpoint"}},
+	{ID: "agent.log_append", Resource: ResourceAgent, Action: "log_append", Description: "Append own agent logs", Reserved: "no handler checks agent.log_append; the agent:log:append agent scope maps to no permission while it is reserved"},
 	{ID: "project.secret_read", Resource: ResourceProject, Action: "secret_read", AgentScopes: []string{"project:secret:read"}, Description: "Read project secrets", NonRouteUse: []string{"agent secret/env resolution"}},
 	{ID: "agent.notify", Resource: ResourceAgent, Action: "notify", AgentScopes: []string{"project:agent:notify"}, Description: "Manage own notification subscriptions", NonRouteUse: []string{"agent notification endpoints"}},
 	{ID: "agent.token_refresh", Resource: ResourceAgent, Action: "token_refresh", AgentScopes: []string{"agent:token:refresh"}, Description: "Refresh own agent token", NonRouteUse: []string{"agent token refresh endpoint"}},
 	{ID: "agent.port_forward", Resource: ResourceAgent, Action: "port_forward", AgentScopes: []string{"agent:port:forward"}, Description: "Register and hold forwarded ports", NonRouteUse: []string{"agent port tunnel endpoints"}},
 	{ID: "agent.identity_token", Resource: ResourceAgent, Action: "identity_token", AgentScopes: []string{"agent:identity:token"}, Description: "Request OIDC identity tokens", NonRouteUse: []string{"agent identity token endpoint"}},
+
+	// Material delivery and runtime-use permissions (ptone/scion#2129).
+	// *.deliver governs launch-time delivery of a secret, stored environment
+	// variable or stored skill reference to a target agent. It carries no
+	// AgentScopes and is intended for the internal hub-delivery credential
+	// only (ptone/scion#2228), never an agent JWT. Holding *.deliver through a
+	// role never substitutes for the association, progeny or skill-default
+	// grant required for the selected item.
+	// secret.use governs an agent's own runtime retrieval and is admitted
+	// under an agent JWT via the AgentScopes mapping below. gcp_service_account.use
+	// keeps AgentScopes nil: the GCP token scope names one service account
+	// instance (project:gcp:token:<sa-id>), so its agent-credential admission
+	// is decided per resource instead of from this permission's static
+	// scope list. See pkg/hub/authz.go's agent-scope restriction and its
+	// request-local synthetic grant, both keyed on PermissionGCPServiceAccountUse.
+	{ID: "secret.deliver", Resource: ResourceSecret, Action: ActionDeliver, Description: "Deliver a secret to an agent at launch", NonRouteUse: []string{"material delivery grant evaluation"}},
+	{ID: "env_var.deliver", Resource: ResourceEnvVar, Action: ActionDeliver, Description: "Deliver a stored environment variable to an agent at launch", NonRouteUse: []string{"material delivery grant evaluation"}},
+	{ID: "skill_injection.deliver", Resource: ResourceSkillInjection, Action: ActionDeliver, Description: "Deliver a stored skill reference to an agent at launch", NonRouteUse: []string{"material delivery grant evaluation"}},
+	{ID: "secret.use", Resource: ResourceSecret, Action: ActionUse, AgentScopes: []string{"project:secret:read"}, Description: "Retrieve a secret value at runtime by key", Enforcement: []string{"pkg/hub/material_runtime.go"}},
+	{ID: "gcp_service_account.use", Resource: ResourceGCPServiceAccount, Action: ActionUse, Description: "Mint a token as an assigned GCP service account", NonRouteUse: []string{"GCP token mint request"}},
+
+	// Self-scoped permissions act only on the holder's own records. A user
+	// access token needs the exact selector, and the target checks in
+	// Server.authorizeSelfScoped apply. Mint eligibility is "the issuer is
+	// an active user"; see permissions.IsSelfPermission.
+	{ID: "inbox.read", Resource: ResourceInbox, Action: ActionRead, UATScope: "inbox:read", Description: "Read your own inbox, notifications and direct messages", Enforcement: []string{"pkg/hub/authorize.go:authorizeSelfScoped", "pkg/hub/handlers_messages.go", "pkg/hub/handlers_conversations.go", "pkg/hub/handlers_conversation_resolve.go", "pkg/hub/handlers_notifications.go"}},
+	{ID: "inbox.write", Resource: ResourceInbox, Action: ActionWrite, UATScope: "inbox:write", Description: "Send, change and remove your own inbox items and direct messages", Enforcement: []string{"pkg/hub/authorize.go:authorizeSelfScoped", "pkg/hub/handlers_messages.go", "pkg/hub/handlers_conversations.go", "pkg/hub/handlers_notifications.go"}},
+	{ID: "user_skill_injection.update", Resource: ResourceUserSkillInjection, Action: ActionUpdate, UATScope: "user_skill_injection:update", Description: "Change the skills injected into your own agents", Enforcement: []string{"pkg/hub/authorize.go:authorizeSelfScoped", "pkg/hub/handlers_skills_injection.go"}},
+}
+
+// IsReserved reports whether p is a reserved row (see Permission.Reserved).
+// A blank or whitespace-only Reserved does not count.
+func (p Permission) IsReserved() bool {
+	return strings.TrimSpace(p.Reserved) != ""
+}
+
+// ReservedIDs returns the IDs of the Reserved registry rows, in registry
+// order.
+func ReservedIDs() []string {
+	var out []string
+	for _, p := range Registry {
+		if p.IsReserved() {
+			out = append(out, p.ID)
+		}
+	}
+	return out
 }
 
 // ResourceActions returns item-level capability actions keyed by resource type.
@@ -304,10 +479,12 @@ func UATManageScopesFor(resource string) []string {
 }
 
 // UATScopeOptions returns UAT scopes with display metadata for CLI/UI surfaces.
+// Reserved permissions are left out: their scopes stay valid for existing
+// tokens (UATValidScopes) but are not offered.
 func UATScopeOptions(includeAliases bool) []Permission {
 	var out []Permission
 	for _, permission := range Registry {
-		if permission.UATScope != "" {
+		if permission.UATScope != "" && !permission.IsReserved() {
 			out = append(out, permission)
 		}
 	}
@@ -355,9 +532,301 @@ func UATScopeHelp() string {
 func uatScopesForResource(resource string) []string {
 	var out []string
 	for _, permission := range Registry {
-		if permission.Resource == resource && permission.UATScope != "" {
+		if permission.Resource == resource && permission.UATScope != "" && !permission.ExcludeFromManageAlias && !permission.IsReserved() {
 			out = append(out, permission.UATScope)
 		}
 	}
 	return out
+}
+
+// BoundaryKind identifies the credential-side boundary a UAT is issued
+// under: confined to one project, or spanning the hub (including
+// cross-project use, subject to the holder's live authority on each
+// resolved target — see pkg/hub/authz_boundary.go). The dependency-neutral
+// credentialmeta package owns the canonical enum so permissions and audit
+// metadata cannot drift. pkg/hub aliases this type through permissions.
+type BoundaryKind = credentialmeta.BoundaryKind
+
+const (
+	BoundaryKindProject = credentialmeta.BoundaryProject
+	BoundaryKindHub     = credentialmeta.BoundaryHub
+)
+
+// ValidBoundary is defined in project_applicability.go (shared with
+// pkg/store, which cannot import pkg/hub).
+
+// SelectorMapping is the resolved, explicit mapping from one published
+// token selector (an ordinary UAT scope or a manage alias such as
+// "agent:manage") to the canonical permission ID(s) it carries and the
+// boundary kinds it may be issued under. PermissionIDs has exactly one
+// entry for an ordinary selector and one entry per expanded scope for a
+// manage alias. AllowedBoundaries is the intersection of
+// SelectorAllowedBoundaries (project_applicability.go) across every ID in
+// PermissionIDs — a separate, independently hand-reviewed table, not
+// derived from Permission.Resource/Action.
+//
+// This table is derived from the existing Permission.UATScope field and
+// UATManageAliases/UATManageScopesFor, not a second hand-maintained
+// selector vocabulary: a resource:action reconstruction would silently
+// collapse two permissions sharing a resource/action pair (e.g.
+// hub.settings.read and hub.config.read, both {hub, read}) into one
+// selector once either becomes UAT-selectable. Mint resolves selectors
+// through this table, and runtime authorization and delegation enforce the
+// ceiling persisted from that resolution.
+type SelectorMapping struct {
+	Selector          string
+	PermissionIDs     []string
+	AllowedBoundaries []BoundaryKind
+}
+
+var (
+	selectorRegistry     map[string]SelectorMapping
+	selectorRegistryOnce sync.Once
+)
+
+// buildSelectorRegistry constructs the selector table from Registry and
+// UATManageAliases. A selector is only added to the table when every
+// expanded permission ID has a reviewed SelectorAllowedBoundaries entry and
+// the intersection of those boundary sets is non-empty; a selector missing
+// that review, or whose reviewed boundaries never agree, is simply absent
+// from the map (ResolveSelector then reports ok=false) rather than silently
+// getting an empty or partially-reviewed AllowedBoundaries. It is
+// deterministic and side-effect free; callers must not mutate the returned
+// map (ResolveSelector caches it).
+func buildSelectorRegistry() map[string]SelectorMapping {
+	type pending struct {
+		selector string
+		ids      []string
+	}
+	var candidates []pending
+
+	for _, p := range Registry {
+		if p.UATScope == "" {
+			continue
+		}
+		candidates = append(candidates, pending{selector: p.UATScope, ids: []string{p.ID}})
+	}
+
+	// Manage aliases expand to their concrete scopes via the existing
+	// UATManageScopesFor, which already excludes ExcludeFromManageAlias
+	// scopes (e.g. agent:attach, agent:port_access stay outside
+	// agent:manage).
+	byScope := make(map[string][]string, len(candidates))
+	for _, c := range candidates {
+		byScope[c.selector] = c.ids
+	}
+	aliases := make([]string, 0, len(UATManageAliases))
+	for alias := range UATManageAliases {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	for _, alias := range aliases {
+		resource := UATManageAliases[alias]
+		var ids []string
+		for _, scope := range UATManageScopesFor(resource) {
+			ids = append(ids, byScope[scope]...)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		candidates = append(candidates, pending{selector: alias, ids: ids})
+	}
+
+	out := make(map[string]SelectorMapping, len(candidates))
+	for _, c := range candidates {
+		boundaries, ok := intersectAllowedBoundaries(c.ids)
+		if !ok || len(boundaries) == 0 {
+			// Unreviewed permission ID, or the reviewed boundary sets for
+			// this alias's members never agree: fail closed by omitting
+			// the selector entirely rather than guessing.
+			continue
+		}
+		out[c.selector] = SelectorMapping{
+			Selector:          c.selector,
+			PermissionIDs:     c.ids,
+			AllowedBoundaries: boundaries,
+		}
+	}
+	return out
+}
+
+// intersectAllowedBoundaries returns the intersection of
+// SelectorAllowedBoundaries across every ID in ids. ok is false if any ID
+// lacks a reviewed entry. An empty ids yields no boundaries and ok=false:
+// there is nothing to intersect, so the function has no basis for allowing
+// any boundary.
+func intersectAllowedBoundaries(ids []string) (boundaries []BoundaryKind, ok bool) {
+	if len(ids) == 0 {
+		return nil, false
+	}
+	counts := make(map[BoundaryKind]int)
+	for _, id := range ids {
+		kinds, reviewed := SelectorAllowedBoundaries(id)
+		if !reviewed {
+			return nil, false
+		}
+		for _, k := range kinds {
+			counts[k]++
+		}
+	}
+	for _, k := range []BoundaryKind{BoundaryKindProject, BoundaryKindHub} {
+		if counts[k] == len(ids) {
+			boundaries = append(boundaries, k)
+		}
+	}
+	return boundaries, true
+}
+
+// ResolveSelector is the single lookup point from a published token selector
+// to its canonical permission ID(s) and allowed boundaries. Unknown,
+// unmapped, unreviewed, or (defensively) empty-after-expansion selectors
+// return ok=false — callers must fail closed rather than reconstruct a
+// selector from resource/action.
+//
+// ResolveSelector returns a COPY of the derived mapping: PermissionIDs and
+// AllowedBoundaries are cloned so a caller mutating the returned slices
+// cannot corrupt the process-wide cached selectorRegistry.
+func ResolveSelector(selector string) (SelectorMapping, bool) {
+	selectorRegistryOnce.Do(func() {
+		selectorRegistry = buildSelectorRegistry()
+	})
+	m, ok := selectorRegistry[selector]
+	if !ok || len(m.PermissionIDs) == 0 {
+		return SelectorMapping{}, false
+	}
+	m.PermissionIDs = slices.Clone(m.PermissionIDs)
+	m.AllowedBoundaries = slices.Clone(m.AllowedBoundaries)
+	return m, true
+}
+
+// ValidateSelectorRegistry compares the live, derived selector table against
+// a caller-supplied pinned expected snapshot (selector -> sorted permission
+// IDs). This is the actual "every selector maps explicitly" enforcement:
+// pure derivation from Permission.UATScope is safe only because UATScope
+// itself is a hand-authored literal per Registry entry (never derived from
+// Resource/Action), and this pin forces a human to update the test's
+// expected table — an explicit review act — whenever a Registry change
+// adds, removes, or retargets a UATScope or alias member. It also re-checks
+// the no-duplicate-UATScope invariant directly against Registry, independent
+// of the pinned snapshot.
+func ValidateSelectorRegistry(expected map[string][]string) error {
+	seenScopes := make(map[string]string) // UATScope -> Permission.ID
+	for _, p := range Registry {
+		if p.UATScope == "" {
+			continue
+		}
+		if owner, dup := seenScopes[p.UATScope]; dup {
+			return fmt.Errorf("duplicate UATScope %q claimed by both %q and %q", p.UATScope, owner, p.ID)
+		}
+		seenScopes[p.UATScope] = p.ID
+	}
+
+	selectorRegistryOnce.Do(func() {
+		selectorRegistry = buildSelectorRegistry()
+	})
+
+	if len(selectorRegistry) != len(expected) {
+		return fmt.Errorf("selector registry has %d entries, expected snapshot has %d", len(selectorRegistry), len(expected))
+	}
+	for selector, wantIDs := range expected {
+		m, ok := selectorRegistry[selector]
+		if !ok {
+			return fmt.Errorf("expected selector %q not present in derived registry", selector)
+		}
+		gotIDs := append([]string(nil), m.PermissionIDs...)
+		sort.Strings(gotIDs)
+		wantSorted := append([]string(nil), wantIDs...)
+		sort.Strings(wantSorted)
+		if len(gotIDs) != len(wantSorted) {
+			return fmt.Errorf("selector %q resolved to %v, want %v", selector, gotIDs, wantSorted)
+		}
+		for i := range gotIDs {
+			if gotIDs[i] != wantSorted[i] {
+				return fmt.Errorf("selector %q resolved to %v, want %v", selector, gotIDs, wantSorted)
+			}
+		}
+	}
+	for selector := range selectorRegistry {
+		if _, ok := expected[selector]; !ok {
+			return fmt.Errorf("derived registry has unexpected selector %q not present in pinned snapshot", selector)
+		}
+	}
+	return nil
+}
+
+// MintEligibilityKind names one way a permission can become eligible for
+// selection when minting a UAT restriction.
+type MintEligibilityKind string
+
+const (
+	// MintEligibilityFlatRole is the existing rule: the principal's current
+	// role grant includes this permission as a flat subset. Unchanged by
+	// A.1.
+	MintEligibilityFlatRole MintEligibilityKind = "flat_role"
+	// MintEligibilityRelationship means a relationship rule of a declared
+	// type (see MintEligibilitySource.RelationshipTypes) could justify this
+	// permission for this principal kind — not that a specific target
+	// already exists or has been checked.
+	MintEligibilityRelationship MintEligibilityKind = "relationship"
+)
+
+// MintEligibilitySource is one way a selector can become mintable. A
+// permission may declare more than one source; Sources are OR'd — any one
+// satisfied source makes the selector eligible for selection.
+type MintEligibilitySource struct {
+	Kind MintEligibilityKind
+	// RelationshipTypes names candidate relationship rule types (e.g.
+	// "owner", "ancestor"), matching the RelationshipType values B.1's
+	// resolver evaluates. Set only when Kind == MintEligibilityRelationship.
+	RelationshipTypes []string
+}
+
+// MintEligibilityDescriptor is what a UAT mint path and CLI/UI eligibility
+// display consume for one permission. It answers "may this authenticated
+// user select this restriction for this boundary," never "does a target
+// already exist" and never "is this a grant" — every later request against
+// a specific target still goes through full request-time authorization.
+//
+// It does NOT carry its own AllowedBoundaries or ActionAllowlist: those
+// would duplicate PermissionAllowedBoundaries/RelationshipPolicy — callers
+// derive boundaries via SelectorAllowedBoundaries(PermissionID) and derive
+// the action limit for a
+// MintEligibilityRelationship source via RelationshipPolicyAllows against
+// RelationshipPolicies (relationship_policy.go), the ONE shared authoring
+// surface B.1's runtime relationship-grant evaluator also reads — so there
+// is never a second, drifting allowlist.
+type MintEligibilityDescriptor struct {
+	PermissionID string
+	Sources      []MintEligibilitySource
+	// RequiresExistingTarget is false for resource-relative permissions
+	// such as agent.attach/agent.port_access: a member may mint the
+	// restriction before creating their first agent. The token gains no
+	// grant either way — every later request is independently authorized.
+	RequiresExistingTarget bool
+}
+
+// MintEligibilityRegistry declares mint eligibility for resource-relative
+// permissions reviewed for #2092 (creator/ancestor attach and port access).
+// Scope-wide/durable-authority permissions are not listed here; they keep
+// the existing flat role-permission-subset mint rule by default (callers
+// treat a PermissionID absent from this map as MintEligibilityFlatRole
+// only). Every MintEligibilityRelationship source's RelationshipTypes must
+// resolve to at least one MintEligible==true RelationshipPolicies row with a
+// matching ResourceType/PermissionID (consistency test in
+// relationship_policy_test.go).
+var MintEligibilityRegistry = map[string]MintEligibilityDescriptor{
+	"agent.attach": {
+		PermissionID: "agent.attach",
+		Sources: []MintEligibilitySource{
+			{Kind: MintEligibilityRelationship, RelationshipTypes: []string{"owner", "ancestor"}},
+		},
+		RequiresExistingTarget: false,
+	},
+	"agent.port_access": {
+		PermissionID: "agent.port_access",
+		Sources: []MintEligibilitySource{
+			{Kind: MintEligibilityRelationship, RelationshipTypes: []string{"owner", "ancestor"}},
+		},
+		RequiresExistingTarget: false,
+	},
 }

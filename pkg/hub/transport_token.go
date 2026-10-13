@@ -36,6 +36,12 @@ type TransportTokenMinter interface {
 	MintIDToken(ctx context.Context, audience string) (token string, expiry time.Time, err error)
 }
 
+// TransportMintFailedMessage is returned to an agent in the refresh
+// response's transportError field when the hub is configured to mint
+// transport tokens but could not mint one. It is deliberately generic; the
+// underlying error is logged on the hub.
+const TransportMintFailedMessage = "hub could not mint a transport token; see hub logs for the cause"
+
 // RefreshTokenEntry represents a single token in the generalized refresh response.
 // Used in both the refresh endpoint response and internally for dispatch payload construction.
 type RefreshTokenEntry struct {
@@ -44,14 +50,6 @@ type RefreshTokenEntry struct {
 	Value     string `json:"value"`              // the token value
 	ExpiresIn int    `json:"expiresIn"`          // seconds until expiry
 	Audience  string `json:"audience,omitempty"` // only for transport tokens
-}
-
-// noopTransportMinter is used when transport auth is disabled (mode == "none").
-// It always returns an error indicating transport auth is not configured.
-type noopTransportMinter struct{}
-
-func (m *noopTransportMinter) MintIDToken(_ context.Context, _ string) (string, time.Time, error) {
-	return "", time.Time{}, fmt.Errorf("transport auth is disabled (mode=none)")
 }
 
 // gcpTransportMinter mints Google OIDC ID tokens by impersonating a dedicated

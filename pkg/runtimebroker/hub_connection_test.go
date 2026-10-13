@@ -15,7 +15,6 @@
 package runtimebroker
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -26,7 +25,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,7 +35,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
-	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 )
 
 // makeTestCreds creates BrokerCredentials with a base64-encoded secret key.
@@ -64,12 +61,6 @@ func newTestServerWithInMemoryCreds(creds *brokercredentials.BrokerCredentials) 
 	// Most tests in this file focus on hub connection behavior, not auth gates.
 	cfg.BrokerAuthEnabled = false
 	cfg.ForceRuntime = "mock"
-
-	tempDir, err := os.MkdirTemp("", "scion-broker-test-*")
-	if err == nil {
-		cfg.TemplateCacheDir = filepath.Join(tempDir, "cache", "templates")
-		cfg.StateDir = filepath.Join(tempDir, "state")
-	}
 
 	mgr := &mockManager{}
 	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
@@ -135,8 +126,6 @@ func TestHubConnection_MultipleConnections(t *testing.T) {
 	cfg.HubEnabled = true
 	cfg.HubEndpoint = "http://localhost:8080"
 	cfg.InMemoryCredentials = localCreds
-	cfg.TemplateCacheDir = filepath.Join(tmpDir, "cache", "templates")
-	cfg.StateDir = filepath.Join(tmpDir, "state")
 
 	mgr := &mockManager{}
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
@@ -181,8 +170,8 @@ func TestMultiKeyBrokerAuth_MatchesAnyKey(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret1},
-		{hubName: "hub-2", brokerID: "broker-1", secretKey: secret2},
+		{hubName: "hub-1", secretKey: secret1},
+		{hubName: "hub-2", secretKey: secret2},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +210,76 @@ func TestMultiKeyBrokerAuth_MatchesAnyKey(t *testing.T) {
 	}
 }
 
+// TestMultiKeyBrokerAuth_SetsAuthenticatingHubConnContextValue covers the
+// middleware setting authenticatingHubConnCtxKey to the name of the hub
+// connection whose key verified the request, not just letting the request
+// through, so resolveHubNameForLaunch's routing rule 2 (design §3.8.5) has
+// something real to read.
+func TestMultiKeyBrokerAuth_SetsAuthenticatingHubConnContextValue(t *testing.T) {
+	secret1 := []byte("secret-key-for-hub-1-32bytes!!!!")
+	secret2 := []byte("secret-key-for-hub-2-32bytes!!!!")
+
+	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
+	middleware.UpdateKeys([]secretKeyEntry{
+		{hubName: "hub-1", secretKey: secret1},
+		{hubName: "hub-2", secretKey: secret2},
+	})
+
+	var gotHubName string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHubName = authenticatingHubConnFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	signRequest(req, "broker-1", secret2)
+	rr := httptest.NewRecorder()
+	middleware.Middleware(handler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotHubName != "hub-2" {
+		t.Fatalf("authenticatingHubConnFromContext = %q, want hub-2 (the key that verified the request)", gotHubName)
+	}
+}
+
+// TestMultiKeyBrokerAuth_NoContextValueWhenUnauthenticated covers the
+// disabled/allow-unauthenticated paths, where there is no key to attribute
+// the request to.
+func TestMultiKeyBrokerAuth_NoContextValueWhenUnauthenticated(t *testing.T) {
+	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, true)
+
+	var gotHubName string
+	var sawContextValue bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHubName, sawContextValue = ctxValueOK(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil) // no HMAC headers at all
+	rr := httptest.NewRecorder()
+	middleware.Middleware(handler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 (allowUnauthenticated), got %d", rr.Code)
+	}
+	if sawContextValue {
+		t.Fatalf("expected no authenticatingHubConnCtxKey value, got %q", gotHubName)
+	}
+}
+
+// ctxValueOK is authenticatingHubConnFromContext with an explicit "was it
+// set at all" bit, for the unauthenticated-path test above.
+func ctxValueOK(ctx context.Context) (string, bool) {
+	v := ctx.Value(authenticatingHubConnCtxKey{})
+	if v == nil {
+		return "", false
+	}
+	name, ok := v.(string)
+	return name, ok
+}
+
 func TestMultiKeyBrokerAuth_Disabled(t *testing.T) {
 	middleware := NewMultiKeyBrokerAuthMiddleware(false, 5*time.Minute, false)
 
@@ -241,7 +300,7 @@ func TestMultiKeyBrokerAuth_AllowUnauthenticated(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, true)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
+		{hubName: "hub-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +323,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", brokerID: "broker-1", secretKey: oldSecret},
+		{hubName: "hub-1", secretKey: oldSecret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -282,7 +341,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	// Update keys to new secret only
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", brokerID: "broker-1", secretKey: newSecret},
+		{hubName: "hub-1", secretKey: newSecret},
 	})
 
 	// Request with old key should now fail
@@ -308,7 +367,7 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
+		{hubName: "hub-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -335,282 +394,20 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 	}
 }
 
-func TestHubConnectionReinitializePublishesAuthorityAtomically(t *testing.T) {
-	oldKey := []byte("old-connection-secret")
-	newKey := []byte("new-connection-secret")
-	oldCreds := &brokercredentials.BrokerCredentials{
-		Name:        "hub-a",
-		BrokerID:    "broker-a",
-		HubEndpoint: "https://hub-a.example",
-		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	newCreds := &brokercredentials.BrokerCredentials{
-		Name:        "hub-a",
-		BrokerID:    "broker-b",
-		HubEndpoint: "https://hub-b.example",
-		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	conn := &HubConnection{
-		Name:        oldCreds.Name,
-		HubEndpoint: oldCreds.HubEndpoint,
-		BrokerID:    oldCreds.BrokerID,
-		AuthMode:    oldCreds.AuthMode,
-		Credentials: oldCreds,
-		SecretKey:   oldKey,
-	}
-	conn.authorityReady.Store(true)
-	srv := &Server{
-		config: ServerConfig{
-			BrokerAuthEnabled:    true,
-			BrokerAuthStrictMode: true,
-		},
-		hubConnections: map[string]*HubConnection{"hub-a": conn},
-	}
-	srv.buildAuthMiddleware()
-
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	observed := make(chan brokerRequestAuthority, 1)
-	handler := srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authority, ok := authenticatedBrokerAuthority(r)
-		if !ok {
-			t.Error("authenticated request had no bound authority")
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		observed <- *authority
-		close(entered)
-		<-release
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	oldResponse := httptest.NewRecorder()
-	oldRequest := httptest.NewRequest(http.MethodPost, "/api/v1/agents/retained/start", strings.NewReader(`{"runtimeRecovery":{}}`))
-	oldRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
-	signRequest(oldRequest, oldCreds.BrokerID, oldKey)
-	requestDone := make(chan struct{})
-	go func() {
-		handler.ServeHTTP(oldResponse, oldRequest)
-		close(requestDone)
-	}()
-	<-entered
-
-	reinitializeDone := make(chan error, 1)
-	go func() {
-		reinitializeDone <- conn.Reinitialize(context.Background(), srv, newCreds)
-	}()
-	select {
-	case err := <-reinitializeDone:
-		t.Fatalf("Reinitialize published while an admitted request held its authority lease: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(release)
-	<-requestDone
-	if oldResponse.Code != http.StatusOK {
-		t.Fatalf("in-flight old authority status %d, want %d", oldResponse.Code, http.StatusOK)
-	}
-	oldAuthority := <-observed
-	if oldAuthority.brokerID != oldCreds.BrokerID || oldAuthority.hubEndpoint != oldCreds.HubEndpoint {
-		t.Fatalf("in-flight authority changed: broker=%q endpoint=%q", oldAuthority.brokerID, oldAuthority.hubEndpoint)
-	}
-	if err := <-reinitializeDone; err != nil {
-		t.Fatalf("Reinitialize: %v", err)
-	}
-
-	// The stale signature/identity cannot cross the publication boundary.
-	staleRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
-	staleRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
-	signRequest(staleRequest, oldCreds.BrokerID, oldKey)
-	staleResponse := httptest.NewRecorder()
-	handler.ServeHTTP(staleResponse, staleRequest)
-	if staleResponse.Code != http.StatusUnauthorized {
-		t.Fatalf("stale authority status %d, want %d", staleResponse.Code, http.StatusUnauthorized)
-	}
-
-	newRequest := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
-	newRequest.Header.Set("X-Scion-Hub-Connection", "hub-a")
-	signRequest(newRequest, newCreds.BrokerID, newKey)
-	newResponse := httptest.NewRecorder()
-	srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authority, ok := authenticatedBrokerAuthority(r)
-		if !ok || authority.brokerID != newCreds.BrokerID || authority.hubEndpoint != newCreds.HubEndpoint {
-			t.Fatalf("new request observed incoherent authority: %#v", authority)
-		}
-		w.WriteHeader(http.StatusOK)
-	})).ServeHTTP(newResponse, newRequest)
-	if newResponse.Code != http.StatusOK {
-		t.Fatalf("new authority status %d, want %d: %s", newResponse.Code, http.StatusOK, newResponse.Body.String())
-	}
-}
-
-func TestAuthMiddlewarePublicationOrdersTwoConnectionReinitialize(t *testing.T) {
-	const (
-		connectionA = "hub-a"
-		connectionB = "hub-b"
-		brokerA     = "broker-a"
-		oldBrokerB  = "broker-b-old"
-		newBrokerB  = "broker-b-new"
-	)
-	keyA := []byte("connection-a-current-secret")
-	oldKeyB := []byte("connection-b-stale-secret")
-	newKeyB := []byte("connection-b-current-secret")
-
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer hub.Close()
-
-	srv := newTestServer(t)
-	connA := configureAuthenticatedHubFixture(t, srv, connectionA, hub.URL, brokerA, keyA)
-	connB := configureAuthenticatedHubFixture(t, srv, connectionB, hub.URL, oldBrokerB, oldKeyB)
-	oldCredsB := &brokercredentials.BrokerCredentials{
-		Name:        connectionB,
-		BrokerID:    oldBrokerB,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(oldKeyB),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	connB.mu.Lock()
-	connB.Credentials = oldCredsB
-	connB.AuthMode = oldCredsB.AuthMode
-	connB.mu.Unlock()
-
-	snapshotBuilt := make(chan struct{})
-	releaseSnapshot := make(chan struct{})
-	defer func() {
-		select {
-		case <-releaseSnapshot:
-		default:
-			close(releaseSnapshot)
-		}
-	}()
-	var paused atomic.Bool
-	srv.authMiddlewarePublicationHook = func(stage string, keys []secretKeyEntry) {
-		if stage != "snapshot" || !paused.CompareAndSwap(false, true) {
-			return
-		}
-		foundOldB := false
-		for _, key := range keys {
-			if key.hubName == connectionB && bytes.Equal(key.secretKey, oldKeyB) {
-				foundOldB = true
-				break
-			}
-		}
-		if !foundOldB {
-			t.Error("paused auth snapshot did not contain the stale connection-B key")
-		}
-		close(snapshotBuilt)
-		<-releaseSnapshot
-	}
-
-	firstBuildDone := make(chan struct{})
-	go func() {
-		srv.buildAuthMiddleware()
-		close(firstBuildDone)
-	}()
-	select {
-	case <-snapshotBuilt:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the first auth snapshot")
-	}
-	if srv.authMiddlewarePublicationMu.TryLock() {
-		srv.authMiddlewarePublicationMu.Unlock()
-		t.Fatal("auth snapshot was not serialized through UpdateKeys publication")
-	}
-
-	newCredsB := &brokercredentials.BrokerCredentials{
-		Name:        connectionB,
-		BrokerID:    newBrokerB,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(newKeyB),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	reinitializeActive := make(chan struct{})
-	srv.hubConnectionLifecycleHook = func(stage string) {
-		if stage == "reinitialize-active" {
-			close(reinitializeActive)
-		}
-	}
-	reinitializeDone := make(chan error, 1)
-	go func() {
-		reinitializeDone <- connB.Reinitialize(context.Background(), srv, newCredsB)
-	}()
-	select {
-	case <-reinitializeActive:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for connection B to begin Reinitialize")
-	}
-
-	// The complete older snapshot remains serialized with its publication, so
-	// connection B cannot change authority generation until that publication
-	// finishes. This ties snapshot order to authority-transition order.
-	if !connB.authorityReady.Load() || connB.authorityGeneration.Load() != 0 {
-		t.Fatal("connection B authority changed while an older auth snapshot was unpublished")
-	}
-	select {
-	case err := <-reinitializeDone:
-		t.Fatalf("connection B Reinitialize completed ahead of the older auth publication: %v", err)
-	default:
-	}
-	close(releaseSnapshot)
-	select {
-	case <-firstBuildDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first auth publication did not finish")
-	}
-	select {
-	case err := <-reinitializeDone:
-		if err != nil {
-			t.Fatalf("Reinitialize connection B: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("connection B Reinitialize did not finish")
-	}
-
-	authenticate := func(name, brokerID string, key []byte) int {
-		t.Helper()
-		request := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
-		request.Header.Set("X-Scion-Hub-Connection", name)
-		signRequest(request, brokerID, key)
-		response := httptest.NewRecorder()
-		srv.brokerAuthMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusNoContent)
-		})).ServeHTTP(response, request)
-		return response.Code
-	}
-	if status := authenticate(connectionA, brokerA, keyA); status != http.StatusNoContent {
-		t.Fatalf("surviving connection A status %d, want %d", status, http.StatusNoContent)
-	}
-	if status := authenticate(connectionB, newBrokerB, newKeyB); status != http.StatusNoContent {
-		t.Fatalf("current connection B status %d, want %d", status, http.StatusNoContent)
-	}
-	if status := authenticate(connectionB, oldBrokerB, oldKeyB); status != http.StatusUnauthorized {
-		t.Fatalf("stale connection B status %d, want %d", status, http.StatusUnauthorized)
-	}
-
-	if !connA.authorityReady.Load() {
-		t.Fatal("serializing connection B authority disturbed connection A")
-	}
-}
-
 func TestHeartbeatService_ProjectFilter(t *testing.T) {
 	client := &mockRuntimeBrokerService{}
 	manager := &heartbeatMockManager{
 		agents: []api.AgentInfo{
-			{Name: "agent-1", ProjectID: "grove-hub1", Phase: "running"},
-			{Name: "agent-2", ProjectID: "grove-hub1", Phase: "running"},
-			{Name: "agent-3", ProjectID: "grove-hub2", Phase: "running"},
-			{Name: "agent-4", ProjectID: "grove-shared", Phase: "running"},
+			{Name: "agent-1", ProjectID: "project-hub1", Phase: "running"},
+			{Name: "agent-2", ProjectID: "project-hub1", Phase: "running"},
+			{Name: "agent-3", ProjectID: "project-hub2", Phase: "running"},
+			{Name: "agent-4", ProjectID: "project-shared", Phase: "running"},
 		},
 	}
 
-	// Filter: only include grove-hub1 projects
+	// Filter: only include project-hub1 projects
 	projectFilter := func(projectID string) bool {
-		return projectID == "grove-hub1"
+		return projectID == "project-hub1"
 	}
 
 	svc := NewHeartbeatService(client, "test-host", time.Hour, manager, projectFilter, slog.Default())
@@ -626,17 +423,17 @@ func TestHeartbeatService_ProjectFilter(t *testing.T) {
 
 	heartbeat := calls[0].Heartbeat
 
-	// Should only include grove-hub1 (2 agents), not grove-hub2 or grove-shared
+	// Should only include project-hub1 (2 agents), not project-hub2 or project-shared
 	if len(heartbeat.Projects) != 1 {
 		t.Errorf("Expected 1 project in heartbeat (filtered), got %d", len(heartbeat.Projects))
 	}
 
-	if len(heartbeat.Projects) > 0 && heartbeat.Projects[0].ProjectID != "grove-hub1" {
-		t.Errorf("Expected grove-hub1, got %q", heartbeat.Projects[0].ProjectID)
+	if len(heartbeat.Projects) > 0 && heartbeat.Projects[0].ProjectID != "project-hub1" {
+		t.Errorf("Expected project-hub1, got %q", heartbeat.Projects[0].ProjectID)
 	}
 
 	if len(heartbeat.Projects) > 0 && heartbeat.Projects[0].AgentCount != 2 {
-		t.Errorf("Expected 2 agents in grove-hub1, got %d", heartbeat.Projects[0].AgentCount)
+		t.Errorf("Expected 2 agents in project-hub1, got %d", heartbeat.Projects[0].AgentCount)
 	}
 }
 
@@ -644,8 +441,8 @@ func TestHeartbeatService_NilProjectFilter(t *testing.T) {
 	client := &mockRuntimeBrokerService{}
 	manager := &heartbeatMockManager{
 		agents: []api.AgentInfo{
-			{Name: "agent-1", ProjectID: "grove-1", Phase: "running"},
-			{Name: "agent-2", ProjectID: "grove-2", Phase: "running"},
+			{Name: "agent-1", ProjectID: "project-1", Phase: "running"},
+			{Name: "agent-2", ProjectID: "project-2", Phase: "running"},
 		},
 	}
 
@@ -715,318 +512,54 @@ func TestHydrateHarnessConfig_NoResolverIsGraceful(t *testing.T) {
 	}
 }
 
-type stubHCSClient struct {
-	hubclient.Client
-	hcs hubclient.HarnessConfigService
-}
-
-func (c *stubHCSClient) HarnessConfigs() hubclient.HarnessConfigService { return c.hcs }
-
-type stubHCService struct {
-	hubclient.HarnessConfigService
-	getFunc                 func(ctx context.Context, id string) (*hubclient.HarnessConfig, error)
-	requestDownloadURLsFunc func(ctx context.Context, id string) (*hubclient.DownloadResponse, error)
-	downloadFileFunc        func(ctx context.Context, url string) ([]byte, error)
-}
-
-func (s *stubHCService) Get(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
-	if s.getFunc != nil {
-		return s.getFunc(ctx, id)
-	}
-	return nil, nil
-}
-
-func (s *stubHCService) RequestDownloadURLs(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
-	if s.requestDownloadURLsFunc != nil {
-		return s.requestDownloadURLsFunc(ctx, id)
-	}
-	return nil, nil
-}
-
-func (s *stubHCService) DownloadFile(ctx context.Context, url string) ([]byte, error) {
-	if s.downloadFileFunc != nil {
-		return s.downloadFileFunc(ctx, url)
-	}
-	return nil, nil
-}
-
-func TestResolveHubConnection_WithHCResolverOnly(t *testing.T) {
+func TestResolveHubConnection_WithConnectionHeader(t *testing.T) {
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 	srv := newTestServerWithInMemoryCreds(creds)
 
-	srv.hubMu.Lock()
-	conn := srv.hubConnections["local"]
-	// Clear all other resolvers, keep only HCResolver
-	conn.Hydrator = nil
-	conn.LocalStorage = nil
-	cache, err := templatecache.New(t.TempDir(), 0)
-	if err != nil {
-		t.Fatalf("failed to create cache: %v", err)
-	}
-	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{})
-	srv.hubMu.Unlock()
-
-	// 1. Resolve with connection header
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-1/start", nil)
-	req.Header.Set("X-Scion-Hub-Connection", "local")
-	resolved := srv.resolveHubConnection(req)
-	if resolved != conn {
-		t.Errorf("expected connection to resolve when HCResolver is set, got %v", resolved)
-	}
-
-	// 2. Resolve via fallback (no connection header)
-	reqNoHeader := httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-1/start", nil)
-	resolvedFallback := srv.resolveHubConnection(reqNoHeader)
-	if resolvedFallback != conn {
-		t.Errorf("expected fallback connection to resolve when HCResolver is set, got %v", resolvedFallback)
-	}
-
-	// 3. When HCResolver is also nil, resolveHubConnection returns nil
-	srv.hubMu.Lock()
-	conn.HCResolver = nil
-	srv.hubMu.Unlock()
-
-	resolvedNil := srv.resolveHubConnection(req)
-	if resolvedNil != nil {
-		t.Errorf("expected nil when all resolvers are cleared, got %v", resolvedNil)
-	}
-}
-
-func TestHydrateHarnessConfig_ResolverColdAndWarmCache(t *testing.T) {
-	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
-	srv := newTestServerWithInMemoryCreds(creds)
-
-	cacheDir := t.TempDir()
-	cache, err := templatecache.New(cacheDir, 0)
-	if err != nil {
-		t.Fatalf("failed to create cache: %v", err)
-	}
-
-	fileBytes := []byte("harness: claude\nversion: 1\n")
-	fileHash := transfer.HashBytes(fileBytes)
-	contentHash := "test-content-hash-123"
-
-	downloadCalls := 0
-	stubService := &stubHCService{
-		getFunc: func(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
-			return &hubclient.HarnessConfig{
-				ID:          id,
-				ContentHash: contentHash,
-			}, nil
-		},
-		requestDownloadURLsFunc: func(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
-			return &hubclient.DownloadResponse{
-				Files: []hubclient.DownloadURLInfo{
-					{
-						Path: "config.yaml",
-						URL:  "http://hub.local/api/v1/harness-configs/" + id + "/files/config.yaml?raw=1",
-						Hash: fileHash,
-						Size: int64(len(fileBytes)),
-					},
-				},
-			}, nil
-		},
-		downloadFileFunc: func(ctx context.Context, url string) ([]byte, error) {
-			downloadCalls++
-			return fileBytes, nil
-		},
-	}
-
-	srv.hubMu.Lock()
-	conn := srv.hubConnections["local"]
-	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
-	srv.hubMu.Unlock()
-
-	cfg := &CreateAgentConfig{
-		HarnessConfigID:   "hc-remote-1",
-		HarnessConfigHash: contentHash,
-	}
-
-	// Cold cache: downloads and hydrates
-	path1, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
-	if err != nil {
-		t.Fatalf("hydrateHarnessConfig failed on cold cache: %v", err)
-	}
-	if path1 == "" {
-		t.Fatal("expected non-empty path from hydration")
-	}
-	if downloadCalls != 1 {
-		t.Errorf("expected 1 download call on cold cache, got %d", downloadCalls)
-	}
-
-	// Verify file was written to disk
-	gotContent, err := os.ReadFile(filepath.Join(path1, "config.yaml"))
-	if err != nil {
-		t.Fatalf("failed to read hydrated file: %v", err)
-	}
-	if string(gotContent) != string(fileBytes) {
-		t.Errorf("hydrated content mismatch: got %q, want %q", string(gotContent), string(fileBytes))
-	}
-
-	// Warm cache: returns cached directory without downloading
-	path2, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
-	if err != nil {
-		t.Fatalf("hydrateHarnessConfig failed on warm cache: %v", err)
-	}
-	if path2 != path1 {
-		t.Errorf("expected warm cache to return same path %q, got %q", path1, path2)
-	}
-	if downloadCalls != 1 {
-		t.Errorf("expected no additional download calls on warm cache, got %d", downloadCalls)
-	}
-}
-
-func TestHydrateHarnessConfig_ResolverHashMismatchFails(t *testing.T) {
-	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
-	srv := newTestServerWithInMemoryCreds(creds)
-
-	cacheDir := t.TempDir()
-	cache, err := templatecache.New(cacheDir, 0)
-	if err != nil {
-		t.Fatalf("failed to create cache: %v", err)
-	}
-
-	expectedHash := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-	corruptBytes := []byte("corrupted or tampered content")
-
-	stubService := &stubHCService{
-		getFunc: func(ctx context.Context, id string) (*hubclient.HarnessConfig, error) {
-			return &hubclient.HarnessConfig{
-				ID:          id,
-				ContentHash: "hash-mismatch-test",
-			}, nil
-		},
-		requestDownloadURLsFunc: func(ctx context.Context, id string) (*hubclient.DownloadResponse, error) {
-			return &hubclient.DownloadResponse{
-				Files: []hubclient.DownloadURLInfo{
-					{
-						Path: "config.yaml",
-						URL:  "http://hub.local/api/v1/harness-configs/" + id + "/files/config.yaml?raw=1",
-						Hash: expectedHash,
-						Size: int64(len(corruptBytes)),
-					},
-				},
-			}, nil
-		},
-		downloadFileFunc: func(ctx context.Context, url string) ([]byte, error) {
-			return corruptBytes, nil
-		},
-	}
-
-	srv.hubMu.Lock()
-	conn := srv.hubConnections["local"]
-	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
-	srv.hubMu.Unlock()
-
-	cfg := &CreateAgentConfig{
-		HarnessConfigID:   "hc-corrupt-1",
-		HarnessConfigHash: "hash-mismatch-test",
-	}
-
-	path, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
-	if err == nil {
-		t.Errorf("expected hash mismatch error, got path %q", path)
-	}
-	if !strings.Contains(err.Error(), "hash mismatch") {
-		t.Errorf("expected error to mention 'hash mismatch', got %v", err)
-	}
-}
-
-func TestHydrateHarnessConfig_PlainNameFallsBackToLocalDisk(t *testing.T) {
-	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
-	srv := newTestServerWithInMemoryCreds(creds)
-
-	cacheDir := t.TempDir()
-	cache, err := templatecache.New(cacheDir, 0)
-	if err != nil {
-		t.Fatalf("failed to create cache: %v", err)
-	}
-
-	stubService := &stubHCService{
-		getFunc: func(ctx context.Context, ref string) (*hubclient.HarnessConfig, error) {
-			t.Errorf("unexpected call to Hub getFunc for plain harness config name: %q", ref)
-			return nil, nil
-		},
-	}
-
-	srv.hubMu.Lock()
-	conn := srv.hubConnections["local"]
-	conn.HCResolver = templatecache.NewHarnessConfigResolver(cache, &stubHCSClient{hcs: stubService})
-	srv.hubMu.Unlock()
-
-	// Plain HarnessConfig name without Hub identity (no ID and no ContentHash)
-	// must not hydrate via Hub and must fall back to broker local search.
-	cfg := &CreateAgentConfig{
-		HarnessConfig: "claude",
-	}
-
-	path, err := srv.hydrateHarnessConfig(context.Background(), cfg, conn)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if path != "" {
-		t.Errorf("expected empty path (fallback to disk) for plain harness config, got %q", path)
-	}
-}
-
-func TestResolveHydrator_WithConnectionHeader(t *testing.T) {
-	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
-	srv := newTestServerWithInMemoryCreds(creds)
-
-	// Verify the hydrator resolves via header
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
-	req.Header.Set("X-Scion-Hub-Connection", "local")
-
-	hydrator := srv.resolveHydrator(req)
-	// In test mode cache is nil, so hydrator is nil -- that's expected
-	// What we're testing is the routing logic
 	srv.hubMu.RLock()
 	conn := srv.hubConnections["local"]
 	srv.hubMu.RUnlock()
-
 	if conn == nil {
 		t.Fatal("expected 'local' connection to exist")
 	}
+	conn.Hydrator = new(templatecache.Hydrator)
 
-	// The hydrator from resolveHydrator should match the connection's hydrator
-	if hydrator != conn.Hydrator {
-		t.Error("expected resolveHydrator to return the local connection's hydrator")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
+	req.Header.Set("X-Scion-Hub-Connection", "local")
+
+	if got := srv.resolveHubConnection(req); got != conn {
+		t.Error("expected resolveHubConnection to return the named connection")
 	}
 }
 
-func TestResolveHydrator_FallbackToFirstAvailable(t *testing.T) {
+func TestResolveHubConnection_FallbackToFirstAvailable(t *testing.T) {
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 	srv := newTestServerWithInMemoryCreds(creds)
-
-	// Request without connection header should fall back to first available
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
-	hydrator := srv.resolveHydrator(req)
 
 	srv.hubMu.RLock()
 	conn := srv.hubConnections["local"]
 	srv.hubMu.RUnlock()
+	conn.Hydrator = new(templatecache.Hydrator)
 
-	if hydrator != conn.Hydrator {
-		t.Error("expected resolveHydrator to fall back to first available hydrator")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
+	if got := srv.resolveHubConnection(req); got != conn {
+		t.Error("expected resolveHubConnection to fall back to first available connection")
 	}
 }
 
-func TestResolveHydrator_UnknownConnection(t *testing.T) {
+func TestResolveHubConnection_UnknownConnection(t *testing.T) {
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 	srv := newTestServerWithInMemoryCreds(creds)
 
-	// Request with unknown connection name should fall back
+	srv.hubMu.RLock()
+	conn := srv.hubConnections["local"]
+	srv.hubMu.RUnlock()
+	conn.Hydrator = new(templatecache.Hydrator)
+
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
 	req.Header.Set("X-Scion-Hub-Connection", "nonexistent")
-	hydrator := srv.resolveHydrator(req)
-
-	// Should fall back to any available hydrator
-	srv.hubMu.RLock()
-	conn := srv.hubConnections["local"]
-	srv.hubMu.RUnlock()
-
-	if hydrator != conn.Hydrator {
-		t.Error("expected resolveHydrator to fall back when connection not found")
+	if got := srv.resolveHubConnection(req); got != conn {
+		t.Error("expected resolveHubConnection to fall back when connection not found")
 	}
 }
 
@@ -1072,8 +605,8 @@ func TestGlobalProjectRejection_MultiHub(t *testing.T) {
 	if !ok {
 		t.Fatal("expected error object in response")
 	}
-	if errObj["code"] != "global_grove_disabled" {
-		t.Errorf("expected error code 'global_grove_disabled', got %q", errObj["code"])
+	if errObj["code"] != "global_project_disabled" {
+		t.Errorf("expected error code 'global_project_disabled', got %q", errObj["code"])
 	}
 }
 
@@ -1112,8 +645,8 @@ func TestGlobalProjectRejection_WithProjectID_MultiHub(t *testing.T) {
 
 	body := `{
 		"name": "scoped-agent",
-		"groveId": "my-project",
-		"grovePath": "/some/path/.scion",
+		"projectId": "my-project",
+		"projectPath": "/some/path/.scion",
 		"config": {"template": "claude"}
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -1143,8 +676,8 @@ func TestGlobalProjectRejection_GitProjectWithProjectID_NoPath_MultiHub(t *testi
 	srv.hubMu.Unlock()
 
 	body := `{
-		"name": "git-grove-agent",
-		"groveId": "abc-123-grove-id",
+		"name": "git-project-agent",
+		"projectId": "abc-123-project-id",
 		"config": {"template": "claude"}
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
@@ -1489,531 +1022,18 @@ func TestCredentialWatcher_RemoveConnection(t *testing.T) {
 	}
 }
 
-func TestCredentialWatcher_RemovalRevokesSignedCreateWithoutDeadlock(t *testing.T) {
-	const (
-		connectionName = "hub-remove"
-		brokerID       = "registered-broker"
-		hubEndpoint    = "https://hub.remove.example"
-		projectID      = "removal-project"
-	)
-	key := []byte("credential-removal-secret-key")
-
-	srv := newTestServer(t)
-	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hubEndpoint, brokerID, key)
-	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
-
-	managerEntered := make(chan struct{})
-	releaseManager := make(chan struct{})
-	defer func() {
-		select {
-		case <-releaseManager:
-		default:
-			close(releaseManager)
-		}
-	}()
-	manager := &admissionBoundaryManager{
-		Manager: srv.manager,
-		beforeStart: func(api.StartOptions) error {
-			close(managerEntered)
-			<-releaseManager
-			return nil
-		},
-	}
-	srv.manager = manager
-
-	hubLocked := make(chan struct{})
-	allowHubUnlock := make(chan struct{})
-	authorityRevoked := make(chan struct{})
-	defer func() {
-		select {
-		case <-allowHubUnlock:
-		default:
-			close(allowHubUnlock)
-		}
-	}()
-	srv.hubConnectionLifecycleHook = func(stage string) {
-		switch stage {
-		case "hub-locked":
-			close(hubLocked)
-			<-allowHubUnlock
-		case "authority-revoked":
-			close(authorityRevoked)
-		}
-	}
-
-	waitFor := func(ch <-chan struct{}, event string) {
-		t.Helper()
-		select {
-		case <-ch:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for %s", event)
-		}
-	}
-	sign := func(req *http.Request, nonce string) {
-		timestamp := fmt.Sprintf("%d", time.Now().Unix())
-		req.Header.Set(apiclient.HeaderBrokerID, brokerID)
-		req.Header.Set(apiclient.HeaderTimestamp, timestamp)
-		req.Header.Set(apiclient.HeaderNonce, nonce)
-		canonical := apiclient.BuildCanonicalString(req, timestamp, nonce)
-		signature := apiclient.ComputeHMAC(key, canonical)
-		req.Header.Set(apiclient.HeaderSignature, base64.StdEncoding.EncodeToString(signature))
-	}
-	newCreateRequest := func(name, nonce string) *http.Request {
-		body, err := json.Marshal(CreateAgentRequest{
-			ID:          name + "-id",
-			Name:        name,
-			ProjectID:   projectID,
-			HubEndpoint: hubEndpoint,
-			NoAuth:      true,
-			Config:      &CreateAgentConfig{Template: "claude"},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
-		req.Header.Set("Content-Type", "application/json")
-		// Control-channel dispatch injects this connection selector before the
-		// request enters the same Server.Handler path exercised here.
-		req.Header.Set("X-Scion-Hub-Connection", connectionName)
-		sign(req, nonce)
-		return req
-	}
-
-	reloadDone := make(chan error, 1)
-	go func() {
-		reloadDone <- srv.checkAndReloadCredentials(context.Background())
-	}()
-	waitFor(hubLocked, "credential reload to hold hubMu")
-
-	firstResponse := httptest.NewRecorder()
-	firstDone := make(chan struct{})
-	go func() {
-		defer close(firstDone)
-		srv.Handler().ServeHTTP(firstResponse, newCreateRequest("already-admitted", "before-removal"))
-	}()
-
-	// The request must hold the connection's read lease while waiting for
-	// hubMu. This is the lock ordering that deadlocked when removal called Stop
-	// while still holding hubMu.
-	leaseDeadline := time.NewTimer(2 * time.Second)
-	leasePoll := time.NewTicker(time.Millisecond)
-	for conn.mu.TryLock() {
-		conn.mu.Unlock()
-		select {
-		case <-leaseDeadline.C:
-			t.Fatal("signed CREATE did not acquire the Hub authority lease")
-		case <-leasePoll.C:
-		}
-	}
-	leaseDeadline.Stop()
-	leasePoll.Stop()
-
-	close(allowHubUnlock)
-	waitFor(authorityRevoked, "removed authority to be revoked")
-
-	// A new request signed by the removed key must fail before Manager.Start,
-	// even while removal is waiting for the already-admitted request's lease.
-	secondResponse := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(secondResponse, newCreateRequest("after-revocation", "after-removal"))
-	if secondResponse.Code != http.StatusUnauthorized {
-		t.Fatalf("post-revocation CREATE status %d, want %d: %s", secondResponse.Code, http.StatusUnauthorized, secondResponse.Body.String())
-	}
-	waitFor(managerEntered, "already-admitted CREATE to reach manager")
-	if manager.starts != 1 {
-		t.Fatalf("manager starts %d, want only the already-admitted request", manager.starts)
-	}
-	select {
-	case err := <-reloadDone:
-		t.Fatalf("credential removal returned before the admitted authority lease: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-
-	close(releaseManager)
-	waitFor(firstDone, "already-admitted CREATE to complete")
-	if firstResponse.Code != http.StatusCreated {
-		t.Fatalf("already-admitted CREATE status %d, want %d: %s", firstResponse.Code, http.StatusCreated, firstResponse.Body.String())
-	}
-	select {
-	case err := <-reloadDone:
-		if err != nil {
-			t.Fatalf("credential removal failed: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("credential removal deadlocked after the authority lease was released")
-	}
-
-	if conn.authorityReady.Load() {
-		t.Fatal("removed connection authority remained ready")
-	}
-	if conn.authorityGeneration.Load() == 0 {
-		t.Fatal("removed connection authority generation was not invalidated")
-	}
-	srv.hubMu.RLock()
-	_, retained := srv.hubConnections[connectionName]
-	srv.hubMu.RUnlock()
-	if retained {
-		t.Fatal("removed connection remained published")
-	}
-}
-
-func TestCredentialWatcher_RemovalWinsQueuedReinitialize(t *testing.T) {
-	const (
-		connectionName = "hub-remove-wins"
-		brokerID       = "registered-broker"
-		projectID      = "remove-wins-project"
-	)
-	oldKey := []byte("remove-wins-old-secret")
-	newKey := []byte("remove-wins-new-secret")
-
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer hub.Close()
-
-	srv := newTestServer(t)
-	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
-	oldCredentials := &brokercredentials.BrokerCredentials{
-		Name:        connectionName,
-		BrokerID:    brokerID,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	conn.mu.Lock()
-	conn.Credentials = oldCredentials
-	conn.AuthMode = oldCredentials.AuthMode
-	conn.mu.Unlock()
-	srv.config.HeartbeatEnabled = true
-	srv.config.HeartbeatInterval = time.Hour
-	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
-	manager := srv.manager.(*mockManager)
-
-	newCredentials := &brokercredentials.BrokerCredentials{
-		Name:        connectionName,
-		BrokerID:    brokerID,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-
-	removalLocked := make(chan struct{})
-	reinitializeWaiting := make(chan struct{})
-	allowRemoval := make(chan struct{})
-	defer func() {
-		select {
-		case <-allowRemoval:
-		default:
-			close(allowRemoval)
-		}
-	}()
-	srv.hubConnectionLifecycleHook = func(stage string) {
-		switch stage {
-		case "removal-locked":
-			close(removalLocked)
-			<-allowRemoval
-		case "reinitialize-waiting":
-			close(reinitializeWaiting)
-		}
-	}
-
-	waitFor := func(ch <-chan struct{}, event string) {
-		t.Helper()
-		select {
-		case <-ch:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for %s", event)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	reloadDone := make(chan error, 1)
-	go func() {
-		reloadDone <- srv.checkAndReloadCredentials(ctx)
-	}()
-	waitFor(removalLocked, "credential removal to acquire lifecycle serialization")
-
-	reinitializeDone := make(chan error, 1)
-	go func() {
-		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
-	}()
-	waitFor(reinitializeWaiting, "Reinitialize to queue behind credential removal")
-
-	// Removal owns lifecycle serialization before detaching the exact pointer.
-	// The queued Reinitialize must observe the completed removal and refuse to
-	// publish replacement capabilities or restart outbound services.
-	close(allowRemoval)
-	select {
-	case err := <-reloadDone:
-		if err != nil {
-			t.Fatalf("credential removal failed: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("credential removal did not finish while owning lifecycle serialization")
-	}
-	select {
-	case err := <-reinitializeDone:
-		if err == nil {
-			t.Fatal("queued Reinitialize succeeded after exact connection removal")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("queued Reinitialize did not return after connection removal")
-	}
-
-	if conn.authorityReady.Load() {
-		t.Fatal("removed connection authority was revived")
-	}
-	if generation := conn.authorityGeneration.Load(); generation != 1 {
-		t.Fatalf("removed authority generation %d, want only the removal invalidation", generation)
-	}
-	conn.mu.RLock()
-	heartbeat := conn.Heartbeat
-	controlChannel := conn.ControlChannel
-	gotSecret := append([]byte(nil), conn.SecretKey...)
-	conn.mu.RUnlock()
-	if heartbeat != nil || controlChannel != nil {
-		t.Fatalf("removed connection retained services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
-	}
-	if !bytes.Equal(gotSecret, oldKey) {
-		t.Fatal("queued Reinitialize published replacement credentials after removal")
-	}
-
-	body, err := json.Marshal(CreateAgentRequest{
-		ID:          "after-remove-wins-id",
-		Name:        "after-remove-wins",
-		ProjectID:   projectID,
-		HubEndpoint: hub.URL,
-		NoAuth:      true,
-		Config:      &CreateAgentConfig{Template: "claude"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Scion-Hub-Connection", connectionName)
-	signRequest(request, brokerID, oldKey)
-	response := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("removed authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
-	}
-	if manager.startCalls != 0 {
-		t.Fatalf("removed authority reached manager %d times", manager.startCalls)
-	}
-}
-
-func TestCredentialWatcher_ActiveReinitializeCompletesBeforeRemovalDetaches(t *testing.T) {
-	const (
-		connectionName = "hub-active-reinitialize"
-		brokerID       = "registered-broker"
-		projectID      = "active-reinitialize-project"
-	)
-	oldKey := []byte("active-reinitialize-old-secret")
-	newKey := []byte("active-reinitialize-new-secret")
-
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer hub.Close()
-
-	srv := newTestServer(t)
-	conn := configureAuthenticatedHubFixture(t, srv, connectionName, hub.URL, brokerID, oldKey)
-	oldCredentials := &brokercredentials.BrokerCredentials{
-		Name:        connectionName,
-		BrokerID:    brokerID,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(oldKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-	conn.mu.Lock()
-	conn.Credentials = oldCredentials
-	conn.AuthMode = oldCredentials.AuthMode
-	conn.mu.Unlock()
-	srv.config.HeartbeatEnabled = true
-	srv.config.HeartbeatInterval = time.Hour
-	srv.config.ControlChannelEnabled = true
-	srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
-	manager := srv.manager.(*mockManager)
-
-	newCredentials := &brokercredentials.BrokerCredentials{
-		Name:        connectionName,
-		BrokerID:    brokerID,
-		HubEndpoint: hub.URL,
-		SecretKey:   base64.StdEncoding.EncodeToString(newKey),
-		AuthMode:    brokercredentials.AuthModeHMAC,
-	}
-
-	reinitializeActive := make(chan struct{})
-	allowReinitialize := make(chan struct{})
-	removalWaiting := make(chan struct{})
-	connectionDetached := make(chan struct{})
-	allowRemoval := make(chan struct{})
-	defer func() {
-		for _, ch := range []chan struct{}{allowReinitialize, allowRemoval} {
-			select {
-			case <-ch:
-			default:
-				close(ch)
-			}
-		}
-	}()
-	srv.hubConnectionLifecycleHook = func(stage string) {
-		switch stage {
-		case "reinitialize-active":
-			close(reinitializeActive)
-			<-allowReinitialize
-		case "removal-waiting":
-			close(removalWaiting)
-		case "connections-detached":
-			close(connectionDetached)
-			<-allowRemoval
-		}
-	}
-
-	waitFor := func(ch <-chan struct{}, event string) {
-		t.Helper()
-		select {
-		case <-ch:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for %s", event)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	reinitializeDone := make(chan error, 1)
-	go func() {
-		reinitializeDone <- conn.Reinitialize(ctx, srv, newCredentials)
-	}()
-	waitFor(reinitializeActive, "Reinitialize to own lifecycle serialization")
-
-	reloadDone := make(chan error, 1)
-	go func() {
-		reloadDone <- srv.checkAndReloadCredentials(ctx)
-	}()
-	waitFor(removalWaiting, "credential removal to reach lifecycle serialization")
-
-	// Removal has snapshotted the candidate but cannot detach it while the
-	// active Reinitialize owns lifecycle serialization.
-	srv.hubMu.RLock()
-	published := srv.hubConnections[connectionName]
-	srv.hubMu.RUnlock()
-	if published != conn {
-		t.Fatal("credential removal detached an active Reinitialize candidate before lifecycle serialization")
-	}
-	select {
-	case <-connectionDetached:
-		t.Fatal("connection detached while Reinitialize still owned lifecycle serialization")
-	default:
-	}
-
-	close(allowReinitialize)
-	waitFor(connectionDetached, "credential removal to detach after Reinitialize")
-	select {
-	case err := <-reinitializeDone:
-		if err != nil {
-			t.Fatalf("active Reinitialize failed before serialized removal: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("credential removal detached before active Reinitialize returned")
-	}
-
-	// At detachment, all Reinitialize publication and service-start work has
-	// completed and removal has atomically revoked the published authority. No
-	// writer can run again while removal owns reinitializeMu.
-	if conn.authorityReady.Load() {
-		t.Fatal("connection authority remained ready after serialized detachment")
-	}
-	if generation := conn.authorityGeneration.Load(); generation != 3 {
-		t.Fatalf("authority generation at detachment %d, want Reinitialize publication plus removal invalidation", generation)
-	}
-	conn.mu.RLock()
-	detachedSecret := append([]byte(nil), conn.SecretKey...)
-	heartbeatStarted := conn.Heartbeat != nil
-	controlChannelStarted := conn.ControlChannel != nil
-	conn.mu.RUnlock()
-	if !bytes.Equal(detachedSecret, newKey) {
-		t.Fatal("Reinitialize replacement was not published before serialized detachment")
-	}
-	if !heartbeatStarted || !controlChannelStarted {
-		t.Fatalf("Reinitialize services did not start before detachment: heartbeat=%v controlChannel=%v", heartbeatStarted, controlChannelStarted)
-	}
-
-	close(allowRemoval)
-	select {
-	case err := <-reloadDone:
-		if err != nil {
-			t.Fatalf("credential removal failed: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("credential removal did not complete after serialized detachment")
-	}
-
-	if conn.authorityReady.Load() {
-		t.Fatal("removed connection authority was restored after detachment")
-	}
-	if generation := conn.authorityGeneration.Load(); generation != 3 {
-		t.Fatalf("final authority generation %d, want Reinitialize publication plus one removal invalidation", generation)
-	}
-	conn.mu.RLock()
-	finalSecret := append([]byte(nil), conn.SecretKey...)
-	heartbeat := conn.Heartbeat
-	controlChannel := conn.ControlChannel
-	conn.mu.RUnlock()
-	if !bytes.Equal(finalSecret, detachedSecret) {
-		t.Fatal("connection capabilities changed after detachment")
-	}
-	if heartbeat != nil || controlChannel != nil {
-		t.Fatalf("removed connection revived services: heartbeat=%v controlChannel=%v", heartbeat != nil, controlChannel != nil)
-	}
-	srv.hubMu.RLock()
-	_, retained := srv.hubConnections[connectionName]
-	srv.hubMu.RUnlock()
-	if retained {
-		t.Fatal("serialized removal left the connection published")
-	}
-
-	body, err := json.Marshal(CreateAgentRequest{
-		ID:          "after-active-remove-id",
-		Name:        "after-active-remove",
-		ProjectID:   projectID,
-		HubEndpoint: hub.URL,
-		NoAuth:      true,
-		Config:      &CreateAgentConfig{Template: "claude"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(string(body)))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Scion-Hub-Connection", connectionName)
-	signRequest(request, brokerID, newKey)
-	response := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("removed replacement authority CREATE status %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
-	}
-	if manager.startCalls != 0 {
-		t.Fatalf("removed replacement authority reached manager %d times", manager.startCalls)
-	}
-}
-
 func TestBuildAuthMiddleware_NoKeys(t *testing.T) {
 	cfg := DefaultServerConfig()
 	cfg.BrokerAuthEnabled = true
 	srv := New(cfg, &mockManager{}, &runtime.MockRuntime{NameFunc: func() string { return "docker" }})
 
 	// With no connections and no keys, middleware should be nil
-	if srv.brokerAuthMiddleware != nil {
+	if srv.loadBrokerMiddleware() != nil {
 		t.Error("expected nil middleware when no keys available")
 	}
 }
 
 func TestBuildAuthMiddleware_WithKeys(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 
 	cfg := DefaultServerConfig()
@@ -2026,7 +1046,7 @@ func TestBuildAuthMiddleware_WithKeys(t *testing.T) {
 
 	srv := New(cfg, &mockManager{}, &runtime.MockRuntime{NameFunc: func() string { return "docker" }})
 
-	if srv.brokerAuthMiddleware == nil {
+	if srv.loadBrokerMiddleware() == nil {
 		t.Error("expected middleware to be created when keys available")
 	}
 }
@@ -2042,7 +1062,6 @@ func TestDefaultServerConfig_SecureBrokerAuthDefaults(t *testing.T) {
 }
 
 func TestRuntimeBroker_DefaultAuth_DeniesUnauthenticatedRequests(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	creds := makeTestCreds("local", "broker-1", "http://localhost:8080")
 
 	cfg := DefaultServerConfig()
@@ -2104,15 +1123,6 @@ func TestValidateBrokerAuthStartup_NonLoopbackPermissiveModeFails(t *testing.T) 
 	srv := New(cfg, &mockManager{}, &runtime.MockRuntime{NameFunc: func() string { return "docker" }})
 	if err := srv.validateBrokerAuthStartup(); err == nil {
 		t.Fatal("expected startup validation to fail for non-loopback host without strict auth")
-	}
-}
-
-func TestGetFirstHeartbeat_NoConnections(t *testing.T) {
-	srv := newTestServer(t)
-
-	hb := srv.getFirstHeartbeat()
-	if hb != nil {
-		t.Error("expected nil heartbeat when no connections")
 	}
 }
 
@@ -2209,7 +1219,6 @@ func TestColocated_RemoteConnection_GetsHeartbeat(t *testing.T) {
 }
 
 func TestColocated_ComboMode_HeartbeatPerConnection(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	// In combo mode (co-located local + remote), verify that both connections
 	// get heartbeat services.
 	tmpDir := t.TempDir()
@@ -2297,7 +1306,6 @@ func TestColocated_ComboMode_HeartbeatPerConnection(t *testing.T) {
 }
 
 func TestColocated_CredentialWatcher_PreservesLocalConnection(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	// When credentials are reloaded, the "local" connection from InMemoryCredentials
 	// must be preserved even if it's not in the multi-store.
 	tmpDir := t.TempDir()
@@ -2385,7 +1393,6 @@ func TestColocated_CredentialWatcher_PreservesLocalConnection(t *testing.T) {
 }
 
 func TestColocated_CredentialWatcher_AddRemoteAlongsideLocal(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	// Start with only the local co-located connection, then add a remote one
 	// via credential watcher.
 	tmpDir := t.TempDir()
@@ -2487,7 +1494,6 @@ func TestColocated_GlobalProjectRejection_ComboMode(t *testing.T) {
 }
 
 func TestColocated_MultipleRemoteConnections(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	// Test co-located mode with multiple remote connections alongside the local.
 	tmpDir := t.TempDir()
 	credDir := filepath.Join(tmpDir, "hub-credentials")

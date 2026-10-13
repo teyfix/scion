@@ -21,6 +21,7 @@ import (
 	"time"
 
 	entsql "entgo.io/ent/dialect/sql"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	entharnessconfig "github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
@@ -60,6 +61,15 @@ func marshalJSONString(v interface{}) string {
 	return string(data)
 }
 
+// marshalAgentConfig serializes a template's derived agent-config snapshot.
+// A nil snapshot is stored as an empty string (no snapshot), not "null".
+func marshalAgentConfig(cfg *api.ScionConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return marshalJSONString(cfg)
+}
+
 // unmarshalJSONString deserializes a JSON string into v. An empty string is a
 // no-op, leaving v at its zero value.
 func unmarshalJSONString[T any](data string, v *T) {
@@ -91,17 +101,18 @@ func entTemplateRowToStore(e *ent.Template) *store.Template {
 		StorageURI:           e.StorageURI,
 		StorageBucket:        e.StorageBucket,
 		StoragePath:          e.StoragePath,
+		Layout:               e.Layout,
 		BaseTemplate:         e.BaseTemplate,
 		SourceURL:            e.SourceURL,
 		Status:               string(e.Status),
 		OwnerID:              e.OwnerID,
 		CreatedBy:            e.CreatedBy,
 		UpdatedBy:            e.UpdatedBy,
-		Visibility:           e.Visibility,
 		Created:              e.Created,
 		Updated:              e.Updated,
 	}
 	unmarshalJSONString(e.Config, &t.Config)
+	unmarshalJSONString(e.AgentConfig, &t.AgentConfig)
 	unmarshalJSONString(e.Files, &t.Files)
 	return t
 }
@@ -131,6 +142,7 @@ func (s *TemplateStore) CreateTemplate(ctx context.Context, template *store.Temp
 		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
 		SetImage(template.Image).
 		SetConfig(marshalJSONString(template.Config)).
+		SetAgentConfig(marshalAgentConfig(template.AgentConfig)).
 		SetContentHash(template.ContentHash).
 		SetScope(template.Scope).
 		SetScopeID(template.ScopeID).
@@ -138,6 +150,7 @@ func (s *TemplateStore) CreateTemplate(ctx context.Context, template *store.Temp
 		SetStorageURI(template.StorageURI).
 		SetStorageBucket(template.StorageBucket).
 		SetStoragePath(template.StoragePath).
+		SetLayout(template.Layout).
 		SetFiles(marshalJSONString(template.Files)).
 		SetBaseTemplate(template.BaseTemplate).
 		SetSourceURL(template.SourceURL).
@@ -145,7 +158,6 @@ func (s *TemplateStore) CreateTemplate(ctx context.Context, template *store.Temp
 		SetOwnerID(template.OwnerID).
 		SetCreatedBy(template.CreatedBy).
 		SetUpdatedBy(template.UpdatedBy).
-		SetVisibility(template.Visibility).
 		SetCreated(template.Created).
 		SetUpdated(template.Updated)
 
@@ -194,7 +206,10 @@ func (s *TemplateStore) GetTemplateBySlug(ctx context.Context, slug, scope, scop
 	return entTemplateRowToStore(e), nil
 }
 
-// UpdateTemplate updates an existing template.
+// UpdateTemplate updates an existing template's metadata. It leaves the
+// content columns (files, content_hash, harness, default_harness_config,
+// agent_config) and the storage columns (layout, storage_path,
+// storage_bucket, storage_uri) alone; see store.TemplateStore.UpdateTemplate.
 func (s *TemplateStore) UpdateTemplate(ctx context.Context, template *store.Template) error {
 	uid, err := parseUUID(template.ID)
 	if err != nil {
@@ -208,29 +223,86 @@ func (s *TemplateStore) UpdateTemplate(ctx context.Context, template *store.Temp
 		SetSlug(template.Slug).
 		SetDisplayName(template.DisplayName).
 		SetDescription(template.Description).
-		SetHarness(template.Harness).
-		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
 		SetImage(template.Image).
 		SetConfig(marshalJSONString(template.Config)).
-		SetContentHash(template.ContentHash).
 		SetScope(template.Scope).
 		SetScopeID(template.ScopeID).
 		SetProjectID(template.ProjectID).
-		SetStorageURI(template.StorageURI).
-		SetStorageBucket(template.StorageBucket).
-		SetStoragePath(template.StoragePath).
-		SetFiles(marshalJSONString(template.Files)).
 		SetBaseTemplate(template.BaseTemplate).
 		SetSourceURL(template.SourceURL).
 		SetStatus(enttemplate.Status(template.Status)).
 		SetOwnerID(template.OwnerID).
 		SetUpdatedBy(template.UpdatedBy).
-		SetVisibility(template.Visibility).
 		SetUpdated(template.Updated).
 		Save(ctx)
 	if err != nil {
 		return mapError(err)
 	}
+	return nil
+}
+
+// UpdateTemplateContent writes the content columns of template (see the
+// column list below) only if the stored row still matches expected. It is
+// one conditional UPDATE (UPDATE ... WHERE id = ? AND content_hash = ? AND
+// layout = ?), so two concurrent commits that read the same row cannot both
+// succeed.
+func (s *TemplateStore) UpdateTemplateContent(ctx context.Context, template *store.Template, expected store.TemplateContentPrecondition) error {
+	uid, err := parseUUID(template.ID)
+	if err != nil {
+		return err
+	}
+
+	updated := time.Now()
+
+	hashMatches := enttemplate.ContentHashEQ(expected.ContentHash)
+	if expected.ContentHash == "" {
+		hashMatches = enttemplate.Or(enttemplate.ContentHashEQ(""), enttemplate.ContentHashIsNil())
+	}
+	// The layout joins the predicate: a row can move from the legacy layout
+	// to blobs with the same content hash (ptone/scion#4221).
+	layoutMatches := enttemplate.LayoutEQ(expected.Layout)
+	if expected.Layout == "" {
+		layoutMatches = enttemplate.Or(enttemplate.LayoutEQ(""), enttemplate.LayoutIsNil())
+	}
+
+	// Only the columns a commit owns are written: the files, what is
+	// derived from them, where they are stored, the lifecycle status and the
+	// import provenance. Metadata (name, slug, display name, description,
+	// image, base template, owner, scope) belongs to UpdateTemplate, so a
+	// commit computed from an older read cannot revert a concurrent metadata
+	// edit, just as a metadata edit cannot revert a commit.
+	n, err := s.client.Template.Update().
+		Where(enttemplate.IDEQ(uid), hashMatches, layoutMatches).
+		SetHarness(template.Harness).
+		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
+		// temporary: removed with the file-telemetry helper (ptone/scion#4223)
+		SetConfig(marshalJSONString(template.Config)).
+		SetAgentConfig(marshalAgentConfig(template.AgentConfig)).
+		SetContentHash(template.ContentHash).
+		SetStorageURI(template.StorageURI).
+		SetStorageBucket(template.StorageBucket).
+		SetStoragePath(template.StoragePath).
+		SetLayout(template.Layout).
+		SetFiles(marshalJSONString(template.Files)).
+		SetSourceURL(template.SourceURL).
+		SetStatus(enttemplate.Status(template.Status)).
+		SetUpdatedBy(template.UpdatedBy).
+		SetUpdated(updated).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if n == 0 {
+		exists, err := s.client.Template.Query().Where(enttemplate.IDEQ(uid)).Exist(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if !exists {
+			return store.ErrNotFound
+		}
+		return store.ErrTemplateConflict
+	}
+	template.Updated = updated
 	return nil
 }
 
@@ -323,6 +395,12 @@ func (s *TemplateStore) ListTemplates(ctx context.Context, filter store.Template
 			enttemplate.DescriptionContainsFold(filter.Search),
 		))
 	}
+	if filter.StoragePath != "" {
+		query.Where(enttemplate.StoragePathEQ(filter.StoragePath))
+	}
+	if filter.StoragePathPrefix != "" {
+		query.Where(enttemplate.StoragePathHasPrefix(filter.StoragePathPrefix))
+	}
 
 	totalCount := 0
 	if !opts.SkipTotalCount {
@@ -396,7 +474,6 @@ func entHarnessConfigToStore(e *ent.HarnessConfig) *store.HarnessConfig {
 		OwnerID:              e.OwnerID,
 		CreatedBy:            e.CreatedBy,
 		UpdatedBy:            e.UpdatedBy,
-		Visibility:           e.Visibility,
 		Created:              e.Created,
 		Updated:              e.Updated,
 	}
@@ -444,7 +521,6 @@ func (s *TemplateStore) CreateHarnessConfig(ctx context.Context, hc *store.Harne
 		SetOwnerID(hc.OwnerID).
 		SetCreatedBy(hc.CreatedBy).
 		SetUpdatedBy(hc.UpdatedBy).
-		SetVisibility(hc.Visibility).
 		SetCreated(hc.Created).
 		SetUpdated(hc.Updated)
 
@@ -516,7 +592,6 @@ func (s *TemplateStore) UpdateHarnessConfig(ctx context.Context, hc *store.Harne
 		SetImageStatus(entharnessconfig.ImageStatus(hc.ImageStatus)).
 		SetOwnerID(hc.OwnerID).
 		SetUpdatedBy(hc.UpdatedBy).
-		SetVisibility(hc.Visibility).
 		SetUpdated(hc.Updated)
 	if hc.ImageStatusCheckedAt != nil {
 		update.SetImageStatusCheckedAt(*hc.ImageStatusCheckedAt)

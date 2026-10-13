@@ -223,6 +223,63 @@ func TestCloudRunRun_CreatesInstanceWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestCloudRunRun_RestartPolicyAlways(t *testing.T) {
+	fake := &fakeInstancesClient{getErr: notFoundErr()}
+	rt := newFakeCloudRunRuntime(t, fake)
+
+	_, err := rt.Run(context.Background(), runConfigForTest())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(fake.createReqs) != 1 {
+		t.Fatalf("CreateInstance called %d times, want 1", len(fake.createReqs))
+	}
+	inst := fake.createReqs[0].Instance
+	if inst.Annotations == nil {
+		t.Fatal("Instance.Annotations is nil, expected restart policy annotation")
+	}
+	const wantKey = "run.googleapis.com/restart-policy"
+	const wantVal = "Always"
+	if got := inst.Annotations[wantKey]; got != wantVal {
+		t.Errorf("Instance.Annotations[%q] = %q, want %q", wantKey, got, wantVal)
+	}
+}
+
+func TestCloudRunRun_HubEndpointEnvPassthrough(t *testing.T) {
+	fake := &fakeInstancesClient{getErr: notFoundErr()}
+	rt := newFakeCloudRunRuntime(t, fake)
+
+	cfg := runConfigForTest()
+	cfg.Env = []string{
+		"SCION_HUB_ENDPOINT=https://hub.example.com",
+		"SCION_HUB_URL=https://hub.example.com",
+	}
+
+	_, err := rt.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(fake.createReqs) != 1 {
+		t.Fatalf("CreateInstance called %d times, want 1", len(fake.createReqs))
+	}
+	container := fake.createReqs[0].Instance.Containers[0]
+	foundEndpoint := false
+	for _, ev := range container.Env {
+		if ev.Name == "SCION_HUB_ENDPOINT" {
+			val := ev.GetValues().(*runpb.EnvVar_Value).Value
+			if val != "https://hub.example.com" {
+				t.Errorf("SCION_HUB_ENDPOINT = %q, want %q", val, "https://hub.example.com")
+			}
+			foundEndpoint = true
+		}
+	}
+	if !foundEndpoint {
+		t.Error("SCION_HUB_ENDPOINT env var not found in container")
+	}
+}
+
 func TestCloudRunRun_StartsExistingInstance(t *testing.T) {
 	wantID := cloudRunInstanceID("agent-1")
 	wantName := "projects/test-project/locations/us-central1/instances/" + wantID
@@ -328,7 +385,7 @@ func TestCloudRunTeardown_SendsQualifiedName(t *testing.T) {
 	}{
 		{
 			name: "Stop",
-			call: func(rt *CloudRunRuntime) error { return rt.Stop(context.Background(), id) },
+			call: func(rt *CloudRunRuntime) error { return rt.Stop(context.Background(), RunRef{ID: id}) },
 			reqName: func(f *fakeInstancesClient) (string, int) {
 				if len(f.stopReqs) == 0 {
 					return "", 0
@@ -338,7 +395,7 @@ func TestCloudRunTeardown_SendsQualifiedName(t *testing.T) {
 		},
 		{
 			name: "Delete",
-			call: func(rt *CloudRunRuntime) error { return rt.Delete(context.Background(), id) },
+			call: func(rt *CloudRunRuntime) error { return rt.Delete(context.Background(), RunRef{ID: id}) },
 			reqName: func(f *fakeInstancesClient) (string, int) {
 				if len(f.deleteReqs) == 0 {
 					return "", 0
@@ -374,8 +431,8 @@ func TestCloudRunTeardown_SendsQualifiedName(t *testing.T) {
 // TestCloudRunTeardown_ErrorPaths covers Stop and Delete failing at both the
 // call layer and the long-running-operation wait layer.
 func TestCloudRunTeardown_ErrorPaths(t *testing.T) {
-	stop := func(rt *CloudRunRuntime) error { return rt.Stop(context.Background(), "agent-x") }
-	del := func(rt *CloudRunRuntime) error { return rt.Delete(context.Background(), "agent-x") }
+	stop := func(rt *CloudRunRuntime) error { return rt.Stop(context.Background(), RunRef{ID: "agent-x"}) }
+	del := func(rt *CloudRunRuntime) error { return rt.Delete(context.Background(), RunRef{ID: "agent-x"}) }
 
 	tests := []struct {
 		name    string
@@ -407,21 +464,22 @@ func TestCloudRunTeardown_ErrorPaths(t *testing.T) {
 func TestCloudRunList_FiltersByLabelsAndMapsAgentInfo(t *testing.T) {
 	const wanted = "projects/test-project/locations/us-central1/instances/agent-wanted-0000000000"
 
-	// The "scion.name" key here is the label the runtime emits today
-	// (pkg/agent/run.go). It is a fixture, not a contract: if label-key
-	// sanitization is introduced for GCP resource labels, these fixtures and
-	// the filter key below need updating to the sanitized form.
+	// Label keys stored in Cloud Run are sanitized by buildCloudRunInstance
+	// (dots/slashes → underscores via sanitizeGCPLabelKey). The fixtures
+	// below use the sanitized form ("scion_name") to match what the runtime
+	// actually stores. The filter key passed to List uses the original form
+	// ("scion.name") because List sanitizes it before lookup.
 	newFake := func() *fakeInstancesClient {
 		return &fakeInstancesClient{
 			listResult: []*runpb.Instance{
 				{
 					Name:              wanted,
-					Labels:            map[string]string{"scion.name": "wanted", "agent_id": "agent-1"},
+					Labels:            map[string]string{"scion_name": "wanted", "agent_id": "agent-1"},
 					TerminalCondition: &runpb.Condition{State: runpb.Condition_CONDITION_SUCCEEDED},
 				},
 				{
 					Name:   "projects/test-project/locations/us-central1/instances/agent-other-1111111111",
-					Labels: map[string]string{"scion.name": "other", "agent_id": "agent-2"},
+					Labels: map[string]string{"scion_name": "other", "agent_id": "agent-2"},
 				},
 			},
 		}
@@ -431,7 +489,7 @@ func TestCloudRunList_FiltersByLabelsAndMapsAgentInfo(t *testing.T) {
 		fake := newFake()
 		rt := newFakeCloudRunRuntime(t, fake)
 
-		agents, err := rt.List(context.Background(), map[string]string{"scion.name": "wanted"})
+		agents, err := rt.List(context.Background(), map[string]string{"scion_name": "wanted"})
 		if err != nil {
 			t.Fatalf("List: %v", err)
 		}
@@ -459,7 +517,7 @@ func TestCloudRunList_FiltersByLabelsAndMapsAgentInfo(t *testing.T) {
 		if a.ContainerStatus != runpb.Condition_CONDITION_SUCCEEDED.String() {
 			t.Errorf("AgentInfo.ContainerStatus = %q, want %q", a.ContainerStatus, runpb.Condition_CONDITION_SUCCEEDED.String())
 		}
-		if a.Labels["scion.name"] != "wanted" {
+		if a.Labels["scion_name"] != "wanted" {
 			t.Errorf("AgentInfo.Labels = %v, want the instance labels", a.Labels)
 		}
 		if fake.closeCount != 1 {
@@ -539,7 +597,7 @@ func TestCloudRunLifecycle_RunListStopDelete(t *testing.T) {
 	// Stop and Delete accept that ContainerID and address the same instance.
 	stopFake := &fakeInstancesClient{}
 	rt.newClient = func(ctx context.Context) (cloudrun.InstancesAPI, error) { return stopFake, nil }
-	if err := rt.Stop(ctx, containerID); err != nil {
+	if err := rt.Stop(ctx, RunRef{ID: containerID}); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if got := stopFake.stopReqs[0].Name; got != instanceName {
@@ -548,7 +606,7 @@ func TestCloudRunLifecycle_RunListStopDelete(t *testing.T) {
 
 	deleteFake := &fakeInstancesClient{}
 	rt.newClient = func(ctx context.Context) (cloudrun.InstancesAPI, error) { return deleteFake, nil }
-	if err := rt.Delete(ctx, containerID); err != nil {
+	if err := rt.Delete(ctx, RunRef{ID: containerID}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if got := deleteFake.deleteReqs[0].Name; got != instanceName {
@@ -567,10 +625,10 @@ func TestCloudRunRuntime_ClientFactoryError(t *testing.T) {
 	if _, err := rt.Run(context.Background(), runConfigForTest()); err == nil || !strings.Contains(err.Error(), "failed to create client") {
 		t.Errorf("Run error = %v, want 'failed to create client'", err)
 	}
-	if err := rt.Stop(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "failed to create client") {
+	if err := rt.Stop(context.Background(), RunRef{ID: "x"}); err == nil || !strings.Contains(err.Error(), "failed to create client") {
 		t.Errorf("Stop error = %v, want 'failed to create client'", err)
 	}
-	if err := rt.Delete(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "failed to create client") {
+	if err := rt.Delete(context.Background(), RunRef{ID: "x"}); err == nil || !strings.Contains(err.Error(), "failed to create client") {
 		t.Errorf("Delete error = %v, want 'failed to create client'", err)
 	}
 	if _, err := rt.List(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "failed to create client") {

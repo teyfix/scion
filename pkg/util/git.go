@@ -15,7 +15,9 @@
 package util
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -43,6 +45,131 @@ func IsGitRepoDir(dir string) bool {
 	return err == nil
 }
 
+// ErrGitDubiousOwnership is matched (via errors.Is) by the error CheckGitRepoDir
+// returns when git refuses a repository because it is owned by a different
+// user and is not listed in the safe.directory setting.
+var ErrGitDubiousOwnership = errors.New("git refused the repository because of its ownership")
+
+// GitOwnershipError reports that git refused a repository because of its
+// ownership. It matches ErrGitDubiousOwnership with errors.Is.
+type GitOwnershipError struct {
+	// Dir is the directory git was run in.
+	Dir string
+	// SuggestedArg is the safe.directory argument from git's own suggested
+	// command, kept verbatim (git shell-quotes it when the path needs it),
+	// or empty if it could not be read.
+	SuggestedArg string
+}
+
+func (e *GitOwnershipError) Error() string {
+	if e.SuggestedArg != "" {
+		return fmt.Sprintf("git refused the repository because it is owned by a different user; "+
+			"if you trust it, run: git config --global --add safe.directory %s", e.SuggestedArg)
+	}
+	return fmt.Sprintf("git refused the repository at %s because it is owned by a different user; "+
+		"if you trust it, run: git config --global --add safe.directory <path> "+
+		"(use the repository's top-level directory)", e.Dir)
+}
+
+// Is reports whether target is ErrGitDubiousOwnership.
+func (e *GitOwnershipError) Is(target error) bool {
+	return target == ErrGitDubiousOwnership
+}
+
+// CheckGitRepoDir reports whether dir (the current directory when empty) is
+// inside a git work tree. Unlike IsGitRepoDir it tells "not a repository"
+// apart from git refusing a repository because of its ownership: in that
+// case it returns false and a *GitOwnershipError. Any other git failure
+// returns (false, nil), as IsGitRepoDir does.
+func CheckGitRepoDir(dir string) (bool, error) {
+	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	// Force untranslated git messages so the stderr match is locale-stable.
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		return true, nil
+	}
+	msg := stderr.String()
+	if !isGitOwnershipRefusal(msg) {
+		return false, nil
+	}
+	checked := dir
+	if checked == "" {
+		checked, _ = os.Getwd()
+	}
+	if abs, err := filepath.Abs(checked); err == nil {
+		checked = abs
+	}
+	return false, &GitOwnershipError{Dir: checked, SuggestedArg: parseSafeDirectorySuggestion(msg)}
+}
+
+// isGitOwnershipRefusal reports whether git's stderr describes a refusal
+// because of repository ownership. Git 2.36.2 and 2.37.1 onward print
+// "fatal: detected dubious ownership in repository at '<path>'"; 2.35.2 to
+// 2.36.1 and 2.37.0 print "fatal: unsafe repository ('<path>' is owned by
+// someone else)". Only a line that starts with one of these prefixes
+// counts, so other git errors that echo a path containing similar words
+// are not mistaken for a refusal. The prefixes are stable under LC_ALL=C.
+func isGitOwnershipRefusal(stderr string) bool {
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "fatal: detected dubious ownership in repository at ") ||
+			strings.HasPrefix(line, "fatal: unsafe repository (") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSafeDirectorySuggestion returns the argument of git's suggested
+// "git config --global --add safe.directory <arg>" line verbatim, keeping
+// any shell quoting git applied, or "" if there is no such line or the
+// argument is not a complete shell word (for example a quoted path that
+// contains a newline, which git prints across several lines).
+func parseSafeDirectorySuggestion(stderr string) string {
+	const marker = "--add safe.directory "
+	for _, line := range strings.Split(stderr, "\n") {
+		i := strings.Index(line, marker)
+		if i < 0 {
+			continue
+		}
+		arg := strings.TrimSpace(line[i+len(marker):])
+		if !isCompleteShellWord(arg) {
+			return ""
+		}
+		return arg
+	}
+	return ""
+}
+
+// isCompleteShellWord reports whether s is a non-empty single shell word in
+// the form git prints (plain characters, single-quoted runs and
+// backslash-escaped characters) with every quote closed and no newline.
+func isCompleteShellWord(s string) bool {
+	if s == "" || strings.ContainsAny(s, "\r\n") {
+		return false
+	}
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'':
+			inQuote = !inQuote
+		case inQuote:
+		case c == '\\':
+			if i+1 == len(s) {
+				return false
+			}
+			i++
+		case c == ' ' || c == '\t':
+			return false
+		}
+	}
+	return !inQuote
+}
+
 // GetGitVersion returns the git version string and the path to the git binary used.
 func GetGitVersion() (string, string, error) {
 	gitPath := os.Getenv("SCION_GIT_BINARY")
@@ -58,20 +185,23 @@ func GetGitVersion() (string, string, error) {
 	if err != nil {
 		return "", gitPath, err
 	}
-	// Output is usually "git version 2.47.0"
+	// Output is usually "git version 2.48.0"
 	version := strings.TrimPrefix(strings.TrimSpace(string(output)), "git version ")
 	return version, gitPath, nil
 }
 
-// CheckGitVersion returns an error if the git version is less than 2.47.0.
+// CheckGitVersion returns an error if the git version is less than 2.48.0.
+//
+// 2.48 is required: `git worktree add --relative-paths` first shipped in
+// git 2.48; 2.47.x rejects the flag.
 func CheckGitVersion() error {
 	version, gitPath, err := GetGitVersion()
 	if err != nil {
 		return fmt.Errorf("failed to get git version: %w", err)
 	}
 
-	if err := CompareGitVersion(version, 2, 47); err != nil {
-		return fmt.Errorf("git version 2.47.0 or newer is required; scion requires worktree support with relative paths (found %s at %s)", version, gitPath)
+	if err := CompareGitVersion(version, 2, 48); err != nil {
+		return fmt.Errorf("git version 2.48.0 or newer is required; scion requires worktree support with relative paths (found %s at %s)", version, gitPath)
 	}
 
 	return nil
@@ -208,7 +338,57 @@ func CreateWorktree(path, branch string) error {
 	return nil
 }
 
+// ErrPathNotContained is returned by RemoveWorktree when path's resolved
+// (symlink-free) location does not lie under base's resolved location.
+//
+// Callers MUST NOT fall back to a raw recursive removal of path when they see
+// this error — the whole point of the check is that path's real, on-disk
+// location may not be what its lexical form suggests (an intermediate path
+// component, e.g. a worktrees directory or the leaf itself, may be a symlink
+// pointing outside base). Falling back to removing path anyway would defeat
+// the check entirely.
+var ErrPathNotContained = errors.New("path resolves outside the expected base directory")
+
+// pathResolvedUnderBase reports whether candidate, after resolving all
+// symlinks, is a strict descendant of base, also resolved. It fails closed
+// (returns false) on any resolution error, on base==candidate (removing the
+// base itself is never intended), and on non-existent paths — existence must
+// be checked by the caller first.
+// pathResolvedUnderBase also returns the resolved candidate path so a caller
+// that proceeds after a true result can act on that same resolved location
+// (see RemoveWorktree) rather than re-resolving it later — closing the
+// window between "checked" and "used" during which the lexical path could
+// start pointing somewhere else.
+func pathResolvedUnderBase(base, candidate string) (ok bool, resolvedCandidate string, err error) {
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve base %q: %w", base, err)
+	}
+	resolvedCandidate, err = filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve candidate %q: %w", candidate, err)
+	}
+	rel, err := filepath.Rel(resolvedBase, resolvedCandidate)
+	if err != nil {
+		return false, "", nil
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, "", nil
+	}
+	return true, resolvedCandidate, nil
+}
+
 // RemoveWorktree removes a git worktree at the specified path.
+//
+// base is the expected repo/worktree-parent root that path must resolve
+// under; both must be non-empty absolute paths. Before touching anything on
+// disk, RemoveWorktree resolves symlinks on both base and path and refuses
+// (returning ErrPathNotContained) unless path's real location is a strict
+// descendant of base's real location. This guards against a path that is
+// lexically inside base but, through a symlinked intermediate directory or a
+// symlinked leaf, actually resolves outside it — a caller holding such a
+// path (e.g. one sourced from stored/discovered state rather than freshly
+// created here) must not have it silently honored.
 //
 // Instead of using "git worktree remove" (which does its own directory
 // deletion and can trigger macOS autofs timeouts on symlinks pointing to
@@ -217,7 +397,37 @@ func CreateWorktree(path, branch string) error {
 //  2. Removes the worktree directory using RemoveAllSafe (which uses unlinkat
 //     to avoid autofs triggers).
 //  3. Runs "git worktree prune" to clean up the now-stale worktree record.
-func RemoveWorktree(path string, deleteBranch bool) (bool, error) {
+func RemoveWorktree(base, path string, deleteBranch bool) (bool, error) {
+	// Every failure from here through the containment check is a pre-removal
+	// validation failure, not a removal-mechanics failure — none of them have
+	// proven path safe to act on, so all of them wrap ErrPathNotContained
+	// (not just the explicit "not contained" case below). A caller that only
+	// treats the explicit case as no-fallback-eligible would otherwise fall
+	// back to a raw RemoveAllSafe(path) on, for example, an unresolvable
+	// symlink loop — exactly the unvalidated recursive removal this whole
+	// check exists to prevent.
+	if base == "" || path == "" {
+		return false, fmt.Errorf("RemoveWorktree: base and path must both be non-empty: %w", ErrPathNotContained)
+	}
+	if !filepath.IsAbs(base) || !filepath.IsAbs(path) {
+		return false, fmt.Errorf("RemoveWorktree: base and path must both be absolute paths: %w", ErrPathNotContained)
+	}
+
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return false, nil // nothing to remove
+		}
+		return false, fmt.Errorf("RemoveWorktree: lstat %q: %w: %w", path, statErr, ErrPathNotContained)
+	}
+
+	contained, resolvedPath, err := pathResolvedUnderBase(base, path)
+	if err != nil {
+		return false, fmt.Errorf("RemoveWorktree: %w: %w", err, ErrPathNotContained)
+	}
+	if !contained {
+		return false, fmt.Errorf("RemoveWorktree: %q does not resolve under %q: %w", path, base, ErrPathNotContained)
+	}
+
 	var branchName string
 	var repoRoot string
 	branchDeleted := false
@@ -247,9 +457,14 @@ func RemoveWorktree(path string, deleteBranch bool) (bool, error) {
 	// Remove the worktree directory ourselves using RemoveAllSafe, which
 	// uses unlinkat for symlinks to avoid triggering macOS autofs timeouts.
 	// This replaces "git worktree remove" which uses its own (slow) deletion.
-	Debugf("RemoveWorktree: removing worktree directory %s via RemoveAllSafe", path)
+	// Act on resolvedPath (computed above), not the lexical path: using the
+	// lexical form here would re-open the check-then-use window the
+	// containment check just closed — path's containment was proven for its
+	// resolved location, not for whatever the lexical string might resolve to
+	// if something changed between the check and this call.
+	Debugf("RemoveWorktree: removing worktree directory %s via RemoveAllSafe", resolvedPath)
 	removeStart := time.Now()
-	if err := RemoveAllSafe(path); err != nil {
+	if err := RemoveAllSafe(resolvedPath); err != nil {
 		Debugf("RemoveWorktree: RemoveAllSafe failed in %v: %v", time.Since(removeStart), err)
 		return false, err
 	}
@@ -310,10 +525,16 @@ func DeleteBranchIn(repoRoot, branchName string) bool {
 	return cmd.Run() == nil
 }
 
-// FindWorktreeByBranch returns the absolute path of the worktree checked out to the specified branch.
-// It returns an empty string if not found.
-func FindWorktreeByBranch(branchName string) (string, error) {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+// FindWorktreeByBranchIn returns the absolute path of the worktree checked
+// out to the specified branch in the repository at repoRoot. It returns an
+// empty string if not found. The lookup runs against repoRoot, never the
+// process's current directory, so it gives the same answer whether the caller
+// runs inside the repository (a local CLI) or outside it (a runtime broker).
+func FindWorktreeByBranchIn(repoRoot, branchName string) (string, error) {
+	if repoRoot == "" {
+		return "", fmt.Errorf("find worktree for branch %q: no repository directory given", branchName)
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -345,9 +566,181 @@ func FindWorktreeByBranch(branchName string) (string, error) {
 	return "", nil
 }
 
-// BranchExists returns true if the branch exists in the repository.
-func BranchExists(branchName string) bool {
-	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
+// IsRegisteredWorktree reports whether path is one of the worktrees git
+// itself has registered for the repository at repoRoot, via
+// `git -C repoRoot worktree list --porcelain`. Matching is by resolved
+// (symlink-free) equality against each registered worktree path — not a
+// path-prefix guess — because `git worktree add` accepts any destination
+// the caller names and there is no fixed location every worktree must live
+// under. `git worktree list`'s first entry is always the repository's main
+// worktree, but that is not necessarily repoRoot itself: repoRoot may be a
+// linked worktree of the same repository (a project can live in one), in
+// which case the main worktree's own path never equals repoRoot even though
+// both share the same repository. The main worktree is instead recognized
+// structurally, the same way a linked one is: its .git is a directory (not
+// a linked worktree's gitdir-pointer file), and that directory, resolved,
+// is the repository's own common git directory.
+//
+// A failure listing worktrees (repoRoot is not a git repository, git is
+// unavailable, and so on) returns (false, err). Callers must treat that as
+// "membership could not be verified," never as "verified true" — this
+// function does not fail open.
+// splitPorcelainRecords splits git porcelain-format output into its
+// blank-line-separated records, normalizing CRLF line endings to LF first.
+// A "\r\n\r\n" blank-line separator contains no "\n\n" substring (the two
+// newlines have a "\r" between them), so splitting on "\n\n" without this
+// normalization would silently fail to separate records at all when git's
+// output uses CRLF, and a surviving "\r" on a "worktree <path>" line would
+// end up as a trailing byte on the parsed path.
+func splitPorcelainRecords(output string) []string {
+	normalized := strings.ReplaceAll(output, "\r\n", "\n")
+	return strings.Split(normalized, "\n\n")
+}
+
+func IsRegisteredWorktree(repoRoot, path string) (bool, error) {
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s: %w", path, err)
+	}
+	commonDir, err := GetCommonGitDir(repoRoot)
+	if err != nil {
+		return false, fmt.Errorf("git common dir for %s: %w", repoRoot, err)
+	}
+	resolvedCommonDir, err := filepath.EvalSymlinks(commonDir)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s: %w", commonDir, err)
+	}
+	worktreesDir := filepath.Join(resolvedCommonDir, "worktrees")
+
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("git worktree list: %w", err)
+	}
+
+	// Porcelain records are separated by a blank line; each holds a
+	// "worktree <path>" line and, for one that git considers a candidate
+	// for `git worktree prune`, a "prunable ..." line.
+	for _, record := range splitPorcelainRecords(string(output)) {
+		var wtPath string
+		prunable := false
+		for _, line := range strings.Split(record, "\n") {
+			switch {
+			case strings.HasPrefix(line, "worktree "):
+				wtPath = strings.TrimPrefix(line, "worktree ")
+				if strings.HasPrefix(wtPath, "\"") {
+					if unquoted, uerr := strconv.Unquote(wtPath); uerr == nil {
+						wtPath = unquoted
+					}
+				}
+			case strings.HasPrefix(line, "prunable"):
+				prunable = true
+			}
+		}
+		if wtPath == "" || prunable {
+			// A prunable record — git itself considers the registration
+			// stale (its gitdir pointer no longer resolves) — is not
+			// membership: a plain directory later created at the same path
+			// must not inherit the identity of a worktree that no longer
+			// really exists there.
+			//
+			// This specific prunable reason (gitdir file points to a
+			// non-existent location) cannot be exercised independently of
+			// isLinkedWorktreeOf's own check in a real git-backed test:
+			// both read the existence of the exact same file (wtPath's own
+			// .git), so recreating that file with content valid enough for
+			// isLinkedWorktreeOf to accept also, as an unavoidable side
+			// effect, clears this prunable reason in git's own listing
+			// before IsRegisteredWorktree ever sees it. Confirmed
+			// empirically against a real git repository.
+			continue
+		}
+
+		resolvedWt, err := filepath.EvalSymlinks(wtPath)
+		if err != nil || resolvedWt != resolvedPath {
+			continue
+		}
+
+		if isMainWorktreeOf(wtPath, resolvedCommonDir) {
+			return true, nil
+		}
+		if isLinkedWorktreeOf(wtPath, worktreesDir) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// isMainWorktreeOf reports whether wtPath is the repository's main
+// worktree, identified structurally rather than by comparing it against a
+// caller-supplied repoRoot: wtPath's .git is a directory (not a linked
+// worktree's gitdir-pointer file), and that directory, resolved, is the
+// repository's own common git directory (resolvedCommonDir). This still
+// works when repoRoot itself names a linked worktree of the same
+// repository, a shape where wtPath (the real main worktree) never equals
+// repoRoot even though both belong to the same repository.
+//
+// This checks wtPath's .git at the time of the call; the caller acts on the
+// result afterward. A change to wtPath's .git between this check and that
+// later use is out of scope here, the same validate-then-act model the rest
+// of this package's path checks use.
+func isMainWorktreeOf(wtPath, resolvedCommonDir string) bool {
+	gitFile := filepath.Join(wtPath, ".git")
+	info, err := os.Lstat(gitFile)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	resolvedGitDir, err := filepath.EvalSymlinks(gitFile)
+	if err != nil {
+		return false
+	}
+	return resolvedGitDir == resolvedCommonDir
+}
+
+// isLinkedWorktreeOf reports whether wtPath's .git file points into
+// worktreesDir — the repository's own worktrees/ administrative directory —
+// confirming wtPath is a linked worktree git itself created for this
+// repository, not merely a directory whose path happens to match a
+// registration (matching path alone is exactly what a stale-then-recreated
+// directory can satisfy without being a real worktree).
+func isLinkedWorktreeOf(wtPath, worktreesDir string) bool {
+	gitFile := filepath.Join(wtPath, ".git")
+	info, err := os.Lstat(gitFile)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	content, err := os.ReadFile(gitFile)
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(content))
+	const prefix = "gitdir: "
+	if !strings.HasPrefix(line, prefix) {
+		return false
+	}
+	target := strings.TrimPrefix(line, prefix)
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(wtPath, target)
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return false
+	}
+	// A real linked worktree's gitdir always names a specific entry under
+	// worktrees/, never the worktrees directory itself -- there is no
+	// registration that is the whole administrative directory, so a gitdir
+	// resolving to exactly worktreesDir is not a match.
+	return strings.HasPrefix(resolvedTarget, worktreesDir+string(filepath.Separator))
+}
+
+// BranchExistsIn returns true if the branch exists in the repository at
+// repoRoot. Like FindWorktreeByBranchIn, it never consults the process's
+// current directory; an empty repoRoot reports false.
+func BranchExistsIn(repoRoot, branchName string) bool {
+	if repoRoot == "" {
+		return false
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
 	err := cmd.Run()
 	return err == nil
 }
@@ -425,15 +818,36 @@ func NormalizeGitRemote(remote string) string {
 	remote = strings.TrimPrefix(remote, "ssh://")
 	remote = strings.TrimPrefix(remote, "git://")
 
-	// Handle SSH shorthand format (git@host:path → host/path)
+	// Handle SSH shorthand format (git@host:path → host/path). A bracketed
+	// IPv6 host (git@[::1]:path) is split after its closing ']'; one followed
+	// by '/' or the end (from ssh://git@[::1]/path) is left as is. A bracketed
+	// host that is not an IPv6 literal, or is followed by anything else
+	// (git@[x@y]:path, git@[::1]x@y:path), is left without the userinfo strip
+	// below, so any '@' in it remains (callers that persist the result refuse
+	// a normalized remote with '@').
+	malformedBracket := false
 	if strings.HasPrefix(remote, "git@") {
 		remote = strings.TrimPrefix(remote, "git@")
-		remote = strings.Replace(remote, ":", "/", 1)
+		if strings.HasPrefix(remote, "[") {
+			end := strings.Index(remote, "]")
+			switch {
+			case end < 0 || !isBracketedIPv6(remote[:end+1]):
+				malformedBracket = true
+			case strings.HasPrefix(remote[end+1:], ":"):
+				remote = remote[:end+1] + "/" + remote[end+2:]
+			case end+1 == len(remote) || remote[end+1] == '/':
+				// ssh://git@[::1]/path: nothing to split.
+			default:
+				malformedBracket = true
+			}
+		} else {
+			remote = strings.Replace(remote, ":", "/", 1)
+		}
 	}
 
 	// Strip user info (user@, user:pass@) for scheme-based URLs.
 	// This handles token-authenticated HTTPS URLs like x-access-token:TOKEN@github.com/...
-	if atIdx := strings.Index(remote, "@"); atIdx >= 0 {
+	if atIdx := strings.Index(remote, "@"); atIdx >= 0 && !malformedBracket {
 		slashIdx := strings.Index(remote, "/")
 		if slashIdx < 0 || atIdx < slashIdx {
 			remote = remote[atIdx+1:]
@@ -492,9 +906,118 @@ func IsGitURL(s string) bool {
 	return false
 }
 
+// StripGitURLCredentials removes credentials from a git remote URL so it can
+// be stored or displayed safely (for example in a readable project label).
+//
+//   - http(s):// and git:// URLs lose their userinfo entirely, e.g.
+//     https://user:TOKEN@github.com/org/repo.git -> https://github.com/org/repo.git
+//   - ssh:// URLs keep the login name (it selects the SSH account and is not
+//     a secret) but lose any password: ssh://git:pw@host/x -> ssh://git@host/x
+//   - SCP-style shorthand (git@host:org/repo) carries no password and is
+//     returned unchanged, as is anything without a "scheme://" prefix.
+//
+// The userinfo ends at the first '@' that is preceded by a valid login (no
+// '/' before the first ':') and followed by a host (no '@' or '/') — the RFC
+// 3986 authority with a lenient password. So a password containing an
+// unencoded '/' or '@' (https://u:p/w@host/org/repo) is still removed rather
+// than left in place, and a '@' after the start of the path (.../repo@v1,
+// .../repo@github.com/x) is never treated as userinfo.
+//
+// The URL is edited textually rather than round-tripped through net/url so
+// that the rest of it is preserved byte-for-byte.
+func StripGitURLCredentials(remote string) string {
+	schemeEnd := strings.Index(remote, "://")
+	if schemeEnd < 0 {
+		return remote
+	}
+	scheme := strings.ToLower(remote[:schemeEnd])
+	authorityStart := schemeEnd + len("://")
+	rest := remote[authorityStart:]
+	limit := strings.IndexAny(rest, "?#")
+	if limit < 0 {
+		limit = len(rest)
+	}
+	at := userinfoEnd(rest[:limit])
+	if at < 0 {
+		return remote
+	}
+	userinfo, hostAndPath := rest[:at], rest[at+1:]
+	if scheme == "ssh" {
+		if colon := strings.Index(userinfo, ":"); colon >= 0 {
+			userinfo = userinfo[:colon]
+		}
+		if userinfo != "" && !strings.ContainsAny(userinfo, "/@") {
+			return remote[:authorityStart] + userinfo + "@" + hostAndPath
+		}
+	}
+	return remote[:authorityStart] + hostAndPath
+}
+
+// userinfoEnd returns the index of the '@' ending the userinfo of s (a URL
+// with its "scheme://" prefix, query and fragment removed), or -1 if s has no
+// userinfo. It picks the first '@' such that the login before it (up to the
+// first ':') contains no '/', and the host after it (up to the next '/') is
+// non-empty and contains no '@'. Once a '/' appears in the login position the
+// path has started, so no later '@' can end the userinfo.
+//
+// A '/' after the first ':' is ambiguous: "host:8443/org/repo@v1" is a port
+// followed by a path with '@', while "user:pa/ss@host/repo" is a password
+// with an unencoded '/'. When the text before that '/' is a valid host:port
+// (a 1-65535 port without leading zeros), s is read as RFC 3986 does, with no
+// userinfo. Otherwise it cannot be a valid authority, so the '@' is taken to
+// end a password and the credential is stripped (fail closed). Callers that
+// persist the result must still reject '@' in the path, since a password
+// that looks like a port ("user:8443/x@host/repo") is left in place.
+func userinfoEnd(s string) int {
+	for from := 0; ; {
+		i := strings.Index(s[from:], "@")
+		if i < 0 {
+			return -1
+		}
+		at := from + i
+		userinfo := s[:at]
+		login, _, _ := strings.Cut(userinfo, ":")
+		if strings.Contains(login, "/") {
+			return -1
+		}
+		if authority, _, ok := strings.Cut(userinfo, "/"); ok && isHostAndPort(authority) {
+			return -1
+		}
+		host, _, _ := strings.Cut(s[at+1:], "/")
+		if host != "" && !strings.Contains(host, "@") {
+			return at
+		}
+		from = at + 1
+	}
+}
+
+// isHostAndPort reports whether s is a non-empty host followed by ':' and a
+// port of 1-65535 without leading zeros (e.g. "host:8443", "[::1]:8443").
+func isHostAndPort(s string) bool {
+	colon := strings.LastIndex(s, ":")
+	if colon <= 0 {
+		return false
+	}
+	port := s[colon+1:]
+	if port == "" || len(port) > 5 || port[0] == '0' {
+		return false
+	}
+	n := 0
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n <= 65535
+}
+
 // ToHTTPSCloneURL converts any git URL to HTTPS clone form with a .git suffix.
 // SSH shorthand and ssh:// URLs are converted; HTTPS URLs are passed through
-// (with .git appended if missing).
+// (with .git appended if missing). Azure DevOps URLs (dev.azure.com,
+// visualstudio.com, or paths containing /_git/) are an exception: .git is
+// never appended and is stripped if already present, because ADO encodes the
+// repository via the /_git/<repo> path segment.
 func ToHTTPSCloneURL(gitURL string) string {
 	if gitURL == "" {
 		return ""
@@ -524,15 +1047,41 @@ func ToHTTPSCloneURL(gitURL string) string {
 		}
 	}
 
-	// Strip trailing slashes before adding .git suffix
+	// Strip trailing slashes
 	result = strings.TrimRight(result, "/")
 
-	// Ensure .git suffix
-	if !strings.HasSuffix(result, ".git") {
+	// Azure DevOps URLs use /_git/ in the path to identify the repo;
+	// appending .git would break them. For ADO we strip any erroneous
+	// .git suffix. For every other host we ensure the .git suffix is present.
+	if isAzureDevOpsURL(result) {
+		result = strings.TrimSuffix(result, ".git")
+	} else if !strings.HasSuffix(result, ".git") {
 		result += ".git"
 	}
 
 	return "https://" + result
+}
+
+// isAzureDevOpsURL reports whether hostAndPath (without scheme) looks like an
+// Azure DevOps clone URL. It matches dev.azure.com, *.visualstudio.com hosts,
+// and any path containing the /_git/ segment that ADO uses.
+func isAzureDevOpsURL(hostAndPath string) bool {
+	lower := strings.ToLower(hostAndPath)
+	if strings.HasPrefix(lower, "dev.azure.com/") {
+		return true
+	}
+	// <org>.visualstudio.com/...
+	if dotIdx := strings.Index(lower, "."); dotIdx > 0 {
+		rest := lower[dotIdx:]
+		if strings.HasPrefix(rest, ".visualstudio.com/") || rest == ".visualstudio.com" {
+			return true
+		}
+	}
+	// Catch-all: any URL with the /_git/ path segment is ADO-style.
+	if strings.Contains(lower, "/_git/") {
+		return true
+	}
+	return false
 }
 
 // ExtractOrgRepo extracts the organization and repository name from a git URL.

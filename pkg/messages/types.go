@@ -42,6 +42,11 @@ const MaxMetadataKeySize = 256
 // Maximum size of a single metadata value in bytes.
 const MaxMetadataValueSize = 4 * 1024 // 4KB
 
+// AttachmentsMetadataKey is the StructuredMessage.Metadata key carrying the
+// JSON-encoded attachment refs of a message's attachments. It is used by
+// pkg/hub for internal transport and must be stripped before logging.
+const AttachmentsMetadataKey = "attachments"
+
 // Maximum length of the Channel field.
 const MaxChannelLength = 64
 
@@ -54,11 +59,15 @@ func IsValidChannel(ch string) bool {
 }
 
 // Message type constants (closed enum).
+//
+// TypeAssistantReply is retired: it was the harness's automatic end-of-turn
+// transcript mirror. It stays valid so historical rows keep validating and
+// rendering; the hub drops new outbound sends of it.
 const (
 	TypeInstruction    = "instruction"
 	TypeInputNeeded    = "input-needed"
 	TypeStateChange    = "state-change"
-	TypeAssistantReply = "assistant-reply"
+	TypeAssistantReply = "assistant-reply" // retired; see above
 	TypeGroupSet       = "group-set"
 	TypeMention        = "mention"
 	TypeSystem         = "system"
@@ -73,15 +82,19 @@ const (
 	//       deliverToUser in messagebroker.go pass type through without switching
 	//       on it. Human-to-human messages use recipient prefix "thread:" or
 	//       "user:", never "agent:", so they never enter the agent dispatch path.
-	//   (b) Visibility backfill: the frontend shouldShowMessage (chat-thread.ts)
-	//       defaults empty visibility to "normal" (msg.visibility || 'normal').
-	//       type:chat messages have empty visibility, so they correctly display
-	//       as normal. No backend visibility filter switches on type.
+	//   (b) Visibility: the message-envelope visibility field has been removed
+	//       (all messages are now shown unconditionally).
 	//   (c) Plugin Publish/Validate: broker plugins (broker_plugin.go) relay
 	//       StructuredMessage via RPC without checking the Type field. The only
 	//       type validation is in StructuredMessage.Validate(), and chat is now
 	//       in validTypes. No plugin Publish or Validate method rejects unknown types.
 	TypeChat = "chat"
+
+	// TypeReply is used when a user replies to a specific message. It carries
+	// reply-to metadata (e.g. RE-to) so that agents can see the context of
+	// what was replied to. Mapped to text/request in the envelope taxonomy
+	// (same as TypeInstruction — a reply to an agent is still a request).
+	TypeReply = "reply"
 )
 
 // System message category constants identify the origin of a system message.
@@ -89,26 +102,14 @@ const (
 	SystemCategoryScheduler      = "scheduler"
 	SystemCategoryPortForward    = "port-forward"
 	SystemCategoryDeliveryFailed = "delivery-failed"
-)
-
-// Visibility constants control which consumers see a message.
-// Downstream consumers (chat apps, web UI, broker plugins) filter
-// messages by visibility level to avoid surfacing raw agent output
-// (e.g. thinking traces) in normal chat views.
-const (
-	// VisibilityNormal — always shown. Used for explicit agent→user
-	// messages (scion message, ask_user) and user→agent instructions.
-	VisibilityNormal = "normal"
-
-	// VisibilityVerbose — shown in verbose mode. Used for automatic
-	// assistant replies from hook events (agent turn output without
-	// thinking content).
-	VisibilityVerbose = "verbose"
-
-	// VisibilityFull — shown only in full-fidelity mode. Used for
-	// content that includes thinking/reasoning traces and raw tool
-	// output. Intended for ACP streams and debugging interfaces.
-	VisibilityFull = "full"
+	// SystemCategoryDeliveryDeferred marks the notice sent to an agent
+	// sender when the migration gate (design agent-reincarnate §3.7)
+	// deferred their message instead of dispatching it — distinct from
+	// SystemCategoryDeliveryFailed: the message was saved, not dropped.
+	SystemCategoryDeliveryDeferred = "delivery-deferred"
+	// SystemCategoryArtifactReview marks the notice sent to an artifact's
+	// owner when a review version of the artifact was published.
+	SystemCategoryArtifactReview = "artifact-review"
 )
 
 // validTypes is the set of valid message types.
@@ -121,6 +122,7 @@ var validTypes = map[string]bool{
 	TypeMention:        true,
 	TypeSystem:         true,
 	TypeChat:           true,
+	TypeReply:          true,
 }
 
 // StructuredMessage represents a formatted Scion message.
@@ -135,7 +137,6 @@ type StructuredMessage struct {
 	Msg            string            `json:"msg"`
 	Type           string            `json:"type"`
 	Plain          bool              `json:"plain,omitempty"`
-	Raw            bool              `json:"raw,omitempty"`
 	Urgent         bool              `json:"urgent,omitempty"`
 	Broadcasted    bool              `json:"broadcasted,omitempty"`
 	ObserverOnly   bool              `json:"observer_only,omitempty"`
@@ -146,10 +147,26 @@ type StructuredMessage struct {
 	ThreadID       string            `json:"thread_id,omitempty"`
 	ConversationID string            `json:"conversation_id,omitempty"`
 
-	// Visibility controls which consumers see this message.
-	// One of VisibilityNormal, VisibilityVerbose, or VisibilityFull.
-	// Empty defaults to VisibilityNormal for backward compatibility.
-	Visibility string `json:"visibility,omitempty"`
+	// ConversationAsserted records that ConversationID was NAMED BY THE CALLER
+	// and authorized, rather than derived by the hub from message fields.
+	// Hub-internal provenance: it is never rendered into the agent envelope and
+	// never accepted from request JSON. Consumers must branch on this, never on
+	// ConversationID != "" — non-emptiness only means "already resolved upstream".
+	ConversationAsserted bool `json:"-"`
+
+	// ArtifactRefsAdmitted records that the hub's admission step set the
+	// "artifacts" metadata value (ptone/scion#3222): the references were
+	// checked against the sender's own credential. Hub-internal like
+	// ConversationAsserted: never rendered, never accepted from request
+	// JSON. A consumer that persists references must require it and drop
+	// the value otherwise.
+	ArtifactRefsAdmitted bool `json:"-"`
+
+	// DeliveryText is the fully rendered agent-facing envelope, produced by
+	// the hub. When set, the broker delivers it verbatim and performs no
+	// formatting. Phase 13 deletes this field along with the rest of
+	// StructuredMessage.
+	DeliveryText string `json:"delivery_text,omitempty"`
 }
 
 // ValidateType returns an error if the message type is not in the closed enum.
@@ -281,6 +298,14 @@ func NewSystemMessage(sender, recipient, msg, category string) *StructuredMessag
 	}
 }
 
+// logMetadataSkipKeys lists metadata keys that are internal transport
+// mechanisms and should never appear in log output. Defense-in-depth:
+// even if a new call site forgets to strip the key after consuming it,
+// LogAttrs will not emit it.
+var logMetadataSkipKeys = map[string]bool{
+	AttachmentsMetadataKey: true, // internal attachment-ref transport; see pkg/hub/attachments_agent.go
+}
+
 // LogAttrs returns slog attributes for structured logging of this message.
 func (m *StructuredMessage) LogAttrs() []any {
 	attrs := []any{
@@ -291,7 +316,6 @@ func (m *StructuredMessage) LogAttrs() []any {
 		"urgent", m.Urgent,
 		"broadcasted", m.Broadcasted,
 		"plain", m.Plain,
-		"raw", m.Raw,
 	}
 	if m.SenderID != "" {
 		attrs = append(attrs, "sender_id", m.SenderID)
@@ -307,6 +331,15 @@ func (m *StructuredMessage) LogAttrs() []any {
 	}
 	if m.ThreadID != "" {
 		attrs = append(attrs, "thread_id", m.ThreadID)
+	}
+	if m.ConversationID != "" {
+		attrs = append(attrs, "conversation_id", m.ConversationID)
+	}
+	for k, v := range m.Metadata {
+		if logMetadataSkipKeys[k] {
+			continue
+		}
+		attrs = append(attrs, "meta_"+k, v)
 	}
 	return attrs
 }

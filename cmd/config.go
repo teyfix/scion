@@ -25,6 +25,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var configGlobal bool
@@ -32,7 +33,32 @@ var configGlobal bool
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Manage scion configuration settings",
-	Long:  `View and modify settings for scion-agent. Settings are resolved from project (.scion/settings.json) and global (~/.scion/settings.json) locations.`,
+	Long:  `View and modify settings for scion-agent. Settings are resolved from project (.scion/settings.yaml) and global (~/.scion/settings.yaml) locations.`,
+	// Args/Run make this command Runnable so cobra validates subcommand
+	// names: an unrecognized subcommand (e.g. a removed alias) returns an
+	// "unknown command" error instead of silently falling through to this
+	// command's own help with exit status 0.
+	//
+	// A bare "config" (no subcommand), and "config help ..." (cobra only
+	// registers a real "help" subcommand on the root command, so under
+	// "config" it would otherwise hit the same unknown-command path)
+	// return pflag.ErrHelp instead of going through cobra.NoArgs. Cobra's
+	// ExecuteC handles ErrHelp specially: it prints help and returns a nil
+	// error *before* any PersistentPreRunE hook runs. That distinction
+	// matters here because root's PersistentPreRunE requires an active
+	// scion project for "config" (it's not in the exempt command list), so
+	// letting a bare "config" fall through to a normal nil return would
+	// turn "scion config" run outside a project into a "not in a scion
+	// project" error instead of printing help.
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 || args[0] == "help" {
+			return pflag.ErrHelp
+		}
+		return cobra.NoArgs(cmd, args)
+	},
+	// Must be Runnable (any Run/RunE) for the Args validator above to be
+	// evaluated at all; the actual printing happens via the ErrHelp path.
+	Run: func(cmd *cobra.Command, args []string) {},
 }
 
 var configListCmd = &cobra.Command{
@@ -133,7 +159,30 @@ var configSetCmd = &cobra.Command{
 var configGetCmd = &cobra.Command{
 	Use:   "get <key>",
 	Short: "Get a specific configuration value",
-	Args:  cobra.ExactArgs(1),
+	Long: `Get a specific configuration value.
+
+Supported keys include the top-level settings (active_profile, default_template,
+default_harness_config, workspace_path, image_registry, project_id, cli.autohelp,
+hub.enabled, hub.linked, hub.endpoint, hub.local_only, hub.brokerId, hub.brokerToken,
+hub.brokerNickname — note that hub.brokerToken prints its value, as it always has),
+plus dotted paths into a named entry of the profiles or runtimes maps:
+profiles.<name>.<field> and runtimes.<name>.<field>, where <field> is one of that
+entry's scalar (string, bool, or integer) settings, named by its settings.yaml key
+(e.g. profiles.local.runtime, runtimes.kubernetes.namespace). Within a
+profiles/runtimes entry, structured fields (maps, lists, nested objects — e.g. env,
+volumes, secrets, harness_overrides) and credential-like field names are not
+supported and return an error rather than a partial, reformatted, or unmasked value.
+
+harness_configs.<name>.<field> is not supported: harness configs are normally
+resolved from on-disk harness-config directories, not from settings.yaml alone.
+Use "scion harness-config" to inspect them.
+
+Examples:
+  scion config get active_profile
+  scion config get image_registry
+  scion config get profiles.local.runtime
+  scion config get runtimes.kubernetes.namespace`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key := args[0]
 
@@ -239,6 +288,7 @@ against the schema — they use the pre-versioned format.`,
 				r.Version = version
 
 				validationErrors, err := config.ValidateSettings(data, version)
+				r.Warnings = append(r.Warnings, config.SettingsWarnings(data, version)...)
 				if err != nil {
 					r.Valid = false
 					r.Errors = []string{err.Error()}
@@ -487,9 +537,8 @@ var configCdConfigCmd = &cobra.Command{
 }
 
 var configCdProjectCmd = &cobra.Command{
-	Use:     "cd-project",
-	Aliases: []string{"cd-grove"},
-	Short:   "Open a shell in the project workspace directory",
+	Use:   "cd-project",
+	Short: "Open a shell in the project workspace directory",
 	Long: `Open a shell in the project workspace directory.
 
 For external projects (non-git), navigates to the workspace path stored in settings.
@@ -579,7 +628,7 @@ func init() {
 	configCmd.AddCommand(configCdConfigCmd)
 	configCmd.AddCommand(configCdProjectCmd)
 
-	configSetCmd.Flags().BoolVar(&configGlobal, "global", false, "Set configuration globally (~/.scion/settings.json)")
+	configSetCmd.Flags().BoolVar(&configGlobal, "global", false, "Set configuration globally (~/.scion/settings.yaml)")
 	configMigrateCmd.Flags().BoolVar(&configMigrateDryRun, "dry-run", false, "Preview changes without writing files")
 	configMigrateCmd.Flags().BoolVar(&configMigrateGlobal, "global", false, "Migrate only the global settings file")
 }

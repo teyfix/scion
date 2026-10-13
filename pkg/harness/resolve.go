@@ -63,31 +63,18 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 		return nil, fmt.Errorf("harness.Resolve requires a name")
 	}
 
-	var hcDir *config.HarnessConfigDir
-	var hcErr error
-	if opts.ConfigDirPath != "" {
-		hcDir, hcErr = config.LoadHarnessConfigDir(opts.ConfigDirPath)
-	} else {
-		hcDir, hcErr = config.FindHarnessConfigDir(opts.Name, opts.ProjectPath, opts.TemplatePaths...)
-	}
+	hcDir, hcErr := config.ResolveHarnessConfigDir(opts.ConfigDirPath, opts.Name, opts.ProjectPath, opts.TemplatePaths...)
 
-	entry := config.HarnessConfigEntry{Harness: opts.Name}
-	if hcDir != nil {
-		entry = hcDir.Config
-	}
-
-	// Settings overlay: profile-level overrides on top of the dir entry.
-	if opts.Settings != nil {
-		settingsEntry, _ := opts.Settings.ResolveHarnessConfig(opts.ProfileName, opts.Name)
-		entry = mergeHarnessConfigEntries(entry, settingsEntry)
-	}
-
-	if entry.Harness == "" {
-		entry.Harness = opts.Name
-	}
+	entry := EffectiveConfig(opts.Name, hcDir, opts.Settings, opts.ProfileName)
 
 	// 1. Container-script harness (provisioner block present)
 	if entry.Provisioner != nil {
+		// A provisioner that cannot run (legacy "builtin", or no command)
+		// would yield an agent without the provisioner's output; fail
+		// resolution instead (ptone/scion#611).
+		if ue := CheckProvisionerUsable(opts.Name, hcDir, entry); ue != nil {
+			return nil, ue
+		}
 		if hcDir == nil || hcDir.Path == "" {
 			return nil, fmt.Errorf("container-script harness %q requires an on-disk harness-config directory: %w", opts.Name, hcErr)
 		}
@@ -134,6 +121,54 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 		Config:         entry,
 		Implementation: "generic",
 	}, nil
+}
+
+// GenericSkillsDir is the skills directory of the generic harnesses
+// (Generic, and DeclarativeGenericHarness when its entry names none).
+const GenericSkillsDir = ".scion/skills"
+
+// SkillsDirForEntry returns the skills directory of the harness Resolve
+// builds from the effective harness-config entry, without constructing a
+// harness. Resolve owns the rule; this function states it once so callers
+// that only hold an entry (such as pkg/agent's harness-config switch) do not
+// re-implement it:
+//
+//   - a provisioner block selects the container-script harness, which uses
+//     entry.SkillsDir as is (possibly empty);
+//   - otherwise a non-empty entry.SkillsDir selects the declarative generic
+//     harness, which uses it;
+//   - otherwise the generic harnesses use GenericSkillsDir.
+//
+// It does not check that the provisioner is usable: an entry whose
+// provisioner Resolve would reject still yields entry.SkillsDir.
+func SkillsDirForEntry(entry config.HarnessConfigEntry) string {
+	if entry.Provisioner != nil || entry.SkillsDir != "" {
+		return entry.SkillsDir
+	}
+	return GenericSkillsDir
+}
+
+// EffectiveConfig returns the harness-config entry a harness named name
+// runs with: hcDir's config.yaml (or a bare entry when hcDir is nil) with the
+// settings overlay for profile applied, and Harness defaulted to name. Resolve
+// builds harnesses from this entry, and pkg/agent evaluates harness-config
+// policy against it.
+func EffectiveConfig(name string, hcDir *config.HarnessConfigDir, settings *config.VersionedSettings, profile string) config.HarnessConfigEntry {
+	entry := config.HarnessConfigEntry{Harness: name}
+	if hcDir != nil {
+		entry = hcDir.Config
+	}
+
+	// Settings overlay: profile-level overrides on top of the dir entry.
+	if settings != nil {
+		settingsEntry, _ := settings.ResolveHarnessConfig(profile, name)
+		entry = mergeHarnessConfigEntries(entry, settingsEntry)
+	}
+
+	if entry.Harness == "" {
+		entry.Harness = name
+	}
+	return entry
 }
 
 // mergeHarnessConfigEntries overlays settings overrides on top of the

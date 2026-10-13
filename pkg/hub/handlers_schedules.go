@@ -16,15 +16,14 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/robfig/cron/v3"
 )
 
 // CreateScheduleRequest is the API request for creating a recurring schedule.
@@ -93,16 +92,20 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 	// authorization and dispatch below.
 	pathParts := strings.SplitN(schedulePath, "/", 2)
 
-	// Determine the authorization action from method and path.
+	// Determine the authorization action from method and path. authoring
+	// is set for the routes that author future work (create, update and
+	// resume); pause and delete only stop future runs.
 	var authzAction Action
+	authoring := false
 	if schedulePath == "" {
 		switch r.Method {
 		case http.MethodGet:
 			authzAction = ActionList
 		case http.MethodPost:
 			authzAction = ActionCreate
+			authoring = true
 		default:
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 			return
 		}
 	} else {
@@ -118,21 +121,23 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 				authzAction = ActionRead
 			case http.MethodPatch:
 				authzAction = ActionUpdate
+				authoring = true
 			case http.MethodDelete:
 				authzAction = ActionDelete
 			default:
-				MethodNotAllowed(w)
+				MethodNotAllowed(w, http.MethodGet, http.MethodPatch, http.MethodDelete)
 				return
 			}
 		case "pause", "resume":
 			if r.Method != http.MethodPost {
-				MethodNotAllowed(w)
+				MethodNotAllowed(w, http.MethodPost)
 				return
 			}
 			authzAction = ActionUpdate
+			authoring = subAction == "resume"
 		case "history":
 			if r.Method != http.MethodGet {
-				MethodNotAllowed(w)
+				MethodNotAllowed(w, http.MethodGet)
 				return
 			}
 			authzAction = ActionRead
@@ -140,6 +145,12 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 			NotFound(w, "Schedule action")
 			return
 		}
+	}
+
+	// The authoring credential gate runs before the permission check and
+	// before any schedule lookup or body read.
+	if authoring && !authorizeScheduleAuthoringCredential(w, r) {
+		return
 	}
 
 	// Authorize access — fail closed for all identity types.
@@ -210,8 +221,22 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
 		return
 	}
-	if req.EventType == "dispatch_agent" && !s.authorizeAgentCreate(w, r, projectID) {
+	// Recurring schedules accept (ptone/scion#2200)
+	// the same advanced Payload JSON as one-shot scheduled events and must
+	// be tombstoned the same way (see createScheduledEvent), for both
+	// supported event types — not just "message". A malformed or non-object
+	// payload is rejected first, with a sanitized 400; see
+	// validateAndRejectScheduledPayload for the required order.
+	if !s.validateAndRejectScheduledPayload(w, r, req.EventType, req.Payload) {
 		return
+	}
+	if req.EventType == "dispatch_agent" {
+		if !s.authorizeScheduledDispatchAgentAuthoring(w, r) {
+			return
+		}
+		if !s.authorizeAgentCreate(w, r, projectID) {
+			return
+		}
 	}
 	// C1 containment: validate target agent project scope for message schedules.
 	if req.EventType == "message" {
@@ -220,11 +245,10 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		}
 	}
 
-	// Validate cron expression using standard 5-field parser
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	cronSchedule, err := parser.Parse(req.CronExpr)
+	// Validate cron expression (standard 5-field, UTC-only).
+	cronSchedule, err := parseScheduleCron(req.CronExpr)
 	if err != nil {
-		ValidationError(w, fmt.Sprintf("invalid cron expression: %v", err), nil)
+		writeCronParseError(w, err)
 		return
 	}
 
@@ -270,6 +294,12 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		payload = string(payloadBytes)
 	}
 
+	// The revision's frozen ceiling is computed before any write.
+	ceiling, ok := s.revisionAuthorityCeiling(w, r, projectID, ActionCreate)
+	if !ok {
+		return
+	}
+
 	// Compute next run time
 	nextRunAt := cronSchedule.Next(time.Now().UTC())
 
@@ -289,6 +319,20 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		Status:    store.ScheduleStatusActive,
 		NextRunAt: &nextRunAt,
 		CreatedBy: createdBy,
+		// Record the authoring request's initiator attribution in the same
+		// write as the schedule row, together with the credential's frozen
+		// ceiling.
+		InitiatorAttribution: newInitiatorAttribution(r.Context()),
+		AuthorityCeiling:     ceiling,
+	}
+
+	// The creation-time provenance stamp comes from the request's
+	// principal, never from the request body.
+	if err := stampSchedule(r.Context(), s.store, &schedule, fixturePrincipalFromContext(r.Context())); err != nil {
+		if !writeFixtureRootError(w, err) {
+			writeErrorFromErr(w, err, "")
+		}
+		return
 	}
 
 	if err := s.store.CreateSchedule(r.Context(), &schedule); err != nil {
@@ -316,17 +360,7 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request, projectID
 		Name:      query.Get("name"),
 	}
 
-	limit := 50
-	if l := query.Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-
-	result, err := s.store.ListSchedules(r.Context(), filter, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
+	result, err := s.store.ListSchedules(r.Context(), filter, listOptionsFromQuery(query))
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -367,6 +401,10 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 		NotFound(w, "Schedule")
 		return
 	}
+	originalStatus := schedule.Status
+	originalCronExpr := schedule.CronExpr
+	originalEventType := schedule.EventType
+	originalPayload := schedule.Payload
 
 	var req UpdateScheduleRequest
 	if err := readJSON(r, &req); err != nil {
@@ -377,53 +415,172 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
 		return
 	}
-	if (schedule.EventType == "dispatch_agent" || req.EventType == "dispatch_agent") &&
-		!s.authorizeAgentCreate(w, r, projectID) {
-		return
-	}
-	// C1 containment: validate target agent project scope when the schedule
-	// is or becomes a message schedule. Check both the effective event type
-	// and the effective payload after the update is applied.
+	// effectiveEventType is computed here, ahead of the payload
+	// validation block below, so the replacement
+	// payload is decoded against whichever event type will actually be
+	// stored -- the request's own EventType when it changes it, otherwise
+	// the schedule's existing one -- not always re-validated as "message".
 	effectiveEventType := schedule.EventType
 	if req.EventType != "" {
 		effectiveEventType = req.EventType
 	}
+	// Tombstone a caller-supplied
+	// "raw" key in the advanced Payload JSON, for both supported event types
+	// — not just "message". Checked whenever the caller supplies a
+	// replacement Payload in this request: an update that leaves Payload
+	// untouched must not retroactively fail on an existing stored value. A
+	// malformed, non-object, or mistyped-for-effectiveEventType replacement
+	// payload is rejected first, with a sanitized 400; see
+	// validateAndRejectScheduledPayload for the required order.
+	if req.Payload != "" {
+		if !s.validateAndRejectScheduledPayload(w, r, effectiveEventType, req.Payload) {
+			return
+		}
+	} else if req.EventType != "" && req.EventType != schedule.EventType {
+		// The caller is switching EventType
+		// without supplying a new Payload, so the existing stored Payload
+		// carries forward unchanged but will be reinterpreted as
+		// effectiveEventType's shape at fire time. Validate the existing
+		// Payload against the new type now, so an incompatible stored
+		// payload (e.g. one with a field only valid for the old type) is
+		// caught at authoring time instead of failing silently later.
+		if !s.validateAndRejectScheduledPayload(w, r, effectiveEventType, schedule.Payload) {
+			return
+		}
+	}
+	if schedule.EventType == "dispatch_agent" || req.EventType == "dispatch_agent" {
+		if !s.authorizeScheduledDispatchAgentAuthoring(w, r) {
+			return
+		}
+		if !s.authorizeAgentCreate(w, r, projectID) {
+			return
+		}
+	}
+	// C1 containment: validate target agent project scope when the schedule
+	// is or becomes a message schedule. Check both the effective event type
+	// and the effective payload after the update is applied.
 	if effectiveEventType == "message" {
 		effectivePayload := schedule.Payload
 		if req.Payload != "" {
 			effectivePayload = req.Payload
 		}
-		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, effectivePayload, "", "") {
+		// A replacement payload that names another target is authored like
+		// a new schedule; an update that keeps the stored target is
+		// re-checked against it.
+		if scheduledPayloadTargetChanged(schedule.Payload, effectivePayload) {
+			if !s.authorizeScheduledMessageAuthoring(w, r, projectID, effectivePayload, "", "") {
+				return
+			}
+		} else if !s.authorizeScheduledMessageReauthoring(w, r, projectID, effectivePayload) {
 			return
 		}
 	}
 
+	// fields tracks exactly which columns this request changes. UpdateSchedule
+	// writes only these — never the rest of the struct — so a column this
+	// request doesn't mention can never be reverted to whatever GetSchedule
+	// happened to return above, even if that read has since gone stale.
+	var fields store.ScheduleFieldMask
 	if req.Name != "" {
 		schedule.Name = req.Name
+		fields.Name = true
 	}
-	if req.CronExpr != "" {
+	// CronExpr/EventType/Payload are compared against the stored values, not
+	// just checked for presence: a request that resends the current value
+	// (e.g. a client round-tripping the full resource on every PATCH) is
+	// metadata-only, the same as omitting the field. Only an actual change
+	// writes the column, which keeps the field mask consistent with
+	// changesFutureDispatch below.
+	if req.CronExpr != "" && req.CronExpr != originalCronExpr {
 		// Validate new cron expression
-		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-		cronSchedule, err := parser.Parse(req.CronExpr)
+		cronSchedule, err := parseScheduleCron(req.CronExpr)
 		if err != nil {
-			ValidationError(w, fmt.Sprintf("invalid cron expression: %v", err), nil)
+			writeCronParseError(w, err)
 			return
 		}
 		schedule.CronExpr = req.CronExpr
 		nextRunAt := cronSchedule.Next(time.Now().UTC())
 		schedule.NextRunAt = &nextRunAt
+		fields.CronExpr = true
+		fields.NextRunAt = true
 	}
-	if req.EventType != "" {
+	if req.EventType != "" && req.EventType != originalEventType {
 		schedule.EventType = req.EventType
+		fields.EventType = true
 	}
-	if req.Payload != "" {
+	if req.Payload != "" && req.Payload != originalPayload {
 		schedule.Payload = req.Payload
+		fields.Payload = true
 	}
 	if req.Status != "" {
 		schedule.Status = req.Status
+		fields.Status = true
 	}
 
-	if err := s.store.UpdateSchedule(r.Context(), schedule); err != nil {
+	// An enable transition (any prior status, e.g. paused, back to active)
+	// re-arms future dispatch the same way resumeSchedule does. If this
+	// request didn't already recompute NextRunAt via a real CronExpr change,
+	// it must be recomputed here from the stored cron: otherwise a schedule
+	// that went stale while paused (or was paused with a next_run_at already
+	// in the past) would reactivate carrying that stale time, and the
+	// scheduler would treat it as immediately due.
+	enabling := req.Status == store.ScheduleStatusActive && originalStatus != store.ScheduleStatusActive
+	if enabling && !fields.CronExpr {
+		// A stored expression that no longer parses (for example one with a
+		// zone prefix, which is no longer supported) cannot be enabled; the
+		// user must edit it first.
+		cronSchedule, err := parseScheduleCron(schedule.CronExpr)
+		if err != nil {
+			writeCronParseError(w, err)
+			return
+		}
+		nextRunAt := cronSchedule.Next(time.Now().UTC())
+		schedule.NextRunAt = &nextRunAt
+		fields.NextRunAt = true
+	}
+
+	// Ruling Q2: a fully reauthorized mutation that changes future dispatch
+	// (payload/target/type/timing, or an enable transition) replaces the
+	// attribution and bumps authorization_revision atomically in the same
+	// write. A metadata-only edit (name, an unchanged cron/type/payload
+	// resent as-is, or a status change other than an enable, e.g. pause)
+	// does not re-attribute, and attribution is passed to the store only
+	// when it changed. Deriving this from the field mask itself (rather
+	// than from req's presence checks) is what keeps the two in sync: a
+	// dispatch field only re-attributes when the field mask also writes it.
+	changesFutureDispatch := fields.CronExpr || fields.EventType || fields.Payload || enabling
+
+	// The write is conditioned on the revision this handler just read,
+	// regardless of whether this particular call replaces attribution: a
+	// stale read must never be able to apply any field once a newer,
+	// revision-bumping write has landed first. prevRevisionKnown is derived
+	// from the same field the store predicates on (AuthorizationRevision),
+	// not from AttributionVersion — a schedule can carry a revision while its
+	// attribution_version is still NULL (e.g. a historical row), and that
+	// combination must remain writable, not permanently conflict.
+	prevRevision := schedule.AuthorizationRevision
+	prevRevisionKnown := schedule.AuthorizationRevision != 0
+
+	var attribution *store.InitiatorAttribution
+	if changesFutureDispatch {
+		// The store writes this ceiling in the same conditional update as
+		// the attribution and the revision bump.
+		ceiling, ok := s.revisionAuthorityCeiling(w, r, projectID, ActionUpdate)
+		if !ok {
+			return
+		}
+		schedule.AuthorityCeiling = ceiling
+		newAttr := reattributeInitiator(r.Context(), schedule.InitiatorAttribution)
+		schedule.InitiatorAttribution = newAttr
+		attribution = &newAttr
+	}
+
+	if err := s.store.UpdateSchedule(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, attribution); err != nil {
+		if errors.Is(err, store.ErrRevisionConflict) {
+			writeError(w, http.StatusConflict, ErrCodeRevisionConflict,
+				"schedule was concurrently modified; refresh and retry", nil)
+			return
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -443,7 +600,16 @@ func (s *Server) deleteSchedule(w http.ResponseWriter, r *http.Request, projectI
 		return
 	}
 
-	if err := s.store.DeleteSchedule(r.Context(), scheduleID); err != nil {
+	// No future dispatch is created by a delete, so there is no
+	// re-attribution — just a record of who deleted it, written in the same
+	// transaction as the delete.
+	audit := newScheduleAudit(r.Context(), mutationTypeScheduleDelete, scheduleID)
+	if err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		if err := tx.DeleteSchedule(r.Context(), scheduleID); err != nil {
+			return err
+		}
+		return tx.CreateMutationAudit(r.Context(), audit)
+	}); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -467,7 +633,16 @@ func (s *Server) pauseSchedule(w http.ResponseWriter, r *http.Request, projectID
 		return
 	}
 
-	if err := s.store.UpdateScheduleStatus(r.Context(), scheduleID, store.ScheduleStatusPaused); err != nil {
+	// No future dispatch is created by a pause, so there is no
+	// re-attribution — just a record of who paused it, written in the same
+	// transaction as the status change.
+	audit := newScheduleAudit(r.Context(), mutationTypeSchedulePause, scheduleID)
+	if err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		if err := tx.UpdateScheduleStatus(r.Context(), scheduleID, store.ScheduleStatusPaused); err != nil {
+			return err
+		}
+		return tx.CreateMutationAudit(r.Context(), audit)
+	}); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -487,31 +662,70 @@ func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectI
 		NotFound(w, "Schedule")
 		return
 	}
+	// Resuming re-arms future dispatch and records the resumer as the
+	// revision's authority, so the resumer is re-authorized as the author
+	// of the stored schedule, for every event type, before any write. On a
+	// denial the attribution, ceiling and revision are left unchanged.
+	switch schedule.EventType {
+	case "dispatch_agent":
+		if !s.authorizeScheduledDispatchAgentAuthoring(w, r) {
+			return
+		}
+		if !s.authorizeAgentCreate(w, r, projectID) {
+			return
+		}
+	case "message":
+		if !s.authorizeScheduledMessageReauthoring(w, r, projectID, schedule.Payload) {
+			return
+		}
+	default:
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", schedule.EventType), nil)
+		return
+	}
 	if schedule.Status != store.ScheduleStatusPaused {
 		ValidationError(w, "only paused schedules can be resumed", nil)
 		return
 	}
 
 	// Recompute next run time
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	cronSchedule, err := parser.Parse(schedule.CronExpr)
+	// A stored expression that no longer parses (for example one with a
+	// zone prefix, which is no longer supported) cannot be resumed; the user
+	// must edit it first.
+	cronSchedule, err := parseScheduleCron(schedule.CronExpr)
 	if err != nil {
-		InternalError(w)
+		writeCronParseError(w, err)
 		return
 	}
 	nextRunAt := cronSchedule.Next(time.Now().UTC())
 
-	if err := s.store.UpdateScheduleStatus(r.Context(), scheduleID, store.ScheduleStatusActive); err != nil {
-		writeErrorFromErr(w, err, "")
+	ceiling, ok := s.revisionAuthorityCeiling(w, r, projectID, ActionUpdate)
+	if !ok {
 		return
 	}
 
-	// Update next_run_at
+	// Status, next_run_at, the re-attribution and its ceiling are one write,
+	// not two — a failure here must be reported as an error, never as a 200
+	// naming an attribution that was never persisted. prevRevisionKnown
+	// comes from AuthorizationRevision, the same field the store predicates
+	// on, not from AttributionVersion: a schedule can carry a revision while
+	// its attribution_version is still NULL, and that combination must
+	// remain resumable.
+	prevRevision := schedule.AuthorizationRevision
+	prevRevisionKnown := schedule.AuthorizationRevision != 0
 	schedule.Status = store.ScheduleStatusActive
 	schedule.NextRunAt = &nextRunAt
-	if err := s.store.UpdateSchedule(r.Context(), schedule); err != nil {
-		// Status was updated, but next_run_at wasn't — still return success
-		writeJSON(w, http.StatusOK, schedule)
+	newAttr := reattributeInitiator(r.Context(), schedule.InitiatorAttribution)
+	schedule.InitiatorAttribution = newAttr
+	schedule.AuthorityCeiling = ceiling
+
+	fields := store.ScheduleFieldMask{Status: true, NextRunAt: true}
+	if err := s.store.UpdateSchedule(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, &newAttr); err != nil {
+		if errors.Is(err, store.ErrRevisionConflict) {
+			writeError(w, http.StatusConflict, ErrCodeRevisionConflict,
+				"schedule was concurrently modified; refresh and retry", nil)
+			return
+		}
+		writeErrorFromErr(w, err, "")
 		return
 	}
 
@@ -531,21 +745,12 @@ func (s *Server) getScheduleHistory(w http.ResponseWriter, r *http.Request, proj
 	}
 
 	query := r.URL.Query()
-	limit := 50
-	if l := query.Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
 
 	// List events generated by this schedule
 	result, err := s.store.ListScheduledEvents(r.Context(), store.ScheduledEventFilter{
 		ProjectID:  projectID,
 		ScheduleID: scheduleID,
-	}, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
+	}, listOptionsFromQuery(query))
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return

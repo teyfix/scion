@@ -17,6 +17,7 @@ package config
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -29,15 +30,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// isGitRepoFunc is a package-level variable for testing. Defaults to util.IsGitRepo.
-var isGitRepoFunc = util.IsGitRepo
+// isGitRepoFunc is a package-level variable for testing. It reports whether
+// the current directory is inside a git work tree and returns an error
+// matching util.ErrGitDubiousOwnership when git refuses the repository
+// because of its ownership. Defaults to util.CheckGitRepoDir("").
+var isGitRepoFunc = func() (bool, error) { return util.CheckGitRepoDir("") }
 
 // OverrideIsGitRepo replaces the git-repo detection function used by InitProject.
 // It returns a restore function that must be called to reset the override.
 // This is intended for use in tests outside the config package.
 func OverrideIsGitRepo(fn func() bool) func() {
 	orig := isGitRepoFunc
-	isGitRepoFunc = fn
+	isGitRepoFunc = func() (bool, error) { return fn(), nil }
 	return func() { isGitRepoFunc = orig }
 }
 
@@ -152,13 +156,6 @@ func GenerateProjectID() string {
 	return uuid.New().String()
 }
 
-// GenerateProjectIDForDir creates a new random project ID.
-// The dir parameter is accepted for API compatibility but does not affect
-// the generated ID.
-func GenerateProjectIDForDir(_ string) string {
-	return uuid.New().String()
-}
-
 // IsInsideProject returns true if the current working directory or any parent contains a .scion directory.
 func IsInsideProject() bool {
 	_, ok := FindProjectRoot()
@@ -266,6 +263,35 @@ type InitProjectOpts struct {
 	// SkipRuntimeCheck skips local container runtime detection.
 	// Use this when initializing on a hub server where agents run on remote brokers.
 	SkipRuntimeCheck bool
+
+	// ProjectID, when set, is the identity recorded for the project instead
+	// of a generated one. It replaces a different identity already present
+	// in the project. When empty, an existing identity is kept and a new
+	// project gets a generated one.
+	ProjectID string
+}
+
+// newProjectID returns the identity for a newly initialized project.
+func (o InitProjectOpts) newProjectID() string {
+	if o.ProjectID != "" {
+		return o.ProjectID
+	}
+	return GenerateProjectID()
+}
+
+// keepsMarker reports whether the existing marker file at markerPath is kept
+// as the identity of the project rooted at projectRoot. It is kept unless
+// ProjectID is set and the marker does not already record ProjectID under
+// the slug derived from projectRoot.
+func (o InitProjectOpts) keepsMarker(markerPath, projectRoot string) bool {
+	if o.ProjectID == "" {
+		return true
+	}
+	marker, err := ReadProjectMarker(markerPath)
+	if err != nil {
+		return false
+	}
+	return marker.ProjectID == o.ProjectID && marker.ProjectSlug == api.Slugify(filepath.Base(projectRoot))
 }
 
 func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectOpts) error {
@@ -274,7 +300,19 @@ func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectO
 		opt = opts[0]
 	}
 
-	isGit := isGitRepoFunc()
+	// isGitRepoFunc always reports false alongside an error.
+	isGit, gitErr := isGitRepoFunc()
+	if gitErr != nil {
+		// Only the current-directory form (empty targetDir) refuses here: the
+		// git check inspects the current directory, which in that form is the
+		// directory being initialized. With an explicit targetDir the current
+		// directory need not be related to the target, so keep the previous
+		// behaviour and treat the refusal as "not a git repository".
+		if targetDir == "" && errors.Is(gitErr, util.ErrGitDubiousOwnership) {
+			// Returned unwrapped: callers add their own context.
+			return gitErr
+		}
+	}
 
 	var projectDir string
 	var err error
@@ -313,8 +351,14 @@ func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectO
 // The project directory gets a .scion marker file, and the actual project
 // data lives under ~/.scion/project-configs/.
 func initExternalProject(projectDir string, opt InitProjectOpts) error {
-	// projectDir is the intended <project>/.scion path.
-	projectRoot := filepath.Dir(projectDir)
+	// projectDir is the intended <project>/.scion path. Resolve it first so
+	// a relative target (for example ".scion") names the containing
+	// directory rather than ".", the same as the equivalent absolute target.
+	absProjectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return fmt.Errorf("cannot initialize project: failed to resolve %s: %w", projectDir, err)
+	}
+	projectRoot := filepath.Dir(absProjectDir)
 	markerPath := filepath.Join(projectRoot, DotScion)
 
 	// TODO(project-migration): Remove this check after a few releases.
@@ -329,19 +373,24 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 	}
 
 	// If a marker file already exists, read it and use the existing external path
-	if IsProjectMarkerFile(markerPath) {
+	if IsProjectMarkerFile(markerPath) && opt.keepsMarker(markerPath, projectRoot) {
 		resolved, err := ResolveProjectMarker(markerPath)
 		if err != nil {
 			return fmt.Errorf("existing project marker is invalid: %w", err)
 		}
 		// External project already set up — just ensure directories exist
+		if err := mkdirUnderProjectConfigs(resolved, 0755); err != nil {
+			return fmt.Errorf("failed to create external project directory: %w", err)
+		}
 		return ensureProjectDirs(resolved, opt)
 	}
 
-	// Generate new project identity
-	projectID := GenerateProjectID()
-	projectName := filepath.Base(projectRoot)
-	projectSlug := api.Slugify(projectName)
+	// New project identity
+	projectID := opt.newProjectID()
+	projectName, projectSlug, err := externalProjectNameAndSlug(projectRoot)
+	if err != nil {
+		return err
+	}
 
 	marker := &ProjectMarker{
 		ProjectID:   projectID,
@@ -357,12 +406,11 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 
 	// Write settings with workspace-path and project_id before ensureProjectDirs
 	// (which would create a settings.yaml without workspace_path if one doesn't exist yet).
-	absProjectRoot, _ := filepath.Abs(projectRoot)
-	if err := os.MkdirAll(externalPath, 0755); err != nil {
+	if err := mkdirUnderProjectConfigs(externalPath, 0755); err != nil {
 		return fmt.Errorf("failed to create external project directory: %w", err)
 	}
 	if GetSettingsPath(externalPath) == "" {
-		if err := writeProjectSettings(externalPath, absProjectRoot, projectID, opt); err != nil {
+		if err := writeProjectSettings(externalPath, projectRoot, projectID, opt); err != nil {
 			return err
 		}
 	}
@@ -384,6 +432,23 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 	return nil
 }
 
+// externalProjectNameAndSlug derives the project name and slug from the
+// absolute project root (the directory that contains the .scion target). It
+// returns an error when the derived slug would be empty, so that nothing is
+// stored under an empty slug.
+func externalProjectNameAndSlug(projectRoot string) (name, slug string, err error) {
+	if projectRoot == filepath.Dir(projectRoot) {
+		// A filesystem root has no directory name to derive a slug from.
+		return "", "", fmt.Errorf("cannot initialize project: the target's containing directory %s has no name usable as a project slug; initialize the project in a named directory", projectRoot)
+	}
+	name = filepath.Base(projectRoot)
+	slug = api.Slugify(name)
+	if slug == "" {
+		return "", "", fmt.Errorf("cannot initialize project: the directory name %q of %s gives an empty project slug; use a directory name that contains ASCII letters or digits (A-Z, a-z, 0-9)", name, projectRoot)
+	}
+	return name, slug, nil
+}
+
 // initInRepoProject creates a git project with .scion as a directory in the repo.
 // Settings are stored externally at ~/.scion/project-configs/<slug>__<uuid>/.scion/
 // and agent homes are stored externally at ~/.scion/project-configs/<slug>__<uuid>/.scion/agents/.
@@ -393,22 +458,33 @@ func initInRepoProject(projectDir string, opt InitProjectOpts) error {
 		return fmt.Errorf("failed to create settings directory: %w", err)
 	}
 
-	// Ensure project-id file exists for split storage
-	if _, err := ReadProjectID(projectDir); err != nil {
-		if os.IsNotExist(err) {
-			projectID := GenerateProjectIDForDir(filepath.Dir(projectDir))
-			if err := WriteProjectID(projectDir, projectID); err != nil {
+	// Ensure project-id file exists for split storage, recording
+	// opt.ProjectID when set.
+	existingID, err := ReadProjectID(projectDir)
+	switch {
+	case err == nil:
+		if opt.ProjectID != "" && existingID != opt.ProjectID {
+			if err := WriteProjectID(projectDir, opt.ProjectID); err != nil {
 				return fmt.Errorf("failed to write project-id: %w", err)
 			}
-		} else {
-			return fmt.Errorf("failed to read project-id: %w", err)
 		}
+	case os.IsNotExist(err):
+		if err := WriteProjectID(projectDir, opt.newProjectID()); err != nil {
+			return fmt.Errorf("failed to write project-id: %w", err)
+		}
+	default:
+		return fmt.Errorf("failed to read project-id: %w", err)
 	}
 
 	// Seed settings.yaml in the external config dir (machine-specific, not committed)
 	externalConfigDir, err := GetGitProjectExternalConfigDir(projectDir)
 	if err != nil {
 		return fmt.Errorf("failed to compute external config path: %w", err)
+	}
+	if externalConfigDir != "" {
+		if err := mkdirUnderProjectConfigs(externalConfigDir, 0755); err != nil {
+			return fmt.Errorf("failed to create external config directory: %w", err)
+		}
 	}
 	if err := ensureProjectSettingsFile(externalConfigDir, opt); err != nil {
 		return err
@@ -420,7 +496,7 @@ func initInRepoProject(projectDir string, opt InitProjectOpts) error {
 		return fmt.Errorf("failed to compute external agents path: %w", err)
 	}
 	if externalAgentsDir != "" {
-		if err := os.MkdirAll(externalAgentsDir, 0755); err != nil {
+		if err := mkdirUnderProjectConfigs(externalAgentsDir, 0755); err != nil {
 			return fmt.Errorf("failed to create external agents directory: %w", err)
 		}
 	}
@@ -708,7 +784,7 @@ func InitMachine(harnesses []api.Harness, opts ...InitMachineOpts) error {
 // Duplicated from pkg/runtime to avoid an import cycle (config is lower-level
 // than runtime). Must stay in sync with runtime.DefaultSandboxBin.
 // TestDefaultSandboxBin_MatchesLiteral pins this copy;
-// TestSandboxBinConstantSync_Task92 pins the runtime copy. (O5)
+// TestSandboxBinConstantSync_Task92 (pkg/runtime) pins the runtime copy. (O5)
 const defaultSandboxBin = "/usr/local/gcp/bin/sandbox"
 
 // isCloudRunSandboxEnvironment returns true when the process is running on a

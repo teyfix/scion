@@ -64,7 +64,9 @@ func (Message) Fields() []ent.Field {
 			Optional(),
 		field.String("group_id").
 			Optional(),
-		// dispatch_state tracks cross-node delivery: pending|dispatched|failed.
+		// dispatch_state tracks cross-node delivery:
+		// pending|dispatched|failed|deferred|no_recipient (see the
+		// store.MessageDispatch* constants).
 		// After Phase 4 (no-queuing delivery), new rows are created as "dispatched";
 		// any pending rows indicate a bug — monitored by brokerMessageSweepHandler.
 		field.String("dispatch_state").
@@ -90,12 +92,19 @@ func (Message) Fields() []ent.Field {
 		field.UUID("conversation_id", uuid.UUID{}).
 			Optional().
 			Nillable(),
-		// visibility controls which consumers see this message:
-		// "normal", "verbose", or "full". Empty is treated as "normal"
-		// at read time (backfill in the store adapter).
-		field.String("visibility").
+		// sender_project_id / recipient_project_id carry server-derived
+		// cross-project provenance (store.Message.SenderProjectID /
+		// RecipientProjectID). Nullable: human senders and legacy rows have
+		// no project-level provenance. Stamped at admission and never
+		// updated afterwards.
+		field.UUID("sender_project_id", uuid.UUID{}).
 			Optional().
-			MaxLen(16),
+			Nillable().
+			Immutable(),
+		field.UUID("recipient_project_id", uuid.UUID{}).
+			Optional().
+			Nillable().
+			Immutable(),
 		field.Time("created").
 			Default(time.Now).
 			Immutable(),
@@ -109,6 +118,10 @@ func (Message) Indexes() []ent.Index {
 		index.Fields("recipient", "recipient_id"),
 		index.Fields("created"),
 		index.Fields("conversation_id"),
+		// Native chat tail and history reads must not sort the entire DM on
+		// every unread refresh. Both read-switch paths order by created, id.
+		index.Fields("conversation_id", "channel", "created", "id"),
+		index.Fields("thread_id", "channel", "created", "id"),
 	}
 }
 
