@@ -40,10 +40,13 @@ import (
 // This file is the single classification. Agent provisioning strips every
 // template-chain config with StripTemplateEnvironmentKeys before using it,
 // and the hub reports templates that set environment keys.
+//
+// On-prem fork exceptions: Docker grants/attachments and the project image
+// remain live template defaults. Requester values and explicit profile image
+// overrides retain their precedence; defaults are not persisted as own config.
 
 // Environment keys of api.ScionConfig, by their scion-agent.yaml name.
 const (
-	TemplateEnvKeyDocker     = "docker"
 	TemplateEnvKeyTelemetry  = "telemetry"
 	TemplateEnvKeyHub        = "hub"
 	TemplateEnvKeyImage      = "image"
@@ -106,17 +109,11 @@ func StripTemplateEnvironmentKeys(cfg *api.ScionConfig) (*api.ScionConfig, []str
 		return nil, nil
 	}
 	var ignored []string
-	if cfg.Docker != nil {
-		ignored = append(ignored, TemplateEnvKeyDocker)
-	}
 	if cfg.Telemetry != nil {
 		ignored = append(ignored, TemplateEnvKeyTelemetry)
 	}
 	if cfg.Hub != nil {
 		ignored = append(ignored, TemplateEnvKeyHub)
-	}
-	if cfg.Image != "" {
-		ignored = append(ignored, TemplateEnvKeyImage)
 	}
 	if cfg.Resources != nil {
 		ignored = append(ignored, TemplateEnvKeyResources)
@@ -138,10 +135,8 @@ func StripTemplateEnvironmentKeys(cfg *api.ScionConfig) (*api.ScionConfig, []str
 	}
 
 	out := *cfg
-	out.Docker = nil
 	out.Telemetry = nil
 	out.Hub = nil
-	out.Image = ""
 	out.Resources = nil
 	out.Kubernetes = nil
 	out.Volumes = nil

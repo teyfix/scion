@@ -59,15 +59,14 @@ func TestStripTemplateEnvironmentKeys_AllEnvironmentKeys(t *testing.T) {
 	// template env is a lowest-precedence fill applied by the agent, and TZ
 	// is handled by the hub-only rule there.
 	wantIgnored := []string{
-		"docker",
 		"env.SCION_HUB_URL",
 		"env.SCION_WORKSPACE_GIT",
-		"hub", "image", "kubernetes", "resources", "telemetry", "volumes",
+		"hub", "kubernetes", "resources", "telemetry", "volumes",
 	}
 	if !reflect.DeepEqual(ignored, wantIgnored) {
 		t.Errorf("ignored = %v, want %v", ignored, wantIgnored)
 	}
-	if got.Docker != nil || got.Telemetry != nil || got.Hub != nil || got.Image != "" || got.Resources != nil || got.Kubernetes != nil || got.Volumes != nil {
+	if got.Telemetry != nil || got.Hub != nil || got.Resources != nil || got.Kubernetes != nil || got.Volumes != nil {
 		t.Errorf("environment keys survived: %+v", got)
 	}
 	wantEnv := map[string]string{
@@ -78,6 +77,9 @@ func TestStripTemplateEnvironmentKeys_AllEnvironmentKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Env, wantEnv) {
 		t.Errorf("Env = %v, want every non-SCION_ key kept", got.Env)
+	}
+	if got.Docker == nil || got.Image != cfg.Image {
+		t.Fatal("onprem Docker/image defaults were discarded")
 	}
 	if got.HarnessConfig != "claude" || got.Model != "opus" || len(got.Skills) != 1 {
 		t.Errorf("job keys changed: %+v", got)
