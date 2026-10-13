@@ -33,10 +33,9 @@ const (
 
 // hydratedTemplateStartEnv is a project with a global "web-dev" template and
 // a content-hash template cache dir, each bundling its own "claude-web"
-// harness-config, told apart by user and by the harness-config's own image
-// (a template's own image is an ignored environment key,
-// ptone/scion#4524). An agent is created from the hash dir with the
-// "web-dev" slug.
+// harness-config, told apart by user and the harness-config file's image.
+// These templates have no image fallback of their own. An agent is created
+// from the hash dir with the "web-dev" slug.
 type hydratedTemplateStartEnv struct {
 	projectScionDir string
 	agentName       string
@@ -145,8 +144,9 @@ func (e hydratedTemplateStartEnv) restart(t *testing.T, template string) runtime
 // content-addressed cache is read from the provenance record only: with
 // agent-info.json's templateHash removed, a restart still treats the
 // template as unresolvable — the same-named local template supplies
-// neither the image nor the harness-config. No template image is recorded:
-// a template's own image is an ignored environment key (ptone/scion#4524).
+// neither its harness-config file's image nor its provider identity. Live
+// template images require an available source and are never recorded as a
+// legacy template-image snapshot.
 func TestStart_HydratedTemplateFromProvenanceIgnoresAgentInfoHash(t *testing.T) {
 	e := newHydratedTemplateStartEnv(t)
 
@@ -158,7 +158,7 @@ func TestStart_HydratedTemplateFromProvenanceIgnoresAgentInfoHash(t *testing.T) 
 		t.Fatalf("provenance template = %q, templateHash = %q; want %q, %q", prov.Template, prov.TemplateHash, "web-dev", testContentHash)
 	}
 	if prov.TemplateImage != "" {
-		t.Fatalf("provenance templateImage = %q, want none (a template's image is ignored)", prov.TemplateImage)
+		t.Fatalf("provenance templateImage = %q, want none (live fallbacks never create legacy image snapshots)", prov.TemplateImage)
 	}
 
 	e.setInfoTemplateHash(t, "")
@@ -218,5 +218,42 @@ func TestStart_HydratedTemplateLegacyAgentUsesAgentInfo(t *testing.T) {
 	got = e.restart(t, "")
 	if got.UnixUsername != "localuser" || got.Image != localTplImage {
 		t.Errorf("legacy agent without templateHash: user %q, image %q; want the local web-dev template's %q, %q", got.UnixUsername, got.Image, "localuser", localTplImage)
+	}
+}
+
+// Rehydrating the live image source does not change the provenance-pinned
+// harness selection, and subsequent source edits remain visible on restart.
+func TestStart_HydratedTemplateImageSourceKeepsHarnessIdentity(t *testing.T) {
+	e := newHydratedTemplateStartEnv(t)
+	baseline := e.restart(t, "")
+	source := t.TempDir()
+	opts := api.StartOptions{Name: e.agentName, TemplateName: "web-dev", TemplateEnvSource: source, ProjectPath: e.projectScionDir, NoAuth: true}
+	for _, image := range []string{"hydrated-live-image:v1", "hydrated-live-image:v2"} {
+		if err := os.WriteFile(filepath.Join(source, "scion-agent.json"), []byte(`{"image":"`+image+`"}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.mgr.Start(context.Background(), opts); err != nil {
+			t.Fatal(err)
+		}
+		if e.captured.Image != image {
+			t.Fatalf("image=%q want fresh live source %q", e.captured.Image, image)
+		}
+		if e.captured.UnixUsername != baseline.UnixUsername {
+			t.Fatalf("live image source changed harness user: %q → %q", baseline.UnixUsername, e.captured.UnixUsername)
+		}
+		persisted, err := (&config.Template{Path: e.agentDir()}).LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Image != "" {
+			t.Fatalf("live image persisted as requester image: %q", persisted.Image)
+		}
+		provenance, err := readImageProvenance(e.agentDir())
+		if err != nil || provenance == nil {
+			t.Fatalf("image provenance=%v error=%v", provenance, err)
+		}
+		if provenance.RequestImage != "" || provenance.InlineImage != "" || provenance.TemplateImage != "" || provenance.TemplateHash != testContentHash {
+			t.Fatalf("live image changed requester/template identity provenance: %+v", provenance)
+		}
 	}
 }

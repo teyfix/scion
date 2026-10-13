@@ -357,15 +357,9 @@ harness_configs:
 	})
 }
 
-// TestStart_RestartAfterTemplateImageEdited_TemplateImageNeverUsed pins
-// ptone/scion#2156 together with ptone/scion#4524: the value ProvisionAgent
-// persists for the explicit tier's restart fallback is the INLINE config's
-// contribution only, never the template's, and a template's image is an
-// ignored environment key. Here the agent is created with only a template
-// image (no inline config at all), the template file is then edited, and
-// neither the create-time nor the edited template image is ever run: both
-// starts use the harness-config file default.
-func TestStart_RestartAfterTemplateImageEdited_TemplateImageNeverUsed(t *testing.T) {
+// A live template image is re-read on ordinary restart, and never recorded
+// as requester intent. Profile overrides and explicit requests still win.
+func TestStart_RestartAfterTemplateImageEdited_UsesLiveImageWithoutPersisting(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	oldWd, _ := os.Getwd()
@@ -420,9 +414,29 @@ profiles:
 	if err != nil {
 		t.Fatalf("create Start failed: %v", err)
 	}
-	if capturedConfig.Image != "file-default:latest" {
-		t.Fatalf("create-time image = %q, want file-default:latest (the template's image is ignored)", capturedConfig.Image)
+	if capturedConfig.Image != "template-pinned:v1" {
+		t.Fatalf("create-time image = %q, want the initial live template-pinned:v1", capturedConfig.Image)
 	}
+
+	assertNoTemplateRequest := func() {
+		t.Helper()
+		dir := filepath.Join(projectScionDir, "agents", "test-agent")
+		cfg, err := (&config.Template{Path: dir}).LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Image != "" {
+			t.Fatalf("template image persisted as requester image: %q", cfg.Image)
+		}
+		provenance, err := readImageProvenance(dir)
+		if err != nil || provenance == nil {
+			t.Fatalf("image provenance=%v error=%v", provenance, err)
+		}
+		if provenance.RequestImage != "" || provenance.InlineImage != "" || provenance.TemplateImage != "" {
+			t.Fatalf("live template image entered requester/legacy provenance: %+v", provenance)
+		}
+	}
+	assertNoTemplateRequest()
 
 	// Edit the template to pin v2, then restart with no --config.
 	_ = os.WriteFile(tplPath, []byte(`{"default_harness_config": "test-harness", "image": "template-pinned:v2"}`), 0644)
@@ -437,10 +451,36 @@ profiles:
 		t.Fatalf("restart Start failed: %v", err)
 	}
 
-	if capturedConfig.Image != "file-default:latest" {
-		t.Errorf("restart image = %q, want file-default:latest (neither the create-time snapshot nor the edited template image)",
+	if capturedConfig.Image != "template-pinned:v2" {
+		t.Errorf("restart image = %q, want the edited live template-pinned:v2",
 			capturedConfig.Image)
 	}
+	assertNoTemplateRequest()
+	if err := os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+    harness_overrides:
+      test-harness:
+        image: profile-pinned:v3
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Start(context.Background(), api.StartOptions{Name: "test-agent", ProjectPath: projectScionDir, BrokerMode: true, NoAuth: true}); err != nil {
+		t.Fatal(err)
+	}
+	if capturedConfig.Image != "profile-pinned:v3" {
+		t.Fatalf("explicit profile pin lost to template: %q", capturedConfig.Image)
+	}
+	assertNoTemplateRequest()
+	if _, err := mgr.Start(context.Background(), api.StartOptions{Name: "test-agent", Image: "request-pinned:v4", ProjectPath: projectScionDir, BrokerMode: true, NoAuth: true}); err != nil {
+		t.Fatal(err)
+	}
+	if capturedConfig.Image != "request-pinned:v4" {
+		t.Fatalf("explicit request lost to profile/template: %q", capturedConfig.Image)
+	}
+
 }
 
 // TestStart_RestartAfterTemplateDeleted_FallsBackToRecordedImage pins
@@ -451,10 +491,9 @@ profiles:
 // behaviour, rather than silently falling through to Hub settings or the
 // file default just because the template disappeared.
 //
-// Since ptone/scion#4524 a template's image is an ignored environment key,
-// so a new agent records no template image. The recorded value exercised
-// here is that of an agent provisioned before that change: the test writes
-// it into the broker-side image provenance after the create.
+// The fork's live template fallback is not saved in legacy template-image
+// provenance. This test explicitly installs an older provenance snapshot
+// to verify its existing missing-template recovery behavior.
 func TestStart_RestartAfterTemplateDeleted_FallsBackToRecordedImage(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -500,7 +539,7 @@ profiles:
 
 	mgr := NewManager(mockRT)
 
-	// Create from the "custom" template: image tpl:v1, pull policy Never.
+	// Create from "custom": live image tpl:v1; template pull policy is ignored.
 	_, err := mgr.Start(context.Background(), api.StartOptions{
 		Name:        "test-agent",
 		Template:    "custom",
@@ -511,8 +550,8 @@ profiles:
 	if err != nil {
 		t.Fatalf("create Start failed: %v", err)
 	}
-	if capturedConfig.Image != "file-default:latest" {
-		t.Fatalf("precondition failed: create-time image = %q, want file-default:latest (the template's image is ignored)", capturedConfig.Image)
+	if capturedConfig.Image != "tpl:v1" {
+		t.Fatalf("precondition failed: create-time image = %q, want the live template image tpl:v1", capturedConfig.Image)
 	}
 
 	// Record the template image and pull policy a pre-ptone/scion#4524
@@ -523,7 +562,7 @@ profiles:
 		t.Fatalf("read image provenance: %v (record %v)", err, prov)
 	}
 	if prov.TemplateImage != "" || prov.TemplateImagePullPolicy != "" {
-		t.Fatalf("a new agent recorded template image values %q / %q; the template's are ignored", prov.TemplateImage, prov.TemplateImagePullPolicy)
+		t.Fatalf("a new agent recorded template image values %q / %q; live template fallback must not create a legacy snapshot", prov.TemplateImage, prov.TemplateImagePullPolicy)
 	}
 	prov.TemplateImage, prov.TemplateImagePullPolicy = "tpl:v1", "Never"
 	if err := writeImageProvenance(agentDir, *prov); err != nil {
