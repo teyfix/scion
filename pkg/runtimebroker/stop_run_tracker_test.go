@@ -77,6 +77,32 @@ func startInFlight(t *testing.T, srv *Server, mgr *startFuncManager, runID strin
 	return release, done
 }
 
+// createInFlight supplies an overlapping tracked run through synchronous
+// create. The lifecycle gate rejects a second same-agent HTTP start before
+// tracker registration; create and start can share a tracked launch key while
+// the older create remains blocked.
+func createInFlight(t *testing.T, srv *Server, mgr *startFuncManager, runID, projectPath string) (release chan struct{}, done chan *httptest.ResponseRecorder) {
+	t.Helper()
+	started := make(chan struct{})
+	release = make(chan struct{})
+	blockedStart(mgr, started, release, nil)
+	body := fmt.Sprintf(`{"name":"same-name","runId":%q,"projectPath":%q}`, runID, projectPath)
+	done = make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		done <- w
+	}()
+	waitSignal(t, started, "the create's start")
+	key := launchKey{Slug: "same-name"}
+	if !srv.startsInFlight.hasRun(key, runID) || !srv.launchRegistry.runInFlight(key, runID) {
+		t.Fatal("the blocked create must be registered and tracked under its own run")
+	}
+	return release, done
+}
+
 func assertStartNotCancelled(t *testing.T, srv *Server, release chan struct{}, done chan *httptest.ResponseRecorder) {
 	t.Helper()
 	select {
@@ -372,13 +398,13 @@ func TestStartTracker_RunSelection(t *testing.T) {
 	}
 }
 
-// A stale start of run-a (its hub cancel lost) and the current run-b start
+// A stale create of run-a (its hub cancel lost) and the current run-b start
 // are both tracked. A stop for run-b with no container yet cancels run-b's
 // start and is accepted; run-a's start, of another run, is left alone. Never
 // a 404 that would lose the stop.
 func TestStopAgent_BothRunsTrackedStopCurrentRun(t *testing.T) {
-	srv, mgr, _, _ := newSyncStartTestServer(t)
-	relA, doneA := startInFlight(t, srv, mgr, "run-a", nil)
+	srv, mgr, projectPath, _ := newSyncStartTestServer(t)
+	relA, doneA := createInFlight(t, srv, mgr, "run-a", projectPath)
 	_, doneB := startInFlight(t, srv, mgr, "run-b", nil)
 
 	stopDone := make(chan *httptest.ResponseRecorder, 1)
@@ -394,10 +420,10 @@ func TestStopAgent_BothRunsTrackedStopCurrentRun(t *testing.T) {
 }
 
 // The re-lookup after the cancel: run-b's cancelled start leaves its
-// container, which the stop then stops, still with run-a's start tracked.
+// container, which the stop then stops, still with run-a's create tracked.
 func TestStopAgent_BothRunsTrackedReLookupStopsOwnContainer(t *testing.T) {
-	srv, mgr, _, _ := newSyncStartTestServer(t)
-	relA, doneA := startInFlight(t, srv, mgr, "run-a", nil)
+	srv, mgr, projectPath, _ := newSyncStartTestServer(t)
+	relA, doneA := createInFlight(t, srv, mgr, "run-a", projectPath)
 	_, doneB := startInFlight(t, srv, mgr, "run-b", func() {
 		setAgents(mgr, trackedRunEntry("c-b", "run-b"))
 	})
