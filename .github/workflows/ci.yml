@@ -18,6 +18,7 @@ on:
   push:
     branches: [ main, teyfix/onprem ]
   pull_request:
+  workflow_dispatch:
 
 # One run per PR: a new push to the same PR cancels the superseded run
 # (ptone/scion#2845). Runs on main are never cancelled. Outside pull_request
