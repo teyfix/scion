@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import '@shoelace-style/shoelace/dist/components/button/button.js';
 import { render } from 'lit';
 import { describe, expect, it } from 'vitest';
 
@@ -97,23 +98,33 @@ describe('agent Docker configuration forms', () => {
     }
   });
 
-  it('clears an edited GPU override through the Inherit control', () => {
+  it('clears an edited GPU override through the Inherit control', async () => {
     const page = new ScionPageAgentConfigure() as unknown as TestableConfigurePage;
     page.dockerConfigBase = { nvidia_gpu: false, privileged: false };
     page.dockerNetworks = ['backend'];
     const container = document.createElement('div');
-    render(page.renderEnvironmentTab(), container);
-    const inherit = container.querySelector<HTMLElement>(
-      'sl-button[aria-label="Inherit GPU settings"]'
-    );
-    expect(inherit).not.toBeNull();
-    inherit!.click();
-    expect(page.buildConfig().docker).toEqual({ privileged: false, networks: ['backend'] });
-    page.dockerConfigBase = { nvidia_gpu: true };
-    page.dockerNetworks = [];
-    render(page.renderEnvironmentTab(), container);
-    container.querySelector<HTMLElement>('sl-button[aria-label="Inherit GPU settings"]')!.click();
-    expect(page.buildConfig().docker).toEqual({});
+    document.body.append(container);
+    try {
+      render(page.renderEnvironmentTab(), container);
+      const inherit = container.querySelector<HTMLElement & { updateComplete: Promise<boolean> }>(
+        'sl-button[aria-label="Inherit GPU settings"]'
+      );
+      expect(inherit).not.toBeNull();
+      // Shoelace's click() delegates to its rendered native button. Connecting
+      // the fixture and awaiting its update exercises the real control.
+      await inherit!.updateComplete;
+      expect(inherit!.shadowRoot?.querySelector('button')).toBeInstanceOf(HTMLButtonElement);
+      inherit!.click();
+      expect(page.buildConfig().docker).toEqual({ privileged: false, networks: ['backend'] });
+      page.dockerConfigBase = { nvidia_gpu: true };
+      page.dockerNetworks = [];
+      render(page.renderEnvironmentTab(), container);
+      await inherit!.updateComplete;
+      inherit!.click();
+      expect(page.buildConfig().docker).toEqual({});
+    } finally {
+      container.remove();
+    }
   });
 
   it('preserves unrelated Docker fields when a provisioned agent config is edited', () => {
