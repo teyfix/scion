@@ -41,6 +41,7 @@ const imageProvenanceVersion = 1
 // imageProvenance is the per-source image record. See settings-precedence.md,
 // "Container image and Kubernetes image pull policy".
 type imageProvenance struct {
+	RuntimeEnvironmentSnapshot bool `json:"runtimeEnvironmentSnapshot,omitempty"`
 	// Version is always imageProvenanceVersion; see readImageProvenance.
 	Version int `json:"version"`
 	// RequestImage is the user's explicit request image at provision time

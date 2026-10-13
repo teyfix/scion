@@ -332,7 +332,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	var finalScionCfg *api.ScionConfig
 	var recoveryState *retainedRuntimeState
 	if opts.RuntimeRecovery != nil {
-		recoveryState, err = loadRuntimeRecovery(opts, projectDir, agents)
+		recoveryState, err = loadRuntimeRecovery(ctx, opts, projectDir, agents, m.owner)
 		if err == nil {
 			agentDir, agentHome, agentWorkspace, finalScionCfg = recoveryState.dir, recoveryState.home, recoveryState.workspace, recoveryState.config
 			hash, hashErr := runtimeConfigHash(finalScionCfg)
@@ -347,7 +347,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 					return nil, fmt.Errorf("retained container identity does not match")
 				}
 				if a.Phase == string(state.PhaseRunning) {
-					if a.Image == opts.RuntimeRecovery.Update.Image && a.Template == opts.RuntimeRecovery.Update.Template && a.Labels[runtimeConfigHashLabel] == hash {
+					if a.Template == opts.RuntimeRecovery.Update.Template && a.Labels[runtimeConfigHashLabel] == hash {
 						recoveryState.config.Info.Phase = string(state.PhaseRunning)
 						if err := writeRuntimeRecoveryState(recoveryState); err != nil {
 							return nil, fmt.Errorf("record verified runtime recovery: %w", err)
@@ -378,6 +378,13 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		opts.Env, err = recoveryDispatchEnv(opts.Env, recoveryState.requested)
 		if err != nil {
 			return nil, err
+		}
+		// The retained effective selection wins over stale Hub template defaults.
+		if finalScionCfg.Model != "" {
+			opts.Env["SCION_MODEL"] = finalScionCfg.Model
+		}
+		if finalScionCfg.ThinkingLevel != nil {
+			opts.Env["SCION_THINKING_LEVEL"] = strconv.Itoa(*finalScionCfg.ThinkingLevel)
 		}
 	}
 	if opts.FreshProvision {
@@ -457,17 +464,6 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	unixUsername := "root"
 	profileName := opts.Profile
 
-	if finalScionCfg != nil {
-		if recoveryState == nil {
-			finalScionCfg.Docker = resolveDockerConfig(settings, profileName, finalScionCfg.Docker)
-		}
-		if err := config.ValidateDockerConfig(finalScionCfg.Docker); err != nil {
-			return nil, err
-		}
-		if err := validateDockerDeviceRuntime(m.Runtime.Name(), config.ResolveDockerDevices(finalScionCfg.Docker)); err != nil {
-			return nil, err
-		}
-	}
 	util.Debugf("image resolution: starting, harnessConfigName=%s", harnessConfigName)
 
 	// Resolve the template chain unconditionally: it drives both the
@@ -658,6 +654,20 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		if recoveryState == nil {
 			finalScionCfg.Volumes = mergeEnvironmentVolumes(settingsVolumes, fileVolumes, ownEnv.Volumes)
 			applyEnvironmentResources(ctx, finalScionCfg, settings, envProfile, harnessConfigName)
+			templateDocker, err := liveTemplateDockerConfig(opts, finalScionCfg, projectDir)
+			if err != nil {
+				return nil, fmt.Errorf("resolve live template Docker configuration: %w", err)
+			}
+			finalScionCfg.Docker = resolveDockerConfig(settings, envProfile, config.MergeDockerConfig(templateDocker, ownEnv.Docker))
+		}
+	}
+
+	if finalScionCfg != nil {
+		if err := config.ValidateDockerConfig(finalScionCfg.Docker); err != nil {
+			return nil, err
+		}
+		if err := validateDockerDeviceRuntime(m.Runtime.Name(), config.ResolveDockerDevices(finalScionCfg.Docker)); err != nil {
+			return nil, err
 		}
 	}
 
@@ -767,21 +777,22 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 	}
 
-	// There is no live template tier: image and kubernetes are environment
-	// keys, which a template may not set (ptone/scion#4524).
-	//
-	// The recorded template snapshot is a legacy tier for an agent
-	// provisioned before that change whose template can no longer be
-	// resolved (renamed or deleted since provision, or a hub agent restarted
-	// on a broker with no local copy). It replays the template chain's OWN
-	// image / pull policy recorded in broker-side image provenance
-	// (image-provenance.json in the agent dir, not agent-info.json in the
-	// agent home), never the merged scion-agent.json value, which also folds
-	// in that moment's inline, profile, settings and file values, so a
-	// profile or settings pin removed since then cannot linger disguised as
-	// the template's (ptone/scion#1799). New agents record no template image,
-	// so for them the tier is empty. An agent provisioned before image
-	// provenance was recorded still falls back to the merged value.
+	// The onprem fork permits a narrow live template image fallback. Read
+	// the same hydrated chain as template env; keep requester provenance
+	// independent, so edits reach an ordinary restart.
+	var liveTemplateImage string
+	if recoveryState == nil {
+		for _, layer := range envChain {
+			cfg, err := layer.LoadConfig()
+			if err != nil {
+				return nil, fmt.Errorf("read live template image: %w", err)
+			}
+			if cfg.Image != "" {
+				liveTemplateImage = cfg.Image
+			}
+		}
+	}
+	// Missing templates retain the upstream legacy recorded snapshot tier.
 	var snapshotImage, snapshotPullPolicy string
 	if templateUnresolvable {
 		switch {
@@ -862,6 +873,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		{source: imageTierHarnessConfigFile, image: fileImage},
 		{source: imageTierSettings, image: settingsImage},
 		{source: imageTierTemplateSnapshot, image: snapshotImage},
+		{source: imageTierLiveTemplate, image: liveTemplateImage},
 		{source: imageTierInline, image: inlineImage},
 		{source: imageTierProfileOverride, image: profileOverrideImage},
 		{source: requestImageSource, image: requestImage},
@@ -1590,9 +1602,13 @@ authDone:
 	// translated to host.docker.internal, use --network=host so the container
 	// can reach the host's loopback interface directly. This also rewrites any
 	// bridge hostnames back to localhost in opts.Env.
-	networkMode := runtime.ResolveHostNetworking(m.Runtime.Name(), opts.Env)
-	if networkMode != "" {
-		opts.Env["SCION_NETWORK_MODE"] = networkMode
+	var networks []string
+	if finalScionCfg != nil && finalScionCfg.Docker != nil {
+		networks = finalScionCfg.Docker.Networks
+	}
+	networkMode := runtime.ResolveNetworkMode(m.Runtime.Name(), networks, opts.Env)
+	if finalScionCfg != nil {
+		delete(finalScionCfg.Env, "SCION_NETWORK_MODE")
 	}
 
 	// Persist harness auth override to scion-agent.json so sciontool inside the container sees it.
@@ -2661,6 +2677,7 @@ authDone:
 		_ = dropCheckedSharedDirs(agentDir, sharedDirRecord, passed, opts.Name)
 	}
 	if recoveryState != nil {
+		normalizeRuntimeSelection(finalScionCfg, runCfg.Env)
 		recoveryState.config = finalScionCfg
 		recoveryState.config.Info.RunID = runID
 		hash, err := runtimeConfigHash(finalScionCfg)
@@ -2688,6 +2705,12 @@ authDone:
 				return nil, fmt.Errorf("replace retained container: %w", err)
 			}
 		}
+	}
+	snapshotBrokerID := opts.Env["SCION_BROKER_ID"]
+	if m.owner != nil {
+		snapshotBrokerID = m.owner.RuntimeBrokerID
+	} else if finalScionCfg != nil && finalScionCfg.Info != nil && finalScionCfg.Info.RuntimeBrokerID != "" {
+		snapshotBrokerID = finalScionCfg.Info.RuntimeBrokerID
 	}
 	// Record the running phase, runtime and profile before the container
 	// starts rather than after it: some runtimes do not let the host write
@@ -2720,6 +2743,9 @@ authDone:
 			util.Debugf("Start: failed to mark agent error in local config: %v", updateErr)
 		}
 		return nil, classifyLaunchRuntimeError(err, resolvedImage)
+	}
+	if err := writeRuntimeEnvironmentSnapshot(agentDir, finalScionCfg, runCfg, agentID, projectID, snapshotBrokerID); err != nil {
+		return nil, fmt.Errorf("record effective runtime configuration: %w", err)
 	}
 	slog.Info("agent start: runtime.Run complete", "agent", opts.Name,
 		"total_elapsed_ms", time.Since(startEntry).Milliseconds())

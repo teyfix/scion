@@ -172,10 +172,9 @@ func TestStart_ExplicitProfileOverrideImageBeatsSettingsImage(t *testing.T) {
 	}
 }
 
-// TestStart_TemplateImageIgnored: image and kubernetes are environment keys
-// (ptone/scion#4524). A template's image never reaches the container (the
-// plain settings default applies), and Start reports it once as a warning.
-func TestStart_TemplateImageIgnored(t *testing.T) {
+// The onprem live template image fallback outranks harness defaults without
+// pretending that the template image is a requester's explicit image.
+func TestStart_LiveTemplateImageFallback(t *testing.T) {
 	projectScionDir := imagePrecedenceFixture(t, "template-pinned:v2", `schema_version: "1"
 active_profile: local
 profiles:
@@ -190,8 +189,8 @@ harness_configs:
 		Name:        "test-agent",
 		ProjectPath: projectScionDir,
 	})
-	if run.Image != "settings-pinned:v1" {
-		t.Fatalf("image = %q, want the settings default (the template's image is ignored)", run.Image)
+	if run.Image != "template-pinned:v2" {
+		t.Fatalf("image = %q, want the live template fallback", run.Image)
 	}
 	want := "template default sets environment key(s) image; ignored (environment comes from settings)"
 	n := 0
@@ -202,8 +201,8 @@ harness_configs:
 			}
 		}
 	}
-	if n != 1 {
-		t.Errorf("want the warning %q exactly once, got %v", want, info)
+	if n != 0 {
+		t.Errorf("unexpected ignored-image warning %q, got %v", want, info)
 	}
 }
 
@@ -440,15 +439,15 @@ harness_configs:
     harness: generic
 `)
 		run, _ := startCapturingRun(t, api.StartOptions{Name: "test-agent", ProjectPath: projectScionDir, Profile: "staging"})
-		if run.Image != "file-default:latest" || pullPolicyOf(run) != "Always" {
-			t.Fatalf("got image %q policy %q, want file-default:latest / Always (the template's are ignored)", run.Image, pullPolicyOf(run))
+		if run.Image != "template-pinned:v2" || pullPolicyOf(run) != "Always" {
+			t.Fatalf("got image %q policy %q, want template-pinned:v2 / Always (the template pull policy is ignored)", run.Image, pullPolicyOf(run))
 		}
 	})
 	t.Run("plain settings policy applies over the ignored template policy", func(t *testing.T) {
 		projectScionDir := tplWithPolicy(t, noOverrideSettings+"    image_pull_policy: Always\n")
 		run, _ := startCapturingRun(t, api.StartOptions{Name: "test-agent", ProjectPath: projectScionDir, Profile: "staging"})
-		if run.Image != "settings-pinned:v1" || pullPolicyOf(run) != "Always" {
-			t.Fatalf("got image %q policy %q, want settings-pinned:v1 / Always (the template's are ignored)", run.Image, pullPolicyOf(run))
+		if run.Image != "template-pinned:v2" || pullPolicyOf(run) != "Always" {
+			t.Fatalf("got image %q policy %q, want template-pinned:v2 / Always (the template pull policy is ignored)", run.Image, pullPolicyOf(run))
 		}
 	})
 }

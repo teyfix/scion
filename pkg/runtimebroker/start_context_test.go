@@ -16,6 +16,7 @@ package runtimebroker
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -24,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -953,4 +955,31 @@ func TestBuildStartContext_EnvClassificationsCarried(t *testing.T) {
 				"the three-state contract", sc.EnvClassifications, len(sc.EnvClassifications))
 		}
 	})
+}
+
+func TestBuildStartContextHydratedTemplateControlsExplicitBridge(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.HubEndpoint = "http://localhost:8080"
+	cfg.ContainerHubEndpoint = "http://host.docker.internal:9810"
+	srv := newTestServerForStartContextRuntime(t, cfg, "docker")
+	t.Setenv(runtime.ForceHostNetworkEnvVar, "1")
+	template := t.TempDir()
+	if err := os.WriteFile(filepath.Join(template, "scion-agent.json"), []byte(`{"docker":{"networks":["hydrated-preview"]}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+		Name: "bridge-agent", AgentID: "agent-id", ProjectPath: filepath.Join(t.TempDir(), "project"), Operation: opCreate,
+		Config: &CreateAgentConfig{Template: "hub-template"}, Prehydrated: prehydratedBundle{TemplateDone: true, TemplatePath: template},
+		HTTPRequest: httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.Opts.Env["SCION_HUB_ENDPOINT"] != "http://host.docker.internal:8080" || sc.Opts.Env["SCION_NETWORK_MODE"] != "hydrated-preview" {
+		t.Fatalf("hydrated bridge policy disagrees: %v", sc.Opts.Env)
+	}
+	if sc.Opts.TrustedHubEndpoint != sc.Opts.Env["SCION_HUB_ENDPOINT"] {
+		t.Fatalf("trusted endpoint=%q", sc.Opts.TrustedHubEndpoint)
+	}
 }

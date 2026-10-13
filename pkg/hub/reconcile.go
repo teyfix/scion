@@ -202,7 +202,7 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 			if err := recovering.DispatchAgentRecover(ctx, agent, args.RuntimeRecovery); err != nil {
 				return "", err
 			}
-			if err := s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery); err != nil {
+			if err := s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery, true); err != nil {
 				return "", err
 			}
 			return s.lifecycleDispatchResult(ctx, agent.ID, nil), nil

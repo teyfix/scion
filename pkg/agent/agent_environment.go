@@ -37,6 +37,7 @@ import (
 
 // agentEnvironment holds the environment fields of an agent config.
 type agentEnvironment struct {
+	Docker     *api.DockerConfig
 	Image      string
 	Kubernetes *api.KubernetesConfig
 	Resources  *api.ResourceSpec
@@ -49,7 +50,7 @@ func environmentOf(cfg *api.ScionConfig) agentEnvironment {
 	if cfg == nil {
 		return agentEnvironment{}
 	}
-	env := agentEnvironment{Image: cfg.Image}
+	env := agentEnvironment{Image: cfg.Image, Docker: config.CloneDockerConfig(cfg.Docker)}
 	if cfg.Kubernetes != nil {
 		k := *cfg.Kubernetes
 		env.Kubernetes = &k
@@ -77,6 +78,7 @@ func withEnvironment(cfg *api.ScionConfig, env agentEnvironment) *api.ScionConfi
 	}
 	out := *cfg
 	out.Image = env.Image
+	out.Docker = config.CloneDockerConfig(env.Docker)
 	out.Kubernetes = env.Kubernetes
 	out.Resources = env.Resources
 	out.Volumes = env.Volumes

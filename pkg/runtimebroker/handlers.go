@@ -784,6 +784,12 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	span.SetAttributes(attribute.String("scion.agent.name", req.Name))
 
 	// Validate required fields
+	if (req.ProjectID != "" || req.ID != "") && s.hasRegisteredHubAuthority() {
+		if _, ok := authenticatedBrokerAuthority(r); !ok {
+			Unauthorized(w)
+			return
+		}
+	}
 	if req.Name == "" {
 		ValidationError(w, "name is required", nil)
 		return

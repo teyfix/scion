@@ -87,41 +87,14 @@ func ValidateCreateAdmission(opts api.StartOptions) (retainedState bool, err err
 	if opts.InlineConfig == nil || opts.InlineConfig.Docker == nil || opts.InlineConfig.Docker.NvidiaGPU == nil {
 		return retainedState, nil
 	}
-	// Reconstruct exactly the existing agent's native template/config layers.
-	// Current CREATE config contributes only its explicit optional GPU intent.
-	effective := &api.ScionConfig{}
-	templateName := info.Template
-	if templateName == "" {
-		templateName = "default"
-		settings, _, err := config.LoadEffectiveSettings(projectDir)
-		if err != nil {
-			return retainedState, conflict("read retained template defaults", err)
-		}
-		if settings != nil && settings.DefaultTemplate != "" {
-			templateName = settings.DefaultTemplate
-		}
+	// Compare against the retained effective grants, never changed current
+	// profile/template defaults. This read-only check cannot hydrate templates.
+	snapshotOpts := opts
+	snapshotOpts.RuntimeRecovery = &api.RuntimeRecovery{AgentID: admission.AgentID, ProjectID: admission.ProjectID, RuntimeBrokerID: admission.RuntimeBrokerID}
+	if err := restoreRuntimeEnvironmentSnapshot(agentDir, snapshotOpts, retained, &info, nil); err != nil {
+		return retainedState, conflict("read retained effective device grants", err)
 	}
-	// The normal chain resolver can hydrate/download missing templates. This
-	// preflight must only read already-present layers; unresolved layers reject.
-	templateNames := []string{"default"}
-	if templateName != "default" {
-		templateNames = append(templateNames, templateName)
-	}
-	for _, name := range templateNames {
-		if config.IsRemoteURI(name) {
-			return retainedState, conflict("retained template requires download", nil)
-		}
-		template, err := config.FindTemplateInProjectPath(name, opts.ProjectPath)
-		if err != nil {
-			return retainedState, conflict("resolve retained template", err)
-		}
-		cfg, err := template.LoadConfig()
-		if err != nil {
-			return retainedState, conflict("read retained template", err)
-		}
-		effective = config.MergeScionConfig(effective, cfg)
-	}
-	effective = config.MergeScionConfig(effective, retained)
+	effective := &api.ScionConfig{Docker: retained.Docker}
 	candidate := config.MergeScionConfig(effective, &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: opts.InlineConfig.Docker.NvidiaGPU}})
 	if !slices.Equal(config.ResolveDockerDevices(effective.Docker), config.ResolveDockerDevices(candidate.Docker)) {
 		return retainedState, conflict("explicit GPU intent changes retained device grants", nil)

@@ -27,9 +27,10 @@ import (
 const (
 	imageTierHarnessConfigFile = "harness-config file"
 	imageTierSettings          = "settings harness_configs"
+	imageTierLiveTemplate      = "live template image"
 	// imageTierTemplateSnapshot is a legacy tier: a template image recorded
 	// before ptone/scion#4524, replayed only when the template can no
-	// longer be resolved. A template supplies no live image tier.
+	// longer be resolved.
 	imageTierTemplateSnapshot = "recorded template snapshot"
 	imageTierInline           = "inline config"
 	imageTierProfileOverride  = "profile harness_overrides"

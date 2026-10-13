@@ -240,6 +240,11 @@ type prehydratedBundle struct {
 // The caller may further customize the returned startContext before calling
 // mgr.Start or mgr.Provision.
 func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (*startContext, error) {
+	if (in.RuntimeRecovery != nil || (in.Operation == opCreate && (in.ProjectID != "" || in.AgentID != ""))) && s.hasRegisteredHubAuthority() {
+		if _, ok := authenticatedBrokerAuthority(in.HTTPRequest); !ok {
+			return nil, &startContextError{Status: http.StatusUnauthorized, Message: "Scoped lifecycle dispatch requires its registered Hub authority"}
+		}
+	}
 	// The caller must name its operation explicitly: resolveEffectiveHubEndpoint's
 	// ranking depends on it, and there is no safe default to infer from
 	// request shape. Checked first, before any directory or file side effect.
@@ -592,9 +597,11 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		connectionHubEndpoint = s.resolveHubEndpointFromRequest(in.HTTPRequest)
 	}
 
-	hubEndpoint, hubEndpointTrusted, err := resolveEffectiveHubEndpoint(ctx, hubEndpointInputs{
+	_, signedHubCallback := authenticatedBrokerAuthority(in.HTTPRequest)
+	endpointInputs := hubEndpointInputs{
 		Op:                           in.Operation,
 		ReqHubEndpoint:               in.HubEndpoint,
+		RequestEndpointUntrusted:     signedHubCallback,
 		ConnectionHubEndpoint:        connectionHubEndpoint,
 		BrokerHubEndpoint:            s.config.HubEndpoint,
 		ResolvedEnv:                  in.ResolvedEnv,
@@ -604,7 +611,8 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		ColocatedRuntimeHubEndpoints: s.config.ColocatedRuntimeHubEndpoints,
 		RuntimeName:                  runtimeName,
 		HubListenPort:                s.config.HubListenPort,
-	})
+	}
+	hubEndpoint, hubEndpointTrusted, err := resolveEffectiveHubEndpoint(ctx, endpointInputs)
 	if err != nil {
 		return nil, &startContextError{
 			Status:      http.StatusInternalServerError,
@@ -685,8 +693,12 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		env["SCION_BROKER_NAME"] = s.config.BrokerName
 		classifyBrokerEnv("SCION_BROKER_NAME", api.EnvKindPlain)
 	}
-	if s.config.BrokerID != "" {
-		env["SCION_BROKER_ID"] = s.config.BrokerID
+	brokerID := s.config.BrokerID
+	if authority, ok := authenticatedBrokerAuthority(in.HTTPRequest); ok {
+		brokerID = authority.brokerID
+	}
+	if brokerID != "" {
+		env["SCION_BROKER_ID"] = brokerID
 		classifyBrokerEnv("SCION_BROKER_ID", api.EnvKindPlain)
 	}
 	if in.CreatorName != "" {
@@ -991,6 +1003,49 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	if in.Operation != opCreate && opts.Template == "" {
 		s.applyStartTemplateEnvSource(ctx, in, &opts, hubConn, templateSlug)
 	}
+
+	var networkOwner *agent.OwnerScope
+	if s.ownership != nil {
+		networkOwner = &agent.OwnerScope{RuntimeBrokerID: s.ownership.brokerID, RetainedRunOwned: s.retainedRunOwned}
+	}
+	dockerConfig, err := agent.EffectiveStartDockerConfig(ctx, func() api.StartOptions {
+		networkOpts := opts
+		networkOpts.Profile = gcpIdentityProfile
+		networkOpts.FreshProvision = in.Operation == opCreate
+		return networkOpts
+	}(), networkOwner)
+	if err != nil {
+		return nil, &startContextError{Status: http.StatusConflict, Message: "Failed to resolve Docker network policy", OriginalErr: err}
+	}
+	var networks []string
+	if dockerConfig != nil {
+		networks = dockerConfig.Networks
+	}
+
+	endpointInputs.Networks = networks
+	hubEndpoint, hubEndpointTrusted, err = resolveEffectiveHubEndpoint(ctx, endpointInputs)
+	if err != nil {
+		return nil, &startContextError{
+			Status:      http.StatusInternalServerError,
+			Message:     "Failed to resolve the hub endpoint",
+			OriginalErr: err,
+		}
+	}
+	if hubEndpoint != "" {
+		env["SCION_HUB_ENDPOINT"] = hubEndpoint
+		classifyBrokerEnv("SCION_HUB_ENDPOINT", api.EnvKindPlain)
+		env["SCION_HUB_URL"] = hubEndpoint // legacy compat
+		classifyBrokerEnv("SCION_HUB_URL", api.EnvKindPlain)
+		if s.config.Debug {
+			s.agentLifecycleLog.Debug("SCION_HUB_ENDPOINT set", "agent_id", in.AgentID, "endpoint", hubEndpoint)
+		}
+	}
+	runtime.ResolveNetworkMode(runtimeName, networks, env)
+	opts.TrustedHubEndpoint = ""
+	if hubEndpointTrusted {
+		opts.TrustedHubEndpoint = hubEndpoint
+	}
+	opts.ExtraHosts = colocatedExtraHosts(hubEndpoint, isColocated, runtimeName)
 
 	// --- Shared workspace mode (git-workspace hybrid) ---
 	// Deprecated: SCION_SHARED_WORKSPACE — superseded by SCION_WORKSPACE_MODE +

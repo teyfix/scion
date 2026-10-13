@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func (s *AgentStore) UpdateAgentRuntimeRecovery(ctx context.Context, a *store.Agent, admissionVersion int64, replaceLabels bool) error {
+func (s *AgentStore) UpdateAgentRuntimeRecovery(ctx context.Context, a *store.Agent, admissionVersion int64, replaceLabels, clearRemnants bool) error {
 	var result *store.Agent
 	err := s.withLockedAgent(ctx, a.ID, func(ctx context.Context, c *ent.Client, current *ent.Agent, now time.Time) (bool, error) {
 		latest := entAgentToStore(current)
@@ -18,8 +18,11 @@ func (s *AgentStore) UpdateAgentRuntimeRecovery(ctx context.Context, a *store.Ag
 		if current.Phase == "starting" {
 			upd.SetPhase(a.Phase).SetMessage(a.Message)
 			if a.Phase != "error" {
-				upd.SetContainerStatus(a.ContainerStatus).SetRuntimeState(a.RuntimeState).ClearExitCode().SetExitReason("").SetStalledFromActivity("")
+				upd.SetContainerStatus(a.ContainerStatus).SetRuntimeState(a.RuntimeState)
 			}
+		}
+		if clearRemnants && a.Phase != "error" && (current.Phase == "starting" || current.Phase == "running") {
+			upd.ClearExitCode().SetExitReason("").SetStalledFromActivity("")
 		}
 		if a.Phase != "error" {
 			upd.SetAppliedConfig(marshalAppliedConfig(a.AppliedConfig)).SetTemplate(a.Template).SetImage(a.Image).SetDetached(a.Detached).SetHarnessConfig(harnessConfigOf(a.AppliedConfig))

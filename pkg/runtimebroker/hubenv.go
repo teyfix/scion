@@ -24,6 +24,7 @@ import (
 
 	gcemetadata "cloud.google.com/go/compute/metadata"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/metadata"
 )
 
@@ -85,6 +86,8 @@ type hubEndpointInputs struct {
 	// ReqHubEndpoint is the request-level HubEndpoint field, ranked first by
 	// opCreate, opHTTPStart, and opHTTPRestart alike.
 	ReqHubEndpoint string
+	// A Hub-signed callback is usable, but does not grant operator egress policy.
+	RequestEndpointUntrusted bool
 	// ConnectionHubEndpoint is the endpoint named by the request's
 	// X-Scion-Hub-Connection header, when present.
 	ConnectionHubEndpoint string
@@ -100,6 +103,7 @@ type hubEndpointInputs struct {
 	ColocatedPublicHubEndpoint string
 	// ColocatedRuntimeHubEndpoints is ServerConfig.ColocatedRuntimeHubEndpoints.
 	ColocatedRuntimeHubEndpoints map[string]string
+	Networks                     []string
 	RuntimeName                  string
 	HubListenPort                int
 }
@@ -136,6 +140,11 @@ func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (end
 		return "", false, fmt.Errorf("resolveEffectiveHubEndpoint: unknown start operation %q", in.Op)
 	}
 
+	if in.RequestEndpointUntrusted && in.ReqHubEndpoint != "" &&
+		!(isLocalhostEndpoint(in.ReqHubEndpoint) && in.ConnectionHubEndpoint != "" && !isLocalhostEndpoint(in.ConnectionHubEndpoint)) {
+		trusted = false
+	}
+
 	// On the cloudrun-sandbox runtime, sandboxes cannot reach the hub's
 	// public IAP-fronted URL (they hold no IAP credential). The hub is on the
 	// same Instance, listening on 0.0.0.0, and reachable via the launcher's
@@ -163,6 +172,11 @@ func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (end
 			return "", false, fmt.Errorf("cannot resolve hub endpoint for Cloud Run instance: %w", cerr)
 		}
 		return criEndpoint, true, nil
+	}
+	if len(in.Networks) > 0 {
+		env := map[string]string{"SCION_HUB_ENDPOINT": endpoint}
+		runtime.ResolveNetworkMode(in.RuntimeName, in.Networks, env)
+		endpoint = env["SCION_HUB_ENDPOINT"]
 	}
 	return endpoint, trusted, nil
 }

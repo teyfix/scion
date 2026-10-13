@@ -1195,3 +1195,24 @@ func TestResolveEffectiveHubEndpoint_CloudrunLocalhostOverrideValue(t *testing.T
 		})
 	}
 }
+
+func TestExplicitBridgeEndpointAndSignedCallbackTrust(t *testing.T) {
+	for _, signed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "operator request", true: "signed callback"}[signed], func(t *testing.T) {
+			endpoint, trusted, err := resolveEffectiveHubEndpoint(context.Background(), hubEndpointInputs{
+				Op: opHTTPStart, ReqHubEndpoint: "http://localhost:8080", ContainerHubEndpoint: "http://host.docker.internal:9810",
+				Networks: []string{"preview"}, RuntimeName: "docker", RequestEndpointUntrusted: signed,
+			})
+			if err != nil || endpoint != "http://host.docker.internal:8080" || trusted == signed {
+				t.Fatalf("endpoint=%q trusted=%v err=%v", endpoint, trusted, err)
+			}
+		})
+	}
+	endpoint, trusted, err := resolveEffectiveHubEndpoint(context.Background(), hubEndpointInputs{
+		Op: opHTTPStart, ReqHubEndpoint: "https://valid-callback.example", ConnectionHubEndpoint: "https://authority-api.example",
+		RequestEndpointUntrusted: true, RuntimeName: "docker", Networks: []string{"preview"},
+	})
+	if err != nil || endpoint != "https://valid-callback.example" || trusted {
+		t.Fatalf("endpoint=%q trusted=%v err=%v", endpoint, trusted, err)
+	}
+}

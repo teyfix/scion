@@ -600,7 +600,7 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 			slog.Error("Flat Runtime Broker instance will not serve", "error", srv.ownershipSetupErr)
 		} else {
 			am.SetOwner(agent.OwnerScope{RuntimeBrokerID: fi.Identity.RuntimeBrokerID,
-				FileAgentOwned: srv.fileAgentOwned, EntryUnresolved: srv.ownership.ConflictingLabels,
+				FileAgentOwned: srv.fileAgentOwned, RetainedRunOwned: srv.retainedRunOwned, EntryUnresolved: srv.ownership.ConflictingLabels,
 				EntryPathTrusted: trustedEntryProjectPath, LaunchHandleOwned: srv.launchHandleOwned,
 				WorkspaceLock: srv.locks().Lock})
 		}
