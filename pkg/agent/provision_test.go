@@ -170,14 +170,10 @@ harness_configs:
 	}
 }
 
-// TestProvisionAgent_ImageAndPullPolicyPrecedence pins the full precedence
-// order for ptone/scion#2156 (settings win over the harness-config file's
-// own default, but an explicit template override still outranks settings):
-// harness-config file default < Hub settings harness_configs.<h>
-// (profile harness_overrides outranking the base entry) < explicit
-// template/agent config. kubernetes.imagePullPolicy is new to both the
-// harness-config file (config.yaml `image_pull_policy:`) and Hub settings,
-// and follows the identical rule.
+// Provision responses use the same image precedence as Start: harness-file
+// defaults < settings < live template < inline < explicit profile < request.
+// Template Kubernetes pull policy stays ignored; persisted config contains
+// requester values only, independently of the returned effective image.
 func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -188,6 +184,7 @@ func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 		profileOverridePolicy string
 		templateImage         string
 		templatePolicy        string
+		requestImage          string
 		wantImage             string
 		wantPolicy            string
 	}{
@@ -207,12 +204,11 @@ func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 			wantImage:     "example.com/settings-pinned:v1",
 		},
 		{
-			// ptone/scion#4524: a template's image is an ignored
-			// environment key.
-			name:          "template image is ignored; settings applies",
+			// The deliberate live image exception outranks settings.
+			name:          "live template image outranks settings",
 			settingsImage: "example.com/settings-pinned:v1",
 			templateImage: "example.com/template-pinned:v2",
-			wantImage:     "example.com/settings-pinned:v1",
+			wantImage:     "example.com/template-pinned:v2",
 		},
 		{
 			name:           "settings image_pull_policy applies with no template override",
@@ -239,19 +235,23 @@ func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 			wantPolicy:            "Always",
 		},
 		{
-			// ptone/scion#4524: a template's image and pull policy are
-			// ignored environment keys, so they no longer stand between
-			// the profile override and the persisted config; the result is
-			// the same as the profile-outranks case above. (Start ranks
-			// the override itself; see
-			// TestStart_RemovedProfilePinDoesNotLingerInTemplateSnapshot.)
-			name:                 "template image and policy are ignored under a profile override",
+			// The effective response honors the explicit profile image;
+			// template pull policy remains ignored.
+			name:                 "explicit profile image outranks live template image",
 			settingsImage:        "example.com/settings-pinned:v1",
 			profileOverrideImage: "example.com/profile-pinned:v3",
 			templateImage:        "example.com/template-pinned:v2",
 			templatePolicy:       "Never",
 			wantImage:            "example.com/profile-pinned:v3",
 			wantPolicy:           "",
+		},
+		{
+			name:                 "explicit request image outranks profile and live template",
+			settingsImage:        "example.com/settings-pinned:v1",
+			profileOverrideImage: "example.com/profile-pinned:v3",
+			templateImage:        "example.com/template-pinned:v2",
+			requestImage:         "example.com/request-pinned:v4",
+			wantImage:            "example.com/request-pinned:v4",
 		},
 	}
 
@@ -325,9 +325,15 @@ func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 			}
 
 			agentName := "test-agent"
-			_, _, cfg, err := ProvisionAgent(context.Background(), agentName, "test-tpl", "", "", projectScionDir, profileName, "", "", "")
+			_, _, cfg, err := ProvisionAgent(context.Background(), agentName, "test-tpl", tt.requestImage, "", projectScionDir, profileName, "", "", "")
 			if err != nil {
 				t.Fatalf("ProvisionAgent failed: %v", err)
+			}
+			// Manager.Provision reports withProvisionedImage's effective value,
+			// while the raw ProvisionAgent config keeps its independent inputs.
+			cfg, err = withProvisionedImage(context.Background(), api.StartOptions{Name: agentName, Template: "test-tpl", ProjectPath: projectScionDir, Profile: profileName, Image: tt.requestImage}, filepath.Join(projectScionDir, "agents", agentName), cfg)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if cfg.Image != tt.wantImage {
 				t.Errorf("cfg.Image = %q, want %q", cfg.Image, tt.wantImage)
@@ -356,6 +362,13 @@ func TestProvisionAgent_ImageAndPullPolicyPrecedence(t *testing.T) {
 			}
 			if persisted.Image != "" {
 				t.Errorf("persisted image = %q, want none", persisted.Image)
+			}
+			provenance, err := readImageProvenance(filepath.Join(projectScionDir, "agents", agentName))
+			if err != nil || provenance == nil {
+				t.Fatalf("image provenance=%v error=%v", provenance, err)
+			}
+			if provenance.RequestImage != tt.requestImage || provenance.InlineImage != "" || provenance.TemplateImage != "" {
+				t.Fatalf("effective template/profile image contaminated request provenance: %+v", provenance)
 			}
 			if persisted.Kubernetes != nil {
 				t.Errorf("persisted kubernetes = %+v, want none", persisted.Kubernetes)
