@@ -547,7 +547,7 @@ func (s *agentService) RecoverRuntime(ctx context.Context, agentID string, updat
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // Stop stops a running agent.

@@ -267,8 +267,9 @@ echo '{"ID":"aaa","Names":"agent-a","Status":"Up","Image":"img","Labels":"scion.
 }
 
 // writeFailNTimesScript writes a mock docker binary that fails the first
-// failCount invocations (recorded in a counter file) with exit status 1,
-// then succeeds and emits one container line.
+// failCount ps invocations (recorded in a counter file) with exit status 1,
+// then succeeds and emits one container line. Inspection returns runtime facts
+// independently of the ps retry counter.
 func writeFailNTimesScript(t *testing.T, dir string, failCount int) (mockDocker, counterFile string) {
 	t.Helper()
 	mockDocker = filepath.Join(dir, "mock-docker")
@@ -280,6 +281,18 @@ func writeFailNTimesScript(t *testing.T, dir string, failCount int) (mockDocker,
 	// Write the counter via a temp file and rename so a concurrent
 	// readCounter never sees a truncated, empty file (ptone/scion#3694).
 	script := `#!/bin/sh
+case "$1" in
+inspect)
+  echo '{"id":"abc123","privileged":true,"devices":[],"deviceRequests":[{"Driver":"nvidia","Capabilities":[["gpu"]]}]}'
+  exit 0
+  ;;
+ps)
+  ;;
+*)
+  echo "unexpected docker command: $1" >&2
+  exit 1
+  ;;
+esac
 n=$(cat "` + counterFile + `")
 n=$((n + 1))
 echo "$n" > "` + counterFile + `.tmp.$$"
@@ -321,9 +334,15 @@ func TestDockerRuntime_List_RetriesTransientFailure(t *testing.T) {
 	if len(agents) != 1 || agents[0].Name != "agent1" {
 		t.Fatalf("unexpected agents after retry: %+v", agents)
 	}
+	if agents[0].Privileged == nil || !*agents[0].Privileged {
+		t.Fatalf("expected observed privileged=true after retry, got %v", agents[0].Privileged)
+	}
+	if agents[0].NvidiaGPU == nil || !*agents[0].NvidiaGPU {
+		t.Fatalf("expected observed nvidiaGpu=true after retry, got %v", agents[0].NvidiaGPU)
+	}
 
 	if got := readCounter(t, counterFile); got != 2 {
-		t.Fatalf("expected exactly 2 invocations (1 failure + 1 success), got %d", got)
+		t.Fatalf("expected exactly 2 ps invocations (1 failure + 1 success), got %d", got)
 	}
 }
 
@@ -342,7 +361,7 @@ func TestDockerRuntime_List_GivesUpAfterMaxAttempts(t *testing.T) {
 	}
 
 	if got := readCounter(t, counterFile); got != dockerListMaxAttempts {
-		t.Fatalf("expected exactly %d invocations (bounded retry), got %d", dockerListMaxAttempts, got)
+		t.Fatalf("expected exactly %d ps invocations (bounded retry), got %d", dockerListMaxAttempts, got)
 	}
 }
 
@@ -375,7 +394,7 @@ func TestDockerRuntime_List_StopsRetryingWhenContextDone(t *testing.T) {
 	// Give a generous margin, but well under what dockerListMaxAttempts
 	// worth of full backoff would take, to confirm we didn't keep retrying.
 	if got := readCounter(t, counterFile); got >= dockerListMaxAttempts {
-		t.Fatalf("expected fewer than %d invocations once context is done, got %d", dockerListMaxAttempts, got)
+		t.Fatalf("expected fewer than %d ps invocations once context is done, got %d", dockerListMaxAttempts, got)
 	}
 }
 

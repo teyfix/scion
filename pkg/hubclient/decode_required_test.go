@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
 
@@ -90,6 +91,14 @@ func requiredBodyCases() []requiredBodyCase {
 		{"Agents.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.Agents().Get(ctx, "a")) }},
 		{"Agents.Create", func(ctx context.Context, c Client) error {
 			return expectNoResult(c.Agents().Create(ctx, &CreateAgentRequest{Name: "a"}))
+		}},
+		{"Agents.RecoverRuntime", func(ctx context.Context, c Client) error {
+			version := int64(1)
+			return expectNoResult(c.Agents().RecoverRuntime(ctx, "a", &api.RuntimeUpdateRequest{
+				StateVersion: &version,
+				Template:     "current",
+				Image:        "scion-agent:latest",
+			}))
 		}},
 		{"Projects.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.Projects().Get(ctx, "p")) }},
 		{"RuntimeBrokers.Get", func(ctx context.Context, c Client) error { return expectNoResult(c.RuntimeBrokers().Get(ctx, "b")) }},
