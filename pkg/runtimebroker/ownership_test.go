@@ -569,3 +569,17 @@ func TestOwnershipStore_ReconstructKnowsObjectsOfAnUnfinishedDelete(t *testing.T
 		})
 	}
 }
+
+func TestRetainedSnapshotHistoricalRunOwnership(t *testing.T) {
+	s := NewOwnershipStore(t.TempDir(), "broker-a")
+	srv := &Server{ownership: s}
+	require.NoError(t, s.BeginRun("p", "a", "worker", "old-run"))
+	require.NoError(t, s.SetRunState("p", "a", "old-run", OwnershipStateDeleted))
+	require.NoError(t, s.BeginRun("p", "a", "worker", "failed-attempt"))
+	require.True(t, srv.retainedRunOwned("p", "a", "worker", "old-run"))
+	require.False(t, srv.retainedRunOwned("p", "a", "worker", "unknown-run"))
+	require.False(t, srv.retainedRunOwned("p", "a", "foreign", "old-run"))
+	require.False(t, srv.retainedRunOwned("p", "foreign", "worker", "old-run"))
+	require.NoError(t, s.SetRecordState("p", "a", OwnershipStateDeleting))
+	require.False(t, srv.retainedRunOwned("p", "a", "worker", "old-run"))
+}

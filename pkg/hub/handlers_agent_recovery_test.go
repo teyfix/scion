@@ -3,6 +3,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -185,4 +187,33 @@ func TestRetainedRuntimeRecoveryConfigCommitPreservesNewerStopStatus(t *testing.
 	require.Equal(t, "Stopped by user", saved.Message)
 	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
 	require.Equal(t, "current", saved.Template)
+}
+
+func TestRuntimeRecoveryRequiresConfigurationUpdateAuthority(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		t.Run(map[bool]string{false: "session lifecycle only", true: "lifecycle UAT"}[scoped], func(t *testing.T) {
+			var dispatches atomic.Int32
+			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) { dispatches.Add(1); writeSuccessfulRecovery(t, w, r) })
+			user := newReincarnateAuthzUser(t, db, "recovery-update")
+			grantAgentLifecycleAtProject(t, db, user.ID, agent.ProjectID)
+			grantProjectAccessOnly(t, db, user.ID, agent.ProjectID)
+			var identity UserIdentity = NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "web")
+			if scoped {
+				grantPermissionViaRoleBinding(t, db, user.ID, "agent.update", store.RoleScopeProject, agent.ProjectID)
+				identity = scopedIdentityFor(user, agent.ProjectID, []string{"agent:lifecycle"})
+			}
+			body, err := json.Marshal(recoveryStartBody(update))
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", bytes.NewReader(body))
+			req = req.WithContext(contextWithIdentity(req.Context(), identity))
+			rec := httptest.NewRecorder()
+			srv.handleAgentLifecycle(rec, req, agent.ID, "start")
+			require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+			require.Zero(t, dispatches.Load())
+			latest, err := db.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.Equal(t, agent.StateVersion, latest.StateVersion)
+			require.Equal(t, agent.AppliedConfig, latest.AppliedConfig)
+		})
+	}
 }

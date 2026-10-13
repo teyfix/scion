@@ -425,7 +425,7 @@ type AgentStore interface {
 	// It never writes soft_delete_op_id (see SetAgentSoftDeleteOpID).
 	UpdateAgent(ctx context.Context, agent *Agent) error
 	AdmitAgentRuntimeRecovery(ctx context.Context, agentID string, stateVersion, admissionVersion int64) (*Agent, error)
-	UpdateAgentRuntimeRecovery(ctx context.Context, agent *Agent, admissionVersion int64, replaceLabels bool) error
+	UpdateAgentRuntimeRecovery(ctx context.Context, agent *Agent, admissionVersion int64, replaceLabels, clearRemnants bool) error
 
 	// SetAgentSoftDeleteOpID sets the agent's soft_delete_op_id to opID, or
 	// clears it to NULL when opID is empty. It is the only writer of that

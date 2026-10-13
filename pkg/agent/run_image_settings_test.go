@@ -250,7 +250,7 @@ harness_configs:
 // TestStart_TemplateImageAndPullPolicyIgnored: a template's `image:` /
 // `kubernetes.imagePullPolicy` are environment keys, ignored
 // (ptone/scion#4524), so the Hub settings values apply.
-func TestStart_TemplateImageAndPullPolicyIgnored(t *testing.T) {
+func TestStart_TemplateImageFallbackWithPullPolicyIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	oldWd, _ := os.Getwd()
@@ -310,8 +310,8 @@ harness_configs:
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	if capturedConfig.Image != "settings-pinned:v1" {
-		t.Errorf("image = %q, want the settings image (the template's is ignored)", capturedConfig.Image)
+	if capturedConfig.Image != "template-pinned:v2" {
+		t.Errorf("image = %q, want the live template image fallback", capturedConfig.Image)
 	}
 	gotPolicy := ""
 	if capturedConfig.Kubernetes != nil {

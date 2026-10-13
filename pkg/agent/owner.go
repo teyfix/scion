@@ -42,6 +42,9 @@ type OwnerScope struct {
 	// empty when the project has none). Nil means no file-only agent is
 	// owned.
 	FileAgentOwned func(projectID, slug string) bool
+	// RetainedRunOwned validates a historical run against the active immutable
+	// ownership record. Stopped runs remain evidence; deleting records do not.
+	RetainedRunOwned func(projectID, agentID, slug, runID string) bool
 	// EntryUnresolved, when set, reports a runtime object carrying the
 	// owner label whose ownership is nevertheless unresolved (its agent or
 	// slug is claimed by another configured instance too). Such an object

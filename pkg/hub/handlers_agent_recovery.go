@@ -21,6 +21,11 @@ type runtimeRecoveryDispatcher interface {
 
 func (s *Server) recoverAgentRuntime(w http.ResponseWriter, r *http.Request, agent *store.Agent, update *api.RuntimeUpdateRequest) {
 	ctx := r.Context()
+	// A runtime update changes configuration. As for reincarnate patches,
+	// user/session and UAT callers need agent.update as well as lifecycle authority.
+	if GetUserIdentityFromContext(ctx) != nil && !s.authorizeMsg(w, r, agentResource(agent), ActionUpdate, "Runtime recovery with configuration changes requires agent.update permission") {
+		return
+	}
 	if err := update.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
 		return
@@ -107,7 +112,7 @@ func (s *Server) recoverAgentRuntime(w http.ResponseWriter, r *http.Request, age
 			return nil
 		},
 		AfterStart: func(finalCtx context.Context, st startedState) error {
-			if err := s.completeRuntimeRecovery(finalCtx, agent, recovery); err != nil {
+			if err := s.completeRuntimeRecovery(finalCtx, agent, recovery, st.ClearRemnants); err != nil {
 				return err
 			}
 			return nil
@@ -130,9 +135,10 @@ func (s *Server) recoverAgentRuntime(w http.ResponseWriter, r *http.Request, age
 }
 
 // completeRuntimeRecovery fences late results against a newer admitted retry.
-func (s *Server) completeRuntimeRecovery(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery) error {
+func (s *Server) completeRuntimeRecovery(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery, clearRemnants ...bool) error {
+	clear := len(clearRemnants) > 0 && clearRemnants[0]
 	for attempt := 0; attempt < 3; attempt++ {
-		err := s.completeRuntimeRecoveryAttempt(ctx, agent, recovery)
+		err := s.completeRuntimeRecoveryAttempt(ctx, agent, recovery, clear)
 		if !errors.Is(err, store.ErrVersionConflict) {
 			return err
 		}
@@ -140,7 +146,7 @@ func (s *Server) completeRuntimeRecovery(ctx context.Context, agent *store.Agent
 	return store.ErrVersionConflict
 }
 
-func (s *Server) completeRuntimeRecoveryAttempt(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery) error {
+func (s *Server) completeRuntimeRecoveryAttempt(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery, clearRemnants bool) error {
 	latest, err := s.store.GetAgent(ctx, agent.ID)
 	if err != nil {
 		return err
@@ -162,14 +168,14 @@ func (s *Server) completeRuntimeRecoveryAttempt(ctx context.Context, agent *stor
 		*agent = *latest
 		return nil
 	}
-	// The store merges dispatch-owned fields under the same row lock as status
-	// reports, which deliberately do not increment StateVersion.
+	// Status reports do not increment StateVersion. Configuration/metadata
+	// edits do: keep the dispatch snapshot's expected version so a concurrent
+	// PATCH cannot be overwritten by a late recovery result.
 	result := *agent
-	result.StateVersion = latest.StateVersion
 	if recovery.Update.Labels != nil {
 		result.Labels = recovery.Update.Labels
 	}
-	if err := s.store.UpdateAgentRuntimeRecovery(ctx, &result, recovery.AdmissionVersion, recovery.Update.Labels != nil); err != nil {
+	if err := s.store.UpdateAgentRuntimeRecovery(ctx, &result, recovery.AdmissionVersion, recovery.Update.Labels != nil, clearRemnants); err != nil {
 		return err
 	}
 	*agent = result

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -1413,6 +1414,43 @@ func ResolveHostNetworking(runtimeName string, env map[string]string) string {
 	}
 
 	return ""
+}
+
+// ResolveNetworkMode honors the explicit primary network before auto-host
+// heuristics. It also keeps the advertised mode and local Hub URLs consistent
+// with the network Docker actually receives.
+func ResolveNetworkMode(runtimeName string, networks []string, env map[string]string) string {
+	for _, network := range networks {
+		if network == "" {
+			continue
+		}
+		if network == "host" {
+			rewriteBridgeHostToLocalhost(env)
+		} else if runtimeName == "docker" || runtimeName == "podman" {
+			for _, key := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL"} {
+				endpoint, err := url.Parse(env[key])
+				if err == nil && (endpoint.Hostname() == "localhost" || endpoint.Hostname() == "127.0.0.1" || endpoint.Hostname() == "::1") {
+					host := "host.docker.internal"
+					if runtimeName == "podman" {
+						host = "host.containers.internal"
+					}
+					if endpoint.Port() != "" {
+						host = net.JoinHostPort(host, endpoint.Port())
+					}
+					endpoint.Host = host
+					env[key] = endpoint.String()
+				}
+			}
+		}
+		env["SCION_NETWORK_MODE"] = network
+		return network
+	}
+	mode := ResolveHostNetworking(runtimeName, env)
+	delete(env, "SCION_NETWORK_MODE")
+	if mode != "" {
+		env["SCION_NETWORK_MODE"] = mode
+	}
+	return mode
 }
 
 // rewriteBridgeHostToLocalhost rewrites any host.docker.internal references in

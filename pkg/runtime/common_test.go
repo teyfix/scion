@@ -2940,3 +2940,41 @@ func TestBuildCommonRunArgs_Devices(t *testing.T) {
 		}
 	}
 }
+
+func TestExplicitNetworkModeMatchesDockerArgumentsAndMetadata(t *testing.T) {
+	for _, mode := range []string{"block", "assign"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv(ForceHostNetworkEnvVar, "1")
+			env := map[string]string{"SCION_HUB_ENDPOINT": "http://localhost:9810", "SCION_HUB_URL": "http://localhost:9810", "SCION_NETWORK_MODE": "host"}
+			network := ResolveNetworkMode("docker", []string{"preview"}, env)
+			if network != "preview" || env["SCION_NETWORK_MODE"] != "preview" || env["SCION_HUB_ENDPOINT"] != "http://host.docker.internal:9810" {
+				t.Fatalf("network=%q env=%v", network, env)
+			}
+			args, err := buildCommonRunArgs(RunConfig{Name: "explicit-bridge", Image: "test-image", UnixUsername: "root", Harness: &harness.Generic{}, Networks: []string{"preview"}, NetworkMode: network,
+				MetadataInterception: true, Env: []string{"SCION_NETWORK_MODE=" + env["SCION_NETWORK_MODE"], "SCION_METADATA_MODE=" + mode, "SCION_HUB_ENDPOINT=" + env["SCION_HUB_ENDPOINT"]},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, "--network preview") || strings.Contains(joined, "--network host") || !strings.Contains(joined, "SCION_NETWORK_MODE=preview") || !strings.Contains(joined, "--cap-add NET_ADMIN") {
+				t.Fatalf("inconsistent network/metadata args: %v", args)
+			}
+		})
+	}
+}
+
+func TestResolveNetworkModeClearsStaleHostAndExplicitHostRewrites(t *testing.T) {
+	t.Setenv(ForceHostNetworkEnvVar, "")
+	env := map[string]string{"SCION_HUB_ENDPOINT": "https://hub.example", "SCION_NETWORK_MODE": "host"}
+	if got := ResolveNetworkMode("docker", nil, env); got != "" {
+		t.Fatalf("mode=%q", got)
+	}
+	if _, found := env["SCION_NETWORK_MODE"]; found {
+		t.Fatalf("stale mode=%v", env)
+	}
+	env["SCION_HUB_ENDPOINT"] = "http://host.docker.internal:9810"
+	if got := ResolveNetworkMode("docker", []string{"host"}, env); got != "host" || env["SCION_HUB_ENDPOINT"] != "http://localhost:9810" {
+		t.Fatalf("mode=%q env=%v", got, env)
+	}
+}

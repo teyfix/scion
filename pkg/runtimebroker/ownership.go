@@ -1802,3 +1802,15 @@ func (s *OwnershipStore) AdmitRuntimeRecovery(projectID, agentID, slug string, v
 	}
 	return err
 }
+
+// retainedRunOwned treats the ownership record as the authority for historical
+// effective-runtime metadata, including when a failed start changed local info.
+func (s *Server) retainedRunOwned(projectID, agentID, slug, runID string) bool {
+	if s.ownership == nil {
+		return false
+	}
+	rec, found, err := s.ownership.Get(projectID, agentID)
+	return err == nil && found && rec.RuntimeBrokerID == s.ownership.brokerID &&
+		rec.ProjectID == projectID && rec.AgentID == agentID && rec.AgentSlug == slug &&
+		rec.State == OwnershipStateActive && rec.Run(runID) != nil
+}

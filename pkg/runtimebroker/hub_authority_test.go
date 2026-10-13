@@ -21,6 +21,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -769,5 +771,52 @@ func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
 	conn.lifecycleMu.Unlock()
 	if !closed {
 		t.Fatal("background final cleanup did not retain the terminal lifecycle state")
+	}
+}
+
+func TestBoundHubAuthorityPinsHydrationAndBrokerIdentityWithDistinctCallback(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.BrokerID = "global-broker-b"
+	cfg.BrokerAuthEnabled, cfg.BrokerAuthStrictMode = true, true
+	srv := newTestServerForStartContextRuntime(t, cfg, "docker")
+	keyA, keyB := []byte("hub-a-test-secret"), []byte("hub-b-test-secret")
+	connA := configureAuthorityTestConnection(t, srv, "hub-a", "https://a.example", "broker-a", keyA)
+	configureAuthorityTestConnection(t, srv, "hub-b", "https://b.example", "broker-b", keyB)
+	template := t.TempDir()
+	if err := os.WriteFile(filepath.Join(template, "scion-agent.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	handler := srv.loadBrokerMiddleware().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		// Even an internal later routing header cannot override admitted authority.
+		r.Header.Set("X-Scion-Hub-Connection", "hub-b")
+		if srv.resolveHubConnection(r) != connA {
+			t.Fatal("Hub A request selected Hub B hydration")
+		}
+		sc, err := srv.buildStartContext(r.Context(), startContextInputs{
+			Name: "bound-agent", AgentID: "agent-a", ProjectPath: filepath.Join(t.TempDir(), "project"), Operation: opCreate,
+			HubEndpoint: "https://distinct-valid-callback.example", Config: &CreateAgentConfig{Template: "current"},
+			Prehydrated: prehydratedBundle{TemplateDone: true, TemplatePath: template}, HTTPRequest: r,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sc.Opts.Env["SCION_BROKER_ID"] != "broker-a" {
+			t.Fatalf("broker identity=%q", sc.Opts.Env["SCION_BROKER_ID"])
+		}
+		if sc.Opts.Env["SCION_HUB_ENDPOINT"] != "https://distinct-valid-callback.example" || sc.Opts.TrustedHubEndpoint != "" {
+			t.Fatalf("callback/env/trust=%v %q", sc.Opts.Env, sc.Opts.TrustedHubEndpoint)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{}`))
+	req.Header.Set("X-Scion-Hub-Connection", "hub-a")
+	signRequest(req, "broker-a", keyA)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !called {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
