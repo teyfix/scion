@@ -363,6 +363,41 @@ profiles:
 	require.False(t, f.runConfig.Privileged)
 	require.Equal(t, "explicit", f.runConfig.DockerLabels["patched"])
 	require.Empty(t, saved.Docker.Devices)
+	// A third start sees another profile change with no repeated inline
+	// config. Persisted and snapshot requester intent must still exclude
+	// both previous profiles, while the effective snapshot follows the run.
+	require.NoError(t, os.WriteFile(filepath.Join(os.Getenv("HOME"), ".scion", "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+    docker:
+      networks: [latest-profile]
+      devices: [/dev/dri]
+      privileged: true
+`), 0644))
+	f.containers[0].Phase = "stopped"
+	ordinary.InlineConfig = nil
+	_, err = NewManager(f.rt).Start(context.Background(), ordinary)
+	require.NoError(t, err)
+	require.Equal(t, []string{"latest-profile", "preview", "patched"}, f.runConfig.Networks)
+	require.Equal(t, []string{"/dev/dri"}, f.runConfig.Devices)
+	require.False(t, f.runConfig.Privileged)
+	require.Equal(t, "explicit", f.runConfig.DockerLabels["patched"])
+	saved, err = (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, f.opts.RuntimeRecovery.AdmissionVersion, saved.RuntimeUpdateVersion)
+	require.Equal(t, []string{"preview", "patched"}, saved.Docker.Networks)
+	require.Empty(t, saved.Docker.Devices)
+	snapshotData, err := os.ReadFile(filepath.Join(f.state.dir, runtimeEnvironmentSnapshotFile))
+	require.NoError(t, err)
+	var snapshot runtimeEnvironmentSnapshot
+	require.NoError(t, json.Unmarshal(snapshotData, &snapshot))
+	require.Equal(t, f.runConfig.Networks, snapshot.Docker.Networks)
+	require.Equal(t, f.runConfig.Devices, snapshot.Docker.Devices)
+	require.True(t, snapshot.RequesterDockerRecorded)
+	require.Equal(t, saved.Docker, snapshot.RequesterDocker)
+
 	require.NoFileExists(t, legacyHook)
 	f.assertPreserved(t)
 }

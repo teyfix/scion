@@ -322,7 +322,9 @@ func TestRuntimeRecoveryDispatchUsesCommittedTemplateScalarSnapshot(t *testing.T
 			retainedLevel := 11
 			agent.AppliedConfig.ThinkingLevel = &retainedLevel
 			require.NoError(t, db.UpdateAgent(ctx, agent))
-			admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+			version := agent.StateVersion
+			update.StateVersion = &version
+			admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, version, version+1)
 			require.NoError(t, err)
 			update.Template = template.Slug
 			dispatcher := NewHTTPAgentDispatcher(db, false, slog.Default())
