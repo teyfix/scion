@@ -91,6 +91,11 @@ type HubConnection struct {
 	authorityMu         sync.RWMutex
 	authorityGeneration atomic.Uint64
 	authorityReady      atomic.Bool
+	// Each published generation has a cancellation context. Revocation
+	// cancels admitted requests, including long-lived direct PTY sessions.
+	// Both fields are guarded by mu.
+	authorityCtx    context.Context
+	authorityCancel context.CancelFunc
 
 	// lifecycleMu makes Start, Stop, close and Reinitialize on this connection run
 	// one at a time. It is held for the whole operation, including the
@@ -325,20 +330,46 @@ func (hc *HubConnection) Stop() {
 func (hc *HubConnection) close() {
 	hc.lifecycleMu.Lock()
 	defer hc.lifecycleMu.Unlock()
-	hc.authorityReady.Store(false)
-	hc.authorityGeneration.Add(1)
+	hc.revokeAuthority()
 	hc.closeLocked()
 }
 
 // closeLocked is the final stop without lifecycleMu; the caller holds it
 // and has revoked admission before waiting for existing requests.
 func (hc *HubConnection) closeLocked() {
-	hc.authorityMu.Lock()
-	defer hc.authorityMu.Unlock()
 	hc.mu.Lock()
 	hc.closed = true
 	hc.mu.Unlock()
+	// A tracked tunneled request may be waiting to acquire an admission
+	// lease. Stop must drain that transport without holding the lease writer.
 	hc.stop()
+	hc.authorityMu.Lock()
+	hc.authorityMu.Unlock()
+}
+
+// revokeAuthority closes admission and cancels every admitted request in the
+// generation. The context is replaced only when a complete tuple is published.
+func (hc *HubConnection) revokeAuthority() {
+	hc.mu.Lock()
+	hc.authorityReady.Store(false)
+	hc.authorityGeneration.Add(1)
+	cancel := hc.authorityCancel
+	hc.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// closeAsync starts final cleanup so Shutdown can start every connection's
+// cancellation before waiting with its deadline. Cleanup retains lifecycle
+// ownership until transports and cancelled request leases drain.
+func (hc *HubConnection) closeAsync() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		hc.close()
+		close(done)
+	}()
+	return done
 }
 
 // isClosed reports whether close has run.
@@ -581,8 +612,7 @@ func (hc *HubConnection) reinitialize(ctx context.Context, server *Server, creds
 	// Admission closes before draining leases. Serialize the invalidation
 	// and key snapshot so no earlier rebuild can republish stale authority.
 	server.authMiddlewareMu.Lock()
-	hc.authorityReady.Store(false)
-	hc.authorityGeneration.Add(1)
+	hc.revokeAuthority()
 	server.buildAuthMiddlewareLocked()
 	server.authMiddlewareMu.Unlock()
 	if server.hubConnectionLifecycleHook != nil {
@@ -590,9 +620,11 @@ func (hc *HubConnection) reinitialize(ctx context.Context, server *Server, creds
 	}
 
 	capabilities, err := prepareHubConnectionCapabilities(server, creds)
+	// Cancelled old requests must be able to finish acquiring and rejecting
+	// their admission lease while stop drains the control channel's wg.
+	hc.stop()
 	hc.authorityMu.Lock()
 	defer hc.authorityMu.Unlock()
-	hc.stop()
 	if err != nil {
 		hc.mu.Lock()
 		hc.Credentials = creds
@@ -623,6 +655,7 @@ func (hc *HubConnection) reinitialize(ctx context.Context, server *Server, creds
 	hc.Hydrator = capabilities.hydrator
 	hc.HCResolver = capabilities.hcResolver
 	hc.authorityGeneration.Add(1)
+	hc.authorityCtx, hc.authorityCancel = context.WithCancel(context.Background())
 	hc.authorityReady.Store(true)
 	hc.mu.Unlock()
 	server.buildAuthMiddlewareLocked()
