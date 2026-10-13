@@ -17,6 +17,7 @@ package runtimebroker
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
@@ -117,7 +118,7 @@ profiles:
 		"dangling": {Name: "dangling", Type: "no-such-runtime", Available: true},
 	}
 	for name, w := range want {
-		if got, ok := byName[name]; !ok || got != w {
+		if got, ok := byName[name]; !ok || !reflect.DeepEqual(got, w) {
 			t.Errorf("%s = %+v (present=%v), want %+v", name, got, ok, w)
 		}
 	}

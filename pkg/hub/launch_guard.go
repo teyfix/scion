@@ -287,7 +287,7 @@ func lifecycleStartHasInputs(r *http.Request) bool {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return true
 	}
-	return req != (AgentLifecycleStartRequest{})
+	return req.ForceResume || len(req.RuntimeUpdate) != 0
 }
 
 // writeExistingAgentLaunching answers handleExistingAgent's 200 shape for an

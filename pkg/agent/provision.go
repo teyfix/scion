@@ -888,6 +888,12 @@ func reprovisionEmptyPerAgentPreflight(projectDir, agentName string, rt runtime.
 
 func (m *AgentManager) Provision(ctx context.Context, opts api.StartOptions) (*api.ScionConfig, error) {
 	ctx = m.withWorkspaceLock(ctx)
+	if _, err := ValidateCreateAdmission(opts); err != nil {
+		return nil, err
+	}
+	if completeCreateAdmission(opts.CreateAdmission) {
+		ctx = context.WithValue(ctx, createAdmissionContextKey{}, opts.CreateAdmission)
+	}
 	ctx, inlineCfg := buildProvisionContext(ctx, opts)
 	agentDir, agentHome, _, cfg, err := GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "created", opts.Branch, opts.Workspace, inlineCfg)
 	if err != nil {
@@ -1037,6 +1043,11 @@ func resolveTemplateAndHarnessConfig(ctx context.Context, templateName, harnessC
 
 	if inlineCfg != nil {
 		finalScionCfg = config.MergeScionConfig(finalScionCfg, inlineCfg)
+	}
+
+	finalScionCfg.Docker = resolveDockerConfig(settings, profileName, finalScionCfg.Docker)
+	if err := config.ValidateDockerConfig(finalScionCfg.Docker); err != nil {
+		return nil, err
 	}
 
 	// Resolve harness-config name (unified resolution chain)
@@ -2384,6 +2395,9 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// See persistProvisionedWorktreeRepoRootIfValid.
 	persistProvisionedWorktreeRepoRootIfValid(agentDir, api.ProvisionedWorktreeRepoRootFromContext(ctx), workspaceSource)
 
+	if admission, ok := ctx.Value(createAdmissionContextKey{}).(*api.CreateAdmission); ok {
+		info.ID, info.ProjectID, info.RuntimeBrokerID = admission.AgentID, admission.ProjectID, admission.RuntimeBrokerID
+	}
 	// scion-agent.json carries only the requester's own environment values
 	// (the inline image, kubernetes, resources and volumes) and the workspace
 	// mount resolved above. The harness-config file, settings, profile, hub

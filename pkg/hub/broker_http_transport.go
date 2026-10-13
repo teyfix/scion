@@ -201,6 +201,9 @@ func (t *brokerHTTPTransport) StartAgent(ctx context.Context, brokerID, brokerEn
 	}
 	endpoint = withRunIDURL(endpoint, extras.RunID)
 	payload := map[string]interface{}{}
+	if recovery := api.RuntimeRecoveryFromContext(ctx); recovery != nil {
+		payload["runtimeRecovery"] = recovery
+	}
 	if task != "" {
 		payload["task"] = task
 	}

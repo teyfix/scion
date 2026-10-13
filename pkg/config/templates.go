@@ -870,6 +870,7 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	}
 
 	result := *base // Shallow copy initially
+	result.Docker = MergeDockerConfig(base.Docker, override.Docker)
 
 	if override.Harness != "" {
 		result.Harness = override.Harness

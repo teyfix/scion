@@ -114,6 +114,9 @@ func (c *ControlChannelBrokerClient) StartAgent(ctx context.Context, brokerID, b
 	path = withRunIDURL(path, extras.RunID)
 
 	payload := map[string]interface{}{}
+	if recovery := api.RuntimeRecoveryFromContext(ctx); recovery != nil {
+		payload["runtimeRecovery"] = recovery
+	}
 	if task != "" {
 		payload["task"] = task
 	}

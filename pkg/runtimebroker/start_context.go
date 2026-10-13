@@ -97,6 +97,8 @@ type startContext struct {
 // dispatch reaches the broker as a full create request (see
 // DispatchFinalizeEnv on the Hub side), so it takes the createAgent path.
 type startContextInputs struct {
+	RuntimeRecovery *api.RuntimeRecovery
+	Reprovision     bool
 	// Agent identity
 	Name    string
 	AgentID string // Hub UUID (for env injection and logging)
@@ -845,6 +847,28 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		opts.InlineConfig = in.InlineConfig
 	}
 
+	opts.RuntimeRecovery = in.RuntimeRecovery
+	if in.Operation == opCreate && !in.Reprovision {
+		brokerID := s.config.BrokerID
+		if authority, ok := authenticatedBrokerAuthority(in.HTTPRequest); ok {
+			brokerID = authority.brokerID
+		}
+		if fi := s.flatInstance(); fi != nil {
+			brokerID = fi.Identity.RuntimeBrokerID
+		}
+		opts.CreateAdmission = &api.CreateAdmission{AgentID: in.AgentID, ProjectID: in.ProjectID, RuntimeBrokerID: brokerID}
+		if retained, err := agent.ValidateCreateAdmission(opts); err != nil {
+			return nil, &startContextError{Status: http.StatusConflict, Message: err.Error(), OriginalErr: err}
+		} else if retained {
+			opts.FreshProvision = false
+		}
+	}
+	if in.RuntimeRecovery != nil {
+		opts.GitClone, opts.Workspace, opts.Branch = nil, "", ""
+		opts.Template = in.RuntimeRecovery.Update.Template
+		opts.Image = in.RuntimeRecovery.Update.Image
+		opts.Resume = true
+	}
 	// ResolvedKubernetesServiceAccountName (not InlineConfig) is how the
 	// mapped KSA reaches the pod: for an existing agent, GetAgent
 	// (pkg/agent/provision.go) builds its config from the template chain
@@ -1048,7 +1072,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// created the agent's own worktree; see tryProvisionWorktree.
 	worktreeProvisioned := false
 	var provisionedWorktreeRoot string
-	if !linkedCheckout && in.Config != nil && in.Config.GitClone != nil && in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent {
+	if in.RuntimeRecovery == nil && !linkedCheckout && in.Config != nil && in.Config.GitClone != nil && in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent {
 		var err error
 		worktreeProvisioned, provisionedWorktreeRoot, err = s.tryProvisionWorktree(ctx, in, &opts, env, dispatchRuntimeType)
 		if err != nil {
@@ -1058,7 +1082,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	}
 
 	// --- Git clone mode ---
-	if !worktreeProvisioned && !linkedCheckout && in.Config != nil && in.Config.GitClone != nil {
+	if in.RuntimeRecovery == nil && !worktreeProvisioned && !linkedCheckout && in.Config != nil && in.Config.GitClone != nil {
 		gc := in.Config.GitClone
 		env["SCION_GIT_CLONE_URL"] = gc.URL
 		// Clone URL may embed credentials — the original #127 bug.

@@ -58,11 +58,16 @@ type BrokerInfoResponse struct {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
+	Privileged *bool             `json:"privileged,omitempty"`
+	Networks   []string          `json:"networks,omitempty"`
+	Devices    []string          `json:"devices,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	LabelVars  []string          `json:"labelVars,omitempty"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	Available  bool              `json:"available"`
+	Context    string            `json:"context,omitempty"`
+	Namespace  string            `json:"namespace,omitempty"`
 	// Attach reports whether this profile's runtime supports interactive
 	// attach (pkg/runtime.AttachCapableRuntime, via HasAttachSupport). A
 	// pointer, not a plain bool: this broker can only answer for a profile
@@ -78,10 +83,12 @@ type BrokerProfile struct {
 
 // BrokerCapabilities describes what this runtime broker can do.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
-	Exec   bool `json:"exec"`
+	NvidiaGPU       bool `json:"nvidiaGpu,omitempty"`
+	RuntimeRecovery bool `json:"runtimeRecovery,omitempty"`
+	WebPTY          bool `json:"webPty"`
+	Sync            bool `json:"sync"`
+	Attach          bool `json:"attach"`
+	Exec            bool `json:"exec"`
 	// Reprovision indicates this broker supports the reincarnation reprovision
 	// primitive (POST .../agents/{id} with provisionOnly+reprovision, design
 	// §3.4). The hub gates `scion reincarnate` on this — see
@@ -158,6 +165,8 @@ type HubConnectionInfo struct {
 
 // AgentResponse represents an agent in API responses.
 type AgentResponse struct {
+	Privileged    *bool  `json:"privileged,omitempty"`
+	NvidiaGPU     *bool  `json:"nvidiaGpu,omitempty"`
 	ID            string `json:"id,omitempty"`          // Hub UUID
 	Slug          string `json:"slug"`                  // URL-safe identifier
 	ContainerID   string `json:"containerId,omitempty"` // Runtime container ID
@@ -685,6 +694,7 @@ func AgentInfoToResponse(info api.AgentInfo) AgentResponse {
 	}
 
 	resp := AgentResponse{
+		Privileged: info.Privileged, NvidiaGPU: info.NvidiaGPU,
 		ID:                    info.ID,
 		Slug:                  info.Slug,
 		ContainerID:           info.ContainerID,

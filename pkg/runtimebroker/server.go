@@ -484,9 +484,11 @@ type Server struct {
 	dedicatedMessageLog *slog.Logger
 
 	// Subsystem loggers for handler methods
-	agentLifecycleLog *slog.Logger
-	messageLog        *slog.Logger
-	envSecretLog      *slog.Logger
+	agentLifecycleMu      sync.Map
+	agentLifecycleAliases sync.Map
+	agentLifecycleLog     *slog.Logger
+	messageLog            *slog.Logger
+	envSecretLog          *slog.Logger
 }
 
 // auxiliaryRuntime pairs a runtime with its manager for non-default runtimes.

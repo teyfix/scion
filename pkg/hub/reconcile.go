@@ -194,6 +194,19 @@ func (s *Server) execDispatchStart(ctx context.Context, d store.BrokerDispatch) 
 		}
 		task = args.Task
 		resume = args.Resume
+		if args.RuntimeRecovery != nil {
+			recovering, ok := dispatcher.(runtimeRecoveryDispatcher)
+			if !ok {
+				return "", fmt.Errorf("dispatcher does not support runtime recovery")
+			}
+			if err := recovering.DispatchAgentRecover(ctx, agent, args.RuntimeRecovery); err != nil {
+				return "", err
+			}
+			if err := s.completeRuntimeRecovery(ctx, agent, args.RuntimeRecovery); err != nil {
+				return "", err
+			}
+			return s.lifecycleDispatchResult(ctx, agent.ID, nil), nil
+		}
 	}
 	ctx, warns := withDispatchWarnings(ctx)
 	if err := dispatcher.DispatchAgentStart(ctx, agent, task, resume); err != nil {
