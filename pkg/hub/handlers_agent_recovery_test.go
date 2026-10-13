@@ -281,3 +281,59 @@ func TestRuntimeRecoveryDeferredOwnerRefusesNewerSameAdmissionPatch(t *testing.T
 	require.Equal(t, patched.Labels, latest.Labels)
 	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
 }
+
+func TestRuntimeRecoveryDispatchUsesCommittedTemplateScalarSnapshot(t *testing.T) {
+	for _, committed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "committed full snapshot", false: "legacy model index"}[committed], func(t *testing.T) {
+			ctx := context.Background()
+			expectedModel, expectedThinking := "committed-model", "73"
+			if !committed {
+				expectedModel, expectedThinking = "legacy-model", "11"
+			}
+			var calls atomic.Int32
+			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var req struct {
+					ResolvedEnv     map[string]string    `json:"resolvedEnv"`
+					RuntimeRecovery *api.RuntimeRecovery `json:"runtimeRecovery"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.NotNil(t, req.RuntimeRecovery)
+				require.Equal(t, expectedModel, req.ResolvedEnv["SCION_MODEL"])
+				require.Equal(t, expectedThinking, req.ResolvedEnv["SCION_THINKING_LEVEL"])
+				require.NotContains(t, req.ResolvedEnv, "TEMPLATE_TOOL_FALLBACK")
+				w.Header().Set("Content-Type", "application/json")
+				require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{ID: "new-container", Name: "retained", Phase: "running", Image: "new:latest", Template: req.RuntimeRecovery.Update.Template, ContainerStatus: "Up"}}))
+			})
+			var template *store.Template
+			if committed {
+				srv.SetStorage(newContentMockStorage("test-bucket"))
+				template = seedCommittedTemplate(t, srv, "recovery-thinking", store.TemplateScopeGlobal, "", map[string]string{
+					"scion-agent.yaml": "default_harness_config: claude\nmodel: committed-model\nthinking_level: 73\nenv:\n  TEMPLATE_TOOL_FALLBACK: literal\n",
+				})
+				require.NotNil(t, template.AgentConfig)
+				require.Equal(t, 73, *template.AgentConfig.ThinkingLevel)
+				template.Config = &store.TemplateConfig{Model: "stale-legacy-model"}
+				require.NoError(t, db.UpdateTemplate(ctx, template))
+			} else {
+				template = &store.Template{ID: api.NewUUID(), Name: "legacy-recovery", Slug: "legacy-recovery", Scope: store.TemplateScopeGlobal, Status: store.TemplateStatusActive, Config: &store.TemplateConfig{Model: "legacy-model"}}
+				require.NoError(t, db.CreateTemplate(ctx, template))
+			}
+			retainedLevel := 11
+			agent.AppliedConfig.ThinkingLevel = &retainedLevel
+			require.NoError(t, db.UpdateAgent(ctx, agent))
+			admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+			require.NoError(t, err)
+			update.Template = template.Slug
+			dispatcher := NewHTTPAgentDispatcher(db, false, slog.Default())
+			require.NoError(t, dispatcher.DispatchAgentRecover(ctx, admitted, &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.StateVersion, TemplateID: template.ID, TemplateHash: template.ContentHash}))
+			require.Equal(t, int32(1), calls.Load())
+			require.Equal(t, expectedModel, admitted.AppliedConfig.Model)
+			if committed {
+				require.Equal(t, 73, *admitted.AppliedConfig.ThinkingLevel)
+			} else {
+				require.Equal(t, 11, *admitted.AppliedConfig.ThinkingLevel)
+			}
+		})
+	}
+}
