@@ -509,6 +509,14 @@ func runtimeConfigHash(cfg *api.ScionConfig) (string, error) {
 	// Admission changes on retry; effective configuration identity does not.
 	copy.RuntimeUpdateVersion = 0
 	copy.Info = nil
+	// Model and thinking level are normalized runtime selections above. Their
+	// old env expressions are a duplicate input, not a different runtime config.
+	copy.Env = make(map[string]string, len(cfg.Env))
+	for key, value := range cfg.Env {
+		copy.Env[key] = value
+	}
+	delete(copy.Env, "SCION_MODEL")
+	delete(copy.Env, "SCION_THINKING_LEVEL")
 	data, err := json.Marshal(&copy)
 	if err != nil {
 		return "", err

@@ -373,3 +373,18 @@ func TestRuntimeRecoveryRetryHashesActualHarnessUser(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, f.runs)
 }
+
+func TestLegacyRuntimeRecoveryRetryPreservesSelectedEnvironmentModel(t *testing.T) {
+	f := newRecoveryFixture(t)
+	f.state.config.Env["SCION_MODEL"] = "retained-environment-model"
+	f.state.config.Env["SCION_THINKING_LEVEL"] = "50"
+	require.NoError(t, writeRuntimeRecoveryState(f.state))
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Contains(t, f.runConfig.Env, "SCION_MODEL=retained-environment-model")
+	require.Contains(t, f.runConfig.Env, "SCION_THINKING_LEVEL=50")
+	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.runs)
+	f.assertPreserved(t)
+}
