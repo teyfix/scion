@@ -68,6 +68,18 @@ type SetEnvVarResponse struct {
 // For broker scope: verifies the broker exists. Brokers get self-access via
 // BrokerIdentity. Users must pass CheckAccess.
 func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool) (string, bool) {
+	// Secret routes retain their existing authorization contract. Environment
+	// routes use the canonical broker permission through resolveEnvVarAccess.
+	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, "runtime_broker")
+}
+
+// resolveEnvVarAccess uses the registered broker.read/update permissions for
+// environment operations without changing the separate secret endpoints.
+func (s *Server) resolveEnvVarAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool) (string, bool) {
+	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, "broker")
+}
+
+func (s *Server) resolveScopedEnvSecretAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool, brokerResourceType string) (string, bool) {
 	ctx := r.Context()
 
 	if scope == "project" {
@@ -169,7 +181,7 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 				action = ActionUpdate
 			}
 			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
+				Type: brokerResourceType,
 				ID:   clientScopeID,
 			}, action)
 			if !decision.Allowed {
@@ -225,12 +237,12 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 // hubScope reports whether the request lists hub-level variables. readOnly is
 // true only when the caller was admitted here; the caller then lists plain
 // variables without secret metadata. When readOnly is false the caller must
-// fall through to resolveEnvSecretAccess, which keeps its existing checks for
+// fall through to resolveEnvVarAccess, which keeps the existing checks for
 // legacy admins, agents, other scopes and refusals. ok is false only after an
 // error response has been written.
 //
-// This covers the list endpoint only. Single-variable reads, writes and every
-// secret endpoint keep using resolveEnvSecretAccess unchanged.
+// This covers the list endpoint only. Single-variable reads and writes use
+// resolveEnvVarAccess. Secret endpoints use resolveEnvSecretAccess.
 func (s *Server) authorizeHubEnvVarList(w http.ResponseWriter, r *http.Request, scope string) (hubScope, readOnly, ok bool) {
 	if scope != store.ScopeHub {
 		return false, false, true
@@ -303,7 +315,7 @@ func (s *Server) listEnvVars(w http.ResponseWriter, r *http.Request) {
 		scopeID = s.hubID
 		includeSecretMeta = false
 	} else {
-		resolved, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), false)
+		resolved, ok := s.resolveEnvVarAccess(w, r, scope, query.Get("scopeId"), false)
 		if !ok {
 			return
 		}
@@ -372,7 +384,7 @@ func (s *Server) getEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		scope = store.ScopeUser
 	}
 
-	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), false)
+	scopeID, ok := s.resolveEnvVarAccess(w, r, scope, query.Get("scopeId"), false)
 	if !ok {
 		return
 	}
@@ -426,7 +438,7 @@ func (s *Server) setEnvVar(w http.ResponseWriter, r *http.Request, key string) {
 		scope = store.ScopeUser
 	}
 
-	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, req.ScopeID, true)
+	scopeID, ok := s.resolveEnvVarAccess(w, r, scope, req.ScopeID, true)
 	if !ok {
 		return
 	}
@@ -559,7 +571,7 @@ func (s *Server) deleteEnvVar(w http.ResponseWriter, r *http.Request, key string
 		scope = store.ScopeUser
 	}
 
-	scopeID, ok := s.resolveEnvSecretAccess(w, r, scope, query.Get("scopeId"), true)
+	scopeID, ok := s.resolveEnvVarAccess(w, r, scope, query.Get("scopeId"), true)
 	if !ok {
 		return
 	}
@@ -2671,7 +2683,7 @@ func (s *Server) handleBrokerEnvVars(w http.ResponseWriter, r *http.Request, bro
 		}
 		if userIdent, ok := identity.(UserIdentity); ok {
 			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
+				Type: "broker",
 				ID:   brokerID,
 			}, ActionRead)
 			if !decision.Allowed {
@@ -2742,7 +2754,7 @@ func (s *Server) handleBrokerEnvVarByKey(w http.ResponseWriter, r *http.Request,
 				action = ActionUpdate
 			}
 			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
+				Type: "broker",
 				ID:   brokerID,
 			}, action)
 			if !decision.Allowed {
