@@ -3452,9 +3452,12 @@ export class ScionPageProjectDetail extends LitElement {
               ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
               : nothing}
             ${agentUsesNvidiaGPU(agent)
-              ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                  >GPU</scion-status-badge
-                >`
+              ? html`<scion-status-badge
+                  status="neutral"
+                  icon="gpu"
+                  label="GPU"
+                  size="small"
+                ></scion-status-badge>`
               : nothing}
           </span>
         </td>
@@ -3636,9 +3639,12 @@ export class ScionPageProjectDetail extends LitElement {
                 ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
                 : nothing}
               ${agentUsesNvidiaGPU(agent)
-                ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                    >GPU</scion-status-badge
-                  >`
+                ? html`<scion-status-badge
+                    status="neutral"
+                    icon="gpu"
+                    label="GPU"
+                    size="small"
+                  ></scion-status-badge>`
                 : nothing}
             </h3>
             <div class="agent-meta">

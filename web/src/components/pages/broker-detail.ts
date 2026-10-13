@@ -1036,9 +1036,12 @@ export class ScionPageBrokerDetail extends LitElement {
                 ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
                 : ''}
               ${agentUsesNvidiaGPU(agent)
-                ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                    >GPU</scion-status-badge
-                  >`
+                ? html`<scion-status-badge
+                    status="neutral"
+                    icon="gpu"
+                    label="GPU"
+                    size="small"
+                  ></scion-status-badge>`
                 : ''}
             </h3>
             <div class="agent-meta"><sl-icon name="code-square"></sl-icon> ${agent.template}</div>

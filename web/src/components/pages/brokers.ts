@@ -451,9 +451,12 @@ export class ScionPageBrokers extends LitElement {
             <sl-icon name="hdd-rack"></sl-icon>
             ${broker.name} ${this.renderBrokerTypeBadge(broker)}
             ${broker.capabilities?.nvidiaGpu
-              ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
-                  >GPU</scion-status-badge
-                >`
+              ? html`<scion-status-badge
+                  status="neutral"
+                  icon="gpu"
+                  label="GPU"
+                  size="small"
+                ></scion-status-badge>`
               : ''}
           </span>
         </td>
