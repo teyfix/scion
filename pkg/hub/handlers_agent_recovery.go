@@ -208,8 +208,11 @@ func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *s
 		if template.ContentHash != recovery.TemplateHash {
 			return fmt.Errorf("requested recovery template changed after admission")
 		}
-		if template.Config != nil {
-			requested.Model, requested.ThinkingLevel = template.Config.Model, template.Config.ThinkingLevel
+		if template.AgentConfig != nil {
+			requested.Model, requested.ThinkingLevel = template.AgentConfig.Model, template.AgentConfig.ThinkingLevel
+		} else if template.Config != nil {
+			// Older templates have only the reduced configuration index.
+			requested.Model = template.Config.Model
 		}
 	}
 	requested = config.MergeScionConfig(requested, recovery.Update.Config)
