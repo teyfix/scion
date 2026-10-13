@@ -296,7 +296,7 @@ func TestValidateDisplayName(t *testing.T) {
 		{name: "at sign", input: "bot@host", wantErr: true},
 		{name: "colon", input: "bot:1", wantErr: true},
 		{name: "cyrillic", input: "Бот", wantErr: true},
-		{name: "zero-width space", input: "bot​name", wantErr: true},
+		{name: "zero-width space", input: "bot\u200bname", wantErr: true},
 
 		// Reject table: characters Slugify itself drops or folds to
 		// nothing must not be admitted by the charset check, since they

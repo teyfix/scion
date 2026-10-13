@@ -344,6 +344,7 @@ func (hc *HubConnection) closeLocked() {
 	// lease. Stop must drain that transport without holding the lease writer.
 	hc.stop()
 	hc.authorityMu.Lock()
+	//nolint:staticcheck // SA2001: writer acquisition drains all admitted reader leases after stop.
 	hc.authorityMu.Unlock()
 }
 

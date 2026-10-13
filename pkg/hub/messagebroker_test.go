@@ -1327,7 +1327,7 @@ func TestMessageBrokerProxy_SubscribesAgentResumedAfterStart(t *testing.T) {
 	events.PublishAgentStatus(context.Background(), agent)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !(subscribed(userTopic) && subscribed(agentTopic)) {
+	for !subscribed(userTopic) || !subscribed(agentTopic) {
 		if time.Now().After(deadline) {
 			t.Fatalf("after a running status: user topic %v, agent topic %v; want both subscribed",
 				subscribed(userTopic), subscribed(agentTopic))

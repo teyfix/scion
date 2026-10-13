@@ -3435,10 +3435,10 @@ func agentsWithoutProjectLabel(agents []api.AgentInfo) []api.AgentInfo {
 	return filtered
 }
 
-// projectScopedTarget resolves an agent slug to its project-scoped container
-// identifier (container ID for docker/podman, pod name for k8s) via
-// lookupAgentTarget, together with the agent.Manager whose runtime reported
-// that identifier. When multiple projects on this broker have an agent with
+// projectScopedTargetFrom applies project-scoped target rules to a caller's
+// lookupAgentMatch result, returning its container identifier (container ID
+// for docker/podman, pod name for k8s) and the agent.Manager whose runtime
+// reported it. When multiple projects on this broker have an agent with
 // the same slug, this ensures single-container operations act on the agent
 // in the requested project rather than whichever the slug matches first,
 // and the returned manager is the one the identifier came from, so the
@@ -3464,14 +3464,6 @@ func agentsWithoutProjectLabel(agents []api.AgentInfo) []api.AgentInfo {
 // container id (e.g. a malformed or partial runtime entry that carries no
 // container id — nothing addressable to stop): that case is folded into
 // the same "not found" outcome as a genuine no-match.
-func (s *Server) projectScopedTarget(ctx context.Context, id, projectID string) (string, agent.Manager, error) {
-	m, err := s.lookupAgentMatch(ctx, id, projectID)
-	return s.projectScopedTargetFrom(ctx, id, projectID, m, err)
-}
-
-// projectScopedTargetFrom applies projectScopedTarget's rules to a
-// lookupAgentMatch result the caller already has, so restart can read the
-// agent's project path from the same entry it stops.
 func (s *Server) projectScopedTargetFrom(ctx context.Context, id, projectID string, m agentMatch, err error) (string, agent.Manager, error) {
 	if err == nil && m.containerID != "" {
 		return m.containerID, m.manager, nil

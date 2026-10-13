@@ -401,6 +401,7 @@ func TestCredentialRemoval_RevokesBeforeDrainingAuthorityLease(t *testing.T) {
 		// The handler may still need the map while its authority drains.
 		_ = srv.resolveHubNameForLaunch(r)
 		srv.hubMu.RLock()
+		_ = srv.hubConnections["hub-a"]
 		srv.hubMu.RUnlock()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -641,7 +642,7 @@ func TestHubAuthority_RevocationCancelsHealthyDirectAttach(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer ws.Close()
+			defer func() { _ = ws.Close() }()
 			socketDone := make(chan struct{})
 			go func() {
 				defer close(socketDone)
@@ -693,7 +694,7 @@ func TestHubAuthority_RevocationCancelsHealthyDirectAttach(t *testing.T) {
 				if err != nil {
 					t.Fatalf("replacement authority could not attach: %v", err)
 				}
-				fresh.Close()
+				_ = fresh.Close()
 			}
 		})
 	}
@@ -718,7 +719,7 @@ func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("healthy listener status=%d", response.StatusCode)
 	}
@@ -758,7 +759,7 @@ func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
 		t.Fatal("Shutdown ignored its deadline")
 	}
 	if response, err := client.Get(live.URL + "/healthz"); err == nil {
-		response.Body.Close()
+		_ = response.Body.Close()
 		t.Fatal("HTTP listener still accepted a fresh request after the shutdown deadline")
 	}
 	if conn.authorityReady.Load() {

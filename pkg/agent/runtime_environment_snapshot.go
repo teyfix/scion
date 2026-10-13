@@ -189,7 +189,7 @@ func requesterDockerFromSnapshot(dir string, cfg *api.ScionConfig, allowOlder ..
 	if snapshot.Version != 1 || snapshot.AgentID != agentID || snapshot.ProjectID != projectID || snapshot.RuntimeBrokerID != brokerID || runtime.ValidateRunID(snapshot.RunID) != nil {
 		return nil, false, fmt.Errorf("retained requester Docker snapshot identity does not match")
 	}
-	if snapshot.RuntimeUpdateVersion < cfg.RuntimeUpdateVersion && !(len(allowOlder) > 0 && allowOlder[0]) {
+	if snapshot.RuntimeUpdateVersion < cfg.RuntimeUpdateVersion && (len(allowOlder) == 0 || !allowOlder[0]) {
 		return nil, false, fmt.Errorf("complete interrupted runtime recovery before an ordinary start")
 	}
 	if snapshot.RuntimeUpdateVersion > cfg.RuntimeUpdateVersion {

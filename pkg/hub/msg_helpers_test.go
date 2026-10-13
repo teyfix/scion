@@ -136,6 +136,12 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "start_claim.go", function: "startAgentCore", symbol: "DispatchAgentStart",
 		class: "guarded", reason: "every caller authorizes before calling: lifecycle and create-on-existing routers' authz; wake after DM admission checks"},
 
+	// Retained recovery enters through the lifecycle router and its exact
+	// agent.lifecycle permission, then recoverAgentRuntime checks agent.update
+	// for configuration changes before the start claim and admission CAS.
+	{file: "handlers_agent_recovery.go", function: "DispatchAgentRecover", symbol: "DispatchAgentStart",
+		class: "guarded", reason: "lifecycle router authorizes; recoverAgentRuntime checks agent.update before start claim and admission CAS; dispatcher fences the admitted version"},
+
 	// reincarnate_worker.go: DispatchAgentStart in runReincarnationWorker —
 	// the detached background worker for `scion reincarnate` (design §3.1).
 	// Started only from handleReincarnateAgent, after authorizeAgentReincarnate

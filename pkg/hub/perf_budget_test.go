@@ -155,8 +155,9 @@ var perfBudgets = []perfBudget{
 		// Store calls: per-request sender standing (upstream #3101).
 		name: "agent by id",
 		path: func(f *perfBudgetFixture) string { return "/api/v1/agents/" + f.agentIDs[10] },
-		// Bytes: upstream #3070 added agent editability to the single-agent GET (main ca19871).
-		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14029},
+		// Bytes: fork Docker and runtime-recovery fields add two editability entries;
+		// measured 14344 bytes in CI run 38432427766 (e4ce39012).
+		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14344},
 	},
 	{
 		// Store calls: per-request sender standing (upstream #3101).
@@ -164,8 +165,9 @@ var perfBudgets = []perfBudget{
 		path: func(f *perfBudgetFixture) string {
 			return "/api/v1/projects/" + f.project.ID + "/agents/" + f.agentIDs[10]
 		},
-		// Bytes: upstream #3070 added agent editability to the single-agent GET (main ca19871).
-		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14029},
+		// Bytes: fork Docker and runtime-recovery fields add two editability entries;
+		// measured 14344 bytes in CI run 38432427766 (e4ce39012).
+		baseline: perfBudgetCounts{authzStoreCalls: 15, decisions: 10, dbReads: 0, bytes: 14344},
 	},
 }
 

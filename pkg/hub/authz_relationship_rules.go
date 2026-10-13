@@ -209,7 +209,7 @@ func (a *AuthzService) relationshipCandidates(principal PrincipalContext, resour
 	// Owner: a user principal that owns the resource. Assign on a hub-scoped
 	// service account is governed by hub membership instead.
 	if isUserPrincipal(principal.Kind) && resource.OwnerID != "" && resource.OwnerID == principal.ID &&
-		!(action == ActionAssign && isHubScopedServiceAccount(resource)) {
+		(action != ActionAssign || !isHubScopedServiceAccount(resource)) {
 		out = append(out, relationshipCandidate{
 			rule: RelationshipRuleOwner,
 			decision: Decision{

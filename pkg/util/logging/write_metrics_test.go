@@ -63,7 +63,7 @@ func collectPoints(t *testing.T, reader *sdkmetric.ManualReader) map[string][]po
 			for _, dp := range dps {
 				attrs := map[string]string{}
 				for _, kv := range dp.Attributes.ToSlice() {
-					attrs[string(kv.Key)] = kv.Value.Emit()
+					attrs[string(kv.Key)] = kv.Value.String()
 				}
 				out[m.Name] = append(out[m.Name], point{attrs: attrs, value: dp.Value})
 			}

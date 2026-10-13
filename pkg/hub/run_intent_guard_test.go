@@ -85,6 +85,10 @@ var lifecycleDispatchCallers = map[string]lifecycleDispatchRule{
 	// Starts run under a start claim, which records intent running
 	// (withStartClaim records it itself while start claims are off).
 	"Server.startAgentCore": {kind: intentRecorded, recordedBy: "Server.withStartClaim"},
+	// Recovery dispatches inside startAgentCore's claim, or replays its
+	// admitted queued dispatch; withStartClaim records the running intent
+	// before either path.
+	"HTTPAgentDispatcher.DispatchAgentRecover": {kind: intentRecorded, recordedBy: "Server.withStartClaim"},
 	// A start that completed after a stop was accepted: intent is already
 	// stopped.
 	"Server.compensatingStop": {kind: intentUnchanged},

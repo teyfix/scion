@@ -157,7 +157,7 @@ func TestWireHubCoreMetrics_DecisionLogInstruments(t *testing.T) {
 			for _, dp := range dps {
 				attrs := map[string]string{}
 				for _, kv := range dp.Attributes.ToSlice() {
-					attrs[string(kv.Key)] = kv.Value.Emit()
+					attrs[string(kv.Key)] = kv.Value.String()
 				}
 				points[m.Name] = append(points[m.Name], attrs)
 				values[m.Name] += dp.Value

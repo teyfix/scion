@@ -32,7 +32,7 @@ func resolveDockerConfig(settings *config.VersionedSettings, profile string, own
 
 func validateDockerDeviceRuntime(runtimeName string, devices []string) error {
 	if len(devices) > 0 && runtimeName != "docker" && runtimeName != "podman" && runtimeName != "mock" {
-		return fmt.Errorf("Docker device requests require a Docker-compatible runtime, not %q", runtimeName)
+		return fmt.Errorf("docker device requests require a Docker-compatible runtime, not %q", runtimeName)
 	}
 	return nil
 }

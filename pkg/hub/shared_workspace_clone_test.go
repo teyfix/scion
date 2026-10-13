@@ -177,12 +177,12 @@ func TestPopulateAgentConfig_SharedWorkspace_LeavesGitCloneNil(t *testing.T) {
 		Labels:    map[string]string{store.LabelWorkspaceMode: store.WorkspaceModeShared},
 	}
 	agent := &store.Agent{ID: "agent-shared-pop", AppliedConfig: &store.AgentAppliedConfig{}}
-	srv.populateAgentConfig(context.Background(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 	assert.Nil(t, agent.AppliedConfig.GitClone)
 
 	perAgent := &store.Project{ID: tid("project-per-agent-pop"), Slug: "per-agent-pop", GitRemote: "github.com/test/repo"}
 	agent2 := &store.Agent{ID: "agent-per-agent-pop", AppliedConfig: &store.AgentAppliedConfig{}}
-	srv.populateAgentConfig(context.Background(), agent2, perAgent, nil)
+	require.NoError(t, srv.populateAgentConfig(context.Background(), agent2, perAgent, nil))
 	require.NotNil(t, agent2.AppliedConfig.GitClone)
 	assert.Equal(t, resolveCloneURL("", "github.com/test/repo"), agent2.AppliedConfig.GitClone.URL)
 	assert.Equal(t, "main", agent2.AppliedConfig.GitClone.Branch)

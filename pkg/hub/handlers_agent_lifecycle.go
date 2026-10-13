@@ -556,13 +556,6 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	var startReq AgentLifecycleStartRequest
-	if action == api.AgentActionStart && r.Body != nil && r.ContentLength != 0 {
-		if err := readJSON(r, &startReq); err != nil {
-			BadRequest(w, "invalid start request: "+err.Error())
-			return
-		}
-	}
 	// Start gate (design ptone/scion#2483 §2.1). Authz already ran in the
 	// caller. This runs before the managed-runtime branch so managed agents
 	// get the same answers. Restart is checked here, before its stop leg,
@@ -583,7 +576,7 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			var warnings []string
 			if action == api.AgentActionRestart {
 				warnings = []string{launchRestartNotPerformedWarning}
-			} else if startReq.ForceResume || len(startReq.RuntimeUpdate) != 0 {
+			} else if lifecycleStartHasInputs(r) {
 				warnings = []string{launchInFlightInputsWarning}
 			}
 			s.writeLaunchingAgent(ctx, w, agent, warnings)
@@ -604,6 +597,14 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			respAgent.AppliedConfig = redactAppliedConfigEnvForResponse(agent.AppliedConfig, canViewAgentEnv(ctx, s, agent))
 			respAgent.Deletion = deletionViewForCaller(agent, time.Now(), callerSeesDeletionDetail(ctx))
 			writeJSON(w, http.StatusOK, &respAgent)
+			return
+		}
+	}
+
+	var startReq AgentLifecycleStartRequest
+	if action == api.AgentActionStart && r.Body != nil && r.ContentLength != 0 {
+		if err := readJSON(r, &startReq); err != nil {
+			BadRequest(w, "invalid start request: "+err.Error())
 			return
 		}
 	}

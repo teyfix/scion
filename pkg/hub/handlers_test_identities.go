@@ -528,14 +528,9 @@ func testIdentityWorkloadAuditOf(ctx context.Context) *testIdentityWorkloadAudit
 	return a
 }
 
-// testIdentityAuditSummary is the AfterSummary of a test identity audit
-// record. It never includes a token.
-func testIdentityAuditSummary(u *store.User, tokenTTL time.Duration) string {
-	return testIdentityAuditSummaryWith(u, tokenTTL, nil)
-}
-
-// testIdentityAuditSummaryWith is testIdentityAuditSummary with the
-// workload delegation part, when wl is non-nil.
+// testIdentityAuditSummaryWith is the AfterSummary of a test identity audit
+// record, including the workload delegation when wl is non-nil. It never
+// includes a token.
 func testIdentityAuditSummaryWith(u *store.User, tokenTTL time.Duration, wl *testIdentityWorkloadAudit) string {
 	purpose := ""
 	if u.Purpose != nil {

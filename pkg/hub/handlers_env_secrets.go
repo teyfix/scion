@@ -70,16 +70,16 @@ type SetEnvVarResponse struct {
 func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool) (string, bool) {
 	// Secret routes retain their existing authorization contract. Environment
 	// routes use the canonical broker permission through resolveEnvVarAccess.
-	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, "runtime_broker")
+	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, Resource{Type: "runtime_broker"})
 }
 
 // resolveEnvVarAccess uses the registered broker.read/update permissions for
 // environment operations without changing the separate secret endpoints.
 func (s *Server) resolveEnvVarAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool) (string, bool) {
-	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, "broker")
+	return s.resolveScopedEnvSecretAccess(w, r, scope, clientScopeID, isWrite, Resource{Type: "broker"})
 }
 
-func (s *Server) resolveScopedEnvSecretAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool, brokerResourceType string) (string, bool) {
+func (s *Server) resolveScopedEnvSecretAccess(w http.ResponseWriter, r *http.Request, scope, clientScopeID string, isWrite bool, brokerResource Resource) (string, bool) {
 	ctx := r.Context()
 
 	if scope == "project" {
@@ -180,10 +180,8 @@ func (s *Server) resolveScopedEnvSecretAccess(w http.ResponseWriter, r *http.Req
 			if isWrite {
 				action = ActionUpdate
 			}
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: brokerResourceType,
-				ID:   clientScopeID,
-			}, action)
+			brokerResource.ID = clientScopeID
+			decision := s.authzService.CheckAccess(ctx, userIdent, brokerResource, action)
 			if !decision.Allowed {
 				Forbidden(w)
 				return "", false

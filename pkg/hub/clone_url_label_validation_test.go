@@ -219,7 +219,7 @@ func TestPopulateAgentConfig_LegacyCloneURLLabelUserinfoStripped(t *testing.T) {
 			}
 			agent := &store.Agent{ID: "agent-legacy-clone-url", AppliedConfig: &store.AgentAppliedConfig{}}
 
-			srv.populateAgentConfig(context.Background(), agent, project, nil)
+			require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 			require.NotNil(t, agent.AppliedConfig.GitClone)
 			got := agent.AppliedConfig.GitClone.URL
