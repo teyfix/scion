@@ -40,6 +40,11 @@ import (
 // close-frame code, not a mock of it.
 func newDirectAttachFixture(t *testing.T) (dial func() (*websocket.Conn, *http.Response, error), tmuxCmd func(args ...string) (string, error)) {
 	t.Helper()
+	return newDirectAttachFixtureConfigured(t, nil, nil)
+}
+
+func newDirectAttachFixtureConfigured(t *testing.T, configure func(*Server), authenticate func(*http.Request)) (dial func() (*websocket.Conn, *http.Response, error), tmuxCmd func(args ...string) (string, error)) {
+	t.Helper()
 	tmux, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Skip("real-tmux direct-attach test requires tmux in PATH")
@@ -94,13 +99,22 @@ exec "$TW_DIRECT_ATTACH_TMUX" -S "$TW_DIRECT_ATTACH_SOCKET" "$@"
 	}}
 	rt := &runtime.MockRuntime{NameFunc: func() string { return adapter }}
 	srv := New(DefaultServerConfig(), mgr, rt)
+	if configure != nil {
+		configure(srv)
+	}
 
-	httpSrv := httptest.NewServer(http.HandlerFunc(srv.handleAgentAttach))
+	httpSrv := httptest.NewServer(srv.outerMiddleware(http.HandlerFunc(srv.handleAgentAttach)))
 	t.Cleanup(httpSrv.Close)
 
 	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/api/v1/agents/" + slug + "/attach"
 	dialFn := func() (*websocket.Conn, *http.Response, error) {
-		return websocket.DefaultDialer.Dial(wsURL, nil)
+		var headers http.Header
+		if authenticate != nil {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+slug+"/attach", nil)
+			authenticate(req)
+			headers = req.Header
+		}
+		return websocket.DefaultDialer.Dial(wsURL, headers)
 	}
 	return dialFn, tmuxCommand
 }

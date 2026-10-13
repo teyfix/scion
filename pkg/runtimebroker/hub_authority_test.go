@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
+	"github.com/GoogleCloudPlatform/scion/pkg/wsprotocol"
 )
 
 func newAuthorityTestServer() *Server {
@@ -550,5 +552,201 @@ func TestHubConnection_InvalidReplacementClearsCapabilities(t *testing.T) {
 	srv.loadBrokerMiddleware().Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("old authority reached handler") })).ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("old authority status=%d", rr.Code)
+	}
+}
+
+// A tracked control-channel request that already verified the old key can
+// still be waiting to acquire its authority lease when rotation starts.
+// ControlChannel.Close waits for this request, so it must not hold the lease
+// writer while doing so.
+func TestHubAuthority_TunneledAdmissionDrainsBeforePublication(t *testing.T) {
+	for _, operation := range []string{"rotate", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			srv := newAuthorityTestServer()
+			key := []byte("tunneled-old-authority")
+			conn := configureAuthorityTestConnection(t, srv, "hub-a", "https://a.example", "broker-a", key)
+			mw := srv.loadBrokerMiddleware()
+			selected, release := make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			mw.beforeAuthorityAdmission = func() { close(selected); <-release }
+			var calls atomic.Int32
+			handler := mw.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusOK) }))
+			cc, _ := newCancelTestClient(t, handler, 1)
+			cc.connectionName = conn.Name
+			conn.ControlChannel = cc
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+			signRequest(req, conn.BrokerID, key)
+			headers := make(map[string]string)
+			for name := range req.Header {
+				headers[name] = req.Header.Get(name)
+			}
+			feed(t, cc, wsprotocol.NewRequestEnvelope("authority-waiter", req.Method, req.URL.Path, "", headers, nil))
+			awaitAuthorityTestEvent(t, selected, "verified tunneled request")
+			transitionDone := make(chan error, 1)
+			go func() {
+				if operation == "rotate" {
+					replacement := *conn.Credentials
+					replacement.SecretKey = base64.StdEncoding.EncodeToString([]byte("tunneled-new-authority"))
+					transitionDone <- conn.Reinitialize(context.Background(), srv, &replacement)
+				} else {
+					srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+					transitionDone <- srv.checkAndReloadCredentials(context.Background())
+				}
+			}()
+			// Close cancels the transport before its c.wg wait. The paused request
+			// must be able to enter and reject its now-stale authority after this.
+			awaitAuthorityTestEvent(t, cc.ctx.Done(), "transport shutdown")
+			close(release)
+			select {
+			case err := <-transitionDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("transport drain deadlocked on authority writer")
+			}
+			waitWG(t, cc)
+			if calls.Load() != 0 {
+				t.Fatal("stale tunneled request reached handler")
+			}
+		})
+	}
+}
+
+func TestHubAuthority_RevocationCancelsHealthyDirectAttach(t *testing.T) {
+	for _, operation := range []string{"rotate", "remove", "shutdown"} {
+		t.Run(operation, func(t *testing.T) {
+			useFastPTYTimings(t)
+			var srv *Server
+			var conn *HubConnection
+			key := []byte("direct-attach-old-authority")
+			currentKey := key
+			dial, tmuxCmd := newDirectAttachFixtureConfigured(t, func(server *Server) {
+				srv = server
+				srv.config.HeartbeatEnabled = false
+				srv.config.ControlChannelEnabled = false
+				srv.config.BrokerAuthEnabled = true
+				srv.config.BrokerAuthStrictMode = true
+				conn = configureAuthorityTestConnection(t, srv, "hub-a", "https://a.example", "broker-a", key)
+			}, func(req *http.Request) { signRequest(req, "broker-a", currentKey) })
+			ws, _, err := dial()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ws.Close()
+			socketDone := make(chan struct{})
+			go func() {
+				defer close(socketDone)
+				for {
+					if _, _, err := ws.ReadMessage(); err != nil {
+						return
+					}
+				}
+			}()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				out, err := tmuxCmd("list-clients", "-t", "scion", "-F", "#{client_width}x#{client_height}")
+				if err == nil && out == "80x24" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("signed terminal did not attach")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			transitionDone := make(chan error, 1)
+			go func() {
+				switch operation {
+				case "rotate":
+					replacement := *conn.Credentials
+					replacement.SecretKey = base64.StdEncoding.EncodeToString([]byte("direct-attach-new-authority"))
+					transitionDone <- conn.Reinitialize(context.Background(), srv, &replacement)
+				case "remove":
+					srv.multiCredStore = brokercredentials.NewMultiStore(t.TempDir())
+					transitionDone <- srv.checkAndReloadCredentials(context.Background())
+				case "shutdown":
+					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+					defer cancel()
+					transitionDone <- srv.Shutdown(ctx)
+				}
+			}()
+			select {
+			case err := <-transitionDone:
+				if err != nil && !(operation == "shutdown" && errors.Is(err, context.DeadlineExceeded)) {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("authority transition waited on healthy direct attach")
+			}
+			awaitAuthorityTestEvent(t, socketDone, "cancelled direct terminal")
+			if operation == "rotate" {
+				currentKey = []byte("direct-attach-new-authority")
+				fresh, _, err := dial()
+				if err != nil {
+					t.Fatalf("replacement authority could not attach: %v", err)
+				}
+				fresh.Close()
+			}
+		})
+	}
+}
+
+func TestHubAuthority_ShutdownDeadlineBoundsLeaseDrain(t *testing.T) {
+	srv := newTestServer(t)
+	srv.config.BrokerAuthEnabled = true
+	srv.config.BrokerAuthStrictMode = true
+	key := []byte("shutdown-lease-key")
+	conn := configureAuthorityTestConnection(t, srv, "hub-a", "https://a.example", "broker-a", key)
+	entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	handler := srv.loadBrokerMiddleware().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+		close(cancelled)
+		// Simulate cleanup that has yet to acknowledge cancellation. Shutdown
+		// must respect its deadline without allowing this tuple to be rebound.
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	requestDone := make(chan struct{})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/test", nil)
+	signRequest(req, "broker-a", key)
+	go func() { handler.ServeHTTP(httptest.NewRecorder(), req); close(requestDone) }()
+	awaitAuthorityTestEvent(t, entered, "active shutdown lease")
+	shutdownDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	go func() { shutdownDone <- srv.Shutdown(ctx) }()
+	awaitAuthorityTestEvent(t, cancelled, "shutdown lease cancellation")
+	select {
+	case err := <-shutdownDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown error=%v want deadline", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown ignored its deadline")
+	}
+	if conn.authorityReady.Load() {
+		t.Fatal("timed-out shutdown left authority ready")
+	}
+	close(release)
+	awaitAuthorityTestEvent(t, requestDone, "lease cleanup")
+	conn.lifecycleMu.Lock()
+	closed := conn.isClosed()
+	conn.lifecycleMu.Unlock()
+	if !closed {
+		t.Fatal("background final cleanup did not retain the terminal lifecycle state")
 	}
 }

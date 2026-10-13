@@ -213,6 +213,8 @@ type MultiKeyBrokerAuthMiddleware struct {
 	maxClockSkew         time.Duration
 	allowUnauthenticated bool
 	enabled              bool
+	// Test-only barrier after signature/header verification, before a lease.
+	beforeAuthorityAdmission func()
 }
 
 // NewMultiKeyBrokerAuthMiddleware creates a new multi-key broker authentication middleware.
@@ -345,17 +347,30 @@ func (m *MultiKeyBrokerAuthMiddleware) ServeWith(w http.ResponseWriter, r *http.
 		m.writeError(w, "hub connection does not match signing authority")
 		return
 	}
+	ctx := r.Context()
+	if m.beforeAuthorityAdmission != nil {
+		m.beforeAuthorityAdmission()
+	}
 	if entry.connection != nil {
 		// Keep admission separate from hc.mu: handlers may take snapshots
 		// under hc.mu while a credential transition waits for this lease.
 		conn := entry.connection
 		conn.authorityMu.RLock()
-		conn.mu.RLock()
+		conn.mu.Lock()
 		current := conn.authorityReady.Load() &&
 			conn.authorityGeneration.Load() == entry.generation &&
 			conn.Name == entry.hubName && conn.BrokerID == entry.brokerID &&
 			conn.HubEndpoint == entry.hubEndpoint && bytes.Equal(conn.SecretKey, entry.secretKey)
-		conn.mu.RUnlock()
+		if current {
+			if conn.authorityCtx == nil {
+				conn.authorityCtx, conn.authorityCancel = context.WithCancel(context.Background())
+			}
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			stopCancellation := context.AfterFunc(conn.authorityCtx, cancel)
+			defer func() { stopCancellation(); cancel() }()
+		}
+		conn.mu.Unlock()
 		if !current {
 			conn.authorityMu.RUnlock()
 			m.writeError(w, "stale signing authority")
@@ -367,7 +382,7 @@ func (m *MultiKeyBrokerAuthMiddleware) ServeWith(w http.ResponseWriter, r *http.
 		hubName: entry.hubName, brokerID: entry.brokerID, hubEndpoint: entry.hubEndpoint,
 		generation: entry.generation, connection: entry.connection,
 	}
-	ctx := context.WithValue(r.Context(), brokerRequestAuthorityKey{}, authority)
+	ctx = context.WithValue(ctx, brokerRequestAuthorityKey{}, authority)
 	ctx = context.WithValue(ctx, authenticatingHubConnCtxKey{}, entry.hubName)
 	next.ServeHTTP(w, r.WithContext(ctx))
 }
