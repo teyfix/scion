@@ -4030,6 +4030,10 @@ func GetAgent(ctx context.Context, agentName string, templateName string, agentI
 	}
 
 	finalCfg := config.MergeScionConfig(mergedCfg, agentCfg)
+	// This broker-owned admission marker comes from retained state, never a
+	// template or requester config. Generic config merging intentionally does
+	// not promote it; keep it so Start can restore requester-only provenance.
+	finalCfg.RuntimeUpdateVersion = agentCfg.RuntimeUpdateVersion
 
 	// Resolve model size aliases for existing agents.
 	// Mirrors the alias resolution in ProvisionAgent (line 778-785).
