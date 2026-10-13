@@ -878,13 +878,13 @@ web-test:
 ## fmt: Auto-format Go source files
 fmt:
 	@echo "Formatting Go source files..."
-	@gofmt -w .
+	@./hack/gofmt-source.sh -w
 	@echo "Go formatting done."
 
 ## fmt-check: Check Go formatting without modifying files (mirrors GitHub Actions)
 fmt-check:
 	@echo "Checking Go formatting..."
-	@UNFORMATTED=$$(gofmt -l .); \
+	@UNFORMATTED=$$(./hack/gofmt-source.sh -l); \
 	if [ -n "$$UNFORMATTED" ]; then \
 		echo "Go formatting issues found. Run 'make fmt' to fix:"; \
 		echo "$$UNFORMATTED"; \

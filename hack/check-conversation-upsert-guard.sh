@@ -102,6 +102,7 @@ rc=0
 grep -rEn 'UpsertConversationByExternalRef|\.CreateConversation\(|\.AddParticipant\(' \
   --include='*.go' \
   --exclude='*_test.go' \
+  --exclude-dir='.worktrees' --exclude-dir='.cache' --exclude-dir='.state' \
   . \
   | grep -v '^./pkg/messaging/' \
   | grep -v '^./pkg/store/' \
@@ -132,6 +133,7 @@ fi
 grep -rEn '\.Conversation\.Create(Bulk)?([^a-zA-Z]|$)' \
   --include='*.go' \
   --exclude='*_test.go' \
+  --exclude-dir='.worktrees' --exclude-dir='.cache' --exclude-dir='.state' \
   . \
   | grep -v '^./pkg/store/' \
   | grep -v '^./pkg/ent/' \
@@ -161,6 +163,7 @@ fi
 grep -rEni 'INSERT[[:space:]]+(OR[[:space:]]+[A-Z]+[[:space:]]+)?INTO[[:space:]]+"?conversations"?' \
   --include='*.go' \
   --exclude='*_test.go' \
+  --exclude-dir='.worktrees' --exclude-dir='.cache' --exclude-dir='.state' \
   . \
   | grep -v '^./pkg/store/' \
   | grep -v '^./vendor/' \
