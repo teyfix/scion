@@ -1011,7 +1011,6 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	dockerConfig, err := agent.EffectiveStartDockerConfig(ctx, func() api.StartOptions {
 		networkOpts := opts
 		networkOpts.Profile = gcpIdentityProfile
-		networkOpts.FreshProvision = in.Operation == opCreate
 		return networkOpts
 	}(), networkOwner)
 	if err != nil {
@@ -1040,7 +1039,11 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			s.agentLifecycleLog.Debug("SCION_HUB_ENDPOINT set", "agent_id", in.AgentID, "endpoint", hubEndpoint)
 		}
 	}
-	runtime.ResolveNetworkMode(runtimeName, networks, env)
+	if len(networks) > 0 {
+		runtime.ResolveNetworkMode(runtimeName, networks, env)
+	} else {
+		delete(env, "SCION_NETWORK_MODE")
+	}
 	opts.TrustedHubEndpoint = ""
 	if hubEndpointTrusted {
 		opts.TrustedHubEndpoint = hubEndpoint
