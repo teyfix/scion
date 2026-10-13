@@ -1,0 +1,42 @@
+{
+  "exit_code": 0,
+  "resolved_auth": {
+    "method": "none"
+  },
+  "toml_files": {
+    ".codex/config.toml": {
+      "mcp_servers": {
+        "memory": {
+          "url": "https://memory.example.test/mcp",
+          "bearer_token_env_var": "MCP_TOKEN",
+          "http_headers": {
+            "X-Literal": "fixture$tool"
+          },
+          "enabled_tools": [
+            "read_note",
+            "search_notes",
+            "build_context"
+          ]
+        },
+        "code-search": {
+          "command": "code-search",
+          "enabled_tools": [
+            "search_code",
+            "quote\"tool",
+            "slash\\tool"
+          ]
+        },
+        "blocked": {
+          "command": "files",
+          "enabled_tools": []
+        },
+        "unfiltered": {
+          "command": "files"
+        },
+        "null-default": {
+          "command": "files"
+        }
+      }
+    }
+  }
+}

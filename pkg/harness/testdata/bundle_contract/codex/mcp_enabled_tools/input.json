@@ -1,0 +1,48 @@
+{
+  "auth_candidates": {},
+  "harness_config": {
+    "no_auth": {
+      "behavior": "allow"
+    }
+  },
+  "mcp_servers": {
+    "mcp_servers": {
+      "memory": {
+        "transport": "streamable-http",
+        "url": "https://memory.example.test/mcp",
+        "headers": {
+          "Authorization": "Bearer ${MCP_TOKEN}",
+          "X-Literal": "fixture$tool"
+        },
+        "enabled_tools": [
+          "read_note",
+          "search_notes",
+          "build_context"
+        ]
+      },
+      "code-search": {
+        "transport": "stdio",
+        "command": "code-search",
+        "enabled_tools": [
+          "search_code",
+          "quote\"tool",
+          "slash\\tool"
+        ]
+      },
+      "blocked": {
+        "transport": "stdio",
+        "command": "files",
+        "enabled_tools": []
+      },
+      "unfiltered": {
+        "transport": "stdio",
+        "command": "files"
+      },
+      "null-default": {
+        "transport": "stdio",
+        "command": "files",
+        "enabled_tools": null
+      }
+    }
+  }
+}

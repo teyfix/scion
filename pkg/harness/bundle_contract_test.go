@@ -34,7 +34,7 @@ import (
 // Each fixture case lives under pkg/harness/testdata/bundle_contract/<harness>/<case>/
 // and contains:
 //   - input.json: {"auth_candidates": {...}, "harness_config": {...}, "mcp_servers": {...}}
-//   - want.json:  {"exit_code": N, "resolved_auth": {...}, "env": {...}, "env_absent": [...]}
+//   - want.json:  {"exit_code": N, "resolved_auth": {...}, "env": {...}, "env_absent": [...], "toml_files": {"relative/path": {...}}}
 //
 // Optional files in the fixture dir:
 //   - secrets/<NAME>: staged as secrets/<NAME> in the bundle
@@ -106,6 +106,8 @@ type fixtureWant struct {
 	Env          map[string]interface{} `json:"env"`
 	// EnvAbsent lists keys that must not appear in env.json.
 	EnvAbsent []string `json:"env_absent"`
+	// TOMLFiles pins native TOML projection, independent of provisioning outputs.
+	TOMLFiles map[string]map[string]interface{} `json:"toml_files"`
 }
 
 func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
@@ -315,6 +317,22 @@ func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
 				t.Errorf("env.json: key %q present (value %v), want absent", k, v)
 			}
 		}
+	}
+	for rel, expected := range want.TOMLFiles {
+		path := filepath.Join(tmpHome, rel)
+		// Provisioners already require Python 3.11+ and tomllib; use that
+		// parser to check native TOML without adding a Go dependency.
+		parse := exec.Command(python, "-c",
+			"import json, sys, tomllib; print(json.dumps(tomllib.loads(open(sys.argv[1], encoding='utf-8').read())))", path)
+		out, err := parse.CombinedOutput()
+		if err != nil {
+			t.Fatalf("parse native TOML %s: %v\n%s", rel, err, out)
+		}
+		var got map[string]interface{}
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("decode native TOML %s: %v", rel, err)
+		}
+		assertJSONSubset(t, rel, expected, got)
 	}
 }
 

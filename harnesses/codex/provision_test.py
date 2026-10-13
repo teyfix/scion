@@ -212,6 +212,42 @@ def _also_strip_sections_damaging(header: str):
 
 
 class CodexProvisionTest(unittest.TestCase):
+    def test_mcp_enabled_tools_preserve_empty_and_quoted_tool_names(self) -> None:
+        for transport, endpoint in (
+            ("stdio", {"command": "code-search"}),
+            ("streamable-http", {"url": "https://memory.example.test/mcp"}),
+            ("sse", {"url": "https://memory.example.test/mcp"}),
+        ):
+            for tools in ([], ["read_note", "search_notes", 'quote"tool', "slash\\tool", "literal$tool"]):
+                with self.subTest(transport=transport, tools=tools):
+                    section = provision._build_mcp_section("filtered", {
+                        "transport": transport, **endpoint, "enabled_tools": tools,
+                    })
+                    self.assertEqual(tomllib.loads(section)["mcp_servers"]["filtered"]["enabled_tools"], tools)
+
+    def test_mcp_enabled_tools_unset_and_null_leave_native_default(self) -> None:
+        for extra in ({}, {"enabled_tools": None}):
+            section = provision._build_mcp_section("unfiltered", {
+                "transport": "stdio", "command": "files", **extra,
+            })
+            self.assertNotIn("enabled_tools", tomllib.loads(section)["mcp_servers"]["unfiltered"])
+
+    def test_mcp_invalid_enabled_tools_fail_before_writing(self) -> None:
+        for tools in ("read_note", {}, 1, True, [None], [1], [""], [" "], ["bad\x00name"], ["bad\nname"], ["bad\x7fname"]):
+            with self.subTest(tools=tools), tempfile.TemporaryDirectory() as tmp:
+                bundle = os.path.join(tmp, "bundle")
+                os.makedirs(os.path.join(bundle, "inputs"))
+                with open(os.path.join(bundle, "inputs", "mcp-servers.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"mcp_servers": {"memory": {
+                        "transport": "streamable-http", "url": "https://memory.example.test/mcp",
+                        "enabled_tools": tools,
+                    }}}, handle)
+                ctx = scion_harness.ProvisionContext("codex", {"harness_bundle_dir": bundle})
+                with patch.object(provision, "_write_mcp_to_config") as writer:
+                    with self.assertRaises(scion_harness.ProvisionError):
+                        scion_harness.apply_mcp_translated(ctx, provision._build_mcp_section, writer)
+                writer.assert_not_called()
+
     def test_mcp_bearer_reference_remains_deferred_through_real_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
@@ -226,9 +262,9 @@ class CodexProvisionTest(unittest.TestCase):
                 json.dump({"mcp_servers": {
                     "github": {"transport": "streamable-http", "url": "https://api.githubcopilot.com/mcp/", "headers": {
                         "Authorization": "Bearer ${GITHUB_PAT_TOKEN}", "X-MCP-Tools": "issue_read",
-                    }},
+                    }, "enabled_tools": ["issue_read"]},
                     "basic-memory": {"transport": "streamable-http", "url": "https://memory.example.test/mcp"},
-                    "browser": {"transport": "stdio", "command": "chrome-devtools-mcp", "args": ["--headless"]},
+                    "browser": {"transport": "stdio", "command": "chrome-devtools-mcp", "args": ["--headless"], "enabled_tools": []},
                     "static-auth": {"transport": "streamable-http", "url": "https://static.example.test/mcp", "headers": {
                         "Authorization": static_authorization,
                     }},
@@ -247,10 +283,10 @@ class CodexProvisionTest(unittest.TestCase):
             self.assertNotIn("Bearer ${GITHUB_PAT_TOKEN}", content)
             self.assertEqual(parsed["mcp_servers"]["github"], {
                 "url": "https://api.githubcopilot.com/mcp/", "bearer_token_env_var": "GITHUB_PAT_TOKEN",
-                "http_headers": {"X-MCP-Tools": "issue_read"},
+                "http_headers": {"X-MCP-Tools": "issue_read"}, "enabled_tools": ["issue_read"],
             })
             self.assertEqual(parsed["mcp_servers"]["basic-memory"], {"url": "https://memory.example.test/mcp"})
-            self.assertEqual(parsed["mcp_servers"]["browser"], {"command": "chrome-devtools-mcp", "args": ["--headless"]})
+            self.assertEqual(parsed["mcp_servers"]["browser"], {"command": "chrome-devtools-mcp", "args": ["--headless"], "enabled_tools": []})
             self.assertEqual(parsed["mcp_servers"]["static-auth"], {
                 "url": "https://static.example.test/mcp", "http_headers": {"Authorization": static_authorization},
             })

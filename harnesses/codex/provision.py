@@ -494,6 +494,20 @@ def _build_mcp_section(name: str, spec: dict[str, Any]) -> str | None:
         print(f"codex provision: mcp server {name!r}: unsupported transport {transport!r}", file=sys.stderr)
         return None
 
+    enabled_tools = spec.get("enabled_tools")
+    if enabled_tools is not None:
+        if not isinstance(enabled_tools, list) or any(
+            not isinstance(tool, str) or not tool.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in tool)
+            for tool in enabled_tools
+        ):
+            raise scion_harness.ProvisionError(
+                "MCP enabled_tools must be a list of non-empty tool names without control characters"
+            )
+        # None/absent leaves Codex's defaults; an explicit empty allowlist
+        # remains [] rather than silently expanding access to every tool.
+        body.append(f"enabled_tools = {scion_harness.toml_string_array(enabled_tools)}")
+
     return "\n".join(body) + "\n"
 
 
