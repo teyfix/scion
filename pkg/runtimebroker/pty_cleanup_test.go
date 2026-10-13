@@ -1573,7 +1573,6 @@ func TestPTYCleanup_NoncePIDLookup(t *testing.T) {
 	require.NoError(t, err, string(out))
 	t.Cleanup(func() { _ = exec.Command(tmux, "-S", socket, "kill-server").Run() })
 
-	adapter := nonceTestAdapter(t, dir)
 	t.Setenv("TW_CLEANUP_TMUX", tmux)
 	t.Setenv("TW_CLEANUP_SOCKET", socket)
 
@@ -1597,7 +1596,7 @@ func TestPTYCleanup_NoncePIDLookup(t *testing.T) {
 	})
 
 	expectedPID := strconv.Itoa(attachCmd.Process.Pid)
-	adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
+	adapter := nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 
 	// Wait for the attach to be visible
 	require.Eventually(t, func() bool {
@@ -1686,7 +1685,6 @@ func TestPTYCleanup_NonceStartTimeParsing(t *testing.T) {
 	require.NoError(t, err, string(out))
 	t.Cleanup(func() { _ = exec.Command(tmux, "-S", socket, "kill-server").Run() })
 
-	adapter := nonceTestAdapter(t, dir)
 	t.Setenv("TW_CLEANUP_TMUX", tmux)
 	t.Setenv("TW_CLEANUP_SOCKET", socket)
 
@@ -1711,7 +1709,7 @@ func TestPTYCleanup_NonceStartTimeParsing(t *testing.T) {
 	})
 
 	expectedPID := strconv.Itoa(attachCmd.Process.Pid)
-	adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
+	adapter := nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 
 	require.Eventually(t, func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
