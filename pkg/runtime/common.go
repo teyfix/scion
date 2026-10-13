@@ -376,8 +376,19 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 	addArg("--name", config.Name)
 
-	if config.NetworkMode != "" {
+	if len(config.Networks) > 0 {
+		for _, network := range config.Networks {
+			if network != "" {
+				addArg("--network", network)
+			}
+		}
+	} else if config.NetworkMode != "" {
 		addArg("--network", config.NetworkMode)
+	}
+	for _, device := range config.Devices {
+		if device != "" {
+			addArg("--device", device)
+		}
 	}
 
 	// Reject a home directory that is not an allowed agent-home path before
@@ -708,6 +719,15 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	}
 	for k, v := range config.Annotations {
 		addArg("--label", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	keys := make([]string, 0, len(config.DockerLabels))
+	for key := range config.DockerLabels {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		addArg("--label", fmt.Sprintf("%s=%s", key, config.DockerLabels[key]))
 	}
 
 	// Phase 5: Standard project labels

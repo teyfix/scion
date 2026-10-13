@@ -646,6 +646,7 @@ func compileSchemas() {
 			"additionalProperties": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"docker":                      map[string]interface{}{"type": "object", "properties": map[string]interface{}{"privileged": map[string]interface{}{"type": "boolean"}, "nvidia_gpu": map[string]interface{}{"type": "boolean"}, "networks": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}, "devices": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string", "minLength": 1}}, "labels": map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}}}, "additionalProperties": false},
 					"type":                        map[string]interface{}{"type": "string"},
 					"host":                        map[string]interface{}{"type": "string"},
 					"context":                     map[string]interface{}{"type": "string"},
@@ -676,6 +677,7 @@ func compileSchemas() {
 			"additionalProperties": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"docker":                 map[string]interface{}{"type": "object", "properties": map[string]interface{}{"privileged": map[string]interface{}{"type": "boolean"}, "nvidia_gpu": map[string]interface{}{"type": "boolean"}, "networks": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}, "devices": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string", "minLength": 1}}, "labels": map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}}}, "additionalProperties": false},
 					"runtime":                map[string]interface{}{"type": "string"},
 					"default_template":       map[string]interface{}{"type": "string"},
 					"default_harness_config": map[string]interface{}{"type": "string"},

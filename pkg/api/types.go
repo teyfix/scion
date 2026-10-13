@@ -330,6 +330,16 @@ func ValidateVolumes(volumes []VolumeMount) error {
 	return nil
 }
 
+// DockerConfig holds Docker runtime-specific configuration.
+type DockerConfig struct {
+	// NvidiaGPU overrides inherited NVIDIA device grants. Nil preserves configured devices.
+	NvidiaGPU  *bool             `json:"nvidia_gpu,omitempty" yaml:"nvidia_gpu,omitempty" koanf:"nvidia_gpu"`
+	Privileged *bool             `json:"privileged,omitempty" yaml:"privileged,omitempty" koanf:"privileged"`
+	Networks   []string          `json:"networks,omitempty" yaml:"networks,omitempty" koanf:"networks"`
+	Devices    []string          `json:"devices,omitempty" yaml:"devices,omitempty" koanf:"devices"`
+	Labels     map[string]string `json:"labels,omitempty" yaml:"labels,omitempty" koanf:"labels"`
+}
+
 type KubernetesConfig struct {
 	Context            string `json:"context,omitempty" yaml:"context,omitempty"`
 	Namespace          string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
@@ -475,21 +485,23 @@ type TelemetrySamplingConfig struct {
 }
 
 type ScionConfig struct {
-	Harness          string            `json:"harness,omitempty" yaml:"harness,omitempty"`
-	HarnessConfig    string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
-	ConfigDir        string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
-	Env              map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Volumes          []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
-	Detached         *bool             `json:"detached" yaml:"detached"`
-	CommandArgs      []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
-	TaskFlag         string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
-	Model            string            `json:"model,omitempty" yaml:"model,omitempty"`
-	ThinkingLevel    *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
-	Kubernetes       *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
-	AuthSelectedType string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
-	Resources        *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
-	Image            string            `json:"image,omitempty" yaml:"image,omitempty"`
-	Services         []ServiceSpec     `json:"services,omitempty" yaml:"services,omitempty"`
+	RuntimeUpdateVersion int64             `json:"runtime_update_version,omitempty" yaml:"runtime_update_version,omitempty"`
+	Docker               *DockerConfig     `json:"docker,omitempty" yaml:"docker,omitempty"`
+	Harness              string            `json:"harness,omitempty" yaml:"harness,omitempty"`
+	HarnessConfig        string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
+	ConfigDir            string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
+	Env                  map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Volumes              []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Detached             *bool             `json:"detached" yaml:"detached"`
+	CommandArgs          []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
+	TaskFlag             string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
+	Model                string            `json:"model,omitempty" yaml:"model,omitempty"`
+	ThinkingLevel        *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
+	Kubernetes           *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
+	AuthSelectedType     string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
+	Resources            *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
+	Image                string            `json:"image,omitempty" yaml:"image,omitempty"`
+	Services             []ServiceSpec     `json:"services,omitempty" yaml:"services,omitempty"`
 	// MCPServers is the universal MCP server map. Keys are server names; values
 	// are the transport-agnostic config translated by each harness's
 	// container-side provisioner into native format.
@@ -613,6 +625,8 @@ type FileMapping struct {
 // AgentInfo contains metadata about a scion agent.
 // It supports both local/solo mode and hosted/distributed mode.
 type AgentInfo struct {
+	Privileged *bool `json:"privileged,omitempty"`
+	NvidiaGPU  *bool `json:"nvidiaGpu,omitempty"`
 	// Identity fields
 	ID            string `json:"id,omitempty"`          // Hub UUID (database primary key, globally unique)
 	Slug          string `json:"slug,omitempty"`        // URL-safe slug identifier (unique per project)
@@ -1267,7 +1281,17 @@ func HubAgentDefaultsFromContext(ctx context.Context) *HubAgentDefaults {
 	return v
 }
 
+// CreateAdmission is the identity supplied by the authoritative CREATE handler.
+// It is internal lifecycle input, never inferred from config or environment.
+type CreateAdmission struct {
+	AgentID         string
+	ProjectID       string
+	RuntimeBrokerID string
+}
+
 type StartOptions struct {
+	RuntimeRecovery   *RuntimeRecovery
+	CreateAdmission   *CreateAdmission
 	Name              string
 	Task              string
 	Template          string

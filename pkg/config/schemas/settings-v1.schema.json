@@ -478,6 +478,43 @@
     "runtimeConfig": {
       "type": "object",
       "properties": {
+        "docker": {
+          "type": "object",
+          "description": "Docker runtime configuration.",
+          "properties": {
+            "nvidia_gpu": {
+              "type": "boolean",
+              "description": "Override NVIDIA device attachment. False removes inherited NVIDIA CDI and host device grants; true uses configured NVIDIA devices or defaults to nvidia.com/gpu=all. Omit to inherit. Does not restrict privileged containers or external Docker wrappers."
+            },
+            "privileged": {
+              "type": "boolean",
+              "description": "Run the Docker container in privileged mode."
+            },
+            "networks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Custom Docker networks to join."
+            },
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Docker device mappings or CDI selectors to grant to the container."
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Custom Docker container labels."
+            }
+          },
+          "additionalProperties": false
+        },
         "type": {
           "type": "string",
           "enum": ["docker", "podman", "container", "kubernetes", "cloudrun", "cloudrun-instances", "cloudrun-sandbox", "substrate"],
@@ -807,7 +844,7 @@
       "properties": {
         "behavior": {
           "type": "string",
-          "enum": ["drop-to-shell", "show-setup-instructions", "run-setup-wizard"],
+          "enum": ["allow", "drop-to-shell", "show-setup-instructions", "run-setup-wizard"],
           "description": "What the harness should do when no credentials are provided."
         },
         "message": {
@@ -1047,6 +1084,43 @@
       "type": "object",
       "required": ["runtime"],
       "properties": {
+        "docker": {
+          "type": "object",
+          "description": "Docker runtime configuration.",
+          "properties": {
+            "nvidia_gpu": {
+              "type": "boolean",
+              "description": "Override NVIDIA device attachment. False removes inherited NVIDIA CDI and host device grants; true uses configured NVIDIA devices or defaults to nvidia.com/gpu=all. Omit to inherit. Does not restrict privileged containers or external Docker wrappers."
+            },
+            "privileged": {
+              "type": "boolean",
+              "description": "Run the Docker container in privileged mode."
+            },
+            "networks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Custom Docker networks to join."
+            },
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Docker device mappings or CDI selectors to grant to the container."
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Custom Docker container labels."
+            }
+          },
+          "additionalProperties": false
+        },
         "runtime": {
           "type": "string",
           "description": "Name of the runtime (key in runtimes map) to use."

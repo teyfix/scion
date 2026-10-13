@@ -27,6 +27,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	configpkg "github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"golang.org/x/sync/singleflight"
 )
@@ -58,6 +59,9 @@ func (r *DockerRuntime) ExecUser() string {
 }
 
 func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, error) {
+	if err := configpkg.ValidateDockerConfig(&api.DockerConfig{Networks: config.Networks, Devices: config.Devices, Labels: config.DockerLabels}); err != nil {
+		return "", err
+	}
 	if err := prepareContainerSecretEnv(&config); err != nil {
 		return "", err
 	}
@@ -71,6 +75,9 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	// sciontool already handles PID 1 responsibilities (zombie reaping, signal forwarding),
 	// so we don't use --init to avoid competing init processes.
 	newArgs := []string{"run", "-t"}
+	if config.Privileged {
+		newArgs = append(newArgs, "--privileged")
+	}
 
 	// Apply resource constraints from config.
 	//
@@ -186,6 +193,103 @@ const (
 	dockerListGroupTimeout = 10 * time.Second
 )
 
+type dockerInspectRuntimeFacts struct {
+	ID         string   `json:"id"`
+	CDIDevices []string `json:"cdiDevices"`
+	Privileged bool     `json:"privileged"`
+	Devices    []struct {
+		PathOnHost        string `json:"PathOnHost"`
+		PathInContainer   string `json:"PathInContainer"`
+		CgroupPermissions string `json:"CgroupPermissions"`
+	} `json:"devices"`
+	DeviceRequests []struct {
+		Driver       string     `json:"Driver"`
+		DeviceIDs    []string   `json:"DeviceIDs"`
+		Capabilities [][]string `json:"Capabilities"`
+	} `json:"deviceRequests"`
+}
+
+func dockerFactsHaveNvidiaGPU(facts dockerInspectRuntimeFacts) bool {
+	for _, device := range facts.CDIDevices {
+		if strings.HasPrefix(strings.ToLower(device), "nvidia.com/gpu=") {
+			return true
+		}
+	}
+	for _, device := range facts.Devices {
+		if strings.Contains(strings.ToLower(device.PathOnHost), "nvidia") ||
+			strings.Contains(strings.ToLower(device.PathInContainer), "nvidia") {
+			return true
+		}
+	}
+	for _, request := range facts.DeviceRequests {
+		driver := strings.ToLower(request.Driver)
+		if driver == "nvidia" {
+			return true
+		}
+		for _, id := range request.DeviceIDs {
+			if strings.HasPrefix(strings.ToLower(id), "nvidia.com/gpu=") {
+				return true
+			}
+		}
+		for _, capabilitySet := range request.Capabilities {
+			for _, capability := range capabilitySet {
+				if strings.EqualFold(capability, "gpu") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// populateRuntimeFacts records what Docker actually applied to each container.
+// These are observed facts rather than requested settings: wrappers around the
+// Docker CLI may add --privileged or GPU device requests after Scion builds the
+// command line, so only inspection can report the effective runtime state.
+func (r *DockerRuntime) populateRuntimeFacts(ctx context.Context, agents []api.AgentInfo) {
+	if len(agents) == 0 {
+		return
+	}
+
+	args := []string{
+		"inspect",
+		"--format",
+		`{"id":{{json .Id}},"privileged":{{json .HostConfig.Privileged}},"devices":{{json .HostConfig.Devices}},"deviceRequests":{{json .HostConfig.DeviceRequests}},"cdiDevices":{{json (index .HostConfig "CDIDevices")}}}`,
+	}
+	for i := range agents {
+		args = append(args, agents[i].ContainerID)
+	}
+
+	out, err := exec.CommandContext(ctx, r.Command, args...).CombinedOutput()
+	if err != nil {
+		runtimeLog().Debug("docker inspect runtime facts failed", "error", err)
+		return
+	}
+
+	byID := make(map[string]dockerInspectRuntimeFacts, len(agents))
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		var facts dockerInspectRuntimeFacts
+		if err := json.Unmarshal([]byte(line), &facts); err != nil || facts.ID == "" {
+			continue
+		}
+		byID[facts.ID] = facts
+	}
+
+	for i := range agents {
+		facts, ok := byID[agents[i].ContainerID]
+		if !ok {
+			continue
+		}
+		privileged := facts.Privileged
+		nvidiaGPU := dockerFactsHaveNvidiaGPU(facts)
+		agents[i].Privileged = &privileged
+		agents[i].NvidiaGPU = &nvidiaGPU
+	}
+}
+
 func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
 	// Use DoChan rather than Do: Do would run the shared exec under
 	// whichever caller's ctx happens to start the call, so that caller
@@ -266,6 +370,7 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 		}
 	}
 
+	r.populateRuntimeFacts(ctx, agents)
 	return agents, nil
 }
 

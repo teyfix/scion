@@ -23,6 +23,10 @@ import (
 )
 
 type RunConfig struct {
+	Privileged         bool
+	Networks           []string
+	Devices            []string
+	DockerLabels       map[string]string
 	Name               string
 	Template           string
 	UnixUsername       string
