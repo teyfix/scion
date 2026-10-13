@@ -147,3 +147,14 @@ func TestBrokerRegistrationCapabilities_IncludesAsyncLaunch(t *testing.T) {
 		t.Errorf("brokerRegistrationCapabilities() = %v, want it to include asyncLaunch", brokerRegistrationCapabilities())
 	}
 }
+
+func TestBrokerRegistrationNvidiaCapabilityRequiresExplicitOptIn(t *testing.T) {
+	for _, value := range []string{"", "false", "TRUE", "true"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("SCION_NVIDIA_GPU", value)
+			caps := brokerRegistrationCapabilities()
+			assert.Equal(t, value == "true", slices.Contains(caps, "gpu"))
+			assert.Contains(t, caps, "runtimeRecovery")
+		})
+	}
+}

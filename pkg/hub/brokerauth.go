@@ -308,6 +308,10 @@ func capabilitiesFromStrings(names []string) *store.BrokerCapabilities {
 		switch strings.ToLower(strings.TrimSpace(name)) {
 		case "webpty", "web_pty":
 			caps.WebPTY = true
+		case "gpu", "nvidiagpu", "nvidia_gpu":
+			caps.NvidiaGPU = true
+		case "runtimerecovery", "runtime_recovery":
+			caps.RuntimeRecovery = true
 		case "sync":
 			caps.Sync = true
 		case "attach":

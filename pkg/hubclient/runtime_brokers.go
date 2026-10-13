@@ -325,6 +325,8 @@ type ProjectHeartbeat struct {
 
 // AgentHeartbeat is per-agent status in a heartbeat.
 type AgentHeartbeat struct {
+	Privileged      *bool  `json:"privileged,omitempty"`
+	NvidiaGPU       *bool  `json:"nvidiaGpu,omitempty"`
 	Slug            string `json:"slug"` // Agent's URL-safe identifier
 	Status          string `json:"status"`
 	Phase           string `json:"phase,omitempty"`
