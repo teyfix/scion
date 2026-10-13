@@ -22,6 +22,15 @@ type ImageChecker interface {
 	Check(ctx context.Context, image string) CheckResult
 }
 
+// ValidateReference validates a requested image with the availability checker's parser.
+func ValidateReference(image string) error {
+	if image == "" || strings.ContainsAny(image, " \t\r\n") || strings.Contains(image, "://") {
+		return fmt.Errorf("image reference is empty or contains whitespace")
+	}
+	_, err := parseImageRef(image)
+	return err
+}
+
 type Checker struct {
 	// localMu guards local. SetLocal can run while Check and CheckAll are
 	// serving requests (the hub swaps the local runtime after it has started
