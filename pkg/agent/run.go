@@ -2758,6 +2758,35 @@ authDone:
 		}
 		return nil, classifyLaunchRuntimeError(err, resolvedImage)
 	}
+	if recoveryState == nil && finalScionCfg != nil && finalScionCfg.RuntimeUpdateVersion > 0 {
+		// Recovery installed a full effective Docker config. After a successful
+		// ordinary start, save only the restored requester intent, preserving
+		// every other persisted field and the broker admission marker.
+		path := filepath.Join(agentDir, "scion-agent.json")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read requester runtime config: %w", err)
+		}
+		var persisted map[string]json.RawMessage
+		if err := json.Unmarshal(data, &persisted); err != nil {
+			return nil, fmt.Errorf("read requester runtime config: %w", err)
+		}
+		if persisted == nil {
+			return nil, fmt.Errorf("requester runtime config must be an object")
+		}
+		if ownEnv.Docker == nil {
+			delete(persisted, "docker")
+		} else {
+			docker, err := json.Marshal(ownEnv.Docker)
+			if err != nil {
+				return nil, fmt.Errorf("encode requester Docker configuration: %w", err)
+			}
+			persisted["docker"] = docker
+		}
+		if err := atomicRecoveryJSON(path, persisted); err != nil {
+			return nil, fmt.Errorf("record requester Docker configuration: %w", err)
+		}
+	}
 	if err := writeRuntimeEnvironmentSnapshot(agentDir, finalScionCfg, runCfg, agentID, projectID, snapshotBrokerID, func() *api.DockerConfig {
 		if recoveryState != nil {
 			return recoveryState.requesterDocker
