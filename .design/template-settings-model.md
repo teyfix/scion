@@ -58,6 +58,19 @@ broker settings
       < policy (currently the only policy key: project telemetry on/off)
 ```
 
+### On-prem template environment defaults
+
+This fork preserves Docker configuration and project image selection from the
+current template as defaults for ordinary UI and CLI starts. Docker merges above
+runtime/profile defaults and below requester config; required attachments remain
+additive and explicit false remains effective. Template image is below requester
+inline image, profile harness overrides, and explicit request image. These values
+are refreshed on ordinary starts, never recorded as requester-owned overrides.
+Retained recovery uses its validated effective-runtime snapshot instead. This
+exception preserves project runtime images and role capabilities; template
+volumes, resources, hub, telemetry, and Kubernetes keys still follow the rules
+above.
+
 ### Rules
 
 - Defaults fill only what higher tiers leave unset. Policy overrides for its keys only.
