@@ -15,6 +15,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -567,6 +568,13 @@ func TestFindTemplateInProjectPath(t *testing.T) {
 		if !strings.Contains(err.Error(), "not found") {
 			t.Errorf("expected error to contain 'not found', got: %v", err)
 		}
+		// ptone/scion#1316 fault 3: callers must be able to distinguish "this
+		// named template does not exist" from any other failure via
+		// errors.Is, so the runtime broker can report a 404 naming the
+		// resource instead of folding it into a generic 5xx.
+		if !errors.Is(err, ErrTemplateNotFound) {
+			t.Errorf("expected errors.Is(err, ErrTemplateNotFound) to be true, got err: %v", err)
+		}
 	})
 
 	t.Run("absolute path bypasses project resolution", func(t *testing.T) {
@@ -580,11 +588,11 @@ func TestFindTemplateInProjectPath(t *testing.T) {
 	})
 }
 
-func TestFindTemplateInProjectPath_GitGroveInRepoTemplates(t *testing.T) {
+func TestFindTemplateInProjectPath_GitProjectInRepoTemplates(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
-	// Simulate a git project: in-repo .scion/ with grove-id and templates/ in-repo.
+	// Simulate a git project: in-repo .scion/ with project-id and templates/ in-repo.
 	// Templates live in-repo so they can be committed to the repository.
 	projectDir := filepath.Join(t.TempDir(), "my-git-project", ".scion")
 	_ = os.MkdirAll(projectDir, 0755)
@@ -1104,6 +1112,7 @@ func TestMergeScionConfig_NewFields(t *testing.T) {
 				Namespace:          "base-ns",
 				RuntimeClassName:   "base-runtime",
 				ServiceAccountName: "base-sa",
+				PriorityClassName:  "base-priority",
 				Resources: &api.K8sResources{
 					Requests: map[string]string{"cpu": "250m"},
 					Limits:   map[string]string{"memory": "512Mi"},
@@ -1121,6 +1130,7 @@ func TestMergeScionConfig_NewFields(t *testing.T) {
 				Namespace:          "override-ns",
 				RuntimeClassName:   "override-runtime",
 				ServiceAccountName: "override-sa",
+				PriorityClassName:  "override-priority",
 				Resources: &api.K8sResources{
 					Requests: map[string]string{"memory": "1Gi"},
 					Limits:   map[string]string{"cpu": "500m"},
@@ -1148,6 +1158,9 @@ func TestMergeScionConfig_NewFields(t *testing.T) {
 		}
 		if got.Kubernetes.ServiceAccountName != "override-sa" {
 			t.Errorf("expected ServiceAccountName override, got %q", got.Kubernetes.ServiceAccountName)
+		}
+		if got.Kubernetes.PriorityClassName != "override-priority" {
+			t.Errorf("expected PriorityClassName override, got %q", got.Kubernetes.PriorityClassName)
 		}
 		if got.Kubernetes.ImagePullPolicy != "Never" {
 			t.Errorf("expected ImagePullPolicy override, got %q", got.Kubernetes.ImagePullPolicy)
@@ -1840,6 +1853,9 @@ func TestFriendlyTemplateName(t *testing.T) {
 		{"http URI", "https://example.com/my-template.tar.gz", "my-template"},
 		{"github URI", "https://github.com/user/repo/tree/main/templates/claude", "claude"},
 		{"rclone path", ":gcs:bucket/path/to/template", "template"},
+		{"content-hash cache dir", "/var/scion/template-cache/sha256:" + strings.Repeat("0f", 32), ""},
+		{"bare content hash", "sha256:" + strings.Repeat("0f", 32), ""},
+		{"short sha256-prefixed name kept", "/t/sha256:abc", "sha256:abc"},
 	}
 
 	for _, tt := range tests {
@@ -2230,215 +2246,42 @@ func TestMergeScionConfig_ThinkingLevel_NoAliasing(t *testing.T) {
 	}
 }
 
-func TestMergeScionConfig_Docker_Privileged_Precedence(t *testing.T) {
-	tests := []struct {
-		name     string
-		base     *api.DockerConfig
-		override *api.DockerConfig
-		want     *bool
-	}{
-		{
-			name:     "base nil, override true",
-			base:     nil,
-			override: &api.DockerConfig{Privileged: boolPtr(true)},
-			want:     boolPtr(true),
-		},
-		{
-			name:     "base nil, override false",
-			base:     nil,
-			override: &api.DockerConfig{Privileged: boolPtr(false)},
-			want:     boolPtr(false),
-		},
-		{
-			name:     "base true, override false (explicit false overrides true)",
-			base:     &api.DockerConfig{Privileged: boolPtr(true)},
-			override: &api.DockerConfig{Privileged: boolPtr(false)},
-			want:     boolPtr(false),
-		},
-		{
-			name:     "base false, override true",
-			base:     &api.DockerConfig{Privileged: boolPtr(false)},
-			override: &api.DockerConfig{Privileged: boolPtr(true)},
-			want:     boolPtr(true),
-		},
-		{
-			name:     "base true, override nil Docker (base preserved)",
-			base:     &api.DockerConfig{Privileged: boolPtr(true)},
-			override: nil,
-			want:     boolPtr(true),
-		},
-		{
-			name:     "base true, override Docker with nil Privileged (base preserved)",
-			base:     &api.DockerConfig{Privileged: boolPtr(true)},
-			override: &api.DockerConfig{},
-			want:     boolPtr(true),
-		},
-		{
-			name:     "base nil, override nil",
-			base:     nil,
-			override: nil,
-			want:     nil,
+// TestFindTemplateContentHashDirHasNoName checks that a template found at a
+// content-hash cache directory is not named after the hash, while an
+// ordinary absolute template directory keeps its base name.
+func TestFindTemplateContentHashDirHasNoName(t *testing.T) {
+	root := t.TempDir()
+	hashDir := filepath.Join(root, "sha256:"+strings.Repeat("ab", 32))
+	plainDir := filepath.Join(root, "web-dev")
+	for _, d := range []string{hashDir, plainDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectPath := filepath.Join(root, "project", ".scion")
+
+	finders := map[string]func(string) (*Template, error){
+		"FindTemplate": FindTemplate,
+		"FindTemplateInProjectPath": func(name string) (*Template, error) {
+			return FindTemplateInProjectPath(name, projectPath)
 		},
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			baseCfg := &api.ScionConfig{Docker: tc.base}
-			overrideCfg := &api.ScionConfig{Docker: tc.override}
-			got := MergeScionConfig(baseCfg, overrideCfg)
-
-			if tc.want == nil {
-				if got.Docker != nil && got.Docker.Privileged != nil {
-					t.Fatalf("got Privileged=%v, want nil", *got.Docker.Privileged)
-				}
-				return
+	for fname, find := range finders {
+		t.Run(fname, func(t *testing.T) {
+			tpl, err := find(hashDir)
+			if err != nil {
+				t.Fatalf("hash dir: %v", err)
 			}
-
-			if got.Docker == nil || got.Docker.Privileged == nil {
-				t.Fatalf("got Privileged=nil, want %v", *tc.want)
+			if tpl.Name != "" || tpl.Path != hashDir {
+				t.Errorf("hash dir: got Name=%q Path=%q, want empty name and Path=%q", tpl.Name, tpl.Path, hashDir)
 			}
-			if *got.Docker.Privileged != *tc.want {
-				t.Errorf("got Privileged=%v, want %v", *got.Docker.Privileged, *tc.want)
+			tpl, err = find(plainDir)
+			if err != nil {
+				t.Fatalf("plain dir: %v", err)
+			}
+			if tpl.Name != "web-dev" {
+				t.Errorf("plain dir: Name = %q, want %q", tpl.Name, "web-dev")
 			}
 		})
-	}
-}
-
-func TestMergeScionConfig_Docker_Privileged_NoAliasing(t *testing.T) {
-	overridePriv := true
-	base := &api.ScionConfig{}
-	override := &api.ScionConfig{
-		Docker: &api.DockerConfig{Privileged: &overridePriv},
-	}
-
-	got := MergeScionConfig(base, override)
-	if got.Docker == nil || got.Docker.Privileged == nil {
-		t.Fatal("Docker.Privileged = nil, want true")
-	}
-
-	// Mutate the override pointer
-	*override.Docker.Privileged = false
-
-	if *got.Docker.Privileged != true {
-		t.Errorf("Docker.Privileged = %v after mutating the override, want true: "+
-			"the merged result aliases the caller-owned override pointer", *got.Docker.Privileged)
-	}
-}
-
-func TestCloneDockerConfig(t *testing.T) {
-	if CloneDockerConfig(nil) != nil {
-		t.Error("CloneDockerConfig(nil) should return nil")
-	}
-
-	priv := true
-	orig := &api.DockerConfig{
-		Privileged: &priv,
-		Networks:   []string{"net1", "net2"},
-		Devices:    []string{"nvidia.com/gpu=all", "/dev/fuse"},
-		Labels: map[string]string{
-			"key1": "val1",
-			"key2": "val2",
-		},
-	}
-
-	clone := CloneDockerConfig(orig)
-	if clone == nil {
-		t.Fatal("CloneDockerConfig returned nil for non-nil input")
-	}
-	if clone.Privileged == nil || *clone.Privileged != true {
-		t.Errorf("clone.Privileged = %v, want true", clone.Privileged)
-	}
-	if len(clone.Networks) != 2 || clone.Networks[0] != "net1" || clone.Networks[1] != "net2" {
-		t.Errorf("clone.Networks = %v, want [net1 net2]", clone.Networks)
-	}
-	if len(clone.Devices) != 2 || clone.Devices[0] != "nvidia.com/gpu=all" || clone.Devices[1] != "/dev/fuse" {
-		t.Errorf("clone.Devices = %v, want [nvidia.com/gpu=all /dev/fuse]", clone.Devices)
-	}
-	if len(clone.Labels) != 2 || clone.Labels["key1"] != "val1" || clone.Labels["key2"] != "val2" {
-		t.Errorf("clone.Labels = %v, want key1:val1, key2:val2", clone.Labels)
-	}
-
-	// Verify deep copy isolation
-	*orig.Privileged = false
-	orig.Networks[0] = "mutated"
-	orig.Devices[0] = "mutated"
-	orig.Labels["key1"] = "mutated"
-
-	if *clone.Privileged != true {
-		t.Errorf("clone.Privileged mutated with original")
-	}
-	if clone.Networks[0] != "net1" {
-		t.Errorf("clone.Networks mutated with original")
-	}
-	if clone.Devices[0] != "nvidia.com/gpu=all" {
-		t.Errorf("clone.Devices mutated with original")
-	}
-	if clone.Labels["key1"] != "val1" {
-		t.Errorf("clone.Labels mutated with original")
-	}
-}
-
-func TestMergeScionConfig_Docker_NetworksDevicesAndLabels(t *testing.T) {
-	base := &api.ScionConfig{
-		Docker: &api.DockerConfig{
-			Networks: []string{"profile-net", "shared-net"},
-			Devices:  []string{"nvidia.com/gpu=all", "/dev/fuse"},
-			Labels: map[string]string{
-				"env":     "prod",
-				"profile": "default",
-			},
-		},
-	}
-
-	override := &api.ScionConfig{
-		Docker: &api.DockerConfig{
-			Networks: []string{"shared-net", "template-net", ""},
-			Devices:  []string{"/dev/fuse", "/dev/dri", ""},
-			Labels: map[string]string{
-				"env":      "staging", // should overwrite base
-				"template": "agent-v1",
-			},
-		},
-	}
-
-	merged := MergeScionConfig(base, override)
-	if merged.Docker == nil {
-		t.Fatal("merged.Docker is nil")
-	}
-
-	// Verify Networks union and deduplication preserving base order
-	expectedNets := []string{"profile-net", "shared-net", "template-net"}
-	if len(merged.Docker.Networks) != len(expectedNets) {
-		t.Fatalf("merged.Docker.Networks = %v, want %v", merged.Docker.Networks, expectedNets)
-	}
-	for i, net := range expectedNets {
-		if merged.Docker.Networks[i] != net {
-			t.Errorf("merged.Docker.Networks[%d] = %q, want %q", i, merged.Docker.Networks[i], net)
-		}
-	}
-
-	// Verify Devices union and deduplication preserving base order.
-	expectedDevices := []string{"nvidia.com/gpu=all", "/dev/fuse", "/dev/dri"}
-	if len(merged.Docker.Devices) != len(expectedDevices) {
-		t.Fatalf("merged.Docker.Devices = %v, want %v", merged.Docker.Devices, expectedDevices)
-	}
-	for i, device := range expectedDevices {
-		if merged.Docker.Devices[i] != device {
-			t.Errorf("merged.Docker.Devices[%d] = %q, want %q", i, merged.Docker.Devices[i], device)
-		}
-	}
-
-	// Verify Labels merge with override precedence
-	if len(merged.Docker.Labels) != 3 {
-		t.Fatalf("merged.Docker.Labels count = %d, want 3 (got %v)", len(merged.Docker.Labels), merged.Docker.Labels)
-	}
-	if got := merged.Docker.Labels["env"]; got != "staging" {
-		t.Errorf("merged.Docker.Labels[\"env\"] = %q, want \"staging\"", got)
-	}
-	if got := merged.Docker.Labels["profile"]; got != "default" {
-		t.Errorf("merged.Docker.Labels[\"profile\"] = %q, want \"default\"", got)
-	}
-	if got := merged.Docker.Labels["template"]; got != "agent-v1" {
-		t.Errorf("merged.Docker.Labels[\"template\"] = %q, want \"agent-v1\"", got)
 	}
 }

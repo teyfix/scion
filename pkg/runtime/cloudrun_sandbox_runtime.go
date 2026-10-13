@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -30,11 +31,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/fsutil"
 )
 
 // DefaultSandboxBin is the path to the Cloud Run sandbox launcher binary.
@@ -79,9 +79,21 @@ const sandboxAgentHome = "/home/scion"
 const sandboxWorkspace = "/workspace"
 
 // entrypointLogFile is the filename (relative to agentHome) where the
-// entrypoint's stdout/stderr is captured on failure. When `exec sciontool
-// init` succeeds the shell is replaced and the file contains normal init
-// output; when it fails the file holds the error output that explains why.
+// entrypoint's stdout/stderr is captured.  This file is the ONLY record
+// of failures that occur before, around, or outside sciontool's own
+// logger — shell-level errors ("command not found"), exec failures, and
+// any diagnostic the process writes to stdout/stderr without going
+// through log.go.  Those failures produce a bare exit code in the UI
+// and nothing else; this file is where the explanation lives.
+//
+// The file is opened with >> (append) so that a restart preserves the
+// previous run's output.  A run-delimiter line is emitted at the start
+// of each run to make boundaries unambiguous.  See #110 for the history.
+//
+// Growth is unbounded across restarts, matching agent.log (which also
+// appends without rotation in the same directory).  If disk pressure
+// from diagnostic logs becomes a concern on this tier, rotation should
+// be added to BOTH files together.
 const entrypointLogFile = ".scion-entrypoint.log"
 
 // sandboxUID and sandboxGID control the UID/GID passed to the sandbox via
@@ -132,6 +144,9 @@ type sandboxStateEntry struct {
 	Stopped       bool              `json:"stopped"`
 	ExitCode      *int              `json:"exit_code,omitempty"`
 	StoppedAt     *time.Time        `json:"stopped_at,omitempty"`
+	// EntrypointLogOffset is the entrypoint log size when this run started,
+	// so the exit watcher reports this run's output only.
+	EntrypointLogOffset int64 `json:"entrypoint_log_offset,omitempty"`
 }
 
 // sandboxStateStore is a thread-safe, JSON-backed store of sandbox entries.
@@ -201,23 +216,23 @@ func (s *sandboxStateStore) markStopped(name string, exitCode *int, stoppedAt *t
 func (s *sandboxStateStore) save() {
 	data, err := json.MarshalIndent(s.entries, "", "  ")
 	if err != nil {
-		runtimeLog.Warn("sandbox state store: failed to marshal", "error", err)
+		runtimeLog().Warn("sandbox state store: failed to marshal", "error", err)
 		return
 	}
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		runtimeLog.Warn("sandbox state store: failed to create dir", "error", err)
+		runtimeLog().Warn("sandbox state store: failed to create dir", "error", err)
 		return
 	}
 	// Atomic write: write to temp file then rename. Prevents corruption
 	// from crashes during write (audit M2). 0600 permissions (audit M1).
 	tmpPath := s.path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
-		runtimeLog.Warn("sandbox state store: failed to write temp", "path", tmpPath, "error", err)
+		runtimeLog().Warn("sandbox state store: failed to write temp", "path", tmpPath, "error", err)
 		return
 	}
 	if err := os.Rename(tmpPath, s.path); err != nil {
-		runtimeLog.Warn("sandbox state store: failed to rename", "from", tmpPath, "to", s.path, "error", err)
+		runtimeLog().Warn("sandbox state store: failed to rename", "from", tmpPath, "to", s.path, "error", err)
 	}
 }
 
@@ -226,21 +241,164 @@ func (s *sandboxStateStore) load() {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			runtimeLog.Warn("sandbox state store: failed to read", "path", s.path, "error", err)
+			runtimeLog().Warn("sandbox state store: failed to read", "path", s.path, "error", err)
 		}
 		return
 	}
 	var entries map[string]*sandboxStateEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		runtimeLog.Warn("sandbox state store: failed to unmarshal", "path", s.path, "error", err)
+		runtimeLog().Warn("sandbox state store: failed to unmarshal", "path", s.path, "error", err)
 		return
 	}
 	s.entries = entries
 }
 
-// reconcile checks each entry for liveness and removes confirmed-dead
-// entries. Called once at startup. If the file is stale from a previous
-// Instance, all entries are dead and will be pruned.
+// sandboxReconcileProbeTimeout bounds each start-up liveness probe. A
+// variable so tests can shorten it.
+var sandboxReconcileProbeTimeout = 5 * time.Second
+
+// sandboxGoneOutputs are the output fragments (lower case) that make a
+// failed probe a definitive "this sandbox does not exist" answer.
+//
+// UNVERIFIED: the sandbox CLI's wording for an unknown sandbox is not
+// documented and these fragments have not been checked against the real
+// binary. They err on the side of keeping entries: a dead sandbox whose
+// output matches none of them keeps its entry, which Delete still removes,
+// whereas a dropped entry of a live sandbox cannot be recovered.
+var sandboxGoneOutputs = []string{"not found", "no such", "does not exist"}
+
+// sandboxProbeSaysGone reports whether a failed `sandbox exec <name> --
+// /bin/true` probe (out, err, run under probeCtx) shows that the sandbox
+// is gone. Only a CLI that exited non-zero on its own, before the probe's
+// deadline, with not-found output qualifies. A timeout, a cancelled
+// context, a CLI killed by a signal or one that could not start, and any
+// other output are ambiguous: a slow but live sandbox can produce them.
+func sandboxProbeSaysGone(probeCtx context.Context, out string, err error) bool {
+	if err == nil || probeCtx.Err() != nil {
+		return false
+	}
+	return exitedWithGoneOutput(out, err)
+}
+
+// exitedWithGoneOutput reports whether err is a non-zero exit of a CLI
+// that exited on its own (not killed by a signal) and whose output
+// contains one of sandboxGoneOutputs.
+func exitedWithGoneOutput(out string, err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || !exitErr.Exited() {
+		return false
+	}
+	lower := strings.ToLower(out)
+	for _, frag := range sandboxGoneOutputs {
+		if strings.Contains(lower, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// sandboxDeleteResult classifies the outcome of `sandbox delete --force`.
+type sandboxDeleteResult int
+
+const (
+	// sandboxDeleteDeleted: the CLI exited zero.
+	sandboxDeleteDeleted sandboxDeleteResult = iota
+	// sandboxDeleteGone: the CLI exited non-zero on its own with not-found
+	// output (sandboxGoneOutputs): the sandbox was already gone.
+	sandboxDeleteGone
+	// sandboxDeleteFailed: any other non-zero exit, a CLI that could not
+	// start or was killed, and ctx cancellation during the delete.
+	sandboxDeleteFailed
+	// sandboxDeleteTimedOut: the delete-hang workaround's timeout fired.
+	sandboxDeleteTimedOut
+)
+
+func (r sandboxDeleteResult) String() string {
+	switch r {
+	case sandboxDeleteDeleted:
+		return "deleted"
+	case sandboxDeleteGone:
+		return "gone"
+	case sandboxDeleteFailed:
+		return "failed"
+	case sandboxDeleteTimedOut:
+		return "timedOut"
+	}
+	return fmt.Sprintf("sandboxDeleteResult(%d)", int(r))
+}
+
+// classifySandboxDelete classifies a `sandbox delete --force` run under
+// ctx. out is the CLI's combined output, err its exec error, and timedOut
+// reports that the delete-hang workaround's timeout fired. A cancelled
+// ctx makes any unsuccessful delete "failed", even with not-found output:
+// a killed CLI's partial output is not a definitive answer.
+func classifySandboxDelete(ctx context.Context, out string, err error, timedOut bool) sandboxDeleteResult {
+	switch {
+	case timedOut:
+		return sandboxDeleteTimedOut
+	case err == nil:
+		return sandboxDeleteDeleted
+	case ctx.Err() != nil:
+		return sandboxDeleteFailed
+	case exitedWithGoneOutput(out, err):
+		return sandboxDeleteGone
+	default:
+		return sandboxDeleteFailed
+	}
+}
+
+// maxSandboxDeleteOutput bounds how much delete output is read back.
+const maxSandboxDeleteOutput = 64 << 10
+
+// maxSandboxDeleteOutputLog bounds the copy of delete output that is
+// logged; classification still sees up to maxSandboxDeleteOutput.
+const maxSandboxDeleteOutputLog = 4 << 10
+
+// sandboxDeleteOutputForLog returns out truncated to
+// maxSandboxDeleteOutputLog bytes for logging.
+func sandboxDeleteOutputForLog(out string) string {
+	if len(out) <= maxSandboxDeleteOutputLog {
+		return out
+	}
+	return out[:maxSandboxDeleteOutputLog] + "...(truncated)"
+}
+
+// newSandboxDeleteOutput returns an unlinked temporary file to use as a
+// delete command's stdout and stderr, so the output is captured without
+// a pipe. A pipe would make cmd.Wait block until every holder of its
+// write end exits, and the delete-hang defect leaves orphaned runsc
+// processes holding inherited fds (cloudrun_sandbox_delete_workaround.go).
+// The caller must Close the file. A nil file (on error) leaves the output
+// uncaptured, as before.
+func newSandboxDeleteOutput() *os.File {
+	f, err := os.CreateTemp("", "scion-sandbox-delete-*")
+	if err != nil {
+		runtimeLog().Warn("cloudrun-sandbox: cannot capture delete output", "error", err)
+		return nil
+	}
+	_ = os.Remove(f.Name())
+	return f
+}
+
+// readSandboxDeleteOutput returns what has been written to f so far,
+// bounded by maxSandboxDeleteOutput. Reading a regular file never blocks,
+// even while an orphaned process still writes to it.
+func readSandboxDeleteOutput(f *os.File) string {
+	if f == nil {
+		return ""
+	}
+	b, _ := io.ReadAll(io.NewSectionReader(f, 0, maxSandboxDeleteOutput))
+	return strings.TrimSpace(string(b))
+}
+
+// reconcile checks each entry for liveness and removes entries whose
+// sandbox is confirmed gone. Called once at startup. Stopped entries are
+// removed. A running entry is removed only when its probe gives a
+// definitive not-found answer (sandboxProbeSaysGone); on a timeout or any
+// other failure the entry is kept and a warning logged. List reads only
+// the state and the sandbox CLI has no list command, so dropping the entry
+// of a slow but live sandbox would leave it running with no way to stop or
+// delete it through scion (ptone/scion#3738).
 func (s *sandboxStateStore) reconcile(bin string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,16 +414,21 @@ func (s *sandboxStateStore) reconcile(bin string) {
 			continue
 		}
 		// Probe liveness: try to exec 'true' in the sandbox.
-		// If it fails, the sandbox is dead.
 		// R1: absolute path required — the sandbox launcher resolves argv[0]
 		// before the sandbox environment (including PATH) is in effect.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err := runSimpleCommand(ctx, bin, "exec", name, "--", "/bin/true")
+		ctx, cancel := context.WithTimeout(context.Background(), sandboxReconcileProbeTimeout)
+		out, err := runSimpleCommand(ctx, bin, "exec", name, "--", "/bin/true")
+		gone := sandboxProbeSaysGone(ctx, out, err)
 		cancel()
-		if err != nil {
-			runtimeLog.Info("sandbox state reconcile: sandbox not alive, removing",
+		switch {
+		case err == nil:
+		case gone:
+			runtimeLog().Info("sandbox state reconcile: sandbox not found, removing",
 				"name", name, "agentID", entry.AgentID)
 			toRemove = append(toRemove, name)
+		default:
+			runtimeLog().Warn("sandbox state reconcile: liveness probe failed without a not-found answer; keeping the entry",
+				"name", name, "agentID", entry.AgentID, "error", err)
 		}
 	}
 
@@ -335,19 +498,59 @@ func prepareScionLayout(rootDir, slug string, cfg RunConfig) (scionPaths, error)
 	// symlink ensures the broker reads from the /scion copy where sandbox
 	// writes are visible via the bind mount.
 	if cfg.HomeDir != "" && !strings.HasPrefix(cfg.HomeDir, rootDir+"/") && cfg.HomeDir != rootDir {
-		if err := relocateToScion(cfg.HomeDir, p.agentHome); err != nil {
-			runtimeLog.Warn("could not relocate HomeDir to /scion; agent home writes may go to overlay",
-				"homeDir", cfg.HomeDir, "scionHome", p.agentHome, "error", err)
+		// Reject a home directory that is not an allowed agent-home path
+		// before relocating from it -- the same second-gate reasoning as the
+		// Workspace check just below, and the Cloud Run counterpart to
+		// buildCommonRunArgs and the Kubernetes runtime's Run().
+		resolvedHomeDir, err := ValidateAgentHomeSource(cfg.HomeDir, "")
+		if err != nil {
+			return p, err
+		}
+		// A second launch of the same sandbox agent finds cfg.HomeDir
+		// already relocated: the first launch replaced it with a symlink to
+		// p.agentHome, and resolving that symlink (as validation must, to
+		// judge the real target) makes resolvedHomeDir p.agentHome itself.
+		// relocateToScion below must run on the ORIGINAL, still-symlinked
+		// cfg.HomeDir in that case, not the resolved path: its own Lstat
+		// check recognizes a symlink and does nothing, which is exactly
+		// right on a restart. Passing the already-resolved path instead
+		// would make relocateToScion operate on p.agentHome as both source
+		// and destination -- Lstat then sees a real directory, not a
+		// symlink, so that short-circuit never fires, every entry gets
+		// renamed onto itself, and the whole directory is removed and
+		// replaced with a symlink to itself, losing the agent's home state
+		// and leaving a symlink loop. Skip relocation entirely once the
+		// resolved path already names this agent's own home, rootDir
+		// itself, or anything else under rootDir: there is nothing left
+		// outside /scion to relocate from.
+		if resolvedHomeDir != p.agentHome && resolvedHomeDir != rootDir && !strings.HasPrefix(resolvedHomeDir, rootDir+string(filepath.Separator)) {
+			if err := relocateToScion(cfg.HomeDir, p.agentHome); err != nil {
+				runtimeLog().Warn("could not relocate HomeDir to /scion; agent home writes may go to overlay",
+					"homeDir", cfg.HomeDir, "scionHome", p.agentHome, "error", err)
+			}
 		}
 	}
 
 	// Workspace: copy content from broker-provisioned workspace to /scion.
 	// Do NOT remove the original — it may be shared among agents.
 	if cfg.Workspace != "" && !strings.HasPrefix(cfg.Workspace, rootDir+"/") && cfg.Workspace != rootDir {
-		if err := copyDirContents(cfg.Workspace, p.workspace); err != nil {
+		// Reject a workspace source that is not an allowed workspace path
+		// before copying from it. This is a second gate matching the one at
+		// buildCommonRunArgs and the k8s runtime's Run(): cfg.Workspace
+		// already went through pkg/agent Start()'s validation to reach this
+		// RunConfig, but this call site should not depend on that alone. No
+		// per-project root is passed for the same reason as those two sites:
+		// RunConfig carries no flag to tell "workspace outside repo root"
+		// (a supported shape) apart from a bad value, so only the fixed
+		// deny-set (and its named ~/.scion allow list) applies.
+		resolvedWorkspace, err := ValidateWorkspaceSource(cfg.Workspace)
+		if err != nil {
+			return p, err
+		}
+		if copyErr := copyDirContents(resolvedWorkspace, p.workspace); copyErr != nil {
 			// Non-fatal: agent can still read via rootfs; writes go to /scion.
-			runtimeLog.Debug("workspace content not copied to /scion",
-				"workspace", cfg.Workspace, "scionWorkspace", p.workspace, "error", err)
+			runtimeLog().Debug("workspace content not copied to /scion",
+				"workspace", resolvedWorkspace, "scionWorkspace", p.workspace, "error", copyErr)
 		}
 	}
 
@@ -355,7 +558,7 @@ func prepareScionLayout(rootDir, slug string, cfg RunConfig) (scionPaths, error)
 	for _, sd := range cfg.SharedDirs {
 		sdPath := filepath.Join(rootDir, "shared", sd.Name)
 		if err := os.MkdirAll(sdPath, 0755); err != nil {
-			runtimeLog.Warn("failed to create shared dir in /scion layout",
+			runtimeLog().Warn("failed to create shared dir in /scion layout",
 				"name", sd.Name, "error", err)
 		}
 		// When InWorkspace is true, the mount destination is
@@ -366,7 +569,7 @@ func prepareScionLayout(rootDir, slug string, cfg RunConfig) (scionPaths, error)
 		if sd.InWorkspace {
 			iwPath := filepath.Join(p.workspace, ".scion-volumes", sd.Name)
 			if err := os.MkdirAll(iwPath, 0755); err != nil {
-				runtimeLog.Warn("failed to create in-workspace shared dir",
+				runtimeLog().Warn("failed to create in-workspace shared dir",
 					"name", sd.Name, "path", iwPath, "error", err)
 			}
 		}
@@ -382,22 +585,17 @@ func prepareScionLayout(rootDir, slug string, cfg RunConfig) (scionPaths, error)
 	// root-owned and chown-to-self is a no-op that wastes syscalls on
 	// large directory trees.
 	//
-	// Lchown is used instead of Chown to avoid following symlinks: if a
-	// relocated directory contains symlinks, we change the link's ownership
-	// rather than the target's (which may be outside our mount).
+	// fsutil.ChownTree refuses a critical-system-path or filesystem-root-lookalike
+	// root before touching anything, keeps the walk from crossing onto a
+	// different device, and Lchown's every entry rather than Chown'ing it
+	// (a relocated directory's symlink is re-owned itself, never its
+	// target, which may be outside our mount) -- all independent of
+	// whatever p.agentHome/p.workspace actually resolved to.
 	if os.Getuid() == 0 && sandboxUID > 0 {
 		for _, d := range []string{p.agentHome, p.workspace} {
-			if walkErr := filepath.WalkDir(d, func(path string, entry fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if chownErr := os.Lchown(path, sandboxUID, sandboxGID); chownErr != nil {
-					runtimeLog.Warn("failed to chown path to sandbox user",
-						"path", path, "uid", sandboxUID, "gid", sandboxGID, "error", chownErr)
-				}
-				return nil
-			}); walkErr != nil {
-				runtimeLog.Warn("failed to walk directory for chown", "dir", d, "error", walkErr)
+			if chownErr := fsutil.ChownTree(context.Background(), d, sandboxUID, sandboxGID); chownErr != nil {
+				runtimeLog().Warn("failed to chown directory to sandbox user",
+					"dir", d, "uid", sandboxUID, "gid", sandboxGID, "error", chownErr)
 			}
 		}
 	}
@@ -433,7 +631,7 @@ func relocateToScion(src, dst string) error {
 		dstPath := filepath.Join(dst, entry.Name())
 		if err := os.Rename(srcPath, dstPath); err != nil {
 			// Cross-filesystem: fall back to not relocating this entry.
-			runtimeLog.Debug("could not rename to /scion, skipping",
+			runtimeLog().Debug("could not rename to /scion, skipping",
 				"src", srcPath, "dst", dstPath, "error", err)
 		}
 	}
@@ -562,11 +760,9 @@ func envFor(cfg RunConfig, paths scionPaths) map[string]string {
 	// Project identity.
 	if cfg.Project != "" {
 		env["SCION_PROJECT"] = cfg.Project
-		env["SCION_GROVE"] = cfg.Project
 	}
 	if cfg.ProjectID != "" {
 		env["SCION_PROJECT_ID"] = cfg.ProjectID
-		env["SCION_GROVE_ID"] = cfg.ProjectID
 	}
 
 	// Workspace path: tell sciontool init where the writable workspace is
@@ -645,27 +841,19 @@ func envArgs(env map[string]string) []string {
 //	    while tmux has-session -t scion 2>/dev/null; do sleep 2; done
 func buildEntrypoint(cfg RunConfig) ([]string, error) {
 	// Build the harness command line.
-	var cmdLine string
-	if cfg.NoAuth {
-		cmdLine = buildNoAuthCmdLine(cfg.NoAuthMessage, cfg.NoAuthCommand)
-	} else if cfg.Harness != nil {
-		harnessArgs := cfg.Harness.GetCommand(cfg.Task, cfg.Resume, cfg.CommandArgs)
-		var quotedArgs []string
-		for _, a := range harnessArgs {
-			quotedArgs = append(quotedArgs, shellQuote(a))
-		}
-		cmdLine = strings.Join(quotedArgs, " ")
-	} else {
+	cmdLine, ok := harnessCmdLine(cfg, harnessCmdLineOptions{})
+	if !ok {
 		return nil, fmt.Errorf("cloudrun-sandbox: no harness provided")
 	}
 
 	// Wrap the harness in a shell that records its real exit code (see
-	// common.go:469-475 for the pattern). Use absolute path for sh —
+	// tmuxAgentWindowCmd for the pattern). Use absolute path for sh —
 	// this runs as a tmux window command where PATH is available, but
 	// absolute paths are used throughout buildEntrypoint for consistency.
-	agentWindowCmd := "/bin/sh -c " + shellQuote(cmdLine+"; echo $? > "+state.HarnessExitCodeFile)
+	agentWindowCmd := tmuxAgentWindowCmd("/bin/sh", cmdLine)
 
-	// Build tmux command (common.go:479-482 pattern, adapted for sandbox).
+	// Build tmux command (buildTmuxStartCmd, adapted for sandbox via
+	// tmuxPollSession).
 	//
 	// Finding #12: `sandbox run --detach` provides no TTY. Docker allocates
 	// one with `docker run -t` (docker.go:76), but sandboxes do not.
@@ -676,15 +864,7 @@ func buildEntrypoint(cfg RunConfig) ([]string, error) {
 	// session's lifetime without needing a terminal. PID 1 exits when the
 	// session ends (all windows closed), providing the same lifecycle
 	// semantics as attach-session did in the Docker case.
-	//
-	// Note the boundary between tmux subcommands and the poll loop:
-	// `\;` is a tmux command separator (parsed by tmux), while the bare
-	// `;` after select-window ends the tmux invocation and starts the
-	// shell's while loop.
-	tmuxCmd := fmt.Sprintf(
-		"tmux new-session -d -s scion -n agent %s \\; set-option -g window-size latest \\; new-window -t scion -n shell \\; select-window -t scion:agent; while tmux has-session -t scion 2>/dev/null; do sleep 2; done",
-		agentWindowCmd,
-	)
+	tmuxCmd := buildTmuxStartCmd(agentWindowCmd, tmuxPollSession)
 
 	// CRITICAL: argv[0] must be an absolute path. The sandbox launcher resolves
 	// argv[0] BEFORE the PATH env var (set by envFor) is in effect, so bare "sh"
@@ -712,8 +892,11 @@ func buildEntrypoint(cfg RunConfig) ([]string, error) {
 	// No .rc file: `exec` replaces the shell on success (echo never runs),
 	// and `sandbox wait` already provides the exit code on the host side.
 	logPath := filepath.Join(sandboxAgentHome, entrypointLogFile)
-	wrappedCmd := fmt.Sprintf("{ exec sciontool init -- /bin/sh -c %s; } > %s 2>&1",
-		shellQuote(tmuxCmd), logPath)
+	// Append (>>), not truncate (>): a restart must preserve the previous
+	// run's diagnostic output.  The run delimiter makes boundaries
+	// unambiguous when multiple runs accumulate in the same file.  #110.
+	wrappedCmd := fmt.Sprintf("echo \"--- entrypoint start $(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) ---\" >> %s 2>&1; { exec sciontool init -- /bin/sh -c %s; } >> %s 2>&1",
+		logPath, shellQuote(tmuxCmd), logPath)
 	return []string{"/bin/sh", "-c", wrappedCmd}, nil
 }
 
@@ -778,17 +961,137 @@ func waitForSandboxLiveness(ctx context.Context, delays []time.Duration, probe f
 		probeErr = probe(probeCtx)
 		probeCancel()
 		if probeErr == nil {
-			runtimeLog.Info("sandbox liveness probe passed", "name", name, "attempt", i+1)
+			runtimeLog().Info("sandbox liveness probe passed", "name", name, "attempt", i+1)
 			return nil
 		}
-		runtimeLog.Debug("sandbox liveness probe failed, retrying",
+		runtimeLog().Debug("sandbox liveness probe failed, retrying",
 			"name", name, "attempt", i+1, "delay", delay, "error", probeErr)
 	}
 	return probeErr
 }
 
+// sandboxMaxEnvArgBytes bounds a single env entry passed to the sandbox
+// CLI. Each entry travels as one "--env KEY=VALUE" argv string, which Linux
+// caps at 128 KiB including the NUL terminator (MAX_ARG_STRLEN). The limit
+// is checked against the whole KEY=VALUE string, not the value alone.
+const sandboxMaxEnvArgBytes = 128 * 1024
+
+// sandboxEnvLimit applies sandboxMaxEnvArgBytes to the full argv string.
+var sandboxEnvLimit = envSizeLimit{maxBytes: sandboxMaxEnvArgBytes, includeKey: true}
+
+// sandboxRuntimeEnvKeys are fixed by envFor, so an env-type secret must not
+// supply them. SCION_HOST_UID/SCION_HOST_GID drive the sandbox user setup
+// (the Cloud Run instance runtime reserves the same two keys).
+// SCION_WORKSPACE_PATH, HOME, USER and LOGNAME describe the sandbox mount
+// layout and let tmux find the pane-exited hook in the agent home; the
+// user cannot change those paths, so a secret must not override them.
+// PATH stays overridable, as in Docker.
+var sandboxRuntimeEnvKeys = []string{
+	"SCION_HOST_UID", "SCION_HOST_GID",
+	"SCION_WORKSPACE_PATH", "HOME", "USER", "LOGNAME",
+}
+
+// applySecretEnvOverrides sets each env-type secret key in env to its value
+// from cfgEnv, after harness, auth and synthesised env have been applied.
+// As in Docker, where the secret -e flag comes last, the secret wins.
+// secretKeys never collide with the caller's original cfg.Env keys, since
+// applyResolvedSecretsToEnv skips those.
+func applySecretEnvOverrides(env map[string]string, cfgEnv []string, secretKeys []string) {
+	if len(secretKeys) == 0 {
+		return
+	}
+	want := make(map[string]struct{}, len(secretKeys))
+	for _, k := range secretKeys {
+		want[k] = struct{}{}
+	}
+	for _, e := range cfgEnv {
+		k, v, ok := strings.Cut(e, "=")
+		if _, isSecret := want[k]; ok && isSecret {
+			env[k] = v
+		}
+	}
+}
+
+// sandboxNameLocks serializes Run per sandbox name (ptone/scion#3738). The
+// sandbox name is derived from the agent name and reused across runs, and
+// the sandbox CLI keeps no labels, so two overlapping Runs of one agent
+// could otherwise interleave: an older Run's dead-on-arrival cleanup
+// deleting the newer Run's sandbox by name, or an older Run's probe passing
+// on the newer sandbox and recording it as its own. Holding the name's lock
+// from the launch through the probe and the state record or cleanup closes
+// that window.
+//
+// The lock is package-level, so same-name Runs are serialized within one
+// process across every CloudRunSandboxRuntime (the factory builds one per
+// call). A second process on the same host is NOT fenced: neither this lock
+// nor the per-instance state Run reads covers it (ptone/scion#3951).
+var sandboxNameLocks sync.Map // sandbox name -> *sync.Mutex
+
+// lockSandboxName takes the Run lock for a sandbox name and returns its
+// unlock.
+func lockSandboxName(name string) func() {
+	v, _ := sandboxNameLocks.LoadOrStore(name, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// sandboxHeldByOtherRun returns the run ID of a live (not stopped) state
+// entry for name that belongs to a run other than runID, or "" if there is
+// none. An entry with no run label, or a Run with no run ID, never
+// conflicts (the legacy rule sandboxRunCheck applies).
+func (r *CloudRunSandboxRuntime) sandboxHeldByOtherRun(name, runID string) string {
+	if runID == "" {
+		return ""
+	}
+	entry := r.state.get(name)
+	if entry == nil || entry.Stopped {
+		return ""
+	}
+	if run := entry.Labels[api.LabelRunID]; run != "" && run != runID {
+		return run
+	}
+	return ""
+}
+
+// sandboxAfterLaunchHook, if set, runs after `sandbox run` returns and
+// before the liveness probe. Nil in production; tests use it to model a
+// concurrent start inside that window.
+var sandboxAfterLaunchHook func(name string)
+
 func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string, error) {
+	// Fold resolved secrets into cfg.Env before anything is created and
+	// before envFor reads it, so they reach the sandbox as --env values and
+	// are covered by the error-output redaction (externalEnvValues reads
+	// cfg.Env).
+	secretKeys, err := applyResolvedSecretsToEnv(&cfg, sandboxEnvLimit, sandboxRuntimeEnvKeys...)
+	if err != nil {
+		return "", fmt.Errorf("cloudrun-sandbox: %w", err)
+	}
+
 	slug := sanitizeSandboxName(cfg.Name)
+	runID := cfg.Labels[api.LabelRunID]
+
+	// Serialize same-name Runs from launch to state record or cleanup
+	// (sandboxNameLocks).
+	unlock := lockSandboxName(slug)
+	defer unlock()
+
+	// The sandbox name is held by a live sandbox of another run: reusing
+	// the name would take that sandbox over (its probe passes and this
+	// run's entry replaces the other's), so refuse, as the Cloud Run and
+	// Kubernetes runtimes do. Start's pre-clean normally removes it
+	// first; this is reached after a failed listing. It only sees an
+	// entry already in this instance's state when the check runs: r.state
+	// is loaded from disk when the instance is built (one per factory
+	// call), so a Run whose instance predates another Run's record misses
+	// that entry. Re-loading the state under the lock is left for
+	// ptone/scion#3951.
+	if other := r.sandboxHeldByOtherRun(slug, runID); other != "" {
+		runtimeLog().Info("Sandbox of another run holds the agent's sandbox name; not reusing it",
+			"sandbox", slug, "run_id", runID, "sandbox_run_id", other)
+		return "", fmt.Errorf("cloudrun-sandbox: sandbox %s belongs to run %q, not %q: %w", slug, other, runID, ErrRunConflict)
+	}
 
 	// OQ-14 (§11.12) proved that Vertex AI and gcloud-adc auth modes work
 	// on this runtime via the metadata emulator. The emulator runs INSIDE
@@ -806,7 +1109,7 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 	if cfg.ResolvedAuth != nil {
 		method := cfg.ResolvedAuth.Method
 		if method == "vertex-ai" || strings.Contains(strings.ToLower(method), "gcloud") {
-			runtimeLog.Info("cloudrun-sandbox: GCP auth mode in sandbox — "+
+			runtimeLog().Info("cloudrun-sandbox: GCP auth mode in sandbox — "+
 				"credentials provided via in-sandbox metadata emulator on loopback",
 				"method", method, "agent", cfg.Name)
 		}
@@ -818,6 +1121,23 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 	if err != nil {
 		return "", fmt.Errorf("cloudrun-sandbox: prepare layout: %w", err)
 	}
+
+	// Stat the entrypoint log BEFORE the sandbox launches to capture the
+	// current size as an offset. This run's output starts after this point;
+	// prior content (from earlier runs, if PR 1323 append-mode is present)
+	// is skipped. The entrypoint has not started yet, so nothing can write
+	// to the file between this stat and sandbox launch.
+	entrypointLogPath := filepath.Join(paths.agentHome, entrypointLogFile)
+	var entrypointLogOffset int64
+	if st, err := os.Stat(entrypointLogPath); err == nil {
+		entrypointLogOffset = st.Size()
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// Unexpected stat error (permission denied, I/O error). Proceed with
+		// offset 0 but warn — this may cause prior-run output to be re-shipped.
+		runtimeLog().Warn("entrypoint log stat failed unexpectedly; starting from offset 0",
+			"path", entrypointLogPath, "error", err, "sandbox", slug)
+	}
+	// ENOENT is the normal case for first-ever run: offset stays 0.
 
 	// Build environment.
 	env := envFor(cfg, paths)
@@ -842,6 +1162,9 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 		// the Docker runtime's file-copy mode (common.go:820-839) for
 		// robustness in case the staging path is bypassed or incomplete.
 		for _, f := range cfg.ResolvedAuth.Files {
+			if f.SourcePath == "" {
+				continue
+			}
 			containerPath := expandTildeTarget(f.ContainerPath, sandboxAgentHome)
 			var relPath string
 			if strings.HasPrefix(containerPath, sandboxAgentHome+"/") {
@@ -851,17 +1174,22 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 			}
 			dst := filepath.Join(paths.agentHome, relPath)
 			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-				runtimeLog.Warn("cloudrun-sandbox: failed to create directory for auth file",
+				runtimeLog().Warn("cloudrun-sandbox: failed to create directory for auth file",
 					"dst", dst, "error", err)
 				continue
 			}
 			if err := util.CopyFile(f.SourcePath, dst); err != nil {
-				runtimeLog.Warn("cloudrun-sandbox: failed to copy auth file",
+				runtimeLog().Warn("cloudrun-sandbox: failed to copy auth file",
 					"src", f.SourcePath, "dst", dst, "error", err)
 				continue
 			}
 		}
 	}
+
+	// Env-type secrets win over harness, auth and synthesised env, as in
+	// Docker, except sandboxRuntimeEnvKeys. Keys from the caller's cfg.Env
+	// still win over secrets.
+	applySecretEnvOverrides(env, cfg.Env, secretKeys)
 
 	// Build entrypoint command.
 	entrypoint, err := buildEntrypoint(cfg)
@@ -883,6 +1211,17 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 	// Per-agent mounts -- each sandbox gets only its own paths (not /scion root).
 	for _, m := range mountsFor(paths, cfg.SharedDirs) {
 		args = append(args, "--mount", m)
+	}
+
+	// The template env fallback (ptone/scion#4524) is the LAST env step:
+	// only keys no source above set, never a suppressed key.
+	emitted := make(map[string]bool, len(env))
+	for k := range env {
+		emitted[k] = true
+	}
+	for _, e := range FallbackEnvEntries(cfg.FallbackEnv, cfg.SuppressedFallbackKeys, emitted) {
+		k, v, _ := strings.Cut(e, "=")
+		env[k] = v
 	}
 
 	// Environment variables via --env flags (repeatable, confirmed by AC-0 retest).
@@ -915,6 +1254,10 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 		// rebuilding this error from a string would sever that chain silently.
 		safeOut := redactEnvValues(out, externalEnvValues(cfg, env))
 		return "", fmt.Errorf("cloudrun-sandbox: run failed: %w (output: %s)", err, safeOut)
+	}
+
+	if sandboxAfterLaunchHook != nil {
+		sandboxAfterLaunchHook(slug)
 	}
 
 	// Post-run liveness probe: `sandbox run --detach` returns rc=0 even for
@@ -951,18 +1294,17 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 		// to sandboxAgentHome (/home/scion, the mount destination). The bind
 		// mount makes them the same file. We cannot use `sandbox exec` here
 		// — the probe just proved the sandbox is dead.
+		// Only this run's output (from entrypointLogOffset): with append
+		// mode, the whole file would show a prior run's output as the cause.
 		var diagInfo string
 		logPath := filepath.Join(paths.agentHome, entrypointLogFile)
-		if logData, readErr := os.ReadFile(logPath); readErr == nil {
-			logStr := string(logData)
-			// Truncate to the last 2000 bytes to keep error messages readable.
-			if len(logStr) > 2000 {
-				logStr = "...(truncated)\n" + logStr[len(logStr)-2000:]
-			}
-			diagInfo += fmt.Sprintf("\nentrypoint log (%s):\n%s", logPath, logStr)
+		if logStr := entrypointLogTail(logPath, entrypointLogOffset, entrypointLogTailMax); logStr != "" {
+			diagInfo = fmt.Sprintf("\nentrypoint log (%s):\n%s", logPath, logStr)
+		} else {
+			diagInfo = fmt.Sprintf("\nno entrypoint output from this run (%s)", logPath)
 		}
 
-		runtimeLog.Error("sandbox dead on arrival: all liveness probes failed",
+		runtimeLog().Error("sandbox dead on arrival: all liveness probes failed",
 			"name", slug, "agentID", cfg.Name, "error", probeErr, "diagnostics", diagInfo)
 		// Attempt cleanup — sandbox may be in a broken state.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -990,6 +1332,8 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 		AgentHome:     paths.agentHome,
 		Workspace:     paths.workspace,
 		Image:         cfg.Image,
+
+		EntrypointLogOffset: entrypointLogOffset,
 	}
 	r.state.add(entry)
 
@@ -1002,17 +1346,28 @@ func (r *CloudRunSandboxRuntime) Run(ctx context.Context, cfg RunConfig) (string
 	r.watchCancels[slug] = watchCancel
 	r.watchMu.Unlock()
 	go r.watchSandbox(watchCtx, slug)
+	go r.tailEntrypointLog(watchCtx, slug, cfg.Name, cfg.Project, paths, entrypointLogOffset)
 
 	return slug, nil
 }
 
-func (r *CloudRunSandboxRuntime) Stop(ctx context.Context, id string) error {
+// Stop removes the sandbox ref.ID: there is no stop/pause verb, so Stop
+// is Delete, including its run check (sandboxRunCheck).
+func (r *CloudRunSandboxRuntime) Stop(ctx context.Context, ref RunRef) error {
 	// sandbox delete requires --force for running sandboxes.
 	// There is no stop/pause verb; Stop == Delete.
-	return r.deleteOrWorkaround(ctx, id)
+	return r.Delete(ctx, ref)
 }
 
-func (r *CloudRunSandboxRuntime) Delete(ctx context.Context, id string) error {
+// Delete removes the sandbox ref.ID. The sandbox name is reused across
+// runs, so when ref.RunID is set the state entry is checked first
+// (sandboxRunCheck) and a sandbox of another run is left untouched
+// (ptone/scion#2550).
+func (r *CloudRunSandboxRuntime) Delete(ctx context.Context, ref RunRef) error {
+	id := ref.ID
+	if proceed, err := r.sandboxRunCheck(ref); !proceed {
+		return err
+	}
 	// Always use --force: sandbox delete without it silently fails for
 	// running sandboxes. NEVER fall back to plain delete (without --force) --
 	// it refuses AND kills the sandbox anyway, leaving orphaned
@@ -1020,6 +1375,35 @@ func (r *CloudRunSandboxRuntime) Delete(ctx context.Context, id string) error {
 	// running". This is the more dangerous defect. See
 	// defect-sandbox-delete-hang.md.
 	return r.deleteOrWorkaround(ctx, id)
+}
+
+// sandboxRunCheck enforces ref.RunID before a Stop or Delete, from the
+// state store (the only record of sandboxes: the CLI has no list). It
+// reports whether the delete may proceed:
+//   - no run ID: proceed by name, as before run IDs existed;
+//   - an entry of ref.RunID, or a legacy entry with no run label (the rule
+//     k8s and the broker apply): proceed;
+//   - an entry of another run: do not proceed; ErrRunMismatch;
+//   - no entry: do not proceed; nil. The run's sandbox is already gone
+//     (deleted, or pruned by reconcile), as k8s treats a missing pod, and a
+//     sandbox of a newer run still starting (run, before its entry is
+//     recorded) is not deleted by name.
+func (r *CloudRunSandboxRuntime) sandboxRunCheck(ref RunRef) (bool, error) {
+	if ref.RunID == "" {
+		return true, nil
+	}
+	entry := r.state.get(ref.ID)
+	if entry == nil {
+		runtimeLog().Info("Run-scoped sandbox delete: no state entry; treating the run's sandbox as gone",
+			"sandbox", ref.ID, "run_id", ref.RunID)
+		return false, nil
+	}
+	if run := entry.Labels[api.LabelRunID]; run != "" && run != ref.RunID {
+		runtimeLog().Info("Left a sandbox of another run untouched",
+			"sandbox", ref.ID, "run_id", ref.RunID, "sandbox_run_id", run)
+		return false, fmt.Errorf("sandbox %s belongs to run %q, not %q: %w", ref.ID, run, ref.RunID, ErrRunMismatch)
+	}
+	return true, nil
 }
 
 // deleteOrWorkaround dispatches to the workaround or the plain path based
@@ -1044,9 +1428,27 @@ func (r *CloudRunSandboxRuntime) deleteOrWorkaround(ctx context.Context, id stri
 
 // deletePlain is the non-workaround path: plain `sandbox delete --force`.
 // Used when SCION_CLOUDRUN_DELETE_WORKAROUND=off.
+//
+// A sandbox that is already gone (sandboxDeleteGone) counts as deleted:
+// the entry is removed and nil returned. Any failure keeps the entry.
 func (r *CloudRunSandboxRuntime) deletePlain(ctx context.Context, id string) error {
 	cmd := exec.CommandContext(ctx, r.bin, "delete", "--force", id)
-	if err := cmd.Run(); err != nil {
+	outFile := newSandboxDeleteOutput()
+	if outFile != nil {
+		defer func() { _ = outFile.Close() }()
+		cmd.Stdout = outFile
+		cmd.Stderr = outFile
+	}
+	err := cmd.Run()
+	out := readSandboxDeleteOutput(outFile)
+	switch result := classifySandboxDelete(ctx, out, err, false); result {
+	case sandboxDeleteDeleted:
+	case sandboxDeleteGone:
+		runtimeLog().Info("cloudrun-sandbox: delete --force found the sandbox already gone",
+			"sandbox", id, "output", sandboxDeleteOutputForLog(out))
+	default:
+		runtimeLog().Warn("cloudrun-sandbox: delete --force failed",
+			"sandbox", id, "result", result.String(), "error", err, "output", sandboxDeleteOutputForLog(out))
 		return fmt.Errorf("cloudrun-sandbox: delete --force failed: %w", err)
 	}
 	r.state.remove(id)
@@ -1060,24 +1462,9 @@ func (r *CloudRunSandboxRuntime) List(ctx context.Context, labelFilter map[strin
 
 	var agents []api.AgentInfo
 	for _, entry := range entries {
-		// Label filtering (same pattern as docker.go:182-201).
-		match := true
-		for k, v := range labelFilter {
-			actual := entry.Labels[k]
-			if actual == "" {
-				switch k {
-				case projectcompat.LabelProject:
-					actual = projectcompat.ProjectNameFromLabels(entry.Labels)
-				case projectcompat.LabelProjectID:
-					actual = projectcompat.ProjectIDFromLabels(entry.Labels)
-				}
-			}
-			if actual != v {
-				match = false
-				break
-			}
-		}
-		if !match {
+		// Label filtering uses the shared LabelsMatchFilter, so the project
+		// path is compared as a resolved path, as on the other runtimes.
+		if !LabelsMatchFilter(entry.Labels, labelFilter) {
 			continue
 		}
 
@@ -1104,6 +1491,7 @@ func (r *CloudRunSandboxRuntime) List(ctx context.Context, labelFilter map[strin
 		// so it is available when the above conditions are met.
 		agents = append(agents, api.AgentInfo{
 			ContainerID:     entry.SandboxName,
+			RunID:           entry.Labels[api.LabelRunID],
 			Name:            entry.AgentID,
 			ContainerStatus: statusStr,
 			Phase:           phase,
@@ -1121,9 +1509,83 @@ func (r *CloudRunSandboxRuntime) List(ctx context.Context, labelFilter map[strin
 }
 
 func (r *CloudRunSandboxRuntime) GetLogs(ctx context.Context, id string) (string, error) {
-	// Use tmux capture-pane to get the scrollback buffer.
+	// Try tmux capture-pane first (live sandbox path).
 	// Absolute paths required -- PATH is empty inside a sandbox.
-	return runSimpleCommand(ctx, r.bin, "exec", id, "--", "/usr/bin/tmux", "capture-pane", "-p", "-t", "scion", "-S", "-1000")
+	logs, err := runSimpleCommand(ctx, r.bin, "exec", id, "--", "/usr/bin/tmux", "capture-pane", "-p", "-t", "scion", "-S", "-1000")
+	if err == nil && strings.TrimSpace(logs) != "" {
+		return logs, nil
+	}
+
+	// Fall back to reading the entrypoint log from the host filesystem
+	// via the state entry. This triggers in two cases:
+	//
+	//   1. tmux exec failed — the sandbox is likely dead.
+	//   2. tmux succeeded but returned empty output — the pane has
+	//      printed nothing (or only whitespace). Showing the entrypoint
+	//      log is strictly better than an empty tab, and the source
+	//      label (below) tells the operator what they are looking at.
+	//
+	// WHY FALLBACK, NOT FLAG CHECK: on this tier, liveness flags have
+	// been wrong before (#17: hub reported agents "running" when the
+	// entrypoint had hung). A flag-check strategy would consult the
+	// flag, and if it said "running" while the sandbox was dead, it
+	// would SKIP the fallback and return the exec error — leaving the
+	// tab empty in precisely the case the feature exists for. Try-and-
+	// fallback is strictly more robust: it does not consult the flag.
+
+	var reason string
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		// Preserve the tmux failure for diagnostics. The operator gets
+		// the fallback content (better than empty), but the exec error
+		// is recorded so it can be found during debugging.
+		runtimeLog().Warn("tmux capture-pane failed, falling back to entrypoint log",
+			"agent_id", id, "error", err)
+		reason = "sandbox was not reachable via tmux"
+	} else {
+		reason = "tmux returned no terminal output"
+	}
+
+	return r.readEntrypointLogFromState(id, reason)
+}
+
+// readEntrypointLogFromState reads the entrypoint log from the host
+// filesystem using the AgentHome path stored in the sandbox state entry.
+// This is the same file and the same host-side path that the DOA handler
+// (line 812-826) reads after a failed liveness probe — the mechanism
+// exists, this gives it an exit through GetLogs.
+func (r *CloudRunSandboxRuntime) readEntrypointLogFromState(id, reason string) (string, error) {
+	entry := r.state.get(id)
+	if entry == nil {
+		return "", fmt.Errorf("cloudrun-sandbox: sandbox %q not found in state store", id)
+	}
+	if entry.AgentHome == "" {
+		return "", fmt.Errorf("cloudrun-sandbox: sandbox %q has no AgentHome in state entry", id)
+	}
+
+	logPath := filepath.Join(entry.AgentHome, entrypointLogFile)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// State the observation, not the inference.
+			return fmt.Sprintf("[no entrypoint log at %s]", logPath), nil
+		}
+		return "", fmt.Errorf("cloudrun-sandbox: failed to read entrypoint log at %s: %w", logPath, err)
+	}
+
+	if len(data) == 0 {
+		return fmt.Sprintf("[entrypoint log at %s is empty]", logPath), nil
+	}
+
+	// Label the source so the operator knows this is startup output,
+	// not live terminal content. This is mandatory: without it, the
+	// output is indistinguishable from a live pane. The reason is
+	// per-case so the operator can distinguish "agent is dead" from
+	// "agent has not printed yet."
+	header := fmt.Sprintf("[source: entrypoint log (startup) — %s]\n", reason)
+	return header + string(data), nil
 }
 
 func (r *CloudRunSandboxRuntime) Attach(ctx context.Context, id string) error {
@@ -1181,6 +1643,16 @@ func (r *CloudRunSandboxRuntime) Exec(ctx context.Context, id string, cmd []stri
 	return runSimpleCommand(ctx, r.bin, args...)
 }
 
+// ExecWithStdin runs cmd inside the sandbox with stdin piped from the given
+// reader. Unlike docker/podman, `sandbox exec` has no explicit -i flag: it
+// forwards whatever stdio is attached to the launcher process (see Attach,
+// which relies on the same behaviour for interactive tmux sessions). See
+// #1355.
+func (r *CloudRunSandboxRuntime) ExecWithStdin(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
+	args := append([]string{"exec", id, "--"}, cmd...)
+	return runSimpleCommandWithStdin(ctx, stdin, r.bin, args...)
+}
+
 // GetWorkspacePath returns the HOST-side workspace path from the state
 // store (e.g. /scion/agents/<slug>/workspace). This is the path on the
 // launcher filesystem, not the path inside the sandbox — mountsFor
@@ -1210,7 +1682,7 @@ func (r *CloudRunSandboxRuntime) watchSandbox(ctx context.Context, name string) 
 	// If the context was cancelled (sandbox was force-deleted), don't
 	// update the state store — deleteOrWorkaround handles cleanup.
 	if ctx.Err() != nil {
-		runtimeLog.Debug("watcher cancelled for deleted sandbox", "name", name)
+		runtimeLog().Debug("watcher cancelled for deleted sandbox", "name", name)
 		return
 	}
 
@@ -1236,8 +1708,26 @@ func (r *CloudRunSandboxRuntime) watchSandbox(ctx context.Context, name string) 
 	}
 
 	// Log at info level — sandbox exit is normal (C5).
-	runtimeLog.Info("sandbox exited", "name", name, "exitCode", exitCode)
+	runtimeLog().Info("sandbox exited", "name", name, "exitCode", exitCode)
 	r.state.markStopped(name, exitCode, &now)
+
+	// A non-zero or unknown exit (e.g. death during provisioning) is logged
+	// with this run's entrypoint output: once Delete drops the state entry,
+	// GetLogs can no longer reach it. A non-zero code is an error; an
+	// unknown code (nil) is treated as normal (C5) and logged at warn.
+	if exitCode == nil || *exitCode != 0 {
+		if entry := r.state.get(name); entry != nil && entry.AgentHome != "" {
+			logPath := filepath.Join(entry.AgentHome, entrypointLogFile)
+			logFn, msg := runtimeLog().Error, "sandbox exited abnormally"
+			if exitCode == nil {
+				logFn, msg = runtimeLog().Warn, "sandbox exited with unknown exit code"
+			}
+			logFn(msg,
+				"name", name, "agentID", entry.AgentID, "exitCode", exitCode,
+				"waitOutput", strings.TrimSpace(string(out)),
+				"entrypointLog", entrypointLogTail(logPath, entry.EntrypointLogOffset, entrypointLogTailMax))
+		}
+	}
 
 	// Clean up the cancel function from the map.
 	r.watchMu.Lock()
@@ -1248,6 +1738,47 @@ func (r *CloudRunSandboxRuntime) watchSandbox(ctx context.Context, name string) 
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
+
+// entrypointLogTailMax bounds the entrypoint output put in errors and logs.
+const entrypointLogTailMax = 2000
+
+// entrypointLogTail returns the last max bytes of the entrypoint log
+// written at or after offset (this run's output), or "" when there is
+// none or the file cannot be read. A file shorter than offset was
+// truncated and is read from the start. At most max bytes are read, so
+// a large append-mode log is never loaded whole.
+func entrypointLogTail(path string, offset int64, max int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := info.Size()
+	if offset < 0 || size < offset {
+		offset = 0
+	}
+	start := offset
+	if size-int64(max) > start {
+		start = size - int64(max)
+	}
+	if size <= start {
+		return ""
+	}
+	buf := make([]byte, size-start)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ""
+	}
+	tail := string(buf[:n])
+	if start > offset {
+		return "...(truncated)\n" + tail
+	}
+	return tail
+}
 
 // labelValue safely retrieves a label value, returning "" if the map is
 // nil or the key is absent.

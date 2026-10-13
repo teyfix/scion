@@ -28,6 +28,24 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
 
+// authenticatingHubConnCtxKey is the context key MultiKeyBrokerAuthMiddleware
+// uses to record which hub connection's key authenticated an incoming
+// request (design t1-async-create-v11.md §3.8.5 routing rule 2). It is the
+// authenticated source the broker uses to pick which hub connection owns
+// a launch, so later reports
+// for it are sent directly to that connection instead of fanning out.
+type authenticatingHubConnCtxKey struct{}
+
+// authenticatingHubConnFromContext returns the name of the hub connection
+// whose secret key verified the request's HMAC signature, or "" when
+// authentication is disabled, unauthenticated requests are allowed through,
+// or no context value was set (e.g. a request built by a test without
+// routing it through the middleware).
+func authenticatingHubConnFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(authenticatingHubConnCtxKey{}).(string)
+	return name
+}
+
 // BrokerAuthConfig configures host-side HMAC authentication.
 type BrokerAuthConfig struct {
 	// Enabled controls whether authentication is enforced.
@@ -195,6 +213,8 @@ type MultiKeyBrokerAuthMiddleware struct {
 	maxClockSkew         time.Duration
 	allowUnauthenticated bool
 	enabled              bool
+	// Test-only barrier after signature/header verification, before a lease.
+	beforeAuthorityAdmission func()
 }
 
 // NewMultiKeyBrokerAuthMiddleware creates a new multi-key broker authentication middleware.
@@ -208,151 +228,163 @@ func NewMultiKeyBrokerAuthMiddleware(enabled bool, maxClockSkew time.Duration, a
 
 // UpdateKeys replaces the set of secret keys used for verification.
 func (m *MultiKeyBrokerAuthMiddleware) UpdateKeys(keys []secretKeyEntry) {
-	cloned := make([]secretKeyEntry, len(keys))
-	for i := range keys {
-		cloned[i] = keys[i]
-		cloned[i].secretKey = append([]byte(nil), keys[i].secretKey...)
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.keys = cloned
+	m.keys = make([]secretKeyEntry, len(keys))
+	for i := range keys {
+		m.keys[i] = keys[i]
+		m.keys[i].secretKey = append([]byte(nil), keys[i].secretKey...)
+	}
 }
 
 // Middleware returns an HTTP middleware handler that validates HMAC signatures
 // against any of the registered secret keys.
 func (m *MultiKeyBrokerAuthMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		m.mu.RLock()
-		enabled := m.enabled
-		allowUnauth := m.allowUnauthenticated
-		keys := append([]secretKeyEntry(nil), m.keys...)
-		maxSkew := m.maxClockSkew
-		m.mu.RUnlock()
-
-		if !enabled {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Health endpoints are always public — no authentication required.
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Extract HMAC headers
-		brokerID := r.Header.Get(apiclient.HeaderBrokerID)
-		timestamp := r.Header.Get(apiclient.HeaderTimestamp)
-		nonce := r.Header.Get(apiclient.HeaderNonce)
-		signature := r.Header.Get(apiclient.HeaderSignature)
-
-		// If no HMAC headers present, check if unauthenticated requests are allowed
-		if brokerID == "" && timestamp == "" && signature == "" {
-			if allowUnauth {
-				next.ServeHTTP(w, r)
-				return
-			}
-			m.writeError(w, "missing authentication headers")
-			return
-		}
-
-		// Validate required headers
-		if brokerID == "" {
-			m.writeError(w, "missing X-Scion-Broker-ID header")
-			return
-		}
-		if timestamp == "" {
-			m.writeError(w, "missing X-Scion-Timestamp header")
-			return
-		}
-		if signature == "" {
-			m.writeError(w, "missing X-Scion-Signature header")
-			return
-		}
-
-		// Validate timestamp
-		ts, err := strconv.ParseInt(timestamp, 10, 64)
-		if err != nil {
-			m.writeError(w, "invalid timestamp format")
-			return
-		}
-
-		requestTime := time.Unix(ts, 0)
-		clockSkew := time.Since(requestTime)
-		if clockSkew < 0 {
-			clockSkew = -clockSkew
-		}
-		if clockSkew > maxSkew {
-			m.writeError(w, fmt.Sprintf("timestamp outside acceptable range (skew: %v)", clockSkew))
-			return
-		}
-
-		// Decode the signature
-		sigBytes, err := base64.StdEncoding.DecodeString(signature)
-		if err != nil {
-			m.writeError(w, "invalid signature encoding")
-			return
-		}
-
-		// Build canonical string
-		canonical := apiclient.BuildCanonicalString(r, timestamp, nonce)
-
-		// Resolve exactly one signing authority. The broker ID is not part of
-		// the canonical signature, so it must agree with the identity bound to
-		// the matching key rather than being trusted as request metadata.
-		var matches []secretKeyEntry
-		for _, entry := range keys {
-			if apiclient.VerifyHMAC(entry.secretKey, canonical, sigBytes) {
-				matches = append(matches, entry)
-			}
-		}
-		if len(matches) == 0 {
-			m.writeError(w, "invalid signature")
-			return
-		}
-		if len(matches) != 1 {
-			m.writeError(w, "ambiguous signing authority")
-			return
-		}
-
-		entry := matches[0]
-		if entry.brokerID == "" || brokerID != entry.brokerID {
-			m.writeError(w, "broker identity does not match signing authority")
-			return
-		}
-		if requestedConnection := r.Header.Get("X-Scion-Hub-Connection"); requestedConnection != "" && requestedConnection != entry.hubName {
-			m.writeError(w, "hub connection does not match signing authority")
-			return
-		}
-
-		// Production key entries retain their connection. Keep its read lease
-		// through the downstream handler so a credential rotation cannot turn
-		// an admitted request into a request for a different Hub identity.
-		if entry.connection != nil {
-			entry.connection.mu.RLock()
-			if !entry.connection.authorityReady.Load() ||
-				entry.connection.authorityGeneration.Load() != entry.generation ||
-				entry.connection.Name != entry.hubName ||
-				entry.connection.BrokerID != entry.brokerID ||
-				entry.connection.HubEndpoint != entry.hubEndpoint ||
-				!bytes.Equal(entry.connection.SecretKey, entry.secretKey) {
-				entry.connection.mu.RUnlock()
-				m.writeError(w, "stale signing authority")
-				return
-			}
-			defer entry.connection.mu.RUnlock()
-		}
-
-		authority := &brokerRequestAuthority{
-			hubName:     entry.hubName,
-			brokerID:    entry.brokerID,
-			hubEndpoint: entry.hubEndpoint,
-			generation:  entry.generation,
-			connection:  entry.connection,
-		}
-		ctx := context.WithValue(r.Context(), brokerRequestAuthorityKey{}, authority)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		m.ServeWith(w, r, next)
 	})
+}
+
+// ServeWith handles r as the handler returned by Middleware(next) does.
+func (m *MultiKeyBrokerAuthMiddleware) ServeWith(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	m.mu.RLock()
+	enabled := m.enabled
+	allowUnauth := m.allowUnauthenticated
+	keys := append([]secretKeyEntry(nil), m.keys...)
+	maxSkew := m.maxClockSkew
+	m.mu.RUnlock()
+
+	if !enabled {
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	// Health endpoints are always public — no authentication required.
+	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	// Extract HMAC headers
+	brokerID := r.Header.Get(apiclient.HeaderBrokerID)
+	timestamp := r.Header.Get(apiclient.HeaderTimestamp)
+	nonce := r.Header.Get(apiclient.HeaderNonce)
+	signature := r.Header.Get(apiclient.HeaderSignature)
+
+	// If no HMAC headers present, check if unauthenticated requests are allowed
+	if brokerID == "" && timestamp == "" && signature == "" {
+		if allowUnauth {
+			next.ServeHTTP(w, r)
+			return
+		}
+		m.writeError(w, "missing authentication headers")
+		return
+	}
+
+	// Validate required headers
+	if brokerID == "" {
+		m.writeError(w, "missing X-Scion-Broker-ID header")
+		return
+	}
+	if timestamp == "" {
+		m.writeError(w, "missing X-Scion-Timestamp header")
+		return
+	}
+	if signature == "" {
+		m.writeError(w, "missing X-Scion-Signature header")
+		return
+	}
+
+	// Validate timestamp
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		m.writeError(w, "invalid timestamp format")
+		return
+	}
+
+	requestTime := time.Unix(ts, 0)
+	clockSkew := time.Since(requestTime)
+	if clockSkew < 0 {
+		clockSkew = -clockSkew
+	}
+	if clockSkew > maxSkew {
+		m.writeError(w, fmt.Sprintf("timestamp outside acceptable range (skew: %v)", clockSkew))
+		return
+	}
+
+	// Decode the signature
+	sigBytes, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil {
+		m.writeError(w, "invalid signature encoding")
+		return
+	}
+
+	// Build canonical string
+	canonical := apiclient.BuildCanonicalString(r, timestamp, nonce)
+
+	// Broker ID and connection headers are not part of the HMAC canonical
+	// string. Bind them to exactly one matching signing authority.
+	var matches []secretKeyEntry
+	for _, entry := range keys {
+		if apiclient.VerifyHMAC(entry.secretKey, canonical, sigBytes) {
+			matches = append(matches, entry)
+		}
+	}
+	if len(matches) == 0 {
+		m.writeError(w, "invalid signature")
+		return
+	}
+	if len(matches) != 1 {
+		m.writeError(w, "ambiguous signing authority")
+		return
+	}
+	entry := matches[0]
+	if entry.brokerID == "" || brokerID != entry.brokerID {
+		m.writeError(w, "broker identity does not match signing authority")
+		return
+	}
+	if requested := r.Header.Get("X-Scion-Hub-Connection"); requested != "" && requested != entry.hubName {
+		m.writeError(w, "hub connection does not match signing authority")
+		return
+	}
+	ctx := r.Context()
+	if m.beforeAuthorityAdmission != nil {
+		m.beforeAuthorityAdmission()
+	}
+	if entry.connection != nil {
+		// Keep admission separate from hc.mu: handlers may take snapshots
+		// under hc.mu while a credential transition waits for this lease.
+		conn := entry.connection
+		conn.authorityMu.RLock()
+		conn.mu.Lock()
+		current := conn.authorityReady.Load() &&
+			conn.authorityGeneration.Load() == entry.generation &&
+			conn.Name == entry.hubName && conn.BrokerID == entry.brokerID &&
+			conn.HubEndpoint == entry.hubEndpoint && bytes.Equal(conn.SecretKey, entry.secretKey)
+		if current {
+			if conn.authorityCtx == nil {
+				conn.authorityCtx, conn.authorityCancel = context.WithCancel(context.Background())
+			}
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			stopCancellation := context.AfterFunc(conn.authorityCtx, cancel)
+			defer func() { stopCancellation(); cancel() }()
+		}
+		conn.mu.Unlock()
+		if !current {
+			conn.authorityMu.RUnlock()
+			m.writeError(w, "stale signing authority")
+			return
+		}
+		defer conn.authorityMu.RUnlock()
+	}
+	authority := &brokerRequestAuthority{
+		hubName: entry.hubName, brokerID: entry.brokerID, hubEndpoint: entry.hubEndpoint,
+		generation: entry.generation, connection: entry.connection,
+	}
+	ctx = context.WithValue(ctx, brokerRequestAuthorityKey{}, authority)
+	ctx = context.WithValue(ctx, authenticatingHubConnCtxKey{}, entry.hubName)
+	next.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // writeError writes an authentication error response.

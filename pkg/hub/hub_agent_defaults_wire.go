@@ -14,11 +14,15 @@
 
 package hub
 
-import "github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+import (
+	"slices"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+)
 
 // remoteHubAgentDefaults converts the hub's operational agent_defaults section
 // into the wire form sent to a runtime broker, or nil when the hub has no
-// limit/resource defaults to send.
+// limit/resource or auto-expose defaults to send.
 //
 // Only the four limit/resource fields cross here. default_template and
 // default_harness_config are resolved hub-side (they need ID/hash stamping) and
@@ -31,18 +35,30 @@ import "github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 // Sending them from the hub as well would promote them from that bottom tier to
 // the hub tier and silently outrank broker profile resources and template
 // limits in deployments that have always behaved the other way. Because the
-// snapshot is empty in file mode, this returns nil there, the wire field is
-// omitted, and the broker-side rung never fires — no file-mode branch needed
-// anywhere. That is rejected alternative A7.
-func remoteHubAgentDefaults(d opsettings.AgentDefaultsSettings) *RemoteHubAgentDefaults {
+// snapshot is empty in file mode, the four limit/resource fields are zero
+// there, so the broker-side limit rung never fires — no file-mode branch
+// needed anywhere. That is rejected alternative A7. With no auto-expose
+// default either, this returns nil and the wire field is omitted.
+//
+// autoExposePorts is the hub's auto-expose-ports default. Unlike the four
+// limit/resource fields it is sent in file mode too: no broker reads it from
+// its own settings.yaml, so the hub is its only source, and it lands at the
+// broker's lowest env tier (buildAgentEnv's defaultEnv) in every mode.
+//
+// experiments lists the enabled dispatch experiments (see
+// HTTPAgentDispatcher.dispatchExperiments); like the auto-expose default it is
+// sent in every mode, since the hub is the only place it is decided.
+func remoteHubAgentDefaults(d opsettings.AgentDefaultsSettings, autoExposePorts *bool, experiments []string) *RemoteHubAgentDefaults {
 	if d.DefaultMaxTurns == 0 && d.DefaultMaxModelCalls == 0 &&
-		d.DefaultMaxDuration == "" && d.DefaultResources == nil {
+		d.DefaultMaxDuration == "" && d.DefaultResources == nil && autoExposePorts == nil && len(experiments) == 0 {
 		return nil
 	}
 	out := &RemoteHubAgentDefaults{
-		MaxTurns:      d.DefaultMaxTurns,
-		MaxModelCalls: d.DefaultMaxModelCalls,
-		MaxDuration:   d.DefaultMaxDuration,
+		MaxTurns:        d.DefaultMaxTurns,
+		MaxModelCalls:   d.DefaultMaxModelCalls,
+		MaxDuration:     d.DefaultMaxDuration,
+		AutoExposePorts: copyBoolPtr(autoExposePorts),
+		Experiments:     slices.Clone(experiments),
 	}
 	if d.DefaultResources != nil {
 		// Copy the pointee: hubAgentDefaults() already returns a deep copy, but
@@ -52,4 +68,38 @@ func remoteHubAgentDefaults(d opsettings.AgentDefaultsSettings) *RemoteHubAgentD
 		out.Resources = &rs
 	}
 	return out
+}
+
+// startHubAgentDefaults is the hub-defaults wire value for a start or restart
+// dispatch, built by remoteHubAgentDefaults like the create wire so the two
+// cannot drift. Which hub defaults ride each wire is listed here:
+//
+//   - create: the limits (max turns, model calls, duration), resources,
+//     the auto-expose default and the dispatch experiments.
+//   - start/restart: resources, the auto-expose default and the dispatch
+//     experiments. The broker no longer persists hub resources into the
+//     agent config (ptone/scion#4561) and applies them per start, so they
+//     are sent on every start. The limits stay create-only: Start does not
+//     read them from the request.
+//
+// It returns nil when there is nothing to send.
+func startHubAgentDefaults(d opsettings.AgentDefaultsSettings, autoExposePorts *bool, experiments []string) *RemoteHubAgentDefaults {
+	return remoteHubAgentDefaults(opsettings.AgentDefaultsSettings{DefaultResources: d.DefaultResources}, autoExposePorts, experiments)
+}
+
+// hubAgentDefaults returns the hub's operational agent_defaults, or the zero
+// value when no provider is wired.
+func (d *HTTPAgentDispatcher) hubAgentDefaults() opsettings.AgentDefaultsSettings {
+	if d.hubAgentDefaultsProvider == nil {
+		return opsettings.AgentDefaultsSettings{}
+	}
+	return d.hubAgentDefaultsProvider()
+}
+
+func copyBoolPtr(b *bool) *bool {
+	if b == nil {
+		return nil
+	}
+	v := *b
+	return &v
 }

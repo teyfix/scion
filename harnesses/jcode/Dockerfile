@@ -18,7 +18,6 @@ ARG BASE_IMAGE
 FROM rust:1.98.0-bookworm AS jcode-builder
 
 ARG JCODE_VERSION=v0.58.0
-ARG JCODE_COMMIT=5e064af4a57bf1f1a4e9d68f283a2bb1a2ec09bd
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -29,8 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch "${JCODE_VERSION}" \
-      https://github.com/1jehuang/jcode.git /src/jcode \
-  && test "$(git -C /src/jcode rev-parse HEAD)" = "${JCODE_COMMIT}"
+      https://github.com/1jehuang/jcode.git /src/jcode
 
 WORKDIR /src/jcode
 

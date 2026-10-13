@@ -33,7 +33,12 @@ func resolveTargetAgents(msg *discordgo.MessageCreate, botUserID string, default
 	seen := make(map[string]bool)
 	var result []string
 
-	if botMentioned && defaultAgent != "" {
+	// Additive mention routing: include the default agent as the implicit
+	// primary when the bot is @-mentioned OR when explicit agent @-mentions
+	// are present. This mirrors the native chat additive model
+	// (handlers_chat_v2.go:958-1001) where the implicit primary always
+	// receives the message alongside mentioned agents.
+	if defaultAgent != "" && (botMentioned || len(agentMentions) > 0) {
 		seen[defaultAgent] = true
 		result = append(result, defaultAgent)
 	}
@@ -138,6 +143,19 @@ func stripMentions(text string, botUserID string, agentSlugs []string) string {
 		parts = append(parts, word)
 	}
 	return strings.Join(parts, " ")
+}
+
+// stripBotMention removes Discord-format bot mentions (<@BOT_ID> and
+// <@!BOT_ID>) from text, leaving text-format @agent mentions untouched.
+// Used by the routed inbound path where agent mention extraction is
+// delegated to the hub planner.
+func stripBotMention(text string, botUserID string) string {
+	if botUserID == "" {
+		return text
+	}
+	text = strings.ReplaceAll(text, "<@"+botUserID+">", "")
+	text = strings.ReplaceAll(text, "<@!"+botUserID+">", "")
+	return text
 }
 
 // extractUnresolvedMentions finds @tokens in text that don't match known agents,
@@ -352,25 +370,17 @@ func classifyMentions(text string, botUserID string, knownAgents []string, userR
 	}
 }
 
-// agentFromReply extracts the agent slug from a referenced message.
-// When a user replies to a webhook message, the webhook username IS the agent
-// slug (since the Discord plugin uses per-agent webhooks with the agent slug
-// as the webhook username). When replying to a regular bot API message,
-// returns "" because the bot's own messages don't carry agent identity in
-// the username.
-func agentFromReply(ref *discordgo.Message, botUserID string) string {
-	if ref == nil {
+// agentFromReply returns the agent slug of a referenced message. The
+// plugin posts agent messages through its own per-channel webhook with
+// the agent slug as the username, so a slug is returned only when
+// ownsWebhook confirms ref.WebhookID is that webhook. Any other message
+// yields "".
+func agentFromReply(ref *discordgo.Message, ownsWebhook func(webhookID string) bool) string {
+	if ref == nil || ref.WebhookID == "" || ref.Author == nil || ownsWebhook == nil {
 		return ""
 	}
-
-	// Webhook messages have WebhookID set and the Author.Username is the
-	// agent slug (set when the webhook message was sent).
-	if ref.WebhookID != "" && ref.Author != nil {
-		return ref.Author.Username
+	if !ownsWebhook(ref.WebhookID) {
+		return ""
 	}
-
-	// Regular bot API messages — cannot determine which agent sent them
-	// from the message metadata alone. The bot user's username is the bot
-	// name, not the agent slug.
-	return ""
+	return ref.Author.Username
 }

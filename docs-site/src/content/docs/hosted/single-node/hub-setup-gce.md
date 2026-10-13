@@ -1,69 +1,146 @@
 ---
 title: Hub Setup on GCE
-description: Deploy a Scion Hub on a Google Compute Engine VM using the starter scripts.
+description: Deploy a Scion Hub on a Google Compute Engine VM using the Developer Hub scripts or the binary-release single-node VM script.
 ---
 
 ## Overview
 
-The quickest path to a deployed Scion Hub is a single Google Compute Engine VM using the starter scripts in `scripts/starter-hub/`. These scripts automate VM provisioning, repository setup, TLS configuration, and Hub startup.
+The quickest path to a deployed Scion Hub that builds from source is a single Google Compute Engine VM using the Developer Hub scripts in `scripts/starter-hub/`. These scripts automate VM provisioning, repository setup, TLS configuration, and Hub startup.
 
 ## Prerequisites
 
 - A **GCP project** with billing enabled.
 - The **gcloud CLI** installed and configured (`gcloud auth login`, project set).
-- A **domain name** (optional but recommended for HTTPS/TLS).
+- A **domain name** whose DNS is delegated to Cloud DNS. The default path obtains a wildcard certificate for it through a DNS-01 challenge. Without a public domain, follow [Internal Deployments (BYO TLS)](#internal-deployments-byo-tls) instead.
 
-## Steps
+## Configuration
 
-The starter scripts are designed to be run in sequence from your local machine.
-
-### 1. Provision the VM
+Every script sources `scripts/starter-hub/hub-config.sh`. That file generates nothing. It is a shared set of shell variables that sets resource names, domains, and file paths from `HUB_NAME` (default `demo`) and `BASE_DOMAIN` (default `scion-ai.dev`). Set those, and any other variable listed in `hub-config.sh`, such as `REGION` or `ZONE`, in your environment before you run a script. Set `CERT_EMAIL` in your environment to your own address; Let's Encrypt uses it for certificate notices. It has no default, and `gce-certs.sh` and `gce-demo-deploy.sh` stop with an error before changing anything if it is not set:
 
 ```bash
-./scripts/starter-hub/gce-demo-provision.sh
+export HUB_NAME=demo
+export BASE_DOMAIN=example.com    # the Hub is served at hub.demo.example.com
+export CERT_EMAIL=admin@example.com
 ```
 
-Creates a GCE VM with the necessary machine type, disk, firewall rules, and service account.
-
-### 2. Set Up the Repository
+Then create the Hub environment file, which `gce-start-hub.sh --full` uploads to the VM as `hub.env`:
 
 ```bash
-./scripts/starter-hub/gce-demo-setup-repo.sh
+mkdir -p .scratch
+cp scripts/starter-hub/hub.env.sample .scratch/hub-${HUB_NAME}.env
+# Edit .scratch/hub-<name>.env with your values
 ```
 
-SSHs into the VM and clones the Scion repository, installing required dependencies.
+:::caution[Choose who can sign in before you expose the Hub]
+The default user access mode is `open`. Once OAuth is configured, any account that the identity provider accepts can sign in and gets an account with the default role (`member`). Before the Hub is reachable by others, restrict sign-in in `hub.env`:
 
-### 3. Build and Deploy
+- `SCION_SEED_SERVER_AUTH_AUTHORIZEDDOMAINS=example.com` allows only accounts from the listed domains.
+- `SCION_SEED_SERVER_AUTH_USERACCESSMODE=invite_only` allows only invited or existing users (`domain_restricted` is the other non-default mode).
+
+These set `server.auth.authorized_domains` and `server.auth.user_access_mode`. See [Who can sign in](/scion/hosted/single-node/auth/#who-can-sign-in-user-access-mode).
+:::
+
+## Deploy
+
+Run all scripts from the repository root.
+
+### All-in-one (recommended)
 
 ```bash
 ./scripts/starter-hub/gce-demo-deploy.sh
 ```
 
-Builds the Hub server and its dependencies on the VM.
+`gce-demo-deploy.sh` runs every step below in order, so for a first deployment it is the only command you need. Running the individual scripts afterwards repeats the same work.
 
-### 4. Configure TLS (Optional)
+### Individual steps
 
-```bash
-./scripts/starter-hub/gce-certs.sh
-```
+Run these one at a time instead of `gce-demo-deploy.sh` when you need to skip or re-run a single step, for example on an [internal deployment](#internal-deployments-byo-tls). Each script is what `gce-demo-deploy.sh` runs at that step.
 
-Sets up Caddy as a reverse proxy with automatic TLS certificate provisioning. Requires a domain name pointed at the VM's external IP.
+| Step | Script | What it does |
+|------|--------|--------------|
+| 0 | `gce-demo-preflight.sh` | Checks local tools, the env file, GCP auth, APIs, IAM permissions, and DNS readiness. It changes nothing. |
+| 1 | `gce-demo-provision.sh` | Creates the GCE VM, its service account, a firewall rule for tcp:80 and tcp:443, and, when `ENABLE_GKE=true`, a GKE cluster. |
+| 2 | `gce-demo-telemetry-sa.sh` | Creates a service account for agent telemetry export. |
+| 3 | `gce-demo-setup-repo.sh` | Clones the Scion repository on the VM. |
+| 4 | `gce-certs.sh` | Creates the Cloud DNS managed zone if it is missing, points an A record for the Hub domain at the VM's external IP, and runs certbot on the VM to get a Let's Encrypt wildcard certificate (`*.<CERT_DOMAIN>`) through a DNS-01 challenge. It then runs `fix-tls-rotation.sh` on the VM so that renewed certificates reach Caddy (see [Certificate renewal](#certificate-renewal)). It does not install Caddy or write its configuration. |
+| 5 | `gce-start-hub.sh --full` | Uploads `hub.env`, writes `settings.yaml` and the systemd unit, installs Caddy, writes a Caddyfile that serves the certbot certificate from step 4 and proxies to the Hub on port 8080, builds the web assets and the `scion` binary on the VM, and starts the Hub. |
 
-### 5. Generate Hub Configuration
+The `settings.yaml` that step 5 writes turns on telemetry export and sets `telemetry.cloud.gcp_project_id` to the deployment project (`PROJECT_ID`), so the metrics dashboard in the web UI queries Cloud Monitoring in that project. Step 1 grants the VM's service account `roles/monitoring.viewer` so the Hub can read those metrics. A Hub deployed before this setting existed picks it up at the next `gce-start-hub.sh --full`; re-run `gce-demo-provision.sh` first so the VM's service account has `roles/monitoring.viewer`. See [Metrics & OpenTelemetry](/scion/hosted/single-node/metrics/) for the `telemetry` settings.
 
-```bash
-./scripts/starter-hub/hub-config.sh
-```
+:::note[Internal or private deployments]
+If your VM has no external IP, or TLS is terminated upstream by a load balancer, reverse proxy, or similar appliance, skip step 4 and see [Internal Deployments (BYO TLS)](#internal-deployments-byo-tls) below.
+:::
 
-Generates the `settings.yaml` file with your chosen options (domain, auth settings, etc.).
-
-### 6. Start the Hub
+### Updating a running Hub
 
 ```bash
 ./scripts/starter-hub/gce-start-hub.sh
 ```
 
-Starts the Hub service on the VM. The Hub is now ready to accept connections.
+Without `--full`, `gce-start-hub.sh` only pulls the latest code on the VM, rebuilds, restarts the Hub, and checks its health. Add `--full` again when you change `hub.env` or the generated configuration.
+
+The final health check requests `https://<HUB_DOMAIN>/healthz` and verifies the TLS certificate, so it fails if the certificate is missing or not valid. For a self-signed or test certificate only, add `--insecure-health-check` (or set `HEALTH_CHECK_INSECURE=true`); the script then prints a warning that the certificate was not verified.
+
+### Certificate renewal
+
+Caddy serves the certbot files in `/etc/letsencrypt/live/<CERT_DOMAIN>/` (the `tls` line of the Caddyfile that `gce-start-hub.sh --full` writes). It reads them only when it starts or reloads. certbot renews the files on disk twice a day through `certbot.timer`, from 30 days before expiry. Unless Caddy reloads afterwards, it keeps serving the old certificate until that certificate expires.
+
+`gce-certs.sh` therefore runs `scripts/starter-hub/fix-tls-rotation.sh` on the VM. That installs the certbot deploy hook `/etc/letsencrypt/renewal-hooks/deploy/scion-reload-caddy.sh`. certbot runs it only after a successful renewal. The hook gives Caddy's group read access to the files the live links now point to, then reloads Caddy. If a permission step fails, the hook prints a warning and still reloads. If the reload itself fails, the hook prints `scion-reload-caddy: ERROR: reload failed (...)` and exits 1, so certbot logs the hook failure in `/var/log/letsencrypt/letsencrypt.log`. The Hub is not restarted. The script also enables `certbot.timer`. If the script finds a problem it cannot fix, it exits non-zero, and `gce-certs.sh` stops at that step. Run the script with `--check` on the VM to see the problem, fix it, then re-run `gce-certs.sh`.
+
+#### Repairing an existing Hub
+
+Hubs set up before this change may have no working hook. They then keep serving an expired certificate after a renewal. Copy the script to your home directory on the VM, and look at what it would change before it changes anything. Replace `<INSTANCE_NAME>` and `<ZONE>` with your values from `hub-config.sh`:
+
+```bash
+gcloud compute scp scripts/starter-hub/fix-tls-rotation.sh <INSTANCE_NAME>:fix-tls-rotation.sh --zone=<ZONE>
+gcloud compute ssh <INSTANCE_NAME> --zone=<ZONE> --command='sudo bash ~/fix-tls-rotation.sh --check'
+gcloud compute ssh <INSTANCE_NAME> --zone=<ZONE> --command='sudo bash ~/fix-tls-rotation.sh --dry-run'
+gcloud compute ssh <INSTANCE_NAME> --zone=<ZONE> --command='sudo bash ~/fix-tls-rotation.sh'
+```
+
+- `--check` changes nothing. It reports the following, and exits 1 if something needs fixing:
+  - The serial and expiry date (`notAfter`) of the certificate on disk and of the certificate Caddy serves.
+  - The reload hooks it finds and whether the timer is enabled.
+  - Whether the user Caddy runs as can read the certificate and key, or which path blocks it.
+- `--dry-run` prints each change it would make and changes nothing.
+- Without a flag, the script does the following:
+  - Installs or updates the deploy hook. It always does, even when another hook seems to reload Caddy already (see below).
+  - Removes the inline `renew_hook` that older `gce-certs.sh` versions stored in `/etc/letsencrypt/renewal/<CERT_DOMAIN>.conf`. That hook always failed before it reached the reload. The original file is kept as a `.bak-fix-tls-rotation` backup. The script never prints the content of an inline hook, because it can contain credentials.
+  - Enables the timer.
+  - Tests, as the user Caddy runs as (`User=` of `caddy.service`, default `caddy`), whether it can read the certificate and key. If it can, nothing is changed. Otherwise the script changes the group or mode only of the paths that block it, and prints each path with its old and new group and mode.
+  - Runs `certbot renew` only if the certificate on disk expires within 30 days. `--renew-days` lowers that threshold. It cannot raise it, because certbot only renews within its own `renew_before_expiry` window (30 days by default). If certbot reports that the certificate is not yet due, the script says so and exits 1.
+  - Reloads Caddy only if Caddy serves a different certificate from the one on disk. Without `--force`, Caddy skips a reload when the Caddyfile is unchanged, so the script and the hook choose the reload like this:
+    - `systemctl reload caddy` when `caddy.service` reloads with `--force`.
+    - Otherwise `caddy reload --force`, when `caddy reload --help` lists `--force`.
+    - Otherwise `systemctl reload caddy`, with a warning that Caddy may keep the old certificate. The hook then exits 1, so certbot logs a hook failure rather than a silent success. Check the served certificate afterwards; restarting Caddy (not the Hub) makes it re-read the files.
+
+    Caddy running without systemd is reloaded with `caddy reload --force`. If that `caddy` has no `--force`, the hook reports that it cannot force a reload and exits 1. If the reload fails, the hook prints an ERROR. If the reload ran but could not be forced, the hook says it reloaded without `--force` and adds a WARNING. In both cases the hook exits 1, and the script reports a problem ("reloading Caddy failed or could not be forced"), exits 1, and its result line says how many problems remain.
+  - Ends with the same report as `--check`.
+
+A second run changes nothing. Re-running `gce-certs.sh` has the same effect.
+
+**An existing reload hook.** Some hubs already have a deploy hook added by hand, for example `/etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh`, or an inline `renew_hook` that reloads Caddy. The script still installs its own hook, and reports the other hook as a note, by name only:
+
+```text
+note:    existing hook reload-caddy.sh also appears to reload Caddy; Caddy will be reloaded twice per renewal, which is harmless; you may move it aside: sudo mv /etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh /root/reload-caddy.sh.bak
+```
+
+The script works out whether another hook "appears to reload Caddy" by reading its commands. It ignores commented-out lines, quoted text and `echo` or `printf` output. It notes separately a `caddy reload` without `--force`, which Caddy skips when the Caddyfile is unchanged. This check only affects the note, never whether the script's own hook is installed. The script never removes other hooks. To keep only the script's hook, move the old hook out of `renewal-hooks/deploy/` yourself, keeping a copy (certbot runs every executable in that directory, so renaming it in place is not enough):
+
+```bash
+sudo mv /etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh /root/reload-caddy.sh.bak
+```
+
+#### Checking the served certificate from outside
+
+Compare the serial and expiry date that clients see with the `--check` output. Replace `<HUB_DOMAIN>` with your Hub's domain:
+
+```bash
+openssl s_client -connect <HUB_DOMAIN>:443 -servername <HUB_DOMAIN> </dev/null 2>/dev/null \
+  | openssl x509 -noout -serial -enddate
+```
+
+If the serial differs from the one on disk, Caddy has not reloaded since the last renewal. Run the script to fix this.
 
 ## Post-Setup
 
@@ -74,3 +151,98 @@ Once the Hub is running:
 3. **Register a Runtime Broker** — Connect a machine to execute agents. See [Runtime Broker](/scion/hosted/ha/runtime-broker/) for details on registering your local machine or a remote VM.
 
 For ongoing Hub administration (auth, permissions, observability), see the other guides in the Hub Administration section.
+
+## Binary Release Deployment (single-node VM)
+
+If you don't need to build from source, `scripts/single-node-vm/deploy.sh` stands up a Hub from a published GitHub Release instead. It creates a GCE VM with no public IP that runs the `scion` binary under systemd with embedded SQLite, plus a Cloud Run reverse proxy protected by Identity-Aware Proxy (IAP). The proxy image is built on the VM, pushed to the `cloud-run-source-deploy` Artifact Registry repository, and deployed with `--image`. The deployment does not upload source to Cloud Storage, so it works in organizations whose policies block `storage.googleapis.com`. Re-running the script is idempotent.
+
+**IAP SSH firewall rule.** The `scion-hub-HUB_NAME-allow-iap-ssh` rule targets only the hub VM's network tag, not every VM on the network. Deployments made before this scoping have an unscoped rule. Re-running `deploy.sh` narrows that rule in place, but only once it confirms the tag is on the hub VM. Any other VM that relied on the old rule for IAP SSH loses that access and needs its own firewall rule.
+
+```bash
+./scripts/single-node-vm/deploy.sh                    # interactive wizard
+./scripts/single-node-vm/deploy.sh --version v0.5.0   # pin a release
+```
+
+The wizard asks for the Hub name, region, machine size, disk size, chat plugins, container image source, admin email, and **update policy**.
+
+**Headless installs.** Pass `--config <file>` to pre-answer the wizard from JSON. This is intended for non-interactive and agent-driven installs:
+
+```bash
+./scripts/single-node-vm/deploy.sh --config my-deploy-config.json
+```
+
+Fields in the file skip their prompt. Missing fields fall back to a prompt when a terminal is attached, or to defaults otherwise. With no terminal, a missing required field makes the script exit with an error rather than hang. See `scripts/single-node-vm/deploy-config.example.json` for every field, including `update_policy` and `release_channel`.
+
+**Vertex AI out of the box.** The script enables the Vertex AI API (`aiplatform.googleapis.com`) and grants the VM service account `roles/aiplatform.user`. It then sets two things so agents can use that service account:
+
+- `default_gcp_identity_mode: passthrough` in `settings.yaml`. This is the [hub-default GCP identity](/scion/hosted/ha/permissions/#hub-default-gcp-identity), so new agents on the Hub's embedded broker inherit the VM service account unless the create request or project sets a different identity. To turn this off, change the mode to `block` or `assign` in **Admin > Server Config > Agent Defaults**.
+- `GOOGLE_CLOUD_PROJECT` (the VM's project) and `GOOGLE_CLOUD_LOCATION` (`global`) as hub-scoped environment variables with injection mode `always`. The script only creates them if they are missing, so a redeploy never overwrites your edits. If this step fails, the script prints a warning and you can set them yourself with `scion hub env set --scope hub`.
+
+Agents on the `antigravity` harness detect the metadata-server identity and select Vertex AI auth without a `gcloud-adc` file, so a fresh Hub runs Vertex AI inference with no manual credential setup.
+
+**Automatic updates.** The script writes a `server.maintenance` section with `deployment_tier: binary`, so the Hub checks GitHub Releases on a schedule. It installs updates automatically (`auto`), shows an update banner in the admin UI (`notify`), or does neither (`disabled`). The release channel defaults to `nightly` unless you set it. See [Maintenance (`server.maintenance`)](/scion/reference/server-config/#maintenance-servermaintenance) for all fields.
+
+**Verified downloads.** Releases publish a `SHA256SUMS` file. `deploy.sh` checks that the chosen release has one before creating any GCP resources, and verifies the `scion` binary and chat plugins against it before installing them. The Hub's automatic updater also verifies downloads and refuses to install a release that has no `SHA256SUMS` file. To deploy an older release built before checksums were published, set `ALLOW_UNVERIFIED_RELEASE=true` when running `deploy.sh`.
+
+**Optional GKE runtime (hybrid tier).** Set `gke_target.name` and `gke_target.location` in the config file to attach an existing GKE cluster as a second, Kubernetes-based runtime alongside the VM's co-located Docker broker. The script also serves an NFS export from the VM and creates a PersistentVolumeClaim in the cluster, so agents on both runtimes share the same project [shared directories](/scion/reference/server-config/#shared-directory-storage-servershared_dir_storage). The tier is off by default. The script attaches to the cluster but never creates or deletes it, and the cluster must be in the same project. With the tier enabled, `container_images.source: build` is refused (GKE nodes cannot pull from the VM's local Docker store), and `user_access_mode` must be `invite_only` (the default) or `domain_restricted`. See [`docs/deploy/hybrid-tier.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/hybrid-tier.md) for the full field list and teardown behavior.
+
+For the full guide, including architecture, access patterns, and troubleshooting, see [`docs/deploy/single-node-vm.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/single-node-vm.md). If an AI agent is running the deployment for you, point it at the step-by-step [agent deployment runbook](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/agent-runbook-single-node-vm.md). The runbook covers GCP preflight checks, the questions to ask the user, config file generation, and troubleshooting.
+
+Deploying into a GCP organization with a security-hardening baseline (no default network, Shielded VM required, etc.)? See [Deploy on a VM (Hardened Org)](/scion/hosted/single-node/hub-setup-gce-hardened-org/) for the one manual prerequisite and what the script already handles for you.
+
+## Internal Deployments (BYO TLS)
+
+The steps above assume a public-facing VM with an external IP and public DNS. If your VM is internal-only — for example, on a private VPC with no external IP — the Hub works identically, but TLS must be provided by you or terminated upstream.
+
+### What to skip
+
+| Step | Script | Skip? |
+|------|--------|-------|
+| 1. Provision the VM | `gce-demo-provision.sh` | **No** — run the script as-is. It creates firewall rules for inbound HTTP/HTTPS (tcp:80, tcp:443) that are unnecessary if the VM is not publicly reachable; you can remove them afterward or let your network team manage internal firewall rules instead. |
+| 4. DNS and certificates | `gce-certs.sh` | **Yes** — this script fetches the VM's external IP, creates public Cloud DNS records, and obtains Let's Encrypt certificates via DNS challenge. All of this requires a public IP and will fail without one. |
+
+Steps 0, 2, and 3 work without modification. Step 5 needs a certificate and key at `/etc/letsencrypt/live/<CERT_DOMAIN>/fullchain.pem` and `privkey.pem`. The directory `/etc/letsencrypt/archive` must also exist; it may be empty. When `/etc/letsencrypt/live` exists, `gce-start-hub.sh --full` runs `chown -R` and `chmod -R` on both `live` and `archive` to give group `caddy` read access. The remote commands run under `set -euo pipefail`, so a missing `archive` directory stops the run before the Hub starts. The script then installs a Caddyfile that points at the certificate files and restarts Caddy when the Caddyfile changes; if the files are missing at that point, Caddy fails to start and the script stops before it starts the Hub.
+
+To skip the Caddy/TLS step entirely, for example when TLS is terminated upstream ([Option B](#tls-options)), run `gce-start-hub.sh --full --no-tls` or set `SKIP_TLS=true`. The script then writes no Caddyfile, does not install or restart Caddy, and skips the final HTTPS health check; the health check on the VM still runs. The systemd unit sets `SCION_SERVER_BASE_URL` to `http://<HUB_DOMAIN>:8080` unless you set `HUB_BASE_URL`, and a `SCION_SERVER_BASE_URL` in `hub.env` takes precedence over both. The `http://` default is for a Hub reached directly on port 8080. Behind an upstream TLS terminator, set `SCION_SERVER_BASE_URL` in `hub.env` (or `HUB_BASE_URL`) to the `https://` URL that clients use. With `SKIP_TLS=true`, `gce-demo-deploy.sh` also skips step 4 and does not require `CERT_EMAIL`, so you can use the all-in-one script. Because step 4 is what creates the DNS record, nothing creates one for `HUB_DOMAIN` in this mode: it must resolve to the VM through your own DNS, or set `HUB_BASE_URL` or `SCION_SERVER_BASE_URL` to an address agents can reach. Without it, run the [individual steps](#individual-steps) and skip step 4.
+
+### Set `SCION_SERVER_BASE_URL`
+
+The Hub uses `SCION_SERVER_BASE_URL` to construct OAuth redirect URIs and set the session cookie's `Secure` flag. When step 4 is skipped, you must set this variable yourself.
+
+In your `hub.env` file (see `scripts/starter-hub/hub.env.sample`):
+
+```bash
+# The URL that browsers and agents use to reach the Hub.
+# Must include the scheme (https://) — the Hub derives cookie
+# security from the URL scheme.
+SCION_SERVER_BASE_URL=https://hub.internal.example.com
+```
+
+:::caution[HTTPS is strongly recommended]
+If `SCION_SERVER_BASE_URL` uses `http://`, the Hub will not set the `Secure` flag on session cookies. Use `https://` in production even when TLS is terminated upstream.
+:::
+
+### TLS options
+
+Choose the option that matches your environment:
+
+**Option A — Caddy with your own certificates**
+
+If you still want Caddy as a local reverse proxy but with your own certificate and key instead of Let's Encrypt, create a Caddyfile on the VM:
+
+```caddy
+hub.internal.example.com {
+    tls /path/to/your/cert.pem /path/to/your/key.pem
+    reverse_proxy localhost:8080
+}
+```
+
+Then start Caddy manually (`sudo caddy start --config /etc/caddy/Caddyfile`) instead of running `gce-certs.sh`. `gce-start-hub.sh --full` installs its own `/etc/caddy/Caddyfile`, which points at `/etc/letsencrypt/live/<CERT_DOMAIN>/`, and restarts Caddy when it changes. Before each `--full` run, place your certificate and key at that path as `fullchain.pem` and `privkey.pem`, and make sure `/etc/letsencrypt/archive` exists (it may be empty); otherwise the run stops before it starts the Hub. The script sets group `caddy` on both directories itself. Restore your own Caddyfile after each `--full` run, or keep the generated one if it serves your certificate.
+
+**Option B — TLS terminated upstream**
+
+If TLS is terminated by an upstream load balancer, reverse proxy, or appliance (e.g., an F5, nginx, or GCP HTTPS Load Balancer), no local TLS configuration is needed. The upstream proxy forwards plain HTTP to the Hub on port 8080. Ensure `SCION_SERVER_BASE_URL` is still set to the `https://` URL that clients use.
+
+**Option C — Identity-Aware Proxy (GCP)**
+
+For GCP deployments, you can front the Hub with [Identity-Aware Proxy (IAP)](/scion/hosted/ha/auth-proxy-iap/) instead of managing certificates directly. IAP handles both TLS and user authentication at the network edge. The IAP guide covers HA deployments but the same pattern works for a single VM behind an internal load balancer.

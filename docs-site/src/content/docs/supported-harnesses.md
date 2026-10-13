@@ -14,6 +14,17 @@ projection, and MCP configuration across all bundles. See
 [Harness-Specific Settings](/scion/reference/harness-settings/) for how bundles are packaged and
 managed.
 
+A harness-config that still declares `provisioner.type: builtin`, or a container-script provisioner
+with an empty `command`, cannot be launched: the start fails before the container is created and
+the error names the fix for where the config lives. A Runtime Broker rejects it with
+`422 harness_config_unusable`; through the Hub, the message is currently included in the dispatch
+error, which the Hub reports as a runtime error. For a global harness-config of a bundled harness the
+fix is `scion harness-config upgrade <name> --activate-script`; for a project or template copy, edit
+its `config.yaml` (on the broker host, when the broker launched from its own copy); for a Hub
+harness-config, pull it with `scion harness-config pull <name>`, repair it, and upload it with
+`scion harness-config sync <name>` (add `--global` for a global record). See `harnesses/README.md`
+for details.
+
 `antigravity` and `gemini-cli` are installed by default. `opencode`, `codex`, `copilot`, `hermes`,
 `grok-build`, and `muse-code` are opt-in bundles you add via a [harness-config](/scion/reference/harness-settings/#managing-harness-configs).
 :::
@@ -35,6 +46,8 @@ Auth type can be explicitly set via `auth_selectedType` in your Scion settings p
 - **Settings File**: `~/.gemini/settings.json` (inside the agent container). Scion automatically updates `security.auth.selectedType` in this file to match the resolved auth method.
 - **System Prompt**: `~/.gemini/system_prompt.md` is automatically seeded if `system_prompt` is provided in the agent config. Additionally, Scion injects the system prompt into the `GEMINI_SYSTEM_MD` environment variable to ensure direct pickup by the Gemini CLI tool during initialization.
 - **Model Aliases**: Supports both traditional alias sizes and single-letter model alias mappings (`S` / `M` / `L` for Small / Medium / Large). The `provision.py` script automatically maps and handles fallback alias resolution during startup.
+- **Default model**: the harness-config declares `model: medium`, so an agent started without a model runs on the model that the `medium` alias maps to in `model_aliases` (see `harnesses/gemini-cli/config.yaml`). The broker resolves that tier before it sets `SCION_MODEL`. The container image does not pin a model in `settings.json`.
+- **Model selection**: the model is resolved in this order: the agent's resolved model (`--model`, template `model:`, or `SCION_MODEL`), then `harness_config.model`. Tier aliases (`small`, `medium`, `large`, `extra-large`, and `S` / `M` / `L` / `XL`) are resolved through the harness's `model_aliases` table. The provisioner writes the resolved model to `model.name` in `~/.gemini/settings.json` on every provision. If neither source gives a model, it removes any existing `model.name`, so a stale value is never kept and the Gemini CLI uses its own built-in default.
 
 ### Known Limitations
 - The `gemini` CLI tool must be installed in the container image (included in default images).
@@ -69,6 +82,23 @@ Auth type can be explicitly set via `auth_selectedType` in your Scion settings p
   - `large` &rarr; `opus`
   - `extra-large` &rarr; `fable`
   The resolved model is set in the environment overlay as `ANTHROPIC_MODEL`. If no model is requested, it falls back to the default model `opus`. Note that setting `ANTHROPIC_MODEL` directly in your settings or a template environment block acts as an explicit, non-overridable pin.
+- **Claude Code version guard:** Claude Code versions older than 2.1.280 reject Opus 5.5 (`claude-opus-5-5*`, and the `opus` alias) with a `400 claude_code_version_too_old` error. If the container's `claude` binary is older than 2.1.280 and the resolved model is Opus 5.5, `provision.py` falls back to `claude-opus-4-8` and logs a warning. Rebuild the `scion-claude` image with Claude Code 2.1.280 or later to use Opus 5.5.
+- **Failed-tool hook:** the bundled settings register the `PostToolUseFailure` hook, which reports failed tool calls. The image installs the latest Claude Code. A custom image needs Claude Code 2.0.56 or later for this hook: the published package contains the event from that version on, although the Claude Code changelog does not name the version that added it. Claude Code 2.1.101 and later also tolerate hook event names they do not recognize in `settings.json`.
+- **Auto-updater disabled:** Scion sets `DISABLE_AUTOUPDATER=1` in the container, so Claude Code does not try to update itself in the background. To upgrade Claude Code, rebuild the harness image.
+
+### Effort (Thinking Level)
+When `SCION_THINKING_LEVEL` is set (0–100, from `--thinking-level` on `scion start` or Hub agent defaults), the provisioner sets `CLAUDE_CODE_EFFORT_LEVEL` in the environment of the `claude` process. The table comes from the `thinking:` block in the bundle's `config.yaml` (see [Thinking Level Map](/scion/reference/harness-settings/#thinking-level-map-thinking)):
+
+| Thinking Level | `CLAUDE_CODE_EFFORT_LEVEL` |
+| :--- | :--- |
+| 0–25 | `low` |
+| 26–50 | `medium` |
+| 51–75 | `high` |
+| 76–100 | `xhigh` |
+
+Values outside the 0–100 range are clamped. The top tier is `xhigh` rather than `max` to avoid `max`'s excessive-token runs; `max` is still reachable by setting `CLAUDE_CODE_EFFORT_LEVEL` directly or with a custom `thinking:` table. When a model does not support a level, Claude Code uses the highest level it supports below that one (for example, `xhigh` runs as `high` on Sonnet 4.6). See [Claude Code model configuration](https://code.claude.com/docs/en/model-config).
+
+When the level is unset or blank, the variable is not set, so Claude Code keeps its own per-model default effort. A value that is not an integer (`abc`, `1.5`) also sets nothing, and logs a warning. The variable outranks `--effort`, `/effort` and the `effortLevel` setting in `settings.json`. If `CLAUDE_CODE_EFFORT_LEVEL` is already set in a template or harness-config `env:` block (even to an empty value), the provisioner leaves it alone, and logs a warning if a thinking level was also requested.
 
 ### Known Limitations
 - Claude Code is a beta tool and its configuration format may change.
@@ -85,14 +115,18 @@ OpenCode supports two authentication methods (auto-detected in this order):
 - **Auth File** (`auth-file`): Uses `~/.local/share/opencode/auth.json` if available. Scion copies this file from your host when the agent is created.
 
 ### Configuration
-- **Config File**: `~/.config/opencode/opencode.json`.
+- **Config File**: `~/.config/opencode/opencode.json`, in the current opencode schema. The provisioner merges `model`, MCP servers (under `mcp`) and, for Vertex AI, `google-vertex/...` default models plus `disabled_providers: ["github-copilot"]` into this file. An explicit `SCION_MODEL` wins over the Vertex default, and the Vertex default never replaces a `model` already in the file. A file that is not plain JSON (for example one with comments) is left unchanged, with a warning.
+- **Size aliases**: the bundled `model_aliases` are not yet in opencode's `provider/model` form, so the provisioner skips them with a warning and leaves `model` unchanged (ptone/scion#3065).
+- **`opencode.jsonc`**: opencode loads `opencode.jsonc` after `opencode.json`, so its keys (including `model`) override the file the provisioner writes.
 - **Environment**: Respects standard OpenCode environment variables.
-- **Model Resolution**: Supports model selection via the `SCION_MODEL` environment variable. When `ctx.model_resolution` is empty, the provisioning script automatically falls back to `SCION_MODEL` to resolve and configure the underlying model.
+- **Model Resolution**: Supports model selection via the `SCION_MODEL` environment variable. The provisioning script resolves it with `scion_harness.resolve_model`, which maps a size alias through the harness-config's `model_aliases` to configure the underlying model.
 - **Catalog Pre-fetch**: The provisioner automatically pre-fetches the `models.dev` catalog to ensure fresh model data is available before startup.
+
+### Hooks
+OpenCode communicates lifecycle events to the Scion Hub via a **hook bridge plugin**. The hook bridge translates OpenCode events into standard Scion lifecycle signals using the `opencode` hook dialect, enabling status reporting, activity tracking, and notification dispatch.
 
 ### Known Limitations
 - **Auth File Copy**: The `auth.json` file is copied only when the agent is **created**. If you update your host credentials, you may need to manually update the file in the agent or recreate the agent.
-- **No Hook support**: OpenCode does not have analogous hook support, and so will require use of plugin system to notify the scion orchestrator.
 
 ---
 
@@ -110,7 +144,24 @@ Codex supports two authentication methods (auto-detected in this order):
 - **Default Flags**: Runs with `--full-auto` approval mode enabled by default with unified flag formatting.
 - **Resume Support**: Automatically uses the `resume` positional argument to continue existing sessions.
 - **Notify Bridge**: Scion configures `notify = "sh ~/.codex/scion_notify.sh"` so Codex notify payloads can drive Scion state updates.
+- **Hooks**: `~/.codex/config.toml` registers the `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `SubagentStop` hooks, each routed through `scion_notify.sh` to `sciontool hook --dialect=codex`. `SubagentStart`, `PermissionRequest`, `PreCompact`, `PostCompact` and `Interrupt` are not registered because Scion has no mapping for them.
 - **OpenTelemetry**: When telemetry is enabled, Scion performs telemetry reconciliation at start to ensure consistent OTLP export (default `localhost:4317`).
+
+### Reasoning Effort (Thinking Level)
+When `SCION_THINKING_LEVEL` is set (a value from 0–100, provided via `--thinking-level` on `scion start` or via Hub agent defaults), the Codex provisioner maps it to the `model_reasoning_effort` key in `~/.codex/config.toml` using four quartile buckets. The table comes from the `thinking:` block in the bundle's `config.yaml` (see [Thinking Level Map](/scion/reference/harness-settings/#thinking-level-map-thinking)):
+
+| Thinking Level | Reasoning Effort |
+| :--- | :--- |
+| 0–25 | `low` |
+| 26–50 | `medium` |
+| 51–75 | `high` |
+| 76–100 | `xhigh` |
+
+Values outside the 0–100 range are clamped to the nearest boundary.
+
+When `SCION_THINKING_LEVEL` is unset, blank, or not a valid integer, the provisioner writes `model_reasoning_effort = "medium"` (the block's `default`) rather than leaving the key unwritten. This keeps Codex's own per-model catalog default (which can be `low` for some models) from silently taking over when no one has expressed an explicit preference. A non-integer value also logs a warning.
+
+If a customized Codex `config.yaml` has no `thinking:` block, the provisioner logs a warning and writes no `model_reasoning_effort`, so Codex's own default applies. Copy the block from the bundled `config.yaml`, or run `scion harness-config upgrade codex`, which merges missing top-level keys such as `thinking:` into a customized `config.yaml` without overwriting your values.
 
 ### Known Limitations
 - **Auth File Copy**: The `auth.json` file is only copied when the agent is **created**.
@@ -143,11 +194,13 @@ An active GitHub Copilot subscription is required at runtime.
 - **Config directory**: `~/.copilot/` (settings in `settings.json`, trusted folders in `config.json`).
 - **Instructions**: `agent_instructions` and `system_prompt` are projected into `.github/copilot-instructions.md`. Copilot has no native system-prompt flag, so the system prompt is *prepended to the instructions file*.
 - **MCP**: `~/.copilot/mcp-config.json`. Project-scoped MCP servers are not supported (they are demoted to global).
+- **Hooks**: Copilot lifecycle hooks (`sessionStart`, `userPromptSubmitted`, `preToolUse`, `postToolUse` and others) are wired to `sciontool hook --dialect=copilot`, mapped by the harness's `dialect.yaml`.
 - **Model aliases**: `small` → `claude-haiku-4.5`, `medium` → `claude-sonnet-4.5`, `large` → `claude-opus-4.8`.
+- **OpenTelemetry**: When telemetry is enabled, Scion sets `COPILOT_OTEL_ENABLED`, `COPILOT_OTEL_EXPORTER_TYPE=otlp-http`, and standard `OTEL_*` env vars that always point at sciontool's local OTLP/HTTP receiver (port `4318`), so Copilot's logs are redacted and identity-stamped like any other harness's. For local debugging only, `SCION_COPILOT_OTEL_ENDPOINT` overrides the endpoint. It bypasses sciontool's redaction and identity stamping, so never point it at anything but a local collector.
 
 ### Known Limitations
 - **System Prompt**: approximated via the instructions file (no native override).
-- **No hooks / no OpenTelemetry**: Copilot exposes no hook dialect or telemetry surface.
+- **Native metrics on GCP**: Copilot's raw native metrics (such as `gen_ai.client.token.usage`) are rejected by the GCP telemetry provider. Logs are forwarded normally.
 - **No project-scoped MCP**.
 - **OAuth/Vertex AI**: not supported — Copilot uses GitHub auth only.
 
@@ -174,7 +227,7 @@ with `capture_auth.py`.
 - **Instructions**: `agent_instructions` and `system_prompt` are projected into `AGENTS.md`. Hermes has no native system-prompt flag, so the system prompt is *prepended to `AGENTS.md`*.
 - **MCP**: `~/.hermes/mcp.json`. Project-scoped MCP servers are not supported.
 - **Model aliases**: `small` → `google/gemini-3.5-flash`, `medium` → `anthropic/claude-sonnet-4`, `large` → `anthropic/claude-opus-4`.
-- **Model Resolution**: Integrates with the `SCION_MODEL` environment variable for fallback model alias resolution. When `ctx.model_resolution` is empty, the `provision.py` script falls back to `SCION_MODEL` to map size aliases to the correct Nous Research endpoints.
+- **Model Resolution**: Integrates with the `SCION_MODEL` environment variable for fallback model alias resolution. The `provision.py` script resolves it with `scion_harness.resolve_model`, which maps size aliases to the provider/model strings above.
 
 ### Known Limitations
 - **System Prompt**: approximated via `AGENTS.md` (no native override).
@@ -200,7 +253,7 @@ a containerized workspace agent; choose the managed agent for repo-less, broker-
 ### Authentication
 Antigravity supports three authentication methods, evaluated in priority order (`vertex-ai` > `oauth-token` > `api-key`):
 
-- **Vertex AI** (`vertex-ai`): Google Cloud's Vertex AI mode using Google Cloud Application Default Credentials (ADC) plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` (or `GOOGLE_CLOUD_REGION`). This mode no longer requires `AGY_TOKEN`. It uses the `gcloud-adc` file secret or automatically resolves ADC via the assigned GCP Service Account (Hub-managed GCP Identity). Requires AGY CLI >= 1.1.10.
+- **Vertex AI** (`vertex-ai`): Google Cloud's Vertex AI mode using Google Cloud Application Default Credentials (ADC) plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` (or `GOOGLE_CLOUD_REGION`). This mode no longer requires `AGY_TOKEN`. It uses the `gcloud-adc` file secret or automatically resolves ADC via the agent's GCP identity from the metadata server. When no auth file or env credential is present and the agent has a metadata-server service account (for example through the [hub-default GCP identity](/scion/hosted/ha/permissions/#hub-default-gcp-identity)), `vertex-ai` is selected automatically, with no ADC file needed. Requires AGY CLI >= 1.1.10.
 - **OAuth token** (`oauth-token`): Provide a JSON file secret named `AGY_TOKEN` containing a `refresh_token`. Scion stages it at `~/.gemini/antigravity-cli/antigravity-oauth-token` and injects it into the container's gnome-keyring at launch.
 - **API Key** (`api-key`): The lowest-priority fallback method. Accepts either the `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment secret. The provisioner will automatically set `modelProvider` to `Gemini` in the agent's `settings.json` and authenticate using this key.
 
@@ -213,7 +266,22 @@ the Antigravity bundle's `capture_auth.py` (which can also extract the token fro
 - **MCP**: `~/.gemini/config/mcp_config.json`.
 - **Hooks**: Antigravity ships a hook dialect (`dialect.yaml`) mapping `agy` events to Scion lifecycle events. Hooks fire **project-locally** (wired via `/workspace/.agents/hooks.json`).
 - **Runtime**: requires gnome-keyring and D-Bus in the container (provided by the base image); a generated wrapper script bootstraps the keyring and injects the token before launching `agy`.
-- **Default model**: `Gemini 3.8 Flash (Medium)` (override via `AGY_MODEL`).
+- **Model selection**: the model is resolved in this order: the agent's model (`--model` / `SCION_MODEL`), then `harness_config.model`, then the operator-set `AGY_MODEL` env var, then the default `Gemini 3.8 Flash (Medium)`. Tier aliases (`small`, `medium`, `large`, `extra-large`) are resolved through the harness's `model_aliases` table. The resolved model is written into `settings.json` on every provision, including into an existing `settings.json`, so changing the model takes effect on the next start.
+
+### Effort (Thinking Level)
+When `SCION_THINKING_LEVEL` is set (0–100, from `--thinking-level` on `scion start` or Hub agent defaults), the provisioner adds `--effort <tier>` to the `agy` command in the generated wrapper script (`~/.scion/harness/agy-wrapper.sh`). The table comes from the `thinking:` block in the bundle's `config.yaml` (see [Thinking Level Map](/scion/reference/harness-settings/#thinking-level-map-thinking)):
+
+| Thinking Level | `--effort` |
+| :--- | :--- |
+| 0–25 | `low` |
+| 26–50 | `medium` |
+| 51–100 | `high` |
+
+Values outside the 0–100 range are clamped, so `-5` maps to `low` and `150` to `high`. When the level is unset or blank, no `--effort` flag is passed and AGY's own default applies. A value that is not an integer (`abc`, `1.5`) also passes no flag, and logs a warning.
+
+:::note[Changed cut points]
+Before ptone/scion#2673 the cut points were 50 and 75 (0–49 `low`, 50–74 `medium`, 75–100 `high`), negative values were silently ignored, and non-integer values were dropped without a warning. Levels 26–49 now map to `medium` and 51–74 to `high`.
+:::
 
 ### Known Limitations
 - **System Prompt**: approximated via `GEMINI.md` (no native override).
@@ -240,6 +308,14 @@ global endpoint). The provisioner writes `[auth_provider]` and `[model]` entries
 `~/.grok/config.toml` using `gcloud auth print-access-token` for on-demand token refresh.
 Application Default Credentials (ADC) are placed automatically when staged.
 
+:::note[Vertex AI API backend]
+When using the Vertex AI auth method, the provisioner automatically configures grok to use the
+**Chat Completions API backend** (`api_backend = "chat_completions"`) and disables backend search
+(`supports_backend_search = false`). This is required because the Vertex AI Model Garden does not
+return complete usage metadata under the Responses API, and the `x_search` hosted tool is not
+available through Vertex AI.
+:::
+
 If no credentials are found, the agent drops to a shell — run `grok login --device-auth`
 interactively, then capture the credential with the container's `capture_auth.py`
 (see [Harness Authentication](/scion/local/agent-credentials/#capturing-credentials-from-a-running-agent)).
@@ -255,12 +331,13 @@ interactively, then capture the credential with the container's `capture_auth.py
 - **Instructions**: `agent_instructions` are projected into `~/.grok/AGENTS.md`.
 - **System Prompt**: Supported natively via the `--system-prompt-override` flag during launch.
 - **MCP**: `~/.grok/config.toml` under `[mcp_servers.*]` TOML sections (supports `stdio`, `sse`, and `streamable-http` transports). Project-scoped MCP servers are not supported (demoted to global).
-- **Model aliases**: `small` → `grok-3-mini`, `medium` → `grok-3`, `large` → `grok-4.5`, `extra-large` → `grok-4.6` (resolved and injected via `GROK_DEFAULT_MODEL`).
+- **Model aliases**: `small` → `grok-3-mini`, `medium` → `grok-4.5`, `large` → `grok-4.6`, `extra-large` → `grok-4.6` (resolved and injected via `GROK_DEFAULT_MODEL`).
 - **Hooks**: 15 Grok lifecycle event hooks are wired to sciontool via `~/.grok/hooks/scion.json` using the `grok-build` dialect, including `PermissionDenied`, `SubagentStart`, `PreCompact`, and `PostCompact`.
-- **OpenTelemetry**: When telemetry is enabled, Scion injects `GROK_TELEMETRY_ENABLED`, `GROK_EXTERNAL_OTEL`, and standard `OTEL_*` env vars pointing at sciontool's local OTLP receiver.
+- **OpenTelemetry**: When telemetry is enabled, Scion injects `GROK_TELEMETRY_ENABLED`, `GROK_EXTERNAL_OTEL`, and standard `OTEL_*` env vars that always point at sciontool's local OTLP gRPC receiver (port `4317`), never directly at the cloud endpoint. For local debugging only, `SCION_GROK_BUILD_OTEL_ENDPOINT` overrides the endpoint and bypasses sciontool's redaction and identity stamping.
 
 ### Known Limitations
 - **No max_model_calls** — Grok hooks do not expose model-call start/end events. `max_turns` and `max_duration` are supported.
+- **No backend search** — The `x_search` hosted tool is disabled globally via `--disallowed-tools` to ensure compatibility across all auth modes (including Vertex AI, which does not support it).
 - **No project-scoped MCP**.
 - **OAuth**: not supported — Grok uses xAI auth only.
 
@@ -311,9 +388,9 @@ The following table summarizes the capabilities supported by each agent harness 
 | **Interject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Interrupt Key | C-c | C-c | Esc / C-c | C-c | C-c | C-c | C-c | C-c | Esc |
 | **Enqueue** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Hooks** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| Support | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| **OpenTelemetry** | ✅ | ✅  | ❌ | ✅  | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **Hooks** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Support | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **OpenTelemetry** | ✅ | ✅  | ❌ | ✅  | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **System Prompt Override** | ✅ | ✅ | ❌ | ❌ | ◐ | ◐ | ◐ | ✅ | ◐ |
 | **Auth: API Key** | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ❌ | ✅ | ✅ |
 | **Auth: OAuth Token** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |

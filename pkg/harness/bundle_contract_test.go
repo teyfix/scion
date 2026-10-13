@@ -34,12 +34,16 @@ import (
 // Each fixture case lives under pkg/harness/testdata/bundle_contract/<harness>/<case>/
 // and contains:
 //   - input.json: {"auth_candidates": {...}, "harness_config": {...}, "mcp_servers": {...}}
-//   - want.json:  {"exit_code": N, "resolved_auth": {...}, "env": {...}}
+//   - want.json:  {"exit_code": N, "resolved_auth": {...}, "env": {...}, "env_absent": [...], "toml_files": {"relative/path": {...}}}
 //
 // Optional files in the fixture dir:
 //   - secrets/<NAME>: staged as secrets/<NAME> in the bundle
 //   - instructions.md: staged as inputs/instructions.md
 //   - system-prompt.md: staged as inputs/system-prompt.md
+//   - bin/<NAME>: staged as an executable and prepended onto PATH — for
+//     stubbing external CLIs a provisioner shells out to (e.g. antigravity's
+//     `agy --version` gate), so the version-gated path is reachable without
+//     the real binary installed.
 func TestBundleContract(t *testing.T) {
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -100,6 +104,10 @@ type fixtureWant struct {
 	ExitCode     int                    `json:"exit_code"`
 	ResolvedAuth map[string]interface{} `json:"resolved_auth"`
 	Env          map[string]interface{} `json:"env"`
+	// EnvAbsent lists keys that must not appear in env.json.
+	EnvAbsent []string `json:"env_absent"`
+	// TOMLFiles pins native TOML projection, independent of provisioning outputs.
+	TOMLFiles map[string]map[string]interface{} `json:"toml_files"`
 }
 
 func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
@@ -194,6 +202,26 @@ func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
 		}
 	}
 
+	// Stage optional fixture-local executables (e.g. a fake `agy` CLI so
+	// antigravity's version-gated vertex-ai path is reachable without a real
+	// AGY install) and prepend their directory to PATH.
+	extraPathDir := ""
+	if binEntries, err := os.ReadDir(filepath.Join(caseDir, "bin")); err == nil {
+		extraPathDir = filepath.Join(tmpHome, "fixture-bin")
+		if err := os.MkdirAll(extraPathDir, 0755); err != nil {
+			t.Fatalf("mkdir fixture-bin: %v", err)
+		}
+		for _, be := range binEntries {
+			data, err := os.ReadFile(filepath.Join(caseDir, "bin", be.Name()))
+			if err != nil {
+				t.Fatalf("read bin/%s: %v", be.Name(), err)
+			}
+			if err := os.WriteFile(filepath.Join(extraPathDir, be.Name()), data, 0755); err != nil {
+				t.Fatalf("write bin/%s: %v", be.Name(), err)
+			}
+		}
+	}
+
 	// Build the manifest.
 	manifest := map[string]interface{}{
 		"schema_version":     1,
@@ -249,6 +277,9 @@ func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
 	}
 	cmd := exec.Command(python, filepath.Join(bundleDir, "provision.py"), "--manifest", manifestPath)
 	cmd.Env = append(baseEnv, "HOME="+tmpHome, "PYTHONDONTWRITEBYTECODE=1")
+	if extraPathDir != "" {
+		cmd.Env = append(cmd.Env, "PATH="+extraPathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	output, err := cmd.CombinedOutput()
 
 	gotExitCode := 0
@@ -276,6 +307,32 @@ func runBundleContractCase(t *testing.T, python, hname, caseDir string) {
 		envPath := filepath.Join(bundleDir, "outputs", "env.json")
 		gotEnv := readJSONFile(t, envPath)
 		assertJSONSubset(t, "env.json", want.Env, gotEnv)
+	}
+
+	// Check keys that env.json must leave out.
+	if len(want.EnvAbsent) > 0 {
+		gotEnv := readJSONFile(t, filepath.Join(bundleDir, "outputs", "env.json"))
+		for _, k := range want.EnvAbsent {
+			if v, ok := gotEnv[k]; ok {
+				t.Errorf("env.json: key %q present (value %v), want absent", k, v)
+			}
+		}
+	}
+	for rel, expected := range want.TOMLFiles {
+		path := filepath.Join(tmpHome, rel)
+		// Provisioners already require Python 3.11+ and tomllib; use that
+		// parser to check native TOML without adding a Go dependency.
+		parse := exec.Command(python, "-c",
+			"import json, sys, tomllib; print(json.dumps(tomllib.loads(open(sys.argv[1], encoding='utf-8').read())))", path)
+		out, err := parse.CombinedOutput()
+		if err != nil {
+			t.Fatalf("parse native TOML %s: %v\n%s", rel, err, out)
+		}
+		var got map[string]interface{}
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("decode native TOML %s: %v", rel, err)
+		}
+		assertJSONSubset(t, rel, expected, got)
 	}
 }
 

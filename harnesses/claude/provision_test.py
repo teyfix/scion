@@ -25,6 +25,7 @@ import os
 import tempfile
 import unittest
 from contextlib import contextmanager
+from typing import Any
 
 PROVISION_PATH = os.path.join(os.path.dirname(__file__), "provision.py")
 SPEC = importlib.util.spec_from_file_location("claude_provision", PROVISION_PATH)
@@ -78,6 +79,8 @@ def env_vars(**values: str | None):
 def make_ctx(home: str):
     manifest = {
         "harness_bundle_dir": os.path.join(home, ".scion", "harness"),
+        # Never fall back to the real /workspace (ptone/scion#2993).
+        "agent_workspace": os.path.join(home, "workspace"),
         "harness_config": {
             "model_aliases": dict(MODEL_ALIASES),
             "instructions_file": ".claude/CLAUDE.md",
@@ -97,7 +100,15 @@ class ModelResolutionTest(unittest.TestCase):
         self.assertEqual(model, "sonnet")
         self.assertEqual(env["ANTHROPIC_MODEL"], "sonnet")
 
-    def test_alias_matching_is_case_insensitive_and_accepts_shorthand(self) -> None:
+    def test_apply_model_is_case_insensitive_and_accepts_shorthand(self) -> None:
+        """scion_harness.resolve_model normalizes shorthand/case before lookup.
+
+        This used to be a claude-local mirror of config.NormalizeModelAlias /
+        config.ResolveModelAlias (pkg/config/templates.go); the mirror moved
+        to the shared scion_harness.resolve_model helper (unit-tested in
+        scion_harness_test.py), so this is now an end-to-end check that
+        _apply_model wires SCION_MODEL through that helper correctly.
+        """
         cases = {
             "Medium": "sonnet",
             "L": "opus",
@@ -109,53 +120,56 @@ class ModelResolutionTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
                     ctx = make_ctx(tmp)
-                    self.assertEqual(provision._resolve_model_alias(ctx, raw), want)
+                    with env_vars(SCION_MODEL=raw, ANTHROPIC_MODEL=None):
+                        env: dict[str, str] = {}
+                        model = provision._apply_model(ctx, env)
+                self.assertEqual(model, want)
+                self.assertEqual(env["ANTHROPIC_MODEL"], want)
 
-    def test_shorthand_set_matches_go_normalize_model_alias(self) -> None:
-        """Python must not accept spellings the Go --model path rejects.
-
-        config.NormalizeModelAlias (pkg/config/templates.go) handles only
-        s/m/l/xl plus lower-casing, and config.ResolveModelAlias gates the
-        map lookup on config.KnownModelAliases. A spelling accepted only here
-        would make ANTHROPIC_MODEL disagree with the higher-precedence
-        --model flag.
-        """
-        self.assertEqual(
-            provision.MODEL_ALIAS_SHORTHAND,
-            {"s": "small", "m": "medium", "l": "large", "xl": "extra-large"},
-        )
-        self.assertEqual(
-            provision.KNOWN_MODEL_ALIASES,
-            frozenset({"small", "medium", "large", "extra-large"}),
-        )
-
-        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
-            ctx = make_ctx(tmp)
-            # Spellings Go does not normalize stay concrete (lower-cased),
-            # exactly as `config.ResolveModelAlias` would leave them.
-            for raw in ("xlarge", "extra_large"):
-                with self.subTest(raw=raw):
-                    self.assertEqual(provision._resolve_model_alias(ctx, raw), raw)
-
-    def test_unmapped_alias_falls_back_to_the_tier_name(self) -> None:
+    def test_apply_model_unmapped_alias_falls_back_to_the_tier_name(self) -> None:
         """Matches config.ResolveModelAlias: unmapped alias passes through."""
         with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
             manifest = {
                 "harness_bundle_dir": os.path.join(tmp, ".scion", "harness"),
+                "agent_workspace": os.path.join(tmp, "workspace"),
                 "harness_config": {"model_aliases": {"small": "haiku"}},
             }
             ctx = scion_harness.ProvisionContext("claude", manifest)
-            self.assertEqual(provision._resolve_model_alias(ctx, "large"), "large")
+            with env_vars(SCION_MODEL="large", ANTHROPIC_MODEL=None):
+                env: dict[str, str] = {}
+                model = provision._apply_model(ctx, env)
+        self.assertEqual(model, "large")
 
-    def test_custom_non_tier_alias_keys_are_ignored(self) -> None:
+    def test_apply_model_missing_harness_config_falls_back_to_tier_name(self) -> None:
+        """Regression guard for the gemini review on GoogleCloudPlatform/scion#1891:
+        ctx.harness_config must never be treated as unconditionally truthy/dict-like
+        without a guard. A manifest with no "harness_config" key at all (so the
+        property defaults to {}) must resolve to the bare tier name, not raise.
+        """
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            manifest = {
+                "harness_bundle_dir": os.path.join(tmp, ".scion", "harness"),
+                "agent_workspace": os.path.join(tmp, "workspace"),
+            }
+            ctx = scion_harness.ProvisionContext("claude", manifest)
+            with env_vars(SCION_MODEL="large", ANTHROPIC_MODEL=None):
+                env: dict[str, str] = {}
+                model = provision._apply_model(ctx, env)
+        self.assertEqual(model, "large")
+
+    def test_apply_model_custom_non_tier_alias_keys_are_ignored(self) -> None:
         """Only the four canonical tiers resolve, as on the Go side."""
         with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
             manifest = {
                 "harness_bundle_dir": os.path.join(tmp, ".scion", "harness"),
+                "agent_workspace": os.path.join(tmp, "workspace"),
                 "harness_config": {"model_aliases": {"fast": "haiku"}},
             }
             ctx = scion_harness.ProvisionContext("claude", manifest)
-            self.assertEqual(provision._resolve_model_alias(ctx, "fast"), "fast")
+            with env_vars(SCION_MODEL="fast", ANTHROPIC_MODEL=None):
+                env: dict[str, str] = {}
+                model = provision._apply_model(ctx, env)
+        self.assertEqual(model, "fast")
 
     def test_concrete_model_passes_through_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
@@ -166,6 +180,27 @@ class ModelResolutionTest(unittest.TestCase):
 
         self.assertEqual(model, "claude-sonnet-4-5")
         self.assertEqual(env["ANTHROPIC_MODEL"], "claude-sonnet-4-5")
+
+    def test_concrete_model_case_is_preserved(self) -> None:
+        """Behavior difference from claude's old private mirror (R1 of the
+        round-1 review): the old `_normalize_model_alias` lower-cased every
+        value, tier or not, so a mixed-case concrete model name supplied via
+        an explicit SCION_MODEL (a template/hub `env:` block — Go's
+        reResolveModelAlias only rewrites tier names, not concrete ones)
+        would have been lower-cased before reaching ANTHROPIC_MODEL. The
+        shared scion_harness.resolve_model only normalizes case to decide
+        whether a value is a known tier; a concrete name passes through with
+        the caller's original spelling. Anthropic model IDs happen to be
+        lowercase already, so this is harmless for claude in practice.
+        """
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            with env_vars(SCION_MODEL="Claude-Sonnet-4-5", ANTHROPIC_MODEL=None):
+                env: dict[str, str] = {}
+                model = provision._apply_model(ctx, env)
+
+        self.assertEqual(model, "Claude-Sonnet-4-5")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "Claude-Sonnet-4-5")
 
     def test_no_requested_model_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
@@ -245,6 +280,375 @@ class ModelResolutionTest(unittest.TestCase):
                 provision._apply_model(ctx, {})
 
         self.assertEqual(warnings, [])
+
+    def test_opus_5_5_falls_back_to_opus_4_8_on_old_claude_code(self) -> None:
+        """Claude Code < 2.1.280 rejects claude-opus-5-5* and opus with 400."""
+        for requested in ("claude-opus-5-5", "claude-opus-5-5@default", "opus", None):
+            with self.subTest(requested=requested):
+                warnings: list[str] = []
+                with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+                    ctx = make_ctx(tmp)
+                    ctx.warn = warnings.append  # type: ignore[method-assign]
+                    with env_vars(SCION_MODEL=requested, ANTHROPIC_MODEL=None):
+                        env: dict[str, str] = {}
+                        model = provision._apply_model(ctx, env, claude_version="2.1.270")
+
+                self.assertEqual(model, "claude-opus-4-8")
+                self.assertEqual(env["ANTHROPIC_MODEL"], "claude-opus-4-8")
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("2.1.280", warnings[0])
+                self.assertIn("claude_code_version_too_old", warnings[0])
+
+    def test_opus_5_5_passes_through_on_claude_code_2_1_280_or_newer(self) -> None:
+        for version in ("2.1.280", "2.1.295", "2.2.0"):
+            for requested in ("claude-opus-5-5@default", "opus"):
+                with self.subTest(version=version, requested=requested):
+                    warnings: list[str] = []
+                    with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+                        ctx = make_ctx(tmp)
+                        ctx.warn = warnings.append  # type: ignore[method-assign]
+                        with env_vars(SCION_MODEL=requested, ANTHROPIC_MODEL=None):
+                            env: dict[str, str] = {}
+                            model = provision._apply_model(ctx, env, claude_version=version)
+
+                    self.assertEqual(model, requested)
+                    self.assertEqual(env["ANTHROPIC_MODEL"], requested)
+                    self.assertEqual(warnings, [])
+
+    def test_non_opus_5_5_models_unaffected_by_old_claude_code(self) -> None:
+        for requested in ("claude-opus-4-8", "claude-sonnet-4-5", "haiku"):
+            with self.subTest(requested=requested):
+                warnings: list[str] = []
+                with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+                    ctx = make_ctx(tmp)
+                    ctx.warn = warnings.append  # type: ignore[method-assign]
+                    with env_vars(SCION_MODEL=requested, ANTHROPIC_MODEL=None):
+                        env: dict[str, str] = {}
+                        model = provision._apply_model(ctx, env, claude_version="2.1.270")
+
+                self.assertEqual(model, requested)
+                self.assertEqual(env["ANTHROPIC_MODEL"], requested)
+                self.assertEqual(warnings, [])
+
+    def test_build_env_overlay_disables_autoupdater(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_ctx(tmp)
+            auth = scion_harness.ResolvedAuth(method="api-key", env_key="ANTHROPIC_API_KEY")
+            env = provision._build_env_overlay(ctx, auth)
+
+        self.assertEqual(env.get("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), "1")
+        self.assertEqual(env.get("DISABLE_AUTOUPDATER"), "1")
+
+
+# Mirrors harnesses/claude/config.yaml's `thinking:` block exactly. The Go
+# test TestEmbeddedHarnessThinkingBlocks pins the yaml side to the same
+# literal table, so the two cannot drift.
+CLAUDE_THINKING = {
+    "levels": [
+        {"max": 25, "value": "low"},
+        {"max": 50, "value": "medium"},
+        {"max": 75, "value": "high"},
+        {"max": 100, "value": "xhigh"},
+    ],
+}
+
+
+def make_thinking_ctx(home: str, thinking: Any = CLAUDE_THINKING, *, omit_thinking: bool = False):
+    ctx = make_ctx(home)
+    if not omit_thinking:
+        ctx.harness_config["thinking"] = thinking
+    return ctx
+
+
+class EffortTest(unittest.TestCase):
+    """ptone/scion#3011: SCION_THINKING_LEVEL -> CLAUDE_CODE_EFFORT_LEVEL."""
+
+    def _effort(
+        self,
+        raw: str | None,
+        *,
+        preset: str | None = None,
+        thinking: Any = CLAUDE_THINKING,
+        omit_thinking: bool = False,
+    ) -> tuple[dict[str, str], str | None, list[str]]:
+        warnings: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx = make_thinking_ctx(tmp, thinking, omit_thinking=omit_thinking)
+            ctx.warn = warnings.append  # type: ignore[method-assign]
+            with env_vars(SCION_THINKING_LEVEL=raw, CLAUDE_CODE_EFFORT_LEVEL=preset):
+                env: dict[str, str] = {}
+                effort = provision._apply_effort(ctx, env)
+        return env, effort, warnings
+
+    def test_level_maps_through_quartile_table(self) -> None:
+        cases = (
+            ("0", "low"),
+            ("25", "low"),
+            ("26", "medium"),
+            ("50", "medium"),
+            ("51", "high"),
+            ("75", "high"),
+            ("76", "xhigh"),
+            ("100", "xhigh"),
+            ("150", "xhigh"),
+            ("-5", "low"),
+        )
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                env, effort, warnings = self._effort(raw)
+                self.assertEqual(effort, want)
+                self.assertEqual(env, {"CLAUDE_CODE_EFFORT_LEVEL": want})
+                self.assertEqual(warnings, [])
+
+    def test_no_level_sets_nothing(self) -> None:
+        """Decided requirement: no level means Claude keeps its per-model default."""
+        for raw in (None, "", "   "):
+            with self.subTest(raw=raw):
+                env, effort, warnings = self._effort(raw)
+                self.assertIsNone(effort)
+                self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+                self.assertEqual(warnings, [])
+
+    def test_invalid_level_sets_nothing_and_warns(self) -> None:
+        env, effort, warnings = self._effort("abc")
+        self.assertIsNone(effort)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+        self.assertTrue(any("not a valid integer" in w for w in warnings), warnings)
+
+    def test_preset_env_is_not_clobbered(self) -> None:
+        """A template/harness-config env pin wins; the overlay must not shadow it."""
+        env, effort, warnings = self._effort("90", preset="low")
+        self.assertIsNone(effort)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("CLAUDE_CODE_EFFORT_LEVEL='low'", warnings[0])
+
+    def test_preset_env_without_level_is_silent(self) -> None:
+        env, effort, warnings = self._effort(None, preset="high")
+        self.assertIsNone(effort)
+        self.assertEqual(env, {})
+        self.assertEqual(warnings, [])
+
+    def test_missing_thinking_block_warns_only_when_level_requested(self) -> None:
+        for label, kwargs in (("omitted", {"omit_thinking": True}), ("empty", {"thinking": {}})):
+            with self.subTest(block=label):
+                env, effort, warnings = self._effort("60", **kwargs)
+                self.assertIsNone(effort)
+                self.assertEqual(env, {})
+                self.assertTrue(any("no thinking block" in w for w in warnings), warnings)
+                env, effort, warnings = self._effort(None, **kwargs)
+                self.assertEqual((env, effort), ({}, None))
+                # An empty block still draws resolve_thinking's "malformed"
+                # warning; the requested-level warning must not fire.
+                self.assertFalse(any("no thinking block" in w for w in warnings), warnings)
+
+    def test_preset_empty_env_is_not_clobbered(self) -> None:
+        """An empty pin still blocks the overlay in MergeEnvOverlay (presence wins)."""
+        env, effort, warnings = self._effort("90", preset="")
+        self.assertIsNone(effort)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("CLAUDE_CODE_EFFORT_LEVEL=''", warnings[0])
+
+    def test_max_value_is_written_without_warning(self) -> None:
+        """A customized table may name `max`; the env var accepts it."""
+        thinking = {"levels": [{"max": 100, "value": "max"}]}
+        env, effort, warnings = self._effort("60", thinking=thinking)
+        self.assertEqual(env, {"CLAUDE_CODE_EFFORT_LEVEL": "max"})
+        self.assertEqual(effort, "max")
+        self.assertEqual(warnings, [])
+
+    def test_undocumented_value_is_written_with_warning(self) -> None:
+        thinking = {"levels": [{"max": 100, "value": "turbo"}]}
+        env, effort, warnings = self._effort("60", thinking=thinking)
+        self.assertEqual(env, {"CLAUDE_CODE_EFFORT_LEVEL": "turbo"})
+        self.assertEqual(effort, "turbo")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("'turbo'", warnings[0])
+
+
+class ProvisionEffortWiringTest(unittest.TestCase):
+    """Drives the real provision() entry point and reads outputs/env.json."""
+
+    def _env_json(self, raw: str | None) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            os.makedirs(os.path.join(tmp, ".scion", "harness", "inputs"))
+            ctx = make_thinking_ctx(tmp)
+            ctx.select_auth = lambda _: scion_harness.ResolvedAuth("none")  # type: ignore[method-assign]
+            with env_vars(
+                SCION_THINKING_LEVEL=raw, CLAUDE_CODE_EFFORT_LEVEL=None,
+                SCION_MODEL=None, ANTHROPIC_MODEL=None,
+            ):
+                provision.provision(ctx)
+            with open(os.path.join(tmp, ".scion", "harness", "outputs", "env.json"), encoding="utf-8") as f:
+                return json.load(f)
+
+    def test_level_reaches_env_json(self) -> None:
+        self.assertEqual(self._env_json("80").get("CLAUDE_CODE_EFFORT_LEVEL"), "xhigh")
+
+    def test_no_level_leaves_env_json_without_effort(self) -> None:
+        env = self._env_json(None)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+        self.assertIn("ANTHROPIC_MODEL", env)  # sanity: the overlay was written
+
+
+def _select_with_candidates(home: str, candidates: dict[str, Any]):
+    bundle = os.path.join(home, ".scion", "harness")
+    os.makedirs(os.path.join(bundle, "inputs"), exist_ok=True)
+    with open(os.path.join(bundle, "inputs", "auth-candidates.json"), "w", encoding="utf-8") as f:
+        json.dump(candidates, f)
+    ctx = make_ctx(home)
+    ctx.info = lambda *a, **k: None
+    return ctx, ctx.select_auth(provision.AUTH)
+
+
+class VertexAuthSelectionTest(unittest.TestCase):
+    # config.yaml's vertex-ai region group accepts CLOUD_ML_REGION; the
+    # provisioner must accept it too (ptone/scion#4623).
+    def test_explicit_vertex_ai_accepts_cloud_ml_region(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": ["GOOGLE_CLOUD_PROJECT", "CLOUD_ML_REGION"],
+            })
+            self.assertEqual(resolved.method, "vertex-ai")
+            self.assertEqual(resolved.env_key, "CLOUD_ML_REGION")
+            env = provision._build_env_overlay(ctx, resolved)
+        self.assertEqual(env["CLOUD_ML_REGION"], "${CLOUD_ML_REGION}")
+        self.assertEqual(env["CLAUDE_CODE_USE_VERTEX"], "1")
+
+    def test_location_wins_over_region_placeholder_fallback(self) -> None:
+        # Both keys present, no staged secrets: the LOCATION key is chosen and
+        # the ${VAR} placeholder fallback is kept (ptone/scion#4719). The
+        # process env is cleared: the conflict check reads it for these keys.
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp), env_vars(
+            GOOGLE_CLOUD_LOCATION=None, GOOGLE_CLOUD_REGION=None,
+        ):
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION", "GOOGLE_CLOUD_LOCATION"],
+            })
+            warnings: list[str] = []
+            ctx.warn = warnings.append
+            env = provision._build_env_overlay(ctx, resolved)
+        self.assertEqual(resolved.env_key, "GOOGLE_CLOUD_LOCATION")
+        self.assertEqual(env["CLOUD_ML_REGION"], "${GOOGLE_CLOUD_LOCATION}")
+        self.assertEqual(env["ANTHROPIC_VERTEX_PROJECT_ID"], "${GOOGLE_CLOUD_PROJECT}")
+        self.assertEqual(warnings, [])
+
+    def test_location_and_region_differ_location_wins_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            secrets = os.path.join(tmp, "secrets")
+            os.makedirs(secrets)
+            paths = {}
+            for key, value in (
+                ("GOOGLE_CLOUD_PROJECT", "proj-1"),
+                ("GOOGLE_CLOUD_REGION", "us-central1"),
+                ("GOOGLE_CLOUD_LOCATION", "us-east5"),
+            ):
+                paths[key] = os.path.join(secrets, key)
+                with open(paths[key], "w", encoding="utf-8") as f:
+                    f.write(value)
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": list(paths),
+                "env_secret_files": paths,
+            })
+            warnings: list[str] = []
+            ctx.warn = warnings.append
+            env = provision._build_env_overlay(ctx, resolved)
+        self.assertEqual(resolved.env_key, "GOOGLE_CLOUD_LOCATION")
+        self.assertEqual(env["CLOUD_ML_REGION"], "us-east5")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("GOOGLE_CLOUD_REGION", warnings[0])
+
+    def _env_only_overlay(self, location: str | None, region: str | None):
+        # Both keys are candidates with no staged secrets, so Claude reads the
+        # env values at runtime through the ${VAR} placeholder.
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp), env_vars(
+            GOOGLE_CLOUD_LOCATION=location, GOOGLE_CLOUD_REGION=region,
+        ):
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION", "GOOGLE_CLOUD_LOCATION"],
+            })
+            warnings: list[str] = []
+            ctx.warn = warnings.append
+            env = provision._build_env_overlay(ctx, resolved)
+        return env, warnings
+
+    def test_env_only_location_and_region_differ_warns(self) -> None:
+        # The conflict check reads the env, as Claude does (ptone/scion#4719).
+        env, warnings = self._env_only_overlay("us-east5", "us-central1")
+        self.assertEqual(env["CLOUD_ML_REGION"], "${GOOGLE_CLOUD_LOCATION}")
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("GOOGLE_CLOUD_REGION", warnings[0])
+
+    def test_env_only_location_and_region_equal_no_warning(self) -> None:
+        _, warnings = self._env_only_overlay("us-east5", "us-east5")
+        self.assertEqual(warnings, [])
+
+    def test_env_only_single_key_no_warning(self) -> None:
+        for location, region in (("us-east5", None), (None, "us-central1"), ("us-east5", "")):
+            with self.subTest(location=location, region=region):
+                _, warnings = self._env_only_overlay(location, region)
+                self.assertEqual(warnings, [])
+
+    def test_secret_file_only_keys_differ_warns(self) -> None:
+        # Keys staged only as secret files (not in env_vars), e.g. recorded
+        # secrets merged on restart: selection and _resolve read the files,
+        # so the conflict check must too. Non-candidate env is not read.
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp), env_vars(
+            GOOGLE_CLOUD_LOCATION="us-east5", GOOGLE_CLOUD_REGION="us-east5",
+        ):
+            secrets = os.path.join(tmp, "secrets")
+            os.makedirs(secrets)
+            paths = {}
+            for key, value in (
+                ("GOOGLE_CLOUD_PROJECT", "proj-1"),
+                ("GOOGLE_CLOUD_REGION", "us-central1"),
+                ("GOOGLE_CLOUD_LOCATION", "europe-west4"),
+            ):
+                paths[key] = os.path.join(secrets, key)
+                with open(paths[key], "w", encoding="utf-8") as f:
+                    f.write(value)
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": [],
+                "env_secret_files": paths,
+            })
+            warnings: list[str] = []
+            ctx.warn = warnings.append
+            env = provision._build_env_overlay(ctx, resolved)
+        self.assertEqual(resolved.env_key, "GOOGLE_CLOUD_LOCATION")
+        self.assertEqual(env["CLOUD_ML_REGION"], "europe-west4")
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("'europe-west4'", warnings[0])
+        self.assertIn("'us-central1'", warnings[0])
+
+    def test_non_candidate_env_not_read(self) -> None:
+        # A stale process-env value for a key that is neither a candidate nor
+        # a staged secret is not part of resolution and must not warn.
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp), env_vars(
+            GOOGLE_CLOUD_LOCATION="us-east5", GOOGLE_CLOUD_REGION="us-central1",
+        ):
+            ctx, resolved = _select_with_candidates(tmp, {
+                "explicit_type": "vertex-ai",
+                "env_vars": ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION"],
+            })
+            warnings: list[str] = []
+            ctx.warn = warnings.append
+            env = provision._build_env_overlay(ctx, resolved)
+        self.assertEqual(env["CLOUD_ML_REGION"], "${GOOGLE_CLOUD_REGION}")
+        self.assertEqual(warnings, [])
+
+    def test_explicit_vertex_ai_without_region_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, temporary_home(tmp):
+            with self.assertRaises(scion_harness.ProvisionError):
+                _select_with_candidates(tmp, {
+                    "explicit_type": "vertex-ai",
+                    "env_vars": ["GOOGLE_CLOUD_PROJECT"],
+                })
 
 
 class ConfigYamlTest(unittest.TestCase):

@@ -35,6 +35,9 @@ func ValidAgentRole(r AgentRole) bool {
 }
 
 // ScopesForRole returns the JWT scopes granted by a named agent role.
+// Scopes in ceilingOptionalRoleScopes (project:artifact:read, project:artifact:write) are part of the
+// bundle but never decide whether a role fits a ceiling or may be delegated;
+// a mint drops them when the source ceiling lacks their permission.
 // Returns nil for AgentRoleNone (caller should set NoAuth=true instead).
 // GCP token scopes and identity token scopes are NOT included here —
 // they are appended dynamically at dispatch time based on agent config.
@@ -43,7 +46,7 @@ func ScopesForRole(role AgentRole) []AgentTokenScope {
 	case AgentRoleNone:
 		return nil
 	case AgentRoleReadOnly:
-		return []AgentTokenScope{ScopeProjectRead}
+		return []AgentTokenScope{ScopeProjectRead, ScopeProjectArtifactRead}
 	case AgentRoleBaseline:
 		return []AgentTokenScope{
 			ScopeProjectRead,
@@ -51,6 +54,11 @@ func ScopesForRole(role AgentRole) []AgentTokenScope {
 			ScopeAgentTokenRefresh,
 			ScopeAgentNotify,
 			ScopeAgentPortForward,
+			ScopeProjectArtifactRead,
+			// Publishing artifacts is how an agent hands a document to
+			// readers on other brokers or in the web UI; it only writes
+			// artifacts homed in the agent's own project.
+			ScopeProjectArtifactWrite,
 		}
 	case AgentRoleFull:
 		return []AgentTokenScope{
@@ -60,9 +68,13 @@ func ScopesForRole(role AgentRole) []AgentTokenScope {
 			ScopeAgentNotify,
 			ScopeAgentPortForward,
 			ScopeAgentCreate,
+			ScopeAgentSAAssign,
 			ScopeAgentLifecycle,
 			ScopeProjectSecretRead,
 			ScopeProjectTemplateWrite,
+			ScopeAgentSetMessageMode,
+			ScopeProjectArtifactRead,
+			ScopeProjectArtifactWrite,
 		}
 	case "":
 		return ScopesForRole(AgentRoleNone)
@@ -107,16 +119,4 @@ func minRole(roles ...AgentRole) AgentRole {
 		}
 	}
 	return min
-}
-
-// ResolveEffectiveRole computes the effective agent role.
-//
-// The user-ceiling gate is no longer applied at creation time. Live delegation
-// ceiling (Phase 1G) handles user authority bounding at decision time rather
-// than at role resolution time. Only the project maximum and template boundary
-// apply at creation time.
-//
-// userHubRole is retained for API compatibility but is no longer used.
-func ResolveEffectiveRole(requested AgentRole, userHubRole string, projectMax AgentRole) AgentRole {
-	return minRole(requested, projectMax)
 }

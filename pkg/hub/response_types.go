@@ -29,6 +29,11 @@ type AgentWithCapabilities struct {
 	ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 	HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 	CloudLogging        bool                             `json:"cloudLogging,omitempty"`
+	// Editability is set on the single-agent GET only.
+	Editability *AgentEditability `json:"editability,omitempty"`
+	// SSHHostKey is the authorized_keys line of the agent's SSH host key,
+	// set on the single-agent GET only (agentSSHHostKey).
+	SSHHostKey string `json:"sshHostKey,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to avoid shadowing of fields by the embedded store.Agent.
@@ -41,7 +46,8 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 		ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 		HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 		CloudLogging        bool                             `json:"cloudLogging,omitempty"`
-		GroveID             string                           `json:"groveId"`
+		Editability         *AgentEditability                `json:"editability,omitempty"`
+		SSHHostKey          string                           `json:"sshHostKey,omitempty"`
 	}{
 		AgentAlias:          AgentAlias(a.Agent),
 		Cap:                 a.Cap,
@@ -49,13 +55,14 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 		ResolvedHarness:     a.ResolvedHarness,
 		HarnessCapabilities: a.HarnessCapabilities,
 		CloudLogging:        a.CloudLogging,
-		GroveID:             a.ProjectID,
+		Editability:         a.Editability,
+		SSHHostKey:          a.SSHHostKey,
 	})
 }
 
-// UnmarshalJSON implements custom unmarshaling to handle embedded store.Agent and legacy fields.
+// UnmarshalJSON implements custom unmarshaling to handle the embedded store.Agent.
 func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
-	if err := a.Agent.UnmarshalJSON(data); err != nil {
+	if err := json.Unmarshal(data, &a.Agent); err != nil {
 		return err
 	}
 	type WrapperFields struct {
@@ -64,6 +71,8 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 		ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 		HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 		CloudLogging        bool                             `json:"cloudLogging,omitempty"`
+		Editability         *AgentEditability                `json:"editability,omitempty"`
+		SSHHostKey          string                           `json:"sshHostKey,omitempty"`
 	}
 	var wrapper WrapperFields
 	if err := json.Unmarshal(data, &wrapper); err != nil {
@@ -74,6 +83,8 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 	a.ResolvedHarness = wrapper.ResolvedHarness
 	a.HarnessCapabilities = wrapper.HarnessCapabilities
 	a.CloudLogging = wrapper.CloudLogging
+	a.Editability = wrapper.Editability
+	a.SSHHostKey = wrapper.SSHHostKey
 	return nil
 }
 
@@ -91,22 +102,16 @@ func (p ProjectWithCapabilities) MarshalJSON() ([]byte, error) {
 		ProjectAlias
 		Cap          *Capabilities `json:"_capabilities,omitempty"`
 		CloudLogging bool          `json:"cloudLogging,omitempty"`
-		GroveID      string        `json:"groveId"`
-		GroveName    string        `json:"groveName"`
-		Grove        string        `json:"grove"`
 	}{
 		ProjectAlias: ProjectAlias(p.Project),
 		Cap:          p.Cap,
 		CloudLogging: p.CloudLogging,
-		GroveID:      p.ID,
-		GroveName:    p.Name,
-		Grove:        p.Slug,
 	})
 }
 
-// UnmarshalJSON implements custom unmarshaling to handle embedded store.Project and legacy fields.
+// UnmarshalJSON implements custom unmarshaling to handle the embedded store.Project.
 func (p *ProjectWithCapabilities) UnmarshalJSON(data []byte) error {
-	if err := p.Project.UnmarshalJSON(data); err != nil {
+	if err := json.Unmarshal(data, &p.Project); err != nil {
 		return err
 	}
 	type WrapperFields struct {
@@ -129,8 +134,8 @@ type TemplateWithCapabilities struct {
 }
 
 // HarnessConfigWithCapabilities wraps a store.HarnessConfig with capability annotations.
-// Unlike templates there is no legacy field aliasing, so the embedded struct's default
-// JSON marshaling is sufficient.
+// Unlike the other With-Capabilities wrapper types, this one has no field naming
+// conflicts, so the embedded struct's default JSON marshaling is sufficient.
 type HarnessConfigWithCapabilities struct {
 	store.HarnessConfig
 	Cap *Capabilities `json:"_capabilities,omitempty"`
@@ -141,24 +146,21 @@ func (t TemplateWithCapabilities) MarshalJSON() ([]byte, error) {
 	type TemplateAlias store.Template
 	return json.Marshal(&struct {
 		TemplateAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
+		Cap *Capabilities `json:"_capabilities,omitempty"`
 	}{
 		TemplateAlias: TemplateAlias(t.Template),
 		Cap:           t.Cap,
-		GroveID:       t.ProjectID,
 	})
 }
 
-// UnmarshalJSON implements custom unmarshaling to handle embedded store.Template and legacy fields.
+// UnmarshalJSON implements custom unmarshaling to handle embedded store.Template.
 func (t *TemplateWithCapabilities) UnmarshalJSON(data []byte) error {
 	// store.Template doesn't have UnmarshalJSON, but we call it anyway for consistency
 	// and to handle future-proofing if it gets one.
 	type TemplateAlias store.Template
 	aux := &struct {
 		*TemplateAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
+		Cap *Capabilities `json:"_capabilities,omitempty"`
 	}{
 		TemplateAlias: (*TemplateAlias)(&t.Template),
 	}
@@ -166,9 +168,6 @@ func (t *TemplateWithCapabilities) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	t.Cap = aux.Cap
-	if t.ProjectID == "" && aux.GroveID != "" {
-		t.ProjectID = aux.GroveID
-	}
 	return nil
 }
 
@@ -183,22 +182,19 @@ func (g GroupWithCapabilities) MarshalJSON() ([]byte, error) {
 	type GroupAlias store.Group
 	return json.Marshal(&struct {
 		GroupAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
+		Cap *Capabilities `json:"_capabilities,omitempty"`
 	}{
 		GroupAlias: GroupAlias(g.Group),
 		Cap:        g.Cap,
-		GroveID:    g.ProjectID,
 	})
 }
 
-// UnmarshalJSON implements custom unmarshaling to handle embedded store.Group and legacy fields.
+// UnmarshalJSON implements custom unmarshaling to handle embedded store.Group.
 func (g *GroupWithCapabilities) UnmarshalJSON(data []byte) error {
 	type GroupAlias store.Group
 	aux := &struct {
 		*GroupAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
+		Cap *Capabilities `json:"_capabilities,omitempty"`
 	}{
 		GroupAlias: (*GroupAlias)(&g.Group),
 	}
@@ -206,9 +202,6 @@ func (g *GroupWithCapabilities) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	g.Cap = aux.Cap
-	if g.ProjectID == "" && aux.GroveID != "" {
-		g.ProjectID = aux.GroveID
-	}
 	return nil
 }
 
@@ -246,10 +239,54 @@ func (u *UserWithCapabilities) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// RuntimeBrokerWithCapabilities wraps a store.RuntimeBroker with capability annotations.
+// RuntimeBrokerWithCapabilities wraps a store.RuntimeBroker with capability
+// annotations and its effective agent capacity (ptone/scion#2061 P2.2,
+// design.md §5.6, §5.9). AgentLimit/AgentCount/AgentLimitSource mirror the
+// providers listing's projectProviderView fields exactly (same semantics:
+// nil limit = unlimited, handlers_env_secrets.go) — both are populated
+// through the shared resolveBrokerCapacity/brokerCapacity read model, never
+// a second one (AC-P2-10). They carry no additional visibility check beyond
+// the existing per-broker ActionRead capability filter in
+// listRuntimeBrokers: whoever can already see a broker row sees its
+// capacity fields too, the same rule the providers listing uses.
 type RuntimeBrokerWithCapabilities struct {
 	store.RuntimeBroker
 	Cap *Capabilities `json:"_capabilities,omitempty"`
+	// AgentLimit is the effective max_agents_per_broker ceiling for this
+	// broker. Unset (nil) when unlimited, or when resolution didn't run or
+	// failed — see resolveBrokerCapacity.
+	AgentLimit *int64 `json:"agentLimit,omitempty"`
+	// AgentCount is the number of active max_agents_per_broker reservations
+	// held by this broker. Unset (nil) only when resolution didn't run or
+	// failed — see resolveBrokerCapacity. Unlike AgentLimit, it is still
+	// present (and may be a real, non-zero value) when the broker is
+	// unlimited, since AgentLimit's nil there means "no cap", not "no
+	// count"; a zero count is reported as 0, not omitted.
+	AgentCount *int64 `json:"agentCount,omitempty"`
+	// AgentLimitSource is one of the BrokerLimitSource* constants
+	// (broker_capacity.go): "broker" | "entitlement" | "hub_default" |
+	// "unlimited" | "not_enforced". It is the precedence step that produced
+	// the result, not a statement about whether that result is a cap: when
+	// the effective limit is <= 0 (unlimited), AgentLimit is absent but
+	// AgentLimitSource is still whichever step produced it — "broker" for a
+	// settings.maxAgents=0 override, "entitlement" or "hub_default" for a 0
+	// binding or default. "unlimited" itself is reserved for
+	// effectiveBrokerLimit's other branch — no limit definition or no quota
+	// service configured at all — in which case brokerCapacity returns
+	// before counting and resolveBrokerCapacity omits all three fields, so
+	// "unlimited" is never actually observed here in practice (present in
+	// the source constants, not in this field's real values).
+	//
+	// "not_enforced" (design.md Amendment A1, ptone/scion#2270/P1b, not yet
+	// wired as of this field) means the P1b enforcement switch is off.
+	// AgentLimit keeps whatever the precedence steps resolved — a cap, or
+	// absent when that resolves to unlimited, exactly as in every other
+	// source above — but the value is informational only and is not
+	// currently enforced by Reserve. Every caller that renders AgentLimit
+	// must also render AgentLimitSource, and must show "not_enforced"
+	// visibly (not tooltip-only), since a limit shown without that context
+	// would look enforced when it is not.
+	AgentLimitSource string `json:"agentLimitSource,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to avoid shadowing of fields by the embedded store.RuntimeBroker.
@@ -257,10 +294,16 @@ func (b RuntimeBrokerWithCapabilities) MarshalJSON() ([]byte, error) {
 	type BrokerAlias store.RuntimeBroker
 	return json.Marshal(&struct {
 		BrokerAlias
-		Cap *Capabilities `json:"_capabilities,omitempty"`
+		Cap              *Capabilities `json:"_capabilities,omitempty"`
+		AgentLimit       *int64        `json:"agentLimit,omitempty"`
+		AgentCount       *int64        `json:"agentCount,omitempty"`
+		AgentLimitSource string        `json:"agentLimitSource,omitempty"`
 	}{
-		BrokerAlias: BrokerAlias(b.RuntimeBroker),
-		Cap:         b.Cap,
+		BrokerAlias:      BrokerAlias(b.RuntimeBroker),
+		Cap:              b.Cap,
+		AgentLimit:       b.AgentLimit,
+		AgentCount:       b.AgentCount,
+		AgentLimitSource: b.AgentLimitSource,
 	})
 }
 
@@ -269,7 +312,10 @@ func (b *RuntimeBrokerWithCapabilities) UnmarshalJSON(data []byte) error {
 	type BrokerAlias store.RuntimeBroker
 	aux := &struct {
 		*BrokerAlias
-		Cap *Capabilities `json:"_capabilities,omitempty"`
+		Cap              *Capabilities `json:"_capabilities,omitempty"`
+		AgentLimit       *int64        `json:"agentLimit,omitempty"`
+		AgentCount       *int64        `json:"agentCount,omitempty"`
+		AgentLimitSource string        `json:"agentLimitSource,omitempty"`
 	}{
 		BrokerAlias: (*BrokerAlias)(&b.RuntimeBroker),
 	}
@@ -277,5 +323,8 @@ func (b *RuntimeBrokerWithCapabilities) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	b.Cap = aux.Cap
+	b.AgentLimit = aux.AgentLimit
+	b.AgentCount = aux.AgentCount
+	b.AgentLimitSource = aux.AgentLimitSource
 	return nil
 }

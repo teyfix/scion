@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -30,9 +32,9 @@ import (
 // --- Registry completeness tests ---
 
 func TestRegistryHasAllSections(t *testing.T) {
-	expected := []string{"access", "lifecycle", "maintenance", "telemetry",
-		"agent_defaults", "endpoints", "github_app", "notifications",
-		"project_defaults", "auto_expose_ports", "federation"}
+	expected := []string{"access", "lifecycle", "maintenance", "messaging",
+		"telemetry", "agent_defaults", "endpoints", "github_app", "notifications",
+		"project_defaults", "auto_expose_ports", "quotas", "agent_secrets", "federation", "experiments", "artifacts", "profiling"}
 	for _, name := range expected {
 		if SectionByName(name) == nil {
 			t.Errorf("section %q not found in registry", name)
@@ -68,6 +70,10 @@ func TestSectionHasKoanfPaths(t *testing.T) {
 	// Sections that are DB-only (no settings.yaml representation).
 	dbOnlySections := map[string]bool{
 		"maintenance": true,
+		"messaging":   true,
+		"experiments": true,
+		"artifacts":   true,
+		"profiling":   true,
 	}
 	for _, sec := range Registry {
 		if dbOnlySections[sec.Name] {
@@ -114,6 +120,8 @@ func TestOwningSection(t *testing.T) {
 		{"server.github_app.webhooks_enabled", "github_app"},
 		{"server.notification_channels", "notifications"},
 		{"auto_expose_ports.enabled", "auto_expose_ports"},
+		{"quotas.enforce_broker_quotas", "quotas"},
+		{"agent_secrets.user_scope_only", "agent_secrets"},
 		{"server.federation.enabled", "federation"},
 		{"server.federation.trusted_issuers", "federation"},
 		{"server.federation.algorithms", "federation"},
@@ -137,6 +145,33 @@ func TestMaintenanceHasNoOwnedKeys(t *testing.T) {
 		if sec := OwningSection(key); sec != "" {
 			t.Errorf("maintenance has no KoanfPaths, but OwningSection(%q) returned %q", key, sec)
 		}
+	}
+}
+
+func TestMessagingHasNoOwnedKeys(t *testing.T) {
+	keys := []string{
+		"messaging.conversation_envelope_switch",
+	}
+	for _, key := range keys {
+		if sec := OwningSection(key); sec != "" {
+			t.Errorf("messaging has no KoanfPaths, but OwningSection(%q) returned %q", key, sec)
+		}
+	}
+}
+
+// TestMessagingNotSeeded verifies that syncHubSettings skips the messaging
+// section because KoanfPaths is nil. The seeding loop condition is:
+//
+//	if len(sec.KoanfPaths) == 0 { continue }
+//
+// A seeded messaging row would be a behaviour change on every existing deployment.
+func TestMessagingNotSeeded(t *testing.T) {
+	sec := SectionByName("messaging")
+	if sec == nil {
+		t.Fatal("messaging section not found in registry")
+	}
+	if len(sec.KoanfPaths) != 0 {
+		t.Fatalf("messaging section has non-empty KoanfPaths %v; syncHubSettings will seed it at startup", sec.KoanfPaths)
 	}
 }
 
@@ -199,9 +234,24 @@ func TestValidateValidDoc(t *testing.T) {
 		{"project_defaults", `{}`},
 		{"auto_expose_ports", `{"enabled":true}`},
 		{"auto_expose_ports", `{}`},
+		{"quotas", `{"enforce_broker_quotas":true}`},
+		{"quotas", `{"enforce_broker_quotas":false}`},
+		{"quotas", `{}`},
+		{"agent_secrets", `{"user_scope_only":true}`},
+		{"agent_secrets", `{"user_scope_only":false}`},
+		{"agent_secrets", `{}`},
 		{"federation", `{"enabled":true,"trusted_issuers":[{"issuer_url":"https://hub.example.com","issuer_type":"hub"}],"algorithms":["RS256"]}`},
 		{"federation", `{"enabled":false}`},
 		{"federation", `{}`},
+		{"federation", `{"enabled":true,"trusted_issuers":[{"issuer_url":"https://accounts.google.com","issuer_type":"user","expected_audience":"client-id","allowed_gcp_projects":["my-project"]}]}`},
+		{"federation", `{"enabled":true,"trusted_issuers":[{"issuer_url":"https://accounts.google.com","issuer_type":"user","expected_audience":"client-id","allowed_domains":["example.com"]}]}`},
+		{"harness_configs", `{"claude":{"harness":"claude","image":"scion-claude:latest","image_pull_policy":"IfNotPresent"}}`},
+		{"profiles", `{"staging":{"runtime":"docker","harness_overrides":{"claude":{"image":"scion-claude:staging","image_pull_policy":"Always"}}}}`},
+		{"profiles", `{"gke":{"runtime":"k8s","shared_dir_storage_backend":"nfs"}}`},
+		{"profiles", `{"local":{"runtime":"docker","shared_dir_storage_backend":"local"}}`},
+		{"runtimes", `{"k8s":{"type":"kubernetes","shared_dir_storage_backend":"nfs"}}`},
+		{"profiles", `{"gke":{"runtime":"k8s","home_storage_backend":"nfs","home_storage_leaf":"pod"}}`},
+		{"runtimes", `{"k8s":{"type":"kubernetes","home_storage_backend":"local","home_storage_leaf":"broker"}}`},
 	}
 	for _, tt := range tests {
 		errs := Validate(tt.section, json.RawMessage(tt.doc))
@@ -224,10 +274,22 @@ func TestValidateInvalidDoc(t *testing.T) {
 		{"github_app", `{"app_id":"not-a-number"}`, "wrong type for int64"},
 		{"project_defaults", `{"default_scratchpad":"yes"}`, "wrong type for boolean"},
 		{"project_defaults", `{"unknown_field":true}`, "additional property"},
+		{"quotas", `{"enforce_broker_quotas":"yes"}`, "wrong type for boolean"},
+		{"quotas", `{"unknown_field":true}`, "additional property"},
+		{"agent_secrets", `{"user_scope_only":"yes"}`, "wrong type for boolean"},
+		{"agent_secrets", `{"unknown_field":true}`, "additional property"},
 		{"federation", `{"trusted_issuers":[{"issuer_url":""}]}`, "empty issuer_url (minLength)"},
 		{"federation", `{"algorithms":["INVALID"]}`, "invalid algorithm enum"},
 		{"federation", `{"trusted_issuers":[{"issuer_type":"unknown"}]}`, "invalid issuer_type enum"},
 		{"federation", `{"unknown_field": true}`, "additional property"},
+		{"harness_configs", `{"claude":{"harness":"claude","image_pull_policy":"always"}}`, "invalid image_pull_policy enum (case-sensitive)"},
+		{"profiles", `{"staging":{"runtime":"docker","harness_overrides":{"claude":{"image_pull_policy":"always"}}}}`, "invalid profile harness_overrides image_pull_policy enum"},
+		{"profiles", `{"gke":{"runtime":"k8s","shared_dir_storage_backend":"ceph"}}`, "invalid profile shared_dir_storage_backend enum"},
+		{"runtimes", `{"k8s":{"type":"kubernetes","shared_dir_storage_backend":"NFS"}}`, "invalid runtime shared_dir_storage_backend enum (case-sensitive)"},
+		{"profiles", `{"gke":{"runtime":"k8s","home_storage_backend":"ceph"}}`, "invalid profile home_storage_backend enum"},
+		{"profiles", `{"gke":{"runtime":"k8s","home_storage_leaf":"node"}}`, "invalid profile home_storage_leaf enum"},
+		{"runtimes", `{"k8s":{"type":"kubernetes","home_storage_backend":"NFS"}}`, "invalid runtime home_storage_backend enum (case-sensitive)"},
+		{"runtimes", `{"k8s":{"type":"kubernetes","home_storage_leaf":"Pod"}}`, "invalid runtime home_storage_leaf enum (case-sensitive)"},
 	}
 	for _, tt := range tests {
 		errs := Validate(tt.section, json.RawMessage(tt.doc))
@@ -267,6 +329,13 @@ func TestFederationSettingsRoundTrip(t *testing.T) {
 				DefaultScopes:    []string{"agent:status:update"},
 				IssuerType:       "hub",
 			},
+			{
+				IssuerURL:          "https://accounts.google.com",
+				ExpectedAudience:   "client-id.apps.googleusercontent.com",
+				IssuerType:         "user",
+				AllowedGCPProjects: []string{"gcp-proj-1"},
+				AllowedDomains:     []string{"Example.com"},
+			},
 		},
 		Algorithms:       []string{"RS256"},
 		RefreshInterval:  "1h",
@@ -286,14 +355,20 @@ func TestFederationSettingsRoundTrip(t *testing.T) {
 	if *restored.Enabled != true {
 		t.Errorf("Enabled: got %v, want true", *restored.Enabled)
 	}
-	if len(restored.TrustedIssuers) != 1 {
-		t.Fatalf("TrustedIssuers: got %d, want 1", len(restored.TrustedIssuers))
+	if len(restored.TrustedIssuers) != 2 {
+		t.Fatalf("TrustedIssuers: got %d, want 2", len(restored.TrustedIssuers))
 	}
 	if restored.TrustedIssuers[0].IssuerURL != "https://hub-a.example.com" {
 		t.Errorf("IssuerURL: got %q, want %q", restored.TrustedIssuers[0].IssuerURL, "https://hub-a.example.com")
 	}
 	if restored.TrustedIssuers[0].IssuerType != "hub" {
 		t.Errorf("IssuerType: got %q, want %q", restored.TrustedIssuers[0].IssuerType, "hub")
+	}
+	if got, want := restored.TrustedIssuers[1].AllowedGCPProjects, []string{"gcp-proj-1"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("AllowedGCPProjects: got %v, want %v", got, want)
+	}
+	if got, want := restored.TrustedIssuers[1].AllowedDomains, []string{"Example.com"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("AllowedDomains: got %v, want %v", got, want)
 	}
 	if restored.RefreshInterval != "1h" {
 		t.Errorf("RefreshInterval: got %q, want %q", restored.RefreshInterval, "1h")
@@ -335,9 +410,10 @@ func TestExtractSectionFromKoanf(t *testing.T) {
 		"server.notification_channels": []interface{}{
 			map[string]interface{}{"type": "slack", "params": map[string]interface{}{"url": "https://hooks.slack.com/test"}},
 		},
-		"server.database.driver":    "postgres",
-		"server.hub.port":           9810,
-		"auto_expose_ports.enabled": true,
+		"server.database.driver":       "postgres",
+		"server.hub.port":              9810,
+		"auto_expose_ports.enabled":    true,
+		"quotas.enforce_broker_quotas": false,
 	}, "."), nil)
 	if err != nil {
 		t.Fatalf("load koanf: %v", err)
@@ -396,6 +472,11 @@ func TestExtractSectionFromKoanf(t *testing.T) {
 		{"auto_expose_ports", func(t *testing.T, doc map[string]interface{}) {
 			if doc["enabled"] != true {
 				t.Errorf("expected enabled=true, got %v", doc["enabled"])
+			}
+		}},
+		{"quotas", func(t *testing.T, doc map[string]interface{}) {
+			if doc["enforce_broker_quotas"] != false {
+				t.Errorf("expected enforce_broker_quotas=false, got %v", doc["enforce_broker_quotas"])
 			}
 		}},
 	}
@@ -494,9 +575,10 @@ func TestRoundTrip(t *testing.T) {
 		"server.notification_channels": []interface{}{
 			map[string]interface{}{"type": "slack"},
 		},
-		"server.database.driver":    "postgres",
-		"server.hub.port":           9810,
-		"auto_expose_ports.enabled": true,
+		"server.database.driver":       "postgres",
+		"server.hub.port":              9810,
+		"auto_expose_ports.enabled":    true,
+		"quotas.enforce_broker_quotas": false,
 	}
 	if err := k.Load(confmap.Provider(original, "."), nil); err != nil {
 		t.Fatalf("load original: %v", err)
@@ -529,6 +611,7 @@ func TestRoundTrip(t *testing.T) {
 		{"server.github_app.app_id", nil},
 		{"server.github_app.webhooks_enabled", true},
 		{"auto_expose_ports.enabled", true},
+		{"quotas.enforce_broker_quotas", false},
 	}
 
 	for _, c := range checks {
@@ -584,6 +667,33 @@ func TestRoundTripDefaultResources(t *testing.T) {
 	}
 	if settings.DefaultResources.Disk != "20Gi" {
 		t.Errorf("expected Disk=20Gi, got %q", settings.DefaultResources.Disk)
+	}
+}
+
+// The hub-default GCP identity keys must survive bootstrap extraction:
+// syncHubSettings seeds/re-syncs the agent_defaults row from this document on
+// every boot, so a key missing here is silently dropped on SQLite restart.
+func TestExtractAgentDefaults_GCPIdentityKeys(t *testing.T) {
+	k := koanf.New(".")
+	_ = k.Load(confmap.Provider(map[string]interface{}{
+		"default_gcp_identity_mode":               "assign",
+		"default_gcp_identity_service_account_id": "sa-123",
+	}, "."), nil)
+
+	raw, err := ExtractSectionFromKoanf(k, "agent_defaults")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	var settings AgentDefaultsSettings
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("unmarshal into AgentDefaultsSettings: %v", err)
+	}
+	if settings.DefaultGCPIdentityMode != "assign" {
+		t.Errorf("DefaultGCPIdentityMode = %q, want assign", settings.DefaultGCPIdentityMode)
+	}
+	if settings.DefaultGCPIdentityServiceAccountID != "sa-123" {
+		t.Errorf("DefaultGCPIdentityServiceAccountID = %q, want sa-123", settings.DefaultGCPIdentityServiceAccountID)
 	}
 }
 
@@ -856,6 +966,9 @@ func TestClassifyKeys_AllLayer0Prefixes(t *testing.T) {
 		"server.secrets",
 		"server.storage",
 		"server.workspace_storage",
+		"server.workspace_storage.nfs.auto_mount",
+		"server.shared_dir_storage",
+		"server.shared_dir_storage.nfs",
 		"server.mode",
 		"server.env",
 		"server.hub.hub_id",
@@ -992,6 +1105,22 @@ func TestGlobalDefaultsReserved(t *testing.T) {
 }
 
 // --- DetectDeprecatedServerEnv tests ---
+
+// TestDetectDeprecatedServerEnv_PublicURLIsPin checks that
+// SCION_SERVER_HUB_ENDPOINT, which pins server.hub.public_url on a node, is
+// not reported as a deprecated seed input (ptone/scion#3905).
+func TestDetectDeprecatedServerEnv_PublicURLIsPin(t *testing.T) {
+	envK := koanf.New(".")
+	_ = envK.Load(confmap.Provider(map[string]interface{}{
+		"server.hub.public_url":   "https://hub.example.com",
+		"server.hub.admin_emails": []string{"admin@test.com"},
+	}, "."), nil)
+
+	deprecated := DetectDeprecatedServerEnv(envK)
+	if len(deprecated) != 1 || deprecated[0].KoanfKey != "server.hub.admin_emails" {
+		t.Fatalf("DetectDeprecatedServerEnv = %+v, want only server.hub.admin_emails", deprecated)
+	}
+}
 
 func TestDetectDeprecatedServerEnv_Layer1Keys(t *testing.T) {
 	envK := koanf.New(".")
@@ -1176,6 +1305,124 @@ func TestAutoExposePortsEmptyExtract(t *testing.T) {
 	}
 	if len(doc) != 0 {
 		t.Errorf("expected empty doc for absent auto_expose_ports, got %v", doc)
+	}
+}
+
+// TestQuotasKoanfRoundTrip verifies that quotas can be extracted from koanf
+// and loaded back without data loss.
+func TestQuotasKoanfRoundTrip(t *testing.T) {
+	k := koanf.New(".")
+	err := k.Load(confmap.Provider(map[string]interface{}{
+		"quotas.enforce_broker_quotas": false,
+	}, "."), nil)
+	if err != nil {
+		t.Fatalf("load koanf: %v", err)
+	}
+
+	// Extract the section.
+	raw, err := ExtractSectionFromKoanf(k, "quotas")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc["enforce_broker_quotas"] != false {
+		t.Errorf("expected enforce_broker_quotas=false in extracted doc, got %v", doc["enforce_broker_quotas"])
+	}
+
+	// Reload into a fresh koanf.
+	sections := map[string]json.RawMessage{
+		"quotas": raw,
+	}
+	reloaded, err := LoadSectionsIntoKoanf(sections)
+	if err != nil {
+		t.Fatalf("load sections: %v", err)
+	}
+
+	if !reloaded.Exists("quotas.enforce_broker_quotas") {
+		t.Fatal("expected quotas.enforce_broker_quotas to exist in reloaded koanf")
+	}
+	if reloaded.Bool("quotas.enforce_broker_quotas") != false {
+		t.Errorf("expected quotas.enforce_broker_quotas=false, got %v", reloaded.Get("quotas.enforce_broker_quotas"))
+	}
+}
+
+// TestQuotasEmptyExtract verifies that ExtractSectionFromKoanf returns an
+// empty doc when quotas is not set.
+func TestQuotasEmptyExtract(t *testing.T) {
+	k := koanf.New(".")
+	raw, err := ExtractSectionFromKoanf(k, "quotas")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc) != 0 {
+		t.Errorf("expected empty doc for absent quotas, got %v", doc)
+	}
+}
+
+// TestAgentSecretsKoanfRoundTrip verifies that agent_secrets can be
+// extracted from koanf and loaded back without data loss.
+func TestAgentSecretsKoanfRoundTrip(t *testing.T) {
+	k := koanf.New(".")
+	err := k.Load(confmap.Provider(map[string]interface{}{
+		"agent_secrets.user_scope_only": true,
+	}, "."), nil)
+	if err != nil {
+		t.Fatalf("load koanf: %v", err)
+	}
+
+	// Extract the section.
+	raw, err := ExtractSectionFromKoanf(k, "agent_secrets")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc["user_scope_only"] != true {
+		t.Errorf("expected user_scope_only=true in extracted doc, got %v", doc["user_scope_only"])
+	}
+
+	// Reload into a fresh koanf.
+	sections := map[string]json.RawMessage{
+		"agent_secrets": raw,
+	}
+	reloaded, err := LoadSectionsIntoKoanf(sections)
+	if err != nil {
+		t.Fatalf("load sections: %v", err)
+	}
+
+	if !reloaded.Exists("agent_secrets.user_scope_only") {
+		t.Fatal("expected agent_secrets.user_scope_only to exist in reloaded koanf")
+	}
+	if reloaded.Bool("agent_secrets.user_scope_only") != true {
+		t.Errorf("expected agent_secrets.user_scope_only=true, got %v", reloaded.Get("agent_secrets.user_scope_only"))
+	}
+}
+
+// TestAgentSecretsEmptyExtract verifies that ExtractSectionFromKoanf returns
+// an empty doc when agent_secrets is not set.
+func TestAgentSecretsEmptyExtract(t *testing.T) {
+	k := koanf.New(".")
+	raw, err := ExtractSectionFromKoanf(k, "agent_secrets")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc) != 0 {
+		t.Errorf("expected empty doc for absent agent_secrets, got %v", doc)
 	}
 }
 
@@ -1402,6 +1649,26 @@ func TestMapSectionsSchemaValidation(t *testing.T) {
 		t.Errorf("expected valid runtimes doc, got errors: %v", errs)
 	}
 
+	// Valid priority_class_name on a kubernetes runtime entry.
+	errs = Validate("runtimes", json.RawMessage(`{"k8s": {"type": "kubernetes", "priority_class_name": "scion-agent-priority"}}`))
+	if len(errs) > 0 {
+		t.Errorf("expected valid priority_class_name to pass, got errors: %v", errs)
+	}
+
+	// An empty priority_class_name means unset and must also pass — this
+	// route (the admin settings API) has no DNS-1123 check of its own
+	// before buildPod, so the schema is the only gate.
+	errs = Validate("runtimes", json.RawMessage(`{"k8s": {"type": "kubernetes", "priority_class_name": ""}}`))
+	if len(errs) > 0 {
+		t.Errorf("expected empty priority_class_name to pass, got errors: %v", errs)
+	}
+
+	// Invalid priority_class_name must fail.
+	errs = Validate("runtimes", json.RawMessage(`{"k8s": {"type": "kubernetes", "priority_class_name": "Not_A_Valid_Name"}}`))
+	if len(errs) == 0 {
+		t.Error("expected invalid priority_class_name to fail validation")
+	}
+
 	// Valid profiles doc.
 	errs = Validate("profiles", json.RawMessage(`{"default": {"runtime": "cloudrun"}}`))
 	if len(errs) > 0 {
@@ -1426,28 +1693,6 @@ func TestMapSectionsSchemaValidation(t *testing.T) {
 	errs = Validate("harness_configs", json.RawMessage(`{"bad": {"image": "test:latest"}}`))
 	if len(errs) == 0 {
 		t.Error("expected validation error for harness_configs entry missing 'harness' field")
-	}
-
-	// Valid profiles doc with docker.privileged (true and false).
-	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": true}}}`))
-	if len(errs) > 0 {
-		t.Errorf("expected valid profiles doc with docker.privileged=true, got errors: %v", errs)
-	}
-	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": false}}}`))
-	if len(errs) > 0 {
-		t.Errorf("expected valid profiles doc with docker.privileged=false, got errors: %v", errs)
-	}
-
-	// Invalid profiles doc with non-boolean docker.privileged.
-	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": "not-a-bool"}}}`))
-	if len(errs) == 0 {
-		t.Error("expected validation error for profiles doc with non-boolean docker.privileged")
-	}
-
-	// Invalid profiles doc with unknown field in docker.
-	errs = Validate("profiles", json.RawMessage(`{"onprem": {"runtime": "docker", "docker": {"privileged": true, "unsupported": 123}}}`))
-	if len(errs) == 0 {
-		t.Error("expected validation error for profiles doc with unknown field in docker")
 	}
 }
 
@@ -1474,7 +1719,7 @@ func TestKoanfKeyToEnvSuffix(t *testing.T) {
 		// server. prefix is stripped — it maps to the SCION_SERVER_ env prefix
 		{"server.hub.admin_emails", "HUB_ADMINEMAILS"},
 		{"server.auth.user_access_mode", "AUTH_USERACCESSMODE"},
-		{"server.hub.public_url", "HUB_PUBLICURL"},
+		{"server.hub.public_url", "HUB_ENDPOINT"},
 		// non-server keys are unchanged
 		{"telemetry.enabled", "TELEMETRY_ENABLED"},
 		{"default_max_turns", "DEFAULTMAXTURNS"},
@@ -1484,5 +1729,167 @@ func TestKoanfKeyToEnvSuffix(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("koanfKeyToEnvSuffix(%q) = %q, want %q", tt.key, got, tt.want)
 		}
+	}
+}
+
+// TestSharedDirKeysSchemaValidation verifies the runtimes and profiles
+// section schemas accept shared_dir_storage_class / shared_dir_size as
+// strings and reject a non-string shared_dir_size.
+func TestSharedDirKeysSchemaValidation(t *testing.T) {
+	valid := map[string]string{
+		"runtimes": `{"gke": {"type": "kubernetes", "shared_dir_storage_class": "standard-rwx", "shared_dir_size": "10Gi"}}`,
+		"profiles": `{"gke": {"runtime": "gke", "shared_dir_storage_class": "standard-rwx", "shared_dir_size": "10Gi"}}`,
+	}
+	for sec, doc := range valid {
+		if errs := Validate(sec, json.RawMessage(doc)); len(errs) > 0 {
+			t.Errorf("%s: expected string shared_dir_* keys to be valid, got errors: %v", sec, errs)
+		}
+	}
+
+	invalid := map[string]string{
+		"runtimes": `{"gke": {"type": "kubernetes", "shared_dir_size": 10}}`,
+		"profiles": `{"gke": {"runtime": "gke", "shared_dir_size": 10}}`,
+	}
+	for sec, doc := range invalid {
+		if errs := Validate(sec, json.RawMessage(doc)); len(errs) == 0 {
+			t.Errorf("%s: expected a numeric shared_dir_size to be rejected", sec)
+		}
+	}
+}
+
+// TestSafeToEvictSchemaValidation verifies the runtimes and profiles section
+// schemas accept safe_to_evict as a boolean and reject other types.
+func TestSafeToEvictSchemaValidation(t *testing.T) {
+	valid := map[string]string{
+		"runtimes": `{"gke": {"type": "kubernetes", "safe_to_evict": false}}`,
+		"profiles": `{"gke": {"runtime": "gke", "safe_to_evict": true}}`,
+	}
+	for sec, doc := range valid {
+		if errs := Validate(sec, json.RawMessage(doc)); len(errs) > 0 {
+			t.Errorf("%s: expected boolean safe_to_evict to be valid, got errors: %v", sec, errs)
+		}
+	}
+	invalid := map[string]string{
+		"runtimes": `{"gke": {"type": "kubernetes", "safe_to_evict": "false"}}`,
+		"profiles": `{"gke": {"runtime": "gke", "safe_to_evict": 0}}`,
+	}
+	for sec, doc := range invalid {
+		if errs := Validate(sec, json.RawMessage(doc)); len(errs) == 0 {
+			t.Errorf("%s: expected a non-boolean safe_to_evict to be rejected", sec)
+		}
+	}
+}
+
+// TestCloneDepthSchemaValidation checks the profiles section schema for
+// clone_depth: "full" or an integer from 1 to 999999999, as a string or a
+// bare integer, with null and "" meaning unset. It is the same rule as
+// settings-v1.schema.json.
+func TestCloneDepthSchemaValidation(t *testing.T) {
+	for _, doc := range []string{
+		`{"gke": {"runtime": "gke", "clone_depth": "full"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": 50}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "50"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": 999999999}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "999999999"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": null}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": ""}}`,
+		`{"gke": {"runtime": "gke"}}`,
+	} {
+		if errs := Validate("profiles", json.RawMessage(doc)); len(errs) > 0 {
+			t.Errorf("expected %s to be valid, got errors: %v", doc, errs)
+		}
+	}
+	for _, doc := range []string{
+		`{"gke": {"runtime": "gke", "clone_depth": 0}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "0"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": -1}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "shallow"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": true}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": 1000000000}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "1000000000"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "1234567890"}}`,
+		`{"gke": {"runtime": "gke", "clone_depth": "Full"}}`,
+	} {
+		if errs := Validate("profiles", json.RawMessage(doc)); len(errs) == 0 {
+			t.Errorf("expected %s to be rejected", doc)
+		}
+	}
+}
+
+// TestCloneDepthSchemaFromSettingsSchema checks that the profiles section
+// serves the clone_depth rule from settings-v1.schema.json unchanged.
+func TestCloneDepthSchemaFromSettingsSchema(t *testing.T) {
+	data, err := config.GetSettingsSchemaJSON("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	defs, _ := root["$defs"].(map[string]interface{})
+	want := profileCloneDepthSchema(defs)
+	if want == nil {
+		t.Fatal("settings schema has no profileConfig.clone_depth")
+	}
+
+	info, ok := SchemaInfo()["profiles"]
+	if !ok {
+		t.Fatal("no profiles section schema")
+	}
+	served, _ := json.Marshal(info.Schema)
+	var section map[string]interface{}
+	if err := json.Unmarshal(served, &section); err != nil {
+		t.Fatal(err)
+	}
+	entry, _ := section["additionalProperties"].(map[string]interface{})
+	props, _ := entry["properties"].(map[string]interface{})
+	if got := props["clone_depth"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("profiles clone_depth schema = %v, want %v", got, want)
+	}
+}
+
+// TestKubernetesAssignSettingsSchemaValidation checks the runtimes and
+// profiles section schemas for kubernetes_service_account_mappings and the
+// runtime namespace, which use the same patterns as settings-v1.schema.json.
+func TestKubernetesAssignSettingsSchemaValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		section   string
+		doc       string
+		wantValid bool
+	}{
+		{name: "runtime mapping", section: "runtimes", wantValid: true,
+			doc: `{"k8s": {"type": "kubernetes", "kubernetes_service_account_mappings": {"agent-worker@my-project.iam.gserviceaccount.com": "agent-worker-ksa"}}}`},
+		{name: "profile mapping", section: "profiles", wantValid: true,
+			doc: `{"prod": {"runtime": "k8s", "kubernetes_service_account_mappings": {"agent-worker@my-project.iam.gserviceaccount.com": "profile-ksa"}}}`},
+		{name: "runtime mapping key not a GSA email", section: "runtimes",
+			doc: `{"k8s": {"kubernetes_service_account_mappings": {"not-a-gsa-email": "agent-worker-ksa"}}}`},
+		{name: "profile mapping uppercase key", section: "profiles",
+			doc: `{"prod": {"kubernetes_service_account_mappings": {"Agent-Worker@my-project.iam.gserviceaccount.com": "agent-worker-ksa"}}}`},
+		{name: "runtime mapping invalid KSA name", section: "runtimes",
+			doc: `{"k8s": {"kubernetes_service_account_mappings": {"agent-worker@my-project.iam.gserviceaccount.com": "Not_A_Valid_KSA"}}}`},
+		{name: "profile mapping empty KSA name", section: "profiles",
+			doc: `{"prod": {"kubernetes_service_account_mappings": {"agent-worker@my-project.iam.gserviceaccount.com": ""}}}`},
+		{name: "runtime mapping KSA name too long", section: "runtimes",
+			doc: `{"k8s": {"kubernetes_service_account_mappings": {"agent-worker@my-project.iam.gserviceaccount.com": "` + strings.Repeat("a", 254) + `"}}}`},
+		{name: "runtime namespace label", section: "runtimes", wantValid: true,
+			doc: `{"k8s": {"type": "kubernetes", "namespace": "scion-agents"}}`},
+		{name: "runtime namespace empty means unset", section: "runtimes", wantValid: true,
+			doc: `{"k8s": {"type": "kubernetes", "namespace": ""}}`},
+		{name: "runtime namespace uppercase", section: "runtimes",
+			doc: `{"k8s": {"type": "kubernetes", "namespace": "Scion-Agents"}}`},
+		{name: "runtime namespace too long", section: "runtimes",
+			doc: `{"k8s": {"type": "kubernetes", "namespace": "` + strings.Repeat("a", 64) + `"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := Validate(tc.section, json.RawMessage(tc.doc))
+			if tc.wantValid && len(errs) > 0 {
+				t.Errorf("expected the document to pass, got errors: %v", errs)
+			}
+			if !tc.wantValid && len(errs) == 0 {
+				t.Error("expected the document to fail validation")
+			}
+		})
 	}
 }

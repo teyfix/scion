@@ -50,6 +50,7 @@ export type StatusType =
   | 'created'
   | 'suspended'
   // Agent activity states
+  | 'initializing'
   | 'working'
   | 'thinking'
   | 'executing'
@@ -294,7 +295,7 @@ export class ScionStatusBadge extends LitElement {
           : this.showIcon && resolvedIcon
             ? html`<sl-icon name="${resolvedIcon}"></sl-icon>`
             : ''}
-        <slot>${displayLabel}</slot>
+        ${displayLabel}
       </span>
     `;
   }

@@ -91,7 +91,6 @@ type Skill struct {
 	OwnerID       string    `json:"ownerId,omitempty"`
 	CreatedBy     string    `json:"createdBy,omitempty"`
 	UpdatedBy     string    `json:"updatedBy,omitempty"`
-	Visibility    string    `json:"visibility"`
 	Created       time.Time `json:"created"`
 	Updated       time.Time `json:"updated"`
 }
@@ -141,7 +140,6 @@ type CreateSkillRequest struct {
 	Description string   `json:"description,omitempty"`
 	Scope       string   `json:"scope"`
 	ScopeID     string   `json:"scopeId,omitempty"`
-	Visibility  string   `json:"visibility,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 }
 
@@ -154,7 +152,6 @@ type CreateSkillResponse struct {
 type UpdateSkillRequest struct {
 	Name        string   `json:"name,omitempty"`
 	Description string   `json:"description,omitempty"`
-	Visibility  string   `json:"visibility,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 }
 
@@ -263,7 +260,7 @@ func (s *skillService) List(ctx context.Context, opts *ListSkillsOptions) (*List
 		TotalCount int     `json:"totalCount,omitempty"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +280,7 @@ func (s *skillService) Get(ctx context.Context, skillID string) (*Skill, error) 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Skill](resp)
+	return apiclient.DecodeRequired[Skill](resp)
 }
 
 // Create creates a new skill.
@@ -292,7 +289,7 @@ func (s *skillService) Create(ctx context.Context, req *CreateSkillRequest) (*Cr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[CreateSkillResponse](resp)
+	return apiclient.DecodeRequired[CreateSkillResponse](resp)
 }
 
 // Update updates specific skill fields.
@@ -301,7 +298,7 @@ func (s *skillService) Update(ctx context.Context, skillID string, req *UpdateSk
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Skill](resp)
+	return apiclient.DecodeRequired[Skill](resp)
 }
 
 // Delete removes a skill (soft delete).
@@ -319,7 +316,7 @@ func (s *skillService) PublishVersion(ctx context.Context, skillID string, req *
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[PublishVersionResponse](resp)
+	return apiclient.DecodeRequired[PublishVersionResponse](resp)
 }
 
 // ListVersions returns versions for a skill.
@@ -328,7 +325,7 @@ func (s *skillService) ListVersions(ctx context.Context, skillID string) (*ListS
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListSkillVersionsResponse](resp)
+	return apiclient.DecodeRequired[ListSkillVersionsResponse](resp)
 }
 
 // FinalizeVersion verifies files and transitions a version from draft to published.
@@ -337,7 +334,7 @@ func (s *skillService) FinalizeVersion(ctx context.Context, skillID string, req 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SkillVersion](resp)
+	return apiclient.DecodeRequired[SkillVersion](resp)
 }
 
 // RequestUploadURLs requests signed upload URLs for a skill version's files.
@@ -353,7 +350,7 @@ func (s *skillService) RequestUploadURLs(ctx context.Context, skillID string, ve
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[UploadResponse](resp)
+	return apiclient.DecodeRequired[UploadResponse](resp)
 }
 
 // UploadFile uploads a file to the given signed URL.
@@ -374,7 +371,7 @@ func (s *skillService) DeprecateVersion(ctx context.Context, skillID, versionID 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SkillVersion](resp)
+	return apiclient.DecodeRequired[SkillVersion](resp)
 }
 
 // Resolve performs batch skill resolution.
@@ -383,6 +380,7 @@ func (s *skillService) Resolve(ctx context.Context, req *ResolveSkillsRequest) (
 	if err != nil {
 		return nil, err
 	}
+	// No body is valid here: callers treat a missing body as nothing resolved.
 	return apiclient.DecodeResponse[ResolveSkillsResponse](resp)
 }
 

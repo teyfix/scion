@@ -10,11 +10,10 @@ This document describes the configuration for the Scion Hub (State Server) and t
 Server configuration is defined in the `server` section of your `settings.yaml` file.
 
 - **Primary**: `~/.scion/settings.yaml` (Global settings)
-- **Legacy**: `~/.scion/server.yaml` (Deprecated, but supported as fallback)
+- **Legacy**: `server.yaml` in `~/.scion`, in the `--config` path, or in the working directory (Deprecated, but supported as a fallback when `settings.yaml` has no `server` key)
 
 :::tip[Migration]
-If you are using `server.yaml`, you can migrate it to `settings.yaml` using:
-`scion config migrate --server`
+To move a `server.yaml` into `settings.yaml`, copy its contents under a top-level `server:` key in `~/.scion/settings.yaml`, then remove `server.yaml`. `scion config migrate` merges a `server.yaml` only while it converts a legacy (unversioned) `settings.yaml`; it skips a file that already has `schema_version`. There is no `--server` flag yet (ptone/scion#3116).
 :::
 
 ## Structure
@@ -53,16 +52,32 @@ Controls the central Hub API server.
 | :--- | :--- | :--- | :--- |
 | `port` | int | `9810` | HTTP port to listen on (standalone mode). In combined mode (`--enable-web`), the Hub API is served on the web port instead and this setting is ignored. |
 | `host` | string | `"0.0.0.0"` | Network interface to bind to. |
-| `public_url` | string | | The externally accessible URL of the Hub (used for callbacks). |
+| `public_url` | string | | The externally accessible URL of the Hub (used for callbacks). Also editable in the admin UI; resolved at startup with operator settings first (`SCION_SERVER_HUB_ENDPOINT`, `SCION_SERVER_BASE_URL`, `--base-url`), then a value saved in the database, then this file. See [`server.hub.public_url`: environment first](/scion/reference/admin-settings/#serverhubpublic_url-environment-first). |
+| `agent_endpoint` | string | | Optional override of `public_url` used **only** for the Hub URL injected into agents (`SCION_HUB_ENDPOINT`). Use when agents reach the Hub on a different address than users — e.g. an internal VPC URL — while invite links, chat-bridge links, the OIDC issuer default, and the `cloudrun_invoker` audience default keep using `public_url`. Must be `scheme://host[:port]` only: `http` or `https`, an IP literal or a hostname of letters, digits, `_`, `-`, and `.`, no path, query, fragment, or credentials (a trailing `/` is stripped); the Hub fails to start otherwise. When unset, agents receive the Hub's regular endpoint (`public_url`, or the endpoint the Hub resolves when `public_url` is unset). **Scope:** injected into agents on every broker attached to this Hub, including remote brokers — see [Splitting the agent endpoint from the public URL](#splitting-the-agent-endpoint-from-the-public-url). **Security:** an `http://` value sends agent bearer tokens and fetched secrets unencrypted; prefer `https://` unless the network is trusted and isolated. |
+| `monitoring_dashboard_url` | string | | Optional link to an external monitoring dashboard for this Hub, such as a Cloud Monitoring or Grafana dashboard. Must be an absolute `http` or `https` URL with a host, at most 2048 characters, with no user credentials, a port (if any) from 1 to 65535, and no whitespace (including Unicode spaces such as U+00A0), control characters (C0, DEL or C1), bidirectional formatting characters, invisible format characters (U+00AD, U+180E, U+200B to U+200D, U+2060, U+FEFF) or U+FFFD; a path, query and fragment are allowed. Any other value is rejected with `422` when saved through the admin API. When set, the Health page header shows **Open monitoring dashboard**, which opens the URL in a new tab; when unset, no link is shown. Editable in **Server Config** and applied without a restart. Only callers with `hub.health.read` receive it (as `links.monitoring_dashboard` in the health summary); it is not part of `/api/v1/settings/public`. Env: `SCION_SERVER_HUB_MONITORINGDASHBOARDURL` (seed: `SCION_SEED_SERVER_HUB_MONITORINGDASHBOARDURL`). |
 | `gcp_project_id` | string | | GCP project ID used for minting GCP Service Accounts. Auto-detected if running on GCE/Cloud Run. |
-| `gcp_iam_check_mode` | string | `"off"` | Controls whether IAM `actAs` permission is checked when binding a GCP service account to an agent. Supported values: `"off"` (no check; default) or `"enforce"` (uses Policy Troubleshooter to enforce `iam.serviceAccounts.actAs`). See the security/permissions reference for details on roles and caches. |
+| `gcp_iam_check_mode` | string | `"off"` | Controls whether IAM `actAs` permission is checked when binding a GCP service account to an agent. Supported values: `"off"` (no check; default) or `"enforce"` (uses Policy Troubleshooter to enforce `iam.serviceAccounts.actAs`). `"enforce"` is strongly recommended for any Hub where agents receive GCP identities; see the caution under [GCP IAM Check Mode](#gcp-iam-check-mode) for what `"off"` permits. See the security/permissions reference for details on roles and caches. |
 | `gcp_iam_deny_unknown_policy` | string | `"fail-open"` | Behavior when Policy Troubleshooter cannot evaluate deny policies (e.g. if the Hub lacks org-level reviewer roles). Supported values: `"fail-open"` (allow if no explicit deny is found; default) or `"fail-closed"` (treat as indeterminate and deny). |
 | `read_timeout` | duration | `"30s"` | HTTP read timeout. |
 | `write_timeout` | duration | `"60s"` | HTTP write timeout. |
-| `admin_emails` | list | `[]` | List of emails granted super-admin access. Additive only: listed users are promoted to admin on login, but the list never demotes or rewrites a role already stored in the database (e.g. `admin` or `viewer` set from the admin UI). Changing a role is an explicit admin action. |
+| `admin_emails` | list | `[]` | List of emails granted super-admin access. Listed users are always admins: they are promoted on sign-in. When the list is non-empty, an admin whose email is removed from it is demoted to [`default_user_role`](#authentication-serverauth) at the next hub restart or their next sign-in, whichever comes first. At restart, both `admin_emails` and the default role come from `settings.yaml` or the environment, so a change made only in the Admin UI (Postgres mode) takes effect at the user's next sign-in. If the default role was set only in the Admin UI, a user demoted at restart becomes Member. Two exceptions: admins promoted from **Admin > Users** (or the users API) stay admins, and nobody is demoted if the startup safety check failed (for example, no existing user matched the list at startup and there were no UI-promoted admins); demotions resume only after the configuration is fixed and the hub is restarted. Roles set from the admin UI for users who were never config admins (`member`, `viewer`) are not changed by this list. |
+| `auto_suspend_stalled` | bool | `false` | Suspend an agent when the Hub marks it `stalled`, unless its harness does not support session resume. See [Auto-Suspend of Stalled Agents](/scion/local/agent-lifecycle/#auto-suspend-of-stalled-agents). Editable in **Server Config**. Env: `SCION_SERVER_HUB_AUTOSUSPENDSTALLED` (seed: `SCION_SEED_SERVER_HUB_AUTOSUSPENDSTALLED`). |
+| `stalled_threshold` | duration | `"5m"` | How long a `running` agent with a recent heartbeat may go without activity events before the Hub marks it `stalled`. A value under `2m` falls back to the default. Editable in **Server Config**. Applied without a restart when settings are stored in the database; in file mode, at the next restart. Env: `SCION_SERVER_HUB_STALLEDTHRESHOLD` (seed: `SCION_SEED_SERVER_HUB_STALLEDTHRESHOLD`). |
 | `soft_delete_retention` | duration | | Duration to retain soft-deleted agents (e.g., `"72h"`). |
 | `soft_delete_retain_files` | bool | `false` | Preserve workspace files during the soft-delete period. |
+| `async_agent_launch` | bool | `false` | Turns on asynchronous agent create. A create is asynchronous only when this is on **and** the request opts in (`acceptAsyncLaunch`); `scion start`, `scion resume`, and scheduled agent creates opt in, other clients stay synchronous. Provision-only creates and reprovisioning are always synchronous. See [Asynchronous agent create](#asynchronous-agent-create). Startup-only: restart required to change. Env: `SCION_SERVER_HUB_ASYNCAGENTLAUNCH`. |
+| `launch_timeout` | duration | `"5m"` | Whole-launch budget for an asynchronous create, from the moment the Hub begins the launch until the agent reaches a terminal Hub state. A launch that has not reached one by this deadline is ended and the agent is set to `error` (`launch_timeout`). A Go duration string such as `"15m"`. There is no upper limit. A non-zero value below `30s` is replaced by the default (`5m`) with a warning in the Hub log. In `settings.yaml`, a value that is not a valid duration is ignored and the default applies. Raise it for clusters with slow pod starts. Startup-only: restart required to change. Env: `SCION_SERVER_HUB_LAUNCHTIMEOUT`. |
+| `launch_keepalive_seconds` | int | `15` | Keepalive interval, in seconds, that the Hub sends to the Runtime Broker with each asynchronous create. A launch whose broker sends no report for 8x this interval (120s at the default) is ended and the agent is set to `error` (`broker_lost`). Values of `0` or less use the default. Startup-only: restart required to change. Env: `SCION_SERVER_HUB_LAUNCHKEEPALIVESECONDS`. |
+| `missing_agent_grace` | duration | `"3m"` | How long a `running` (or `stopping`) agent may be absent from its Runtime Broker's heartbeat before the Hub marks it `error` with exit reason `container_missing` (an existing `preempted` or `evicted` exit reason and its message are kept). Applies only when the broker is online, reported a complete runtime inventory, and sent a recent previous heartbeat; agents with a lifecycle operation in progress are skipped. Values below `"1m"` fall back to the default. Env: `SCION_SERVER_HUB_MISSINGAGENTGRACE`. |
+| `start_claim_lease_ttl` | duration | `"90s"` | Lease of the claim the Hub takes before dispatching any agent start; the Hub process running the start renews it every third of this. Allowed `30s` to `5m`; other values fall back to the default. Hot-reloaded. Env: `SCION_SERVER_HUB_STARTCLAIMLEASETTL`. |
+| `start_max_duration` | duration | `"12m"` | Hard deadline on any agent start, including a wait for another Hub node to dispatch it. Minimum `11m` (the broker's pod-ready bound plus a minute). Hot-reloaded. Env: `SCION_SERVER_HUB_STARTMAXDURATION`. |
+| `start_unconfirmed_hold` | duration | `"13m"` | Longest time a start whose outcome is unknown (for example a dispatch timeout) keeps other starts of the agent waiting, until the runtime shows whether it created anything. Minimum `12m40s` (the broker's whole start budget plus a minute). Hot-reloaded. Env: `SCION_SERVER_HUB_STARTUNCONFIRMEDHOLD`. |
+| `start_create_unconfirmed_hold` | duration | `"5m"` | `start_unconfirmed_hold` for a new agent's create-and-start. Allowed `3m` up to `start_unconfirmed_hold`. Hot-reloaded. Env: `SCION_SERVER_HUB_STARTCREATEUNCONFIRMEDHOLD`. |
+| `perf_trace` | bool | `false` | Turns on per-request performance tracing for diagnosis. Observe only. See [Request performance tracing](#request-performance-tracing) and the [developer guide](/scion/contributing/perf-tracing/). Startup-only: restart required to change. Env: `SCION_SERVER_HUB_PERFTRACE`. |
+| `membership_sweep_report_only` | bool | `false` | Puts the membership-standing sweep in report-only mode: it logs and audits (`agent_hold_would_set`) each agent it would hold and stop, and holds and stops none. Off by default (the sweep enforces). Holds from membership changes made while it is on still apply. Set it on every replica: the sweep runs on whichever replica takes its lock, and a replica left enforcing holds the listed agents at its next sweep. For the first boot after an upgrade; see [Upgrading: report-only first boot](/scion/reference/agent-suspension/#upgrading-report-only-first-boot). Startup-only: restart required to change. Env: `SCION_SERVER_HUB_MEMBERSHIPSWEEPREPORTONLY`. |
 | `cors` | object | | CORS configuration (see below). |
+| `conduit` | object | | Conduit relay settings (see [Conduit](#conduit-serverhubconduit)). |
+| `port_proxy` | object | | Agent port proxy settings (see [Port proxy](#port-proxy-serverhubport_proxy)). |
 
 #### CORS (`server.hub.cors`)
 
@@ -70,6 +85,109 @@ Controls the central Hub API server.
 | :--- | :--- | :--- | :--- |
 | `enabled` | bool | `true` | Enable CORS. |
 | `allowed_origins` | list | `["*"]` | Allowed origins. |
+
+#### Conduit (`server.hub.conduit`)
+
+Settings for the in-process conduit relay and its stream grants. They take effect only when the `hub.conduit` [experiment](/scion/reference/experiments/) is on. All of them are read at startup, so a change needs a restart. An invalid value is a startup error, not silently ignored.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `grant_key_activation` | duration | `"15m"` | Delay between publishing a new grant signing key and signing with it. Minimum `"1m"`. Targets must refresh their keys at least this often. Flag: `--conduit-grant-key-activation`. Env: `SCION_SERVER_HUB_CONDUIT_GRANTKEYACTIVATION`. |
+| `tcp_allowed_ports` | list of int | `[]` | Additional agent-local ports a TCP stream grant may target, on every agent, besides that agent's exposed ports. The reserved ports (9810, 18380) are always refused. Empty means exposed ports only; this setting never narrows access to exposed ports. Flag: `--conduit-tcp-allowed-ports`. Env: `SCION_SERVER_HUB_CONDUIT_TCPALLOWEDPORTS` (comma-separated). |
+| `internal_listen` | string | | `host:port` of the internal relay API listener, used by multi-node deployments. It serves only the internal relay API and must be reachable only inside the cluster or VPC, never publicly. Flag: `--internal-listen`. Env: `SCION_SERVER_HUB_CONDUIT_INTERNALLISTEN`. |
+| `internal_advertise` | string | | Base URL (`http(s)://host:port`) other hub nodes use to reach this node's internal listener. Default: `POD_IP` with the listen port, else the listen host if it is not a wildcard. Flag: `--internal-advertise`. Env: `SCION_SERVER_HUB_CONDUIT_INTERNALADVERTISE`. |
+| `peer_auth` | string | `"auto"` | Relay-peer authentication: `auto`, `oidc` or `hmac`. Requests between relays are always signed with a key derived from the hub's signing secret, which is required in every mode. `oidc` also requires a Google OIDC ID token, `auto` adds the ID token on GCP, and `hmac` uses the signature alone. Env: `SCION_SERVER_HUB_CONDUIT_PEERAUTH`. |
+| `peer_service_accounts` | list | own service account | With OIDC peer auth, the service-account emails allowed to call the internal relay API. The hub logs a warning at startup when the default resolves to a Compute Engine default service account. Env: `SCION_SERVER_HUB_CONDUIT_PEERSERVICEACCOUNTS` (comma-separated). |
+| `peer_audience` | string | `"scion-conduit-relay-peer"` | With OIDC peer auth, the ID token audience. It must be identical on every hub node. Env: `SCION_SERVER_HUB_CONDUIT_PEERAUDIENCE`. |
+| `reconnect_window` | duration | `"5s"` | Jitter window sent with a planned close: targets redial after a random delay within it. Between `"0s"` and `"5m"`. Flag: `--conduit-reconnect-window`. Env: `SCION_SERVER_HUB_CONDUIT_RECONNECTWINDOW`. |
+| `authz_recheck_interval` | duration | `"60s"` | Period of the authorization re-check sweep of open user streams: port proxy streams, terminal attach streams on the agent's Conduit session, and `scion tunnel` streams. User streams are also re-checked when the user's access changes and when the hub's event connection is re-established. A stream whose user lost the permission is closed with `4401 authz_expired` within one interval even if the revocation event is missed; revocations normally close it at once. Between `"1s"` and `"10m"`. Flag: `--conduit-authz-recheck-interval`. Env: `SCION_SERVER_HUB_CONDUIT_AUTHZRECHECKINTERVAL`. |
+| `lifetime_cap` | duration | `"3500s"` | Lifetime cap of a conduit session. Set it below the platform's connection limit (Cloud Run request timeout, load balancer or proxy timeout). 60 seconds before the cap the relay sends `GoAway`: the session takes no new streams, the agent reconnects, and streams still open are closed with `4503 relay_restart` within 30 seconds and never later than the cap. A PTY client sees that close as `4503` and reconnects. Server-sent events are not affected. Between `"90s"` and `"24h"`. Flag: `--conduit-lifetime-cap`. Env: `SCION_SERVER_HUB_CONDUIT_LIFETIMECAP`. |
+| `shutdown_grace` | duration | | Time the platform allows between `SIGTERM` and killing the hub process. No default; the Cloud Run deployment profiles set `"10s"`. While the conduit relay runs, the hub handles `SIGTERM` by sending `GoAway` to every conduit session before its listeners close, with a drain deadline of at most `shutdown_grace` minus 2 seconds when this key is set (a value of 2 seconds or less gives a 1 ms deadline); when it is unset there is no cap and the drain deadline stays 30 seconds. Agents open a replacement session and streams still open at the deadline are closed with `4503 relay_restart`. Must be a duration greater than 0. Read at startup; a change needs a restart. Env: `SCION_SERVER_HUB_CONDUIT_SHUTDOWNGRACE`. |
+| `proxy_session_max_age` | duration | `"1h"` | How long a user's Conduit session admitted through trusted-proxy authentication (no bearer credential, so no expiry of its own) may open new tunnels, counted from admission. After it, a new tunnel request on that session is refused with `401`; tunnels already open are unaffected. Between `"5m"` and `"1h"`. Env: `SCION_SERVER_HUB_CONDUIT_PROXYSESSIONMAXAGE`. |
+| `stream_authz_max` | object | see description | Authorization interval of open streams, per originating principal kind (`user`, `broker`, `agent`). When a stream reaches its interval, the hub re-checks the principal: if the permission still holds, the stream is renewed for one more interval; if not, it is closed with `4401 authz_expired` (`4404 target_not_found` if the agent is gone). If the check cannot be evaluated (for example a store outage), the stream is never renewed or closed early; it is closed with `4401 authz_expired` at the end of its current interval. Revocations and the `authz_recheck_interval` sweep close a revoked stream sooner, but never extend it. Defaults: `user` `"8h"`, `broker` `"24h"`, `agent` `"24h"`, each between `"1m"` and `"168h"`. Only `user` is enforced today (port proxy streams, terminal attach streams on the agent's Conduit session, and `scion tunnel` streams); the `broker` and `agent` values are validated but not yet applied. Flag: `--conduit-stream-authz-max-user`. Env: `SCION_SERVER_HUB_CONDUIT_STREAMAUTHZMAX_USER`, `SCION_SERVER_HUB_CONDUIT_STREAMAUTHZMAX_BROKER`, `SCION_SERVER_HUB_CONDUIT_STREAMAUTHZMAX_AGENT`. |
+| `instance_id` | string | see description | This node's relay instance id. It must be unique among live hub processes: a relay that starts with an id already in use takes it over from the other process. Up to 128 printable ASCII characters, no spaces. Default: `POD_NAME` when set, else the host name plus a random per-process suffix. Env: `SCION_SERVER_HUB_CONDUIT_INSTANCEID`. |
+
+**Rotating grant keys.** `POST /api/v1/admin/conduit/grant-keys/rotate` (unscoped Hub administrators only, `hub.conduit_grant_keys.execute`) prunes expired grant signing keys and rotates in a new one with an overlap window: grants signed with the outgoing key stay valid until the earlier of their own expiry and the outgoing key's `NotAfter`. The response lists only key IDs and timestamps.
+
+**TLS on the internal hop.** Use TLS for the internal relay endpoint (for example a service mesh or a TLS-terminating proxy) and advertise it as `https://`. Plain `http://` is accepted.
+
+**Hosted HA.** In an HA deployment each hub node runs a relay that other nodes must reach directly, so the hub refuses to start when:
+
+- the grant key ring is not stored with the shared at-rest key;
+- it runs on Cloud Run (`K_SERVICE` is set), whose instances are not individually addressable;
+- `internal_advertise` uses the public hub host or a `*.run.app` host;
+- the relay is not addressable at its internal endpoint, or answers its self-check as another instance.
+
+Outside HA, a relay that cannot start is logged and the hub serves without it.
+
+#### Port proxy (`server.hub.port_proxy`)
+
+Settings for the agent port proxy (`/api/v1/agents/{id}/ports/{port}/...`) when it runs over the agent's Conduit session (the `hub.conduit` [experiment](/scion/reference/experiments/)). Read at startup, so a change needs a restart. An invalid value is a startup error.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `response_header_timeout` | duration | `"60s"` | How long the proxy waits for the service on the agent port to send its response headers, counted from when the request has been sent. This includes the WebSocket handshake. If the headers do not arrive in time, the proxy cancels the upstream request, answers `504` (code `runtime_error`; a browser gets the proxy error page) and counts it in `scion.hub.port_proxy.upstream_timeout`. The response body has no time limit: server-sent events, downloads, chunked responses and upgraded WebSockets keep flowing once the headers have arrived. Between `"5s"` and `"10m"`; `0` is not accepted. Env: `SCION_SERVER_HUB_PORTPROXY_RESPONSEHEADERTIMEOUT`. |
+
+#### Asynchronous agent create
+
+By default, a Hub agent create is synchronous: the Hub holds the create request open while the Runtime Broker provisions the workspace and starts the agent. That request is bounded by the CLI's HTTP client timeout (30s) and by the Hub's `write_timeout` (`60s` by default), so the synchronous path is not suited to agents that take several minutes to start.
+
+With `async_agent_launch: true`, the Hub instead answers as soon as the broker accepts the create. The agent is returned in a pre-running phase with an active launch, and the broker finishes the start in the background:
+
+- **Opt-in per request.** `scion start` and `scion resume` opt in on every Hub create and then poll the agent until it is `running`, `error`, or `stopped`. By default they wait for the Hub's remaining launch budget plus 30 seconds (5 minutes when the Hub does not report a budget); `--wait-timeout` overrides this and `--no-wait` returns once the Hub has accepted. See [`scion start`](/scion/reference/cli/#scion-start-or-run). Scheduled agent creates opt in server-side. Requests that do not opt in are synchronous.
+- **The wait is not the launch.** If the CLI stops waiting (the wait budget runs out, or Ctrl-C), the launch continues on the Hub and broker, and the agent still comes up. Run `scion start <agent>` again to resume waiting.
+- **Bounded by `launch_timeout`.** A launch that has not reached a terminal Hub state by its deadline is ended: the broker stops it shortly before the deadline, and the Hub sets the agent to `error` with launch error `launch_timeout` shortly after. Starting such an agent is refused with `agent_create_incomplete`; delete it and create it again.
+- **Starts during a launch.** While a launch is in progress and before its deadline, a start or restart of that agent returns the launching agent with HTTP 200 instead of starting it again (a restart adds the warning `agent is launching; restart not performed`), and `scion start` keeps waiting. Restore, reincarnate, and wake are refused with `agent_launching`.
+
+**Requirements.** The Hub, the Runtime Broker, and the CLI must all run a version that includes asynchronous create. A broker that reports no async launch support, or that answers the create synchronously, gets the synchronous create, so mixing versions is safe but slow starts on an older broker keep the synchronous limits. A broker runtime that cannot serve an asynchronous launch also falls back to the synchronous create.
+
+**Slow pod starts.** On clusters with slow node provisioning, for example GKE Autopilot cold starts where a new node is added and the agent image takes several minutes to pull, raise `launch_timeout` so the launch is not ended first:
+
+```yaml
+server:
+  hub:
+    async_agent_launch: true
+    launch_timeout: "15m"
+```
+
+Both keys are read only at Hub startup; restart the Hub after changing them. They cannot be set through the admin server-config API (see [Layer 0](#layer-0--bootstrap-file--env-only)).
+
+**Brokers on a Cloud Run service.** An asynchronous launch keeps running in the Runtime Broker after the create response. A broker hosted on a Cloud Run service therefore needs CPU allocated outside requests: deploy the service with `--no-cpu-throttling`, and keep its minimum instances above zero.
+
+- **Symptoms.** If the service allocates CPU only during requests (the Cloud Run default), the launch stalls after the create response. The broker stops reporting, so the Hub ends the launch and sets the agent to `error` with launch error `broker_lost` (or `launch_timeout`). With minimum instances at zero, idle scale-in can also end a broker mid-launch, with the same result.
+- **Startup warning.** The server cannot see the service's CPU setting. When the Runtime Broker is enabled and the process runs on a Cloud Run service (`K_SERVICE` set, `CLOUD_RUN_INSTANCE` unset), it logs this warning once at startup: "If this Cloud Run service allocates CPU only during requests, async agent launches will stall after the create response and be reaped. Deploy with --no-cpu-throttling and set SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true to silence this."
+- **Silencing it.** Set the environment variable `SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true` on a service deployed with `--no-cpu-throttling`. It is an assertion, not a check: remove it if you redeploy with CPU throttling. The Cloud Run deploy script (`scripts/cloudrun/deploy.sh`) sets both.
+
+#### Request performance tracing
+
+`perf_trace: true` (env `SCION_SERVER_HUB_PERFTRACE=true`) records where Hub API requests and SSE connections spend their time, and how many authorization store reads and decision-audit records each request causes. It is for diagnosing slow agent lists, mainly on a test or staging Hub. On a production Hub, turn it on only for a short diagnosis window: the log volume grows by one line per request. It is off by default. For a how-to (reading the log lines, running the `perf/bench` harness, and using the counts as regression budgets), see [Hub Performance Tracing and Benchmarks](/scion/contributing/perf-tracing/).
+
+```yaml
+server:
+  hub:
+    perf_trace: true
+```
+
+**Observe only.** Tracing never changes an authorization decision, a decision-audit record (content, count or delivery; records are delivered asynchronously and can be lost, see [Log delivery guarantees](#log-delivery-guarantees)), a response body, filtering, sorting, redaction or lineage. The only change a client can see is the extra response headers described below, and only an unscoped local platform admin who asks for them can see it.
+
+**What it records.** Each Hub API request writes one `perf_trace` log line (subsystem `hub.perf-trace`); an SSE connection writes one at connect and one at close (`sse_stage`). A line holds:
+
+- `endpoint`: a fixed endpoint class, for example `agents.global.legacy`, `agents.global.sorted`, `agents.project.legacy`, `agents.project.sorted`, `agents.project.sorted_agent`, `sse.events`, or `other`.
+- `phase_<name>_us` and `phase_<name>_n`: time (microseconds) and count per phase. Phases are `list_scope_authz` (list-level authorization before rows are read), `list_db_read` (agent row and member reads; database time only), `list_read_authz` (per-row read decisions), `enrich`, `capabilities` (per-item capabilities and the env-view decision), `messageability`, `scope_capabilities`, `serialize` (encoding and writing the body), and for SSE `sse_expand`, `sse_authorize` and `sse_write`.
+- `store_<method>_n` and `store_<method>_us`, `authz_store_calls`, `authz_store_us`: reads the authorization service makes to prepare its inputs (groups, role bindings, role definitions, access constraints, delegation edges, and user, agent, project and membership rows), counted after request-local reuse.
+- `audit_records`, `audit_allow`, `audit_deny`, `audit_other`, `audit_emit_us`: decision records counted in memory. With the default sampling setting, each authorization decision emits one record, so `audit_records` is the request's decision count. `audit_emit_us` measures the emitter call. This path performs no database write.
+- `db_wait_count`, `db_wait_us`, `db_in_use`, `db_open`: connection-pool waits during the request and pool use when the line is written (the end of the request), when the database driver reports them. In the response headers they are taken when the response starts. The pool is shared, so waits include concurrent requests.
+- `elapsed_us`, `method`, `request_id` (for correlation only), and for SSE `sse_events`.
+
+**Counted scope.** The store counts cover the authorization service's request-path reads of the methods above. Relationship progeny lookups and reads inside a store transaction are not counted, and work handed to a detached background context after the request ends records into a trace that is no longer logged. `capabilities` also includes the rare re-list read decision for a sorted-list row whose authorization inputs changed between reads.
+
+**Response headers.** Only an unscoped local platform admin (a local user with the admin role, not using a scoped access token, not federated) who sends `X-Scion-Perf-Trace: 1` also gets `X-Scion-Perf-Endpoint`, `X-Scion-Perf-Phases`, `X-Scion-Perf-Phase-Counts`, `X-Scion-Perf-Store-Calls`, `X-Scion-Perf-Store-Us`, `X-Scion-Perf-Decisions` and, when available, `X-Scion-Perf-DB`. Values are `name=integer` pairs; durations are microseconds. The headers are set when the response starts, so they omit `serialize`. No other caller gets them: not unauthenticated endpoints, agents, brokers, scoped tokens, federated identities or non-admin users. Their requests are still traced and logged. The `perf/bench` API benchmark records the headers with `--want-perf-trace`, and for its non-admin caller joins the hub's `perf_trace` log lines by request ID with `--hub-perf-log`. Counts (store calls, decisions, phase counts) do not depend on machine speed, so they suit CI budgets; durations do not.
+
+**What the counts reveal.** The counts are not just timing. A deny count is the number of candidate rows hidden from the caller (on a filtered list, whether one specific agent exists). Store-call counts hint at owner, delegator and group structure behind the rows. DB pool figures describe process-wide load. That is why the headers go only to unscoped local platform admins, and why the log line belongs with other operator logs.
+
+**Cardinality and privacy.** Phase names, store methods, endpoint classes and audit outcomes are fixed sets. No path, query, ID, name, email, token, secret or configuration value is logged or used as a label.
+
+**Overhead.** With tracing off, no middleware or decorator is installed, and each recording point in the list handlers is one context lookup that finds nothing. With tracing on, each recorded phase or store read adds two clock reads and an uncontended lock, plus a few hundred bytes and one log line per request.
 
 ### Broker Settings (`server.broker`)
 
@@ -80,12 +198,13 @@ Controls the Runtime Broker service.
 | `enabled` | bool | `false` | Whether to start the broker service. |
 | `port` | int | `9800` | HTTP port to listen on. |
 | `broker_id` | string | | Unique UUID for this broker. |
-| `broker_name` | string | | Human-readable name. |
-| `broker_nickname` | string | | Short display name. |
+| `broker_name` | string | | Name the broker registers under on the Hub. Default: the hostname (`Hosted Broker` for a broker run with a co-located Hub). |
+| `broker_nickname` | string | | Same as `broker_name`, and takes precedence over it. Set by `scion runtime-broker register --broker-name`. |
 | `hub_endpoint` | string | | The Hub URL this broker connects to. |
 | `container_hub_endpoint` | string | | Overrides `hub_endpoint` when injecting the Hub URL into agent containers. Use when containers cannot reach the Hub at the broker's address (e.g. `http://host.containers.internal:8080` for local development). |
 | `broker_token` | string | | Authentication token for the Hub. |
 | `auto_provide` | bool | `false` | Automatically add as provider for new projects. |
+| `instances` | list | | Experimental. Flat Runtime Broker instances this process hosts; see [Flat Runtime Brokers](/scion/hosted/ha/multi-broker/#flat-runtime-brokers-experimental). Empty or absent means the regular Runtime Broker. This release accepts one entry, requires the Hub in the same process, and is only read from `settings.yaml` (not `server.yaml`). Each entry has `key` (immutable local key: lower-case letters, digits and `-`, starting and ending with a letter or digit, up to 63 characters), `name` (the name registered with the Hub), and `runtime_target` with `type: docker` and an optional `display_name`. |
 
 ### Database (`server.database`)
 
@@ -95,23 +214,74 @@ Persistence settings for the Hub.
 | :--- | :--- | :--- | :--- |
 | `driver` | string | `"sqlite"` | Database driver: `sqlite` or `postgres`. |
 | `url` | string | `"hub.db"` | Connection string or file path. |
+| `allow_shadowed_schema` | bool | `false` | PostgreSQL only. Lets the Hub start, and the maintenance commands that migrate its database run, when the schema migration would create a new table set that hides existing Hub tables in a later schema on the `search_path`. See [PostgreSQL `search_path` check](#postgresql-search_path-check). Env: `SCION_SERVER_DATABASE_ALLOWSHADOWEDSCHEMA`. |
+
+#### PostgreSQL `search_path` check
+
+On PostgreSQL, the Hub's schema migration looks up and creates its tables in `current_schema()`, the first existing schema on the connection's `search_path`. If that schema has no Hub tables but a later schema on the `search_path` does, the migration would create a new, empty table set in the first schema. That set would hide the existing data, and the Hub would start up looking like a new install. This can happen with:
+
+- a custom `search_path`, such as `custom,public`, where `custom` has no Hub tables and `public` holds them;
+- the default `"$user", public`, when a schema named after the database user exists and is empty.
+
+So before migrating, the Hub server and every maintenance command that migrates the Hub database check the schemas on the `search_path`. A schema counts as holding Hub tables when it has both the `agents` and `runtime_brokers` tables. If the current schema has none and a later schema does, the Hub refuses to start (and the command refuses to migrate), and the error names both schemas. To fix it, change the connection's `search_path` so the schema with the Hub tables comes first, or drop the current schema if nothing else uses it.
+
+If you do want a new table set in the current schema, set `server.database.allow_shadowed_schema: true` (or `SCION_SERVER_DATABASE_ALLOWSHADOWEDSCHEMA=true`). The Hub, or the command, then logs a warning that names both schemas and continues.
+
+A fresh database (no Hub tables in any schema on the `search_path`) and an existing install whose current schema holds the Hub tables start as before. SQLite is not affected. The same check and override apply to the maintenance commands that migrate the database: `server migrate` (on its PostgreSQL destination), `server backfill` and `server migrate-dm-keys` (including their default dry-run mode), `server recover-authz`, `server test-infra mark` and `hub secret migrate-names` (except with `--dry-run`, which does not migrate). These commands read the override from the server settings or the environment, as the Hub does. `hub secret migrate` opens only SQLite, so the check does not apply to it.
+
+:::caution[Permanent decision-audit data removal]
+Any schema-migration entry point may permanently drop `decision_audits` and its data through `entc.AutoMigrate`, directly or through `CompositeStore.Migrate`. Export first if preservation is required. During Hub schema migration on PostgreSQL, the drop takes an `ACCESS EXCLUSIVE` table lock while the existing advisory schema lock is held.
+
+Direct maintenance callers include:
+
+- `server recover-authz`: SQLite/PostgreSQL through `CompositeStore.Migrate`.
+- `hub secret migrate-names`: SQLite/PostgreSQL through `CompositeStore.Migrate`, except with `--dry-run`.
+- `hub secret migrate`: SQLite through `CompositeStore.Migrate`, including with `--dry-run`.
+- `server backfill` and `server migrate-dm-keys`: SQLite/PostgreSQL through `entc.AutoMigrate`, including their default dry-run mode.
+- `server migrate`: `entc.AutoMigrate` on the PostgreSQL destination only; the SQLite source is read-only and unaffected. Source decision-audit rows are not copied, as in the existing migration behavior.
+
+These direct calls run outside the Hub's advisory schema lock. Mixed old replicas may report degraded legacy health as well as write failures after the drop. Rolling back to an old binary can recreate an empty table but cannot restore the deleted data.
+:::
+
+:::caution[Duplicate rows removed before schema migration]
+Three tables get a unique index that older Hubs did not enforce, so an existing database can hold rows the index rejects. Before the schema migration, every migrate entry point runs the same pre-migration steps (`entadapter.PreMigrate`), in this order:
+
+1. `access_policies`: a NULL `scope_id` becomes an empty string, so the next step also finds those duplicates.
+2. `access_policies`: one row is kept per (`name`, `scope_type`, `scope_id`), the oldest by `created`.
+3. `delegation_edges`: one active edge is kept per (`delegate_type`, `delegate_id`, `scope_type`, `scope_id`), the oldest by `created`. Inactive edges are kept.
+4. `agent_session_metrics`: one row is kept per agent, session ID and segment start (`started_at`), the earliest stored. Older Hubs stored every report, so a database can hold repeated rows for one segment. Rows for separate segments of a resumed session are kept.
+
+The steps are idempotent and do nothing on a fresh database. They run on Hub start (`CompositeStore.Migrate`, which `server recover-authz`, `hub secret migrate-names` and `hub secret migrate` also use), and in `server backfill`, `server migrate-dm-keys` and `server migrate` (on the PostgreSQL destination) before those commands call `entc.AutoMigrate`. `server backfill` and `server migrate-dm-keys` run them only with `--execute`, so their default dry run removes no rows (it still applies the schema migration); on a database holding such duplicates the dry run therefore fails with a unique-constraint error. Rerun with `--execute`, or start the Hub once on the new version, to remove them. `server migrate` opens its SQLite source read-only and does not de-duplicate it, so duplicate `access_policies` rows in an older source still fail the copy; start the Hub on the source database with the new version first (or run `server backfill --execute` against it), then copy. The read-only `server attribution-report` runs no migration and no pre-migration steps.
+:::
+
+:::caution[Postgres: `broker_dispatch` index on upgrade]
+On Postgres, auto-migrate creates the `brokerdispatch_state_updated_at` index on `broker_dispatch (state, updated_at)` with a plain `CREATE INDEX`, which blocks writes to the table while it builds. On a large deployment, create the index before upgrading so auto-migrate finds it already in place:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS brokerdispatch_state_updated_at ON broker_dispatch (state, updated_at);
+```
+:::
 
 ### Authentication (`server.auth`)
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `mode` | string | `"oauth"` | Selects the exclusive human auth mode: `"oauth"` (default), `"proxy"`, or `"dev"`. |
-| `dev_mode` | bool | `false` | Enable insecure development authentication (used in `"dev"` mode). |
+| `mode` | string | | Human auth mode. `"proxy"` is the only value the server checks: it then uses the proxy authenticator configured under `proxy` and offers no OAuth providers. Any other value, including unset (the default), `"oauth"` and `"dev"`, leaves the hub handling authentication itself. |
+| `dev_mode` | bool | `false` | Enable insecure development authentication. This (or the `--dev-auth` flag) is the dev auth switch; `mode` does not enable it. |
 | `dev_token` | string | | Static token for dev mode. |
 | `authorized_domains` | list | `[]` | Limit access to specific email domains. |
+| `user_access_mode` | string | `"open"` | Who may sign in: `"open"` (any verified email, subject to `authorized_domains` if set), `"domain_restricted"` (email domain must be in `authorized_domains`), or `"invite_only"` (the email must belong to an invited, allow-listed or existing user). Users in `admin_emails` are always allowed. |
+| `default_user_role` | string | `"member"` | Hub role given to a user when their account is first created or activated: first sign-in, including the first sign-in of an invited or allow-listed user. Values: `"member"` or `"viewer"` (`"admin"` is rejected; use `admin_emails`). Users in `admin_emails` are always admins. Changing it does not affect existing users. It is also the role given to an admin who is removed from `admin_emails`. See [Hub roles](/scion/hosted/ha/permissions/#hub-roles). Environment: `SCION_SEED_SERVER_AUTH_DEFAULTUSERROLE` (recommended) or `SCION_SERVER_AUTH_DEFAULTUSERROLE` (per-node, deprecated for Layer-1 keys). |
+| `agent_run_scope` | string | `"off"` | How the Hub treats the run an agent token was issued for. Agent tokens carry a `run_id` claim. `"off"` ignores it; `"observe"` compares it with the agent's current run and logs and counts mismatches (metric `scion.hub.agent_token.run_scope`) without refusing any request. Enforcement cannot be selected yet. Read at startup, so a change needs a Hub restart. Environment: `SCION_SERVER_AUTH_AGENTRUNSCOPE`. |
+| `agent_run_scope_legacy_until` | string | | RFC 3339 time after which agent tokens issued without a `run_id` claim are no longer accepted by the run check (in `observe` mode, counted as mismatches). Empty means no cut-off. Environment: `SCION_SERVER_AUTH_AGENTRUNSCOPELEGACYUNTIL`. |
 
 ### Proxy Auth (`server.auth.proxy`)
 
-Proxy authentication configuration (consulted when `server.auth.mode` is set to `"proxy"`). See [Proxy Auth (Google IAP)](/scion/hosted/ha/auth-proxy-iap/) for the full deployment guide.
+Proxy authentication configuration (consulted when `server.auth.mode` is set to `"proxy"`). See [Proxy Auth (Google IAP)](/scion/hosted/ha/auth-proxy-iap/) for the full deployment guide, and [Generic JWT proxy provider](/scion/hosted/ha/auth-proxy-iap/#generic-jwt-proxy-provider) for bespoke auth proxies.
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `provider` | string | | Selects the proxy auth provider: `"iap"` or `"header"`. |
+| `provider` | string | | Selects the proxy auth provider: `"iap"`, `"jwt"`, or `"header"`. |
 | `require_trusted_proxy_ip` | bool | `false` | Enables defense-in-depth IP allowlisting. Uses the trusted_proxies CIDR list. |
 
 #### Google IAP Settings (`server.auth.proxy.iap`)
@@ -122,6 +292,24 @@ Proxy authentication configuration (consulted when `server.auth.mode` is set to 
 | `issuer` | string | `"https://cloud.google.com/iap"` | The expected JWT issuer. Override only for mock/testing setups. |
 | `jwks_url` | string | `"https://www.gstatic.com/iap/verify/public_key-jwk"` | The URL to retrieve public keys for signature verification. Override only for testing. |
 
+#### Generic JWT Settings (`server.auth.proxy.jwt`)
+
+Used when `provider` is `"jwt"`. Exactly one key source — `public_key_file`, `jwks_url`, or `jwks_file` — must be set; the Hub refuses to start otherwise.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `header` | string | `"X-Auth-Proxy-JWT"` | HTTP header carrying the signed JWT assertion. |
+| `algorithm` | string | | **Required.** The single accepted signing algorithm. Must be asymmetric: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, `PS256`, `PS384`, or `PS512`. |
+| `issuer` | string | | If set, must match the JWT `iss` claim. Empty skips issuer validation. |
+| `audience` | string | | If set, must be contained in the JWT `aud` claim. Empty skips audience validation. |
+| `public_key_file` | string | | Key source: path to a PEM-encoded public key (PKIX, PKCS1, or an X.509 certificate). Loaded once at startup. |
+| `jwks_url` | string | | Key source: JWKS endpoint. Keys are cached and refreshed hourly and on an unknown `kid`, with the last-good key set served if the endpoint fails. |
+| `jwks_file` | string | | Key source: path to a local JWKS JSON document. Loaded once at startup; keys are matched by `kid`. Changes require a restart. |
+| `claims.email` | string | `"email"` | Claim holding the user's email. The claim is required on every token. |
+| `claims.subject` | string | `"sub"` | Claim holding the stable subject ID. Falls back to the email when absent. |
+| `claims.display_name` | string | `"name"` | Claim holding the display name. |
+| `claims.domain` | string | `"hd"` | Claim holding the hosted domain. |
+
 ### Transport Auth (`server.auth.transport`)
 
 Transport auth configuration for the platform guard (IAP or Cloud Run invoker). See [Proxy Auth (Google IAP)](/scion/hosted/ha/auth-proxy-iap/) for the full deployment guide.
@@ -130,7 +318,7 @@ Transport auth configuration for the platform guard (IAP or Cloud Run invoker). 
 | :--- | :--- | :--- | :--- |
 | `mode` | string | `"none"` | Transport auth mode: `none`, `iap`, or `cloudrun_invoker`. |
 | `oidc_audience` | string | | OIDC audience for transport tokens. For `iap`: the IAP OAuth client ID. For `cloudrun_invoker`: the Hub URL (auto-derived from `hub.public_url` if empty). |
-| `platform_auth_sa` | string | | Dedicated service account the Hub impersonates to mint OIDC ID tokens for agents. |
+| `platform_auth_sa` | string | | Dedicated service account the Hub impersonates to mint OIDC ID tokens for agents. This account is never provisioned as a Hub user and is never issued user credentials, even if it signs in. |
 
 #### Agent transport environment variables
 
@@ -138,9 +326,10 @@ When transport auth is configured, the Hub injects these environment variables i
 
 | Variable | Description |
 | :--- | :--- |
-| `SCION_TRANSPORT_TOKEN` | Initial Google OIDC ID token for the transport layer. |
+| `SCION_TRANSPORT_TOKEN` | Initial Google OIDC ID token for the transport layer. Bootstrap only: `sciontool init` moves it to `~/.scion/transport-token` and removes it from the child environment. If the file cannot be written, the value stays in the environment and is used until it expires. |
+| `SCION_TRANSPORT_TOKEN_FILE` | Set by `sciontool init` for child processes. Path of the transport token file, which every refresh rewrites. |
 | `SCION_TRANSPORT_AUDIENCE` | Audience the transport token was minted for. |
-| `SCION_TRANSPORT_TOKEN_EXPIRY` | Token expiry in RFC 3339 format. |
+| `SCION_TRANSPORT_TOKEN_EXPIRY` | Expiry of the initial token, in RFC 3339 format. Bootstrap only: removed by `sciontool init` together with `SCION_TRANSPORT_TOKEN`. |
 | `SCION_TRANSPORT_MODE` | Transport mode (`iap` or `cloudrun_invoker`). Injected alongside the other three transport vars so that in-agent clients can select the correct header placement. |
 
 #### Broker transport configuration
@@ -154,7 +343,7 @@ Brokers are long-lived originators that mint their own OIDC tokens (via GKE Work
 | `SCION_TRANSPORT_MODE` | Transport mode: `iap` or `cloudrun_invoker`. |
 | `SCION_TRANSPORT_AUDIENCE` | OIDC audience — the custom OAuth 2.0 Client ID (for `iap`) or Hub URL (for `cloudrun_invoker`). |
 
-**Credentials-file fields** (per hub connection, persisted by `scion hub brokers register`):
+**Credentials-file fields** (per hub connection, in `~/.scion/hub-credentials/<name>.json`, persisted by `scion runtime-broker register` or `scion runtime-broker join`):
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -204,19 +393,64 @@ Configures the backend and mount settings for storing and managing agent workspa
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `backend` | string | `"local"` | Storage backend pivot: `"local"` (node-local directories), `"nfs"` (Network File System mounts), `"cloudrun-volume"` (Cloud Run platform-managed volume mounts), or `"gke-shared-volume"` (GKE shared CSI-backed PVC mounts). |
+| `backend` | string | `"local"` | Storage backend pivot: `"local"` (node-local directories), `"nfs"` (Network File System mounts), `"cloudrun-volume"` (Cloud Run platform-managed volume mounts), or `"gke-shared-volume"` (GKE shared CSI-backed PVC mounts). Names are case-sensitive; any other value stops the Hub at startup. |
 | `nfs.mount_root` | string | | The host base directory under which NFS exports are mounted. |
 | `nfs.mount_options` | string | `"vers=3,hard,nconnect=4,_netdev"` | Standard mount options passed to the `mount.nfs` utility. |
-| `nfs.uid` | integer | `1000` | Node-independent owner UID for NFS-backed workspace trees to ensure consistent container write permissions. |
-| `nfs.gid` | integer | `1000` | Node-independent owner GID for NFS-backed workspace trees. |
+| `nfs.auto_mount` | boolean | `false` | Whether the Runtime Broker mounts the shares itself. See [NFS Mounts on the Runtime Broker](#nfs-mounts-on-the-runtime-broker). Requires the broker to run as root. |
+| `nfs.uid` | integer | `1000` | Node-independent owner UID for NFS-backed workspace trees to ensure consistent container write permissions. Ignored by the Kubernetes runtime, where agents always run as uid `1000`; when it is set to another value, the broker logs a warning the first time an agent starts on Kubernetes with that value in each broker process, so it appears again after a broker restart. Must be between 0 and 4294967294; 0 or unset means `1000`. |
+| `nfs.gid` | integer | `1000` | Node-independent owner GID for NFS-backed workspace trees. Must be between 0 and 4294967294; 0 or unset means `1000`. |
 | `nfs.storage_class` | string | | The Kubernetes StorageClass name used to dynamically allocate volumes on GKE. |
-| `nfs.subpath_root` | string | `"projects"` | The default base folder name within the share for project workspaces. |
+| `nfs.subpath_root` | string | `"projects"` | The base folder within the share for project workspaces. See [subpath_root](#subpath_root). |
 | `nfs.shares` | list of objects | `[]` | List of NFS share objects. Each share requires: `id` (stable ID), `server` (IP address or hostname), `export` (exported path, e.g., `/scion-workspaces`), and optional `pv_name` (for GKE). |
-| `cloudrun_volume.volume_name` | string | | The name of the platform volume declared in the Cloud Run service specification. The Hub resolves workspaces under `/mnt/<volume_name>`, which is where Cloud Run mounts a declared volume. |
-| `cloudrun_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the Cloud Run volume. |
-| `gke_shared_volume.volume_name` | string | | The K8s volume name referencing the persistent volume claim (PVC). **The pod spec must mount that volume at `/mnt/<volume_name>`**: the Hub derives every workspace path from it, and a pod that mounts the PVC elsewhere fails readiness (`GET /readyz` returns `503`) rather than writing workspaces to ephemeral container storage. |
+| `cloudrun_volume.volume_name` | string | | **Required** when `backend` is `"cloudrun-volume"` (the settings schema checks this only for the selected backend). The name of the platform volume declared in the Cloud Run service specification. The Hub resolves workspaces under `/mnt/<volume_name>`, so the service must mount the volume at exactly that path; see the [Cloud Run volume example](/scion/hosted/ha/setup-gcp/#3d-deploy-the-hub-to-cloud-run) in the GCP HA setup guide. If it is missing or empty, the Hub refuses to start. |
+| `cloudrun_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the Cloud Run volume. See [subpath_root](#subpath_root). |
+| `gke_shared_volume.volume_name` | string | | **Required** when `backend` is `"gke-shared-volume"`; if it is missing or empty, the Hub refuses to start. The K8s volume name referencing the persistent volume claim (PVC). **The pod spec must mount that volume at `/mnt/<volume_name>`**: the Hub derives every workspace path from it, and a pod that mounts the PVC elsewhere fails readiness (`GET /readyz` returns `503`) rather than writing workspaces to ephemeral container storage. |
 | `gke_shared_volume.pv_claim_name` | string | | The name of the GKE-managed PVC bound to the shared storage backend (e.g. Filestore). |
-| `gke_shared_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the GKE volume. |
+| `gke_shared_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the GKE volume. See [subpath_root](#subpath_root). |
+
+#### Startup validation
+
+The Hub checks `workspace_storage` when it starts, and refuses to start with an error naming the bad field when:
+
+- `backend` is not one of the four names above;
+- `backend` is `"nfs"` and `nfs.shares` is empty;
+- `backend` is `"cloudrun-volume"` or `"gke-shared-volume"` and the matching `volume_name` is missing or empty;
+- the selected backend's `subpath_root` is invalid (see below).
+
+A Runtime Broker that runs without the Hub does not refuse to start. It only logs warnings:
+
+- If the `nfs` block is incomplete, the broker warns and skips its NFS mount checks (see [NFS Mounts on the Runtime Broker](#nfs-mounts-on-the-runtime-broker)).
+- If the selected backend's `subpath_root` is invalid, the broker warns at startup. Its NFS mount checks still run, because they do not use `subpath_root`. However, every agent start that uses that backend fails with a `subpath_root` error until the value is fixed. This includes values such as `projects/` or `./projects`, which earlier versions accepted and normalized.
+
+The Hub's readiness check (`GET /readyz`) and its Cloud Run write guard still apply as further safeguards. A volume backend without a mount point fails readiness, and blocks workspace writes on Cloud Run.
+
+#### subpath_root
+
+`subpath_root` is the directory inside the share or volume that holds project trees, at `<subpath_root>/<project-id>/...`. It defaults to `"projects"` for every backend, and for `shared_dir_storage.nfs`. It must be a clean relative path: no leading `/`, no `.` or `..` components, no empty components and no trailing `/`. If a value is not clean, the error names the clean value to use instead (for example `projects` for `projects/`). It may have several components, for example `team/projects`. The Cloud Run runtime's NFS export paths use the same `nfs.subpath_root`.
+
+#### NFS Mounts on the Runtime Broker
+
+When `backend` is `nfs`, the Runtime Broker reads this block from its global `settings.yaml` (never from project settings) and checks each share at `<mount_root>/<share id>`. The block must have an absolute `mount_root`, and every share needs a unique single-segment `id`, a `server` (a hostname or IPv4 address, without whitespace or a leading `-`; IPv6 literals are not supported), and an absolute `export`. If the block is incomplete, the broker logs a warning and skips NFS handling. With any other backend, the broker does no NFS handling at all.
+
+- **`auto_mount: false` (default)**: The broker only checks. It reads the host mount table (`/proc/mounts`) to confirm each share is mounted from the expected `server:export`, at startup and then every minute. It never mounts or unmounts anything and never refuses agent creation. Mount each export on the host yourself, for example with `/etc/fstab`.
+- **`auto_mount: true`**: The broker mounts missing shares in the background, and remounts a share that is mounted from the wrong source. The broker must run as root: if it does not, it logs a warning at startup and only checks, without running `mount`. If the broker's default runtime is Kubernetes or Cloud Run, it also only checks, because the platform mounts the export into the agent. Each mount command times out after 90 seconds, or sooner if the agent-create request ends.
+
+With `auto_mount: true`, agent creation for a project on the `nfs` backend is decided by the runtime the agent is dispatched to. This check runs before anything is mounted. Only agent creation is checked; starting or restarting an existing agent is not.
+
+- **Docker, Podman, or Apple**: The broker first makes sure the first share is mounted, because that share holds the workspaces. If it is not mounted, the broker returns `503` with error code `nfs_unavailable`.
+- **Kubernetes or Cloud Run**: The broker never mounts and never refuses the request. If the share's last check found a problem, it logs a warning and continues.
+
+In both modes, NFS problems are logged and reported per share in the `nfs_mounts` check of `GET /healthz`. The overall status becomes `degraded` only if all of these hold: `auto_mount` is on, the default runtime is not Kubernetes or Cloud Run, the first check has finished, and a share is unhealthy. NFS problems never affect `GET /readyz`, and the broker keeps serving projects that do not use NFS. The Runtime Broker also sends its health to the Hub on every heartbeat, and the admin Health page shows it in the **Health** column of the **Runtime brokers** card. That copy holds only `healthy` or `unhealthy` for `nfs_mounts`. To see which share is failing and the mount error, query `GET /healthz` on the Runtime Broker itself. `scion doctor` runs the same check locally, using the same mount-table lookup. It reports whether NFS is configured, whether each share is mounted from the expected source, and whether each server is reachable on TCP port 2049. A share that is not mounted is a warning when `auto_mount` is off, the share has a `pv_name`, or the default runtime is Kubernetes or Cloud Run (so the broker does not mount it, as in `/healthz`), and a failure otherwise.
+
+#### NFS Workspaces on Kubernetes
+
+With the `nfs` backend and a bound PV claim (`nfs.shares[].pv_name`), each Kubernetes agent pod gets a `workspace-provision` init container. It runs for both git and non-git agents. It creates the per-project subPath (or, if another pod is already provisioning it, waits for that pod to finish) and chowns it to the agent runtime uid (`1000`) and `nfs.gid` so the agent can write `/workspace`; `nfs.uid` is ignored on Kubernetes (see the `nfs.uid` row above). For git agents, it also clones the repository. The init container runs as root with only the `CHOWN`, `FOWNER`, and `DAC_OVERRIDE` capabilities and does not follow symlinks. If the chown fails, the agent start fails and the error names the failed init container, so the agent never runs with an unwritable workspace.
+
+Pods get `fsGroup` from `nfs.gid` (default `1000`). With `server.shared_dir_storage.backend: nfs`, Scion also adds each shared directory's own group to the pod's supplementary groups (see [Agent groups](#agent-groups-on-nfs-shared-directories)), so `nfs.gid` does not need to match it. Shared directories served from the workspace export (`workspace_storage` set to `nfs` without `shared_dir_storage`) do not get that group: there, set `nfs.gid` to the shared-directory leaf group, otherwise pods lose group access to the leaf.
+
+#### Cleanup on project delete
+
+With the `nfs` backend, deleting a project also removes its `<subpath_root>/<project-id>` workspace tree from the export. The Hub removes it in the background from its own mount of the export, and provider Runtime Brokers remove it as part of their project cleanup. If the project exists again by the time cleanup runs, the tree is kept.
 
 #### Ephemeral Storage & 503 Safety Gate
 
@@ -224,6 +458,288 @@ To protect deployments from silent data loss, the Hub implements a strict **503 
 * If the Hub is deployed on serverless environments like Google Cloud Run with the `local` backend selected, its local workspace paths map to ephemeral, non-durable container storage.
 * The Hub detects this non-durable state and automatically intercepts all file write and modification endpoints (including WebDAV, inline file editing, and git cloning).
 * Affected endpoints will return `503 Service Unavailable` with a descriptive message rather than allowing writes to persist ephemerally on the container's scratch space, enforcing the transition to a durable backend (`nfs`, `cloudrun-volume`, or `gke-shared-volume`) for production.
+
+### Shared Directory Storage (`server.shared_dir_storage`)
+
+Selects where project [shared directories](/scion/local/workspace/#5-project-shared-directories) are stored, independently of `server.workspace_storage`. With the `nfs` backend, every Runtime Broker resolves a project's shared directories to the same path on one NFS export, so agents on different brokers — Docker or Kubernetes — see the same files.
+
+This setting is **global-only**: each broker process reads it from its own global `settings.yaml`, never from project settings. It is a [Layer-0](#layer-0--bootstrap-file--env-only) setting and requires a restart to take effect.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `backend` | string | `"local"` | `"local"` (shared directories live next to the project's local config) or `"nfs"`. Any other value, including a different case, is rejected. |
+| `nfs.mount_root` | string | | **Required for `nfs`.** Host directory under which the share is mounted, at `<mount_root>/<shares[0].id>`. Docker, Podman, and Apple runtimes bind-mount from here. |
+| `nfs.shares` | list of objects | `[]` | **Required for `nfs`.** Only the first entry is used. `id` is required. `pv_name` names the static PersistentVolumeClaim that Kubernetes pods mount by `subPath`, and is required for Kubernetes brokers. |
+| `nfs.subpath_root` | string | `"projects"` | Directory within the share that holds per-project trees. Must be a relative path. |
+| `nfs.gid` | integer | | Optional. The only shared-directory group that agents may be given as a supplementary group. When set, a leaf owned by any other group is skipped with a warning. See [Agent groups](#agent-groups-on-nfs-shared-directories). |
+
+Shared directories resolve to `<mount_root>/<share id>/<subpath_root>/<project id>/shared-dirs/<name>`. On Kubernetes, pods mount the `pv_name` claim with the matching `subPath` instead of creating a per-directory PVC.
+
+The `nfs` backend fails closed. Agent start is refused when the block is incomplete, the host base directory does not exist, the runtime is not a local-container or Kubernetes runtime (for example, Cloud Run), or a shared-directory path resolves through a symlink. The NFS export itself must be provisioned and mounted before agents start. The `uid`, `mount_options`, `storage_class`, and `auto_mount` fields of the `nfs` block are ignored here.
+
+With the `nfs` backend, the Hub and brokers also apply the following:
+
+- **Symlink-safe access**: Every Hub operation on an NFS shared directory goes through the same confined resolver. This covers the web file browser, archive downloads, and shared-dir deletion. The resolver walks each path component with `O_NOFOLLOW`, anchored on the inode of the project's tree, and refuses any symlink in the path. A missing or incomplete `nfs` block, or an unusable host base directory, fails closed on the Hub as well as on agent start.
+- **Leaf modes and ACLs**: A newly created shared directory gets mode `2775` (setgid, group-writable) and a minimal default POSIX ACL, so files agents create inside it inherit group write access regardless of umask. If the export does not support POSIX ACLs, a warning is logged once and the directory stays plain `2775` with no ACL. Files created inside such a directory follow each writer's umask (usually `022`), so they are not group-writable. Directories that already existed are never modified. See the [hybrid tier guide](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/hybrid-tier.md) for the manual fix-up recipe.
+- **No file attachments**: The Hub does not stage chat attachments into NFS-backed shared directories. A file attached to a message for an agent is not copied into the project's `scratchpad` shared directory; the agent is given the Hub-local path, which only an agent running as a process on the Hub's host can read. Files that an agent attaches to its own messages are dropped, and the message carries the warning `the scratchpad shared dir is not available on the hub host`. The Hub logs the staging skip once per project at Info level, and logs an Error for each agent message whose attachments are dropped. Attachments currently need the `local` backend, with the agent on the Hub's co-located broker. Attachment transfer for multi-broker Hubs is tracked in [ptone/scion#2449](https://github.com/ptone/scion/issues/2449).
+- **Ownership on an export that does not squash ids**: the broker creates the project chain as its own user and never changes ownership. Upper directories get `2755` and the leaf `2775`, and each inherits the group of a setgid parent. Pods create nothing on this export; they mount the existing leaf by `subPath`. When agents with different uids share a directory, for example Docker agents and Kubernetes pods, give the share directory (`<mount_root>/<share id>`) a shared group with the setgid bit (for example `chgrp <gid>` and `chmod 2775`) so every leaf inherits it. Scion then adds that group to each agent that mounts the leaf; see [Agent groups](#agent-groups-on-nfs-shared-directories).
+- **Cleanup on delete**: Deleting a project removes its `<subpath_root>/<project id>/shared-dirs` tree from the export. Removing a single shared directory removes that directory's contents. Both are best-effort: failures are logged and never block or roll back the database change.
+- **Startup summary**: At startup the server logs one `server.shared_dir_storage resolved layout: …` line, plus a warning if any ignored `nfs` fields are set.
+
+#### Agent groups on NFS shared directories
+
+Different kinds of agents can write to the same NFS shared directory (leaf): Docker or rootful Podman agents on brokers, and Kubernetes pods. They usually run with different uids, so each one can modify the others' files only through the leaf's group. For that to work:
+
+- **New files must be group-writable.** Where the export supports POSIX ACLs, the leaf's default ACL makes new files group-writable whatever the writer's umask. Where it does not (for example NFSv4.1 exports, where Linux clients cannot use POSIX ACLs), Scion logs a warning once, and new files follow the writer's umask. Agents that were given NFS shared-directory groups (below) run with the group bits of their umask cleared (`022` becomes `002`; a stricter `077` becomes `007`), so files they create are group-writable without an ACL. Other writers, and agents on images without this support, use their own umask (usually `022`), and their files cannot be modified by the other kinds of agents.
+- **Every writer must be in the leaf's group.** At each agent start, the broker reads the group of every NFS shared directory the agent mounts, from the leaf itself, and adds it to the agent:
+  - Kubernetes: added to the pod's `supplementalGroups`. `fsGroup` is not changed, and a group equal to `fsGroup` is not repeated (the pod already holds it).
+  - Docker and rootful Podman: added with `--group-add`. The agent image's `sciontool` must keep these groups when it switches from root to the agent user (for the harness, services, lifecycle hooks and commands run through the substrate exec endpoint); older images drop them and keep the previous behaviour.
+  - Rootless Podman and Apple containers: not supported; the broker logs a warning and starts the agent without the group. Docker with `userns-remap` or a rootless `dockerd` also gets no effect from the group, because the leaf gid is not mapped into the container's user namespace; the broker does not detect this case.
+
+  For safety, the broker skips a group (with a warning) when it is below `1000`, when it is an overflow id (`65534` or `4294967294`, which NFSv4 id mapping reports for unmapped groups), or when `nfs.gid` is set and does not match. If the group cannot be read, the agent starts without it. Agents without an NFS shared directory are unchanged. On an `all_squash` export the server maps every client to one identity, so the added group has no effect there.
+
+With umask `002`, other files the agent creates later (for example in its home directory) are group-writable for its primary group too. OpenSSH refuses a group-writable ssh config or key file (such as `~/.ssh/config`). Under umask `002`, a file created without an explicit mode is group-writable; secrets and ssh tools create such files with mode `0600`.
+
+Some files are not upgraded:
+
+- Files created by a writer that passes an explicit restrictive mode (for example `open(..., 0644)`) stay non-group-writable; neither an ACL nor the umask can add permissions the creator did not request.
+- Files copied or moved in with their modes preserved (for example `cp -p`, `rsync -a`, `tar -x` as the owner, or `mv` within the export) keep those modes.
+- Leaves created outside Scion, or before Scion added the leaf ACL, keep their existing mode and ACL. Scion only sets modes and ACLs on leaves it creates. Fix them by hand (see the hybrid tier guide).
+
+The `local` backend (or an unset `shared_dir_storage`) behaves as before.
+
+```yaml
+server:
+  shared_dir_storage:
+    backend: nfs
+    nfs:
+      mount_root: /mnt/scion-nfs
+      subpath_root: projects
+      shares:
+        - id: shared
+          server: 10.0.0.2
+          export: /scion-shared
+          pv_name: scion-shared-pvc
+```
+
+#### Per-profile backend
+
+A runtime entry or a profile can override the backend with `shared_dir_storage_backend` (`local` or `nfs`). This lets one broker keep its Docker profile on `local` while a Kubernetes profile uses `nfs`. The backend for an agent is resolved when it starts, in this order:
+
+1. `profiles.<name>.shared_dir_storage_backend` for the agent's profile.
+2. `runtimes.<name>.shared_dir_storage_backend` for that profile's runtime entry.
+3. `server.shared_dir_storage.backend`.
+
+The `nfs` details always come from `server.shared_dir_storage.nfs`, so an `nfs` override needs a complete `nfs` block there. Settings validation rejects an `nfs` override without one. Validation checks configuration only and never looks at the mount. On a Hub that stores runtimes and profiles in the database, `server.shared_dir_storage.nfs` is edited only in `settings.yaml`, and such an edit is not checked against the overrides stored in the database; an `nfs` override left without a complete block fails at agent start with an error that names the key.
+
+```yaml
+runtimes:
+  docker:
+    type: docker
+  gke:
+    type: kubernetes
+    shared_dir_storage_backend: nfs
+profiles:
+  local:
+    runtime: docker
+  gke:
+    runtime: gke
+server:
+  shared_dir_storage:
+    backend: local
+    nfs:
+      mount_root: /mnt/scion-nfs
+      shares:
+        - id: shared
+          pv_name: scion-shared-pvc
+```
+
+- **Chosen from global settings**: like `server.shared_dir_storage`, the overrides are read from the broker's global settings, never from project settings. On a co-located Hub and broker whose runtimes and profiles are stored in the database, the stored values apply. This picks the backend for an agent's first start; after that, the agent's recorded backend applies (see below).
+- **No restart**: overrides are read again at every agent start, so a change made in `settings.yaml` or through the Hub settings API applies to the next agent start.
+- **Recorded per agent**: an agent records the backend its shared directories were set up with and keeps it on later starts, even if the settings change.
+  - The record is `shared-dir-storage.json` in the agent's directory on the broker, next to `scion-agent.json`. It is outside the agent's home. In the default layouts the agent's container does not mount it. In two older layouts the agent's directory sits inside the workspace mount, so the container sees the record there, as it sees `scion-agent.json`: a non-git project whose `.scion` directory is inside the project, and a shared-workspace git project without an external agents directory. Reincarnating the agent keeps the record, and moving a shared-workspace agent's state out of the project moves the record with it.
+  - If an agent recorded `nfs` and the `nfs` block was later removed, its start fails with an error that says so, before any host path is touched.
+  - An override that later fails validation does not block an agent that recorded a backend, because the agent does not use it. It still fails the first start of a new agent.
+  - A start that could not load the global settings records nothing, so the agent picks up its configured backend once the settings load again.
+  - Agents created before the backend was recorded use the current resolution.
+- **Host mount**: a broker that starts an `nfs`-resolved agent needs the export mounted at `<mount_root>/<share id>`, as with the global `nfs` backend. A missing mount fails only agents that resolve to `nfs`. Agents on the `local` backend, server startup, and health checks are not affected. The startup log has one line per profile whose backend comes from an override.
+- **Hub file browser and attachments**: the Hub's file browser, archive downloads and attachment staging use `server.shared_dir_storage.backend` only, not the per-profile or [per-directory](#per-directory-backend) overrides. When that backend is `nfs`, attachments are not staged (see **No file attachments** above).
+- **Cleanup on delete**: deleting a project removes its tree from the export whenever `server.shared_dir_storage.nfs` is complete, whatever the backend settings select. An agent can still be on `nfs` by its record after every setting has moved to `local`, and the Hub cannot read records kept on brokers. If the global backend is not `nfs` and the export is not mounted on the Hub's host, cleanup logs a warning and the delete still succeeds.
+
+#### Per-directory backend
+
+A runtime entry or a profile can also choose the backend for single shared directories with `shared_dir_storage_backends`, a map from shared directory name to `local` or `nfs`. For example, one project's `notes` directory can live on the NFS export, shared by Docker agents on several brokers and by Kubernetes pods, while a large `gocache` directory stays on local disk. A directory the map does not name uses the single `shared_dir_storage_backend` value, resolved as described above.
+
+For each shared directory the nearest level wins, in this order:
+
+1. `profiles.<name>.shared_dir_storage_backends.<dir>` for the agent's profile.
+2. `profiles.<name>.shared_dir_storage_backend`.
+3. `runtimes.<name>.shared_dir_storage_backends.<dir>` for that profile's runtime entry.
+4. `runtimes.<name>.shared_dir_storage_backend`.
+5. `server.shared_dir_storage.backend`.
+
+```yaml
+runtimes:
+  gke:
+    type: kubernetes
+profiles:
+  docker:
+    runtime: docker
+    shared_dir_storage_backends:
+      notes: nfs
+  gke:
+    runtime: gke
+    shared_dir_storage_backends:
+      notes: nfs
+server:
+  shared_dir_storage:
+    backend: local
+    nfs:
+      mount_root: /mnt/scion-nfs
+      shares:
+        - id: shared
+          pv_name: scion-shared-pvc
+```
+
+Because the profile is nearer than its runtime entry, a profile's single value wins over a per-directory entry on the runtime entry. In the following settings, `gocache` is on `nfs` for agents using the `fast` profile, even though the runtime entry names it `local`:
+
+```yaml
+runtimes:
+  gke:
+    type: kubernetes
+    shared_dir_storage_backends:
+      gocache: local
+profiles:
+  fast:
+    runtime: gke
+    shared_dir_storage_backend: nfs
+```
+
+To keep `gocache` on local disk for that profile, name it in the profile's own map:
+
+```yaml
+profiles:
+  fast:
+    runtime: gke
+    shared_dir_storage_backend: nfs
+    shared_dir_storage_backends:
+      gocache: local
+```
+
+- **Validation**: each key must be a valid shared directory name (lowercase letters, digits and hyphens) and each value `local` or `nfs`. An `nfs` entry needs a complete `server.shared_dir_storage.nfs` block, as for the single value. Errors name the key, for example `profiles.gke.shared_dir_storage_backends.notes`.
+- **Directories a project does not have**: settings are global and shared directories belong to each project, so an entry for a directory that a project does not have is valid and ignored for that project's agents.
+- **Recorded per agent**: the record in `shared-dir-storage.json` keeps the backend of each directory. Its `backend` field applies to every directory that its `dirs` map does not name. An agent whose directories all use one backend gets the same record as before, with no `dirs` map.
+  - A record written before per-directory backends existed has no `dirs` map, so all of that agent's directories keep its one recorded backend. Adding a per-directory entry to the settings does not move an existing agent's directories. No migration step is needed.
+  - A shared directory added to the project after the agent's first start uses the record's `backend`, not the current per-directory settings.
+- **Mounts**: Docker and Podman bind-mount each `nfs` directory from the export and each `local` directory from the broker's local layout. Kubernetes mounts each `nfs` directory from the `pv_name` claim by `subPath`, and each `local` directory as it would without `shared_dir_storage` (its own PersistentVolumeClaim, or the workspace claim when `server.workspace_storage` is `nfs`).
+- **Startup summary**: the startup log has one line per profile and shared directory whose backend comes from a `shared_dir_storage_backends` entry. An entry that a nearer setting overrides, such as a runtime entry's `gocache: local` under a profile with a single `nfs` value, produces no line.
+- **Changing an existing agent**: see [Changing an agent's shared directory to nfs](#changing-an-agents-shared-directory-to-nfs) and [Changing it back to local](#changing-an-agents-shared-directory-back-to-local).
+- **Known limit, mixed writers**: when agents with different uids write to the same `nfs` directory, for example Docker agents (the broker's uid) and Kubernetes pods (uid 1000 with `fsGroup`), subdirectories and files they create follow each writer's umask, usually `022`. Without POSIX ACLs on the export, one kind of agent cannot write into subdirectories the other created. Scion does not set a group-writable umask for agents in this version. Use the shared-group setup described above, and umask `002` for every agent that writes there.
+
+#### Changing an agent's shared directory to nfs
+
+Settings never move an existing agent's shared directories. To move one directory of an existing agent from `local` to `nfs`, reincarnate it with [`--shared-dir-backend`](/scion/reference/cli/#scion-reincarnate):
+
+```bash
+scion reincarnate my-agent --shared-dir-backend notes=nfs
+```
+
+The change is recorded per agent, but a shared directory belongs to the project: on the `local` backend every agent of the project on that broker uses the same local directory, and on `nfs` every agent of the project uses the same `nfs` directory. To move a directory for all of a project's agents:
+
+1. Stop every agent that uses the directory, so nothing writes to the local copy while you copy it.
+2. Copy the contents of the local directory into the `nfs` directory, `<mount_root>/<share id>/<subpath_root>/<project id>/shared-dirs/<name>`, keeping ownership, modes, the setgid bit and ACLs. Copy into the directory rather than replacing it, for example:
+
+   ```bash
+   rsync -aAX <local dir>/ <nfs dir>/
+   # or
+   cp -a --preserve=all <local dir>/. <nfs dir>/
+   ```
+
+   Then check the `nfs` directory with `getfacl <nfs dir>`: it must still show the setgid flag and its `default:` ACL entries. On NFS that inherited default ACL is what makes files one agent creates writable by the others, so a copy that drops it changes how agents can share the directory.
+3. Reincarnate each of those agents with `--shared-dir-backend <name>=nfs`. An agent you do not reincarnate keeps using the local directory.
+
+- **Record only**: the broker changes the agent's `shared-dir-storage.json` during the reincarnation. It never copies, moves or deletes data, and the local directory stays where it is.
+- **Checks**: the Hub checks the directory name and that the new backend is `nfs` or `local`. The broker then refuses the change when the directory is not one of the agent's shared directories, or `server.shared_dir_storage.nfs` is not complete on that broker, or the broker does not support the change. An agent without a record first gets one built from the settings of the profile it was created under, as its next start would have, with the change applied. In the rare case of an agent created with no saved profile, the active profile is used.
+- **Refusals stop the agent**: the broker's checks run after the Hub has stopped the agent, as with every reincarnation step on the broker. When the broker refuses, the reincarnation is recorded as failed and the agent stays stopped, with its record unchanged. Fix the cause and reincarnate again, or start the agent without the change. A `--dry-run` shows the change in the plan but does not run the broker's checks.
+- **Empty directory check**: the next start refuses with an error when the `nfs` directory is empty while the previous local directory is not, and names both paths. On Kubernetes the previous local storage is a PersistentVolumeClaim that the broker cannot read, so the start is refused whenever the `nfs` directory is empty. After copying the data, start the agent again; once the check passes it is not repeated. To start with an empty `nfs` directory anyway, run the reincarnation again with `--allow-empty-shared-dir`:
+
+  ```bash
+  scion reincarnate my-agent --shared-dir-backend notes=nfs --allow-empty-shared-dir
+  ```
+
+- **Brokers**: a broker that does not support the change fails the reincarnation instead of ignoring it.
+
+#### Changing an agent's shared directory back to local
+
+To move a directory back from `nfs` to `local`, for example to roll back an `nfs` pilot, reincarnate with `--shared-dir-backend <name>=local`. It works like the change to `nfs`, in the other direction:
+
+1. Stop every agent that uses the directory, so nothing writes to the `nfs` copy while you copy it.
+2. Copy the contents of the `nfs` directory, `<mount_root>/<share id>/<subpath_root>/<project id>/shared-dirs/<name>`, into the local directory, keeping ownership, modes, the setgid bit and ACLs, for example `rsync -aAX <nfs dir>/ <local dir>/`, then check the local directory with `getfacl <local dir>`. On Docker and Podman the local directory is the broker's local shared directory of the project, the path a refused start names. On Kubernetes it is the project's PersistentVolumeClaim `scion-shared-<project>-<name>`, which is reused by name: copy into it from a pod that mounts both the claim and the export.
+3. If no agent of the project should use `nfs` for this directory any more, change the settings back too: set `server.shared_dir_storage.backend`, or the `shared_dir_storage_backend` and `shared_dir_storage_backends` entries that select `nfs`, back to `local`. Settings never move an existing agent, but new agents follow them, and the chat plugins resolve shared directory files from the settings file and its active profile, not from an agent's record.
+4. Reincarnate each of those agents with `--shared-dir-backend <name>=local`. An agent you do not reincarnate keeps using the `nfs` directory.
+
+```bash
+scion reincarnate my-agent --shared-dir-backend notes=local
+```
+
+- **Record only**: as for the change to `nfs`, only the agent's `shared-dir-storage.json` changes. The `nfs` directory is never moved or deleted. The `nfs` settings need not be complete for this change, but the start check below reads the `nfs` directory.
+- **Same rules**: an agent cannot change its own backend, the change cannot be combined with a move to another Runtime Broker (`--broker` naming the current one is allowed), and the change is sent to the broker on that reincarnation only. Changing a directory back before any start has checked the change to `nfs` only drops that pending check.
+- **Empty directory check**: the next start refuses with an error when the local directory is empty while the `nfs` directory is not, and names both paths. When the `nfs` directory cannot be checked (the export is not mounted on the broker, `server.shared_dir_storage.nfs` is no longer complete, or a component below the export's mount is a symlink), the start is refused too. On Kubernetes the broker cannot read the claim, so when the `nfs` directory is not empty it only looks the claim up by name: a missing claim, which would start empty, or a lookup error refuses the start, and an existing claim passes with a warning in the broker log. **Known limit**: the content of an existing claim is not checked, so make sure your copy reached it. With `server.workspace_storage` set to `nfs` and a bound `pv_name` claim, Kubernetes serves local shared directories from the workspace claim instead of a claim of their own, and the check is skipped with a warning. A runtime that cannot look up claims also skips it with a warning; in both cases the `nfs` directory is not read.
+- **Broker versions**: a broker older than this change cannot read an agent record that still holds a pending check of a change back to `local`, and refuses to start that agent. Do not roll a broker back to such a version while a change to `local` is pending: start the agent on the current version first, so the check runs and is cleared, or remove the `previous` entry for the directory from the agent's `shared-dir-storage.json`.
+- **Retrying**: after a refusal, copy the data and run `scion start` again. Do not reincarnate again to retry. Once the check passes it is not repeated. To start with an empty local directory anyway, reincarnate with `--shared-dir-backend <name>=local --allow-empty-shared-dir`.
+
+### Agent Home Storage (`server.home_storage`)
+
+Selects where the home directory of Kubernetes agents lives. With the default `local` backend the home is inside the pod and is filled from the broker's copy at every start. With `nfs`, each agent's home is a directory on the NFS export of its profile's [shared-dir storage](#shared-directory-storage-servershared_dir_storage), kept across stops, restarts and pod replacements.
+
+The `nfs` backend is in development. It takes effect only when the hub's `hub.k8s_nfs_home` [experiment](/scion/reference/experiments/) is on and `allow_incomplete_phases` is set. The export's group must be the pod group (gid 1000). See [Persistent Agent Home](/scion/hosted/ha/kubernetes/#persistent-agent-home-nfs) for how the home is created and used.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | string | `local` | `local` or `nfs`. A runtime entry or profile can override it with `home_storage_backend`. |
+| `leaf` | string | `pod` | How an agent's home directory is created on the export: `pod` (an init container in the agent's pod) or `broker` (the broker, through its own mount of the export at the shared-dir storage `mount_root`). A runtime entry or profile can override it with `home_storage_leaf`. |
+| `stop_grace_seconds` | int | `30` | Termination grace period of pods with an NFS home. |
+| `termination_wait_seconds` | int | `15` | How long a start waits, beyond the grace period, for the agent's previous pod to stop. Keep `stop_grace_seconds` plus this below 90 (the hub's start window; the broker request timeout is 120); the server warns at startup and `scion config validate` warns when it is not. |
+| `skeleton_max_bytes` | int | `268435456` | Largest image home skeleton copied into a new home. |
+| `allow_incomplete_phases` | bool | `false` | Development only. Allows the `nfs` backend while the feature is incomplete. |
+
+The backend and leaf mode for an agent are resolved when it first starts, each in this order:
+
+1. `profiles.<name>.home_storage_backend` (or `home_storage_leaf`) for the agent's profile.
+2. `runtimes.<name>.home_storage_backend` (or `home_storage_leaf`) for that profile's runtime entry.
+3. `server.home_storage.backend` (or `leaf`).
+4. `local` (or `pod`).
+
+```yaml
+server:
+  shared_dir_storage:
+    backend: local
+    nfs:
+      mount_root: /mnt/scion-nfs
+      shares:
+        - id: shared
+          pv_name: scion-shared-pvc
+  home_storage:
+    allow_incomplete_phases: true
+runtimes:
+  gke:
+    type: kubernetes
+profiles:
+  gke:
+    runtime: gke
+    shared_dir_storage_backend: nfs
+    home_storage_backend: nfs
+    home_storage_leaf: pod
+  docker:
+    runtime: docker
+```
+
+- **Kubernetes only**: agents on any other runtime always get a local home, whatever the settings say. An `nfs` value on a non-Kubernetes runtime entry or profile is accepted with a warning.
+- **Share**: the home uses the first share and claim of the profile's resolved `shared_dir_storage` `nfs` block. A profile that selects `home_storage_backend: nfs` without `shared_dir_storage` `nfs` fails to start agents, with an error naming the profile.
+- **Hub agents only**: an NFS home is named after the agent's hub ID, at `<subpath_root>/<project id>/agents/<agent slug>/home-<agent id>` on the export. A start without a hub agent ID fails.
+- **Chosen from global settings**: like `server.shared_dir_storage`, the per-profile and per-runtime keys are read from the broker's global settings, never from project settings. On a co-located Hub and broker whose runtimes and profiles are stored in the database, the stored values apply, and an edit takes effect at the next agent start with no restart. `server.home_storage` itself is read from `settings.yaml` only.
+- **Recorded per agent**: a new agent's home storage is decided at its first start and recorded in `home-storage.json` in the agent's directory on the broker, next to `shared-dir-storage.json`. Later starts, restarts and reincarnations use the record, so a settings change never moves an existing home. A recorded `nfs` home whose share is no longer configured, or whose agent is started with the experiment off, fails to start rather than getting a new, empty home. Agents created before the record existed keep a local home.
+- **Startup summary**: the startup log has a warning for each invalid value and one line per profile that resolves to `nfs`.
 
 ### Scheduler (`server.scheduler`)
 
@@ -237,6 +753,31 @@ Controls the background task scheduler in the Hub. This regulates the tick inter
 :::note[Database Stability]
 Configuring a modest concurrency limit (such as the default `2`) is highly recommended for small or single-node database instances to prevent sudden spikes in database connection usage.
 :::
+
+### Maintenance (`server.maintenance`)
+
+Controls how the Hub checks for and applies its own updates. The Hub dispatches update checks by **deployment tier**: a `binary` Hub reads the `LATEST.json` release manifest and the GitHub Releases API, while a `source` Hub checks its git checkout for new commits.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `deployment_tier` | string | `binary` if no repository path is configured, otherwise `source` | Update strategy. `binary` updates from GitHub Releases; `source` updates from a git checkout. The single-node VM deploy script sets `binary`. |
+| `release_channel` | string | Detected from the running version | Release channel to track: `stable`, `preview`, or `nightly`. When empty, the channel is derived from the version string (`v0.5.0` → `stable`, `v0.5.0-rc1` → `preview`, `nightly-*` → `nightly`). Development builds have no channel and skip scheduled checks. |
+| `update_policy` | string | `auto` for `binary`, `disabled` for `source` | `auto` checks on a schedule and installs updates automatically. `notify` checks on a schedule and shows an update-available banner in the admin UI, where an admin applies or dismisses it. `disabled` turns off scheduled checks; manual checks from the admin UI still work. |
+| `check_interval_hours` | integer | `6` | How often the scheduled release check runs. Minimum `1`. Each run is jittered by up to ±30 minutes. |
+| `github_repo` | string | `GoogleCloudPlatform/scion` | GitHub repository used for release and manifest lookups. |
+
+Scheduled checks run only when `deployment_tier` is `binary` and `update_policy` is not `disabled`. A binary update downloads the release tarball, verifies the new binary's version, backs up the current binary, installs the new one, and restarts the `scion-hub` systemd service. If the install fails, the backup is restored.
+
+The related admin endpoints are `POST /api/v1/admin/maintenance/check-updates` (manual check) and `GET` / `DELETE` on `/api/v1/admin/maintenance/update-available` (read or dismiss a pending update notification). Both require the `hub.maintenance.execute` permission.
+
+```yaml
+server:
+  maintenance:
+    deployment_tier: "binary"
+    release_channel: "stable"
+    update_policy: "notify"
+    check_interval_hours: 12
+```
 
 ### OIDC Identity Provider (`server.oidc`)
 
@@ -266,13 +807,15 @@ Configuration for inbound OIDC-based federation authentication.
 | :--- | :--- | :--- | :--- |
 | `issuer_url` | string | | **MANDATORY.** The exact OIDC issuer URL (matching token `iss` claim). |
 | `jwks_url` | string | | The URL to fetch signing public keys. Discovered via OIDC discovery if empty. |
-| `expected_audience` | string | | The expected audience `aud` claim in tokens. |
+| `expected_audience` | string | | The expected audience `aud` claim in tokens. Required (non-empty) for a `user`-type Google issuer to enable external bearer tokens. |
 | `allowed_projects` | list of strings | | If set, restricts tokens to specific project UUIDs. |
 | `allowed_root_users` | list of strings | | If set, restricts tokens to specific root user emails. |
 | `default_scopes` | list of strings | | Default JWT scopes granted to federated agents. |
 | `issuer_type` | string | `"hub"` | Type of issuer: `"hub"`, `"service_account"`, or `"user"`. |
 | `default_role` | string | `"viewer"` | Default role for federated users (`issuer_type: user`). |
 | `allowed_emails` | list of strings | | Restrict user tokens to specific email claims (supports wildcards e.g. `*@example.com`). |
+| `allowed_domains` | list of strings | | Google issuer only. Restrict **user** principals presenting an [external bearer token](/scion/hosted/single-node/auth/#external-bearer-tokens-google-credential-pass-through) to these email domains (exact, case-insensitive, no wildcards or subdomain matching). The Hub sign-in policy still applies. Never consulted for service accounts. |
+| `allowed_gcp_projects` | list of strings | | Google issuer only. Admit **service-account** principals whose GCP project ID (parsed from the service account email) is listed. Empty admits no service accounts. Distinct from `allowed_projects`, which matches Scion project IDs. |
 
 ### OIDC Login (`server.oidc_login`)
 
@@ -305,26 +848,39 @@ project_defaults:
 ## Environment Variables
 
 :::tip[Database Mode]
-When running with a postgres database, operational settings (Layer-1) can be configured via `SCION_SEED_*` environment variables and managed in the admin UI. See the [Admin Settings Model](/reference/admin-settings/) for details on the seeded/managed lifecycle and the `SCION_SEED_*` namespace.
+When running with a postgres database, operational settings (Layer-1) can be configured via `SCION_SEED_*` environment variables and managed in the admin UI. See the [Admin Settings Model](/scion/reference/admin-settings/) for details on the seeded/managed lifecycle and the `SCION_SEED_*` namespace.
 :::
 
-All server settings can be overridden via environment variables using the `SCION_SERVER_` prefix and snake_case naming.
+Most server settings can be overridden via environment variables using the `SCION_SERVER_` prefix. Write each path segment in upper case and drop the underscores inside a multi-word field name: `read_timeout` becomes `READTIMEOUT`, not `READ_TIMEOUT`. A name that the Hub does not recognise is ignored and logged as a warning at startup, with a suggested spelling where one exists. An exported but empty `SCION_SERVER_*` or `SCION_SEED_*` variable is treated as unset, so it never overrides a configured value. Each key's working variable is listed as `x-env-var` in the [settings schema](https://github.com/GoogleCloudPlatform/scion/blob/main/pkg/config/schemas/settings-v1.schema.json).
+
+There are two exceptions to the pattern:
+
+- The broker's listener settings under `server.broker` use the `RUNTIMEBROKER` segment, for example `server.broker.port` -> `SCION_SERVER_RUNTIMEBROKER_PORT`.
+- The broker identity keys keep their underscores: `server.broker.broker_id` -> `SCION_SERVER_BROKER_BROKER_ID`, and likewise `BROKER_BROKER_NAME`, `BROKER_BROKER_NICKNAME`, `BROKER_BROKER_TOKEN` and `BROKER_AUTO_PROVIDE`.
+
+`server.log_format` and `server.env` have no environment variable. Neither is read by the Hub: both are accepted so existing settings files still load. The log output format is chosen at startup; set `SCION_LOG_GCP=true` for Cloud Logging JSON. `server.log_level` (or `SCION_SERVER_LOGLEVEL`) is applied when the server starts, and again when a file-mode admin server-config save or reload re-reads the config; clearing it reverts to `info`. `--debug` and `SCION_LOG_LEVEL` take precedence over it (see [Precedence](/scion/hosted/single-node/observability/#precedence)). Upgrade note: a Hub whose settings still contain `server.log_level: debug` from an earlier change now starts at `debug`, because earlier releases ignored the setting at startup.
 
 **Examples:**
 - `server.hub.port` -> `SCION_SERVER_HUB_PORT`
 - `server.hub.gcp_project_id` -> `SCION_SERVER_HUB_GCPPROJECTID`
 - `server.hub.gcp_iam_check_mode` -> `SCION_SERVER_HUB_GCPIAMCHECKMODE`
 - `server.hub.gcp_iam_deny_unknown_policy` -> `SCION_SERVER_HUB_GCPIAMDENYUNKNOWNPOLICY`
-- `server.broker.enabled` -> `SCION_SERVER_BROKER_ENABLED`
-- `server.broker.container_hub_endpoint` -> `SCION_SERVER_BROKER_CONTAINERHUBENDPOINT`
+- `server.hub.admin_emails` -> `SCION_SERVER_HUB_ADMINEMAILS`
+- `server.hub.stalled_threshold` -> `SCION_SERVER_HUB_STALLEDTHRESHOLD`
+- `server.hub.monitoring_dashboard_url` -> `SCION_SERVER_HUB_MONITORINGDASHBOARDURL`
+- `server.auth.user_access_mode` -> `SCION_SERVER_AUTH_USERACCESSMODE`
+- `server.broker.enabled` -> `SCION_SERVER_RUNTIMEBROKER_ENABLED`
+- `server.broker.container_hub_endpoint` -> `SCION_SERVER_RUNTIMEBROKER_CONTAINERHUBENDPOINT`
+- `server.broker.broker_id` -> `SCION_SERVER_BROKER_BROKER_ID`
 - `server.database.url` -> `SCION_SERVER_DATABASE_URL`
+- `server.database.allow_shadowed_schema` -> `SCION_SERVER_DATABASE_ALLOWSHADOWEDSCHEMA`
 - `server.auth.dev_mode` -> `SCION_SERVER_AUTH_DEVMODE`
 - `server.secrets.backend` -> `SCION_SERVER_SECRETS_BACKEND`
 - `server.secrets.gcp_project_id` -> `SCION_SERVER_SECRETS_GCPPROJECTID`
 - `server.secrets.gcp_credentials` -> `SCION_SERVER_SECRETS_GCPCREDENTIALS`
 - `server.secrets.gcp_replication_locations` -> `SCION_SERVER_SECRETS_GCPREPLICATIONLOCATIONS`
-- `server.scheduler.interval_seconds` -> `SCION_SERVER_SCHEDULER_INTERVAL_SECONDS`
-- `server.scheduler.max_concurrency` -> `SCION_SERVER_SCHEDULER_MAX_CONCURRENCY`
+- `server.scheduler.interval_seconds` -> `SCION_SERVER_SCHEDULER_INTERVALSECONDS`
+- `server.scheduler.max_concurrency` -> `SCION_SERVER_SCHEDULER_MAXCONCURRENCY`
 
 ### Logging Environment Variables
 
@@ -333,14 +889,69 @@ These environment variables control server-side logging behavior. They are not p
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `SCION_LOG_GCP` | Enable GCP Cloud Logging JSON format on stdout | `false` |
-| `SCION_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
+| `SCION_LOG_LEVEL` | Log level: `debug`, `info`, `warn` or `error`, optionally followed by per-component levels such as `info,hub.auth=debug`. See [Controlling the Log Level](/scion/hosted/single-node/observability/#controlling-the-log-level). | `info` |
+| `SCION_DEBUG` | Deprecated alias for `SCION_LOG_LEVEL=debug`. Any non-empty value enables it, and a warning is printed to stderr once. `SCION_LOG_LEVEL` wins if both are set. Ignored (no warning) by `scion` commands in agent CLI mode; see [Debugging an agent](/scion/hosted/single-node/observability/#debugging-an-agent). | - |
 | `SCION_CLOUD_LOGGING` | Send logs directly to Cloud Logging via client library | `false` |
-| `SCION_CLOUD_LOGGING_LOG_ID` | Log name in Cloud Logging for application logs | `scion` |
+| `SCION_CLOUD_LOGGING_LOG_ID` | Log name in Cloud Logging for application logs | `scion-server` |
 | `SCION_GCP_PROJECT_ID` | GCP project ID for Cloud Logging (priority 1) | auto-detect |
 | `GOOGLE_CLOUD_PROJECT` | GCP project ID for Cloud Logging (priority 2) | - |
 | `SCION_SERVER_REQUEST_LOG_PATH` | Write HTTP request logs to a file at this path. Each line is a JSON object in `HttpRequest` format. When not set, request logs follow the default routing (stdout in background mode, suppressed in foreground mode, Cloud Logging when enabled). | (disabled) |
 
 See the [Local Development Logging guide](/scion/contributing/logging/) for details on log formats, request log fields, and Cloud Logging integration.
+
+### Shutdown and Signals
+
+Once its startup has installed signal handling, `scion server start` (the Hub, Web and co-located broker process) shuts down gracefully on either `SIGINT` (Ctrl+C) or `SIGTERM` (`systemctl stop`, Kubernetes, Cloud Run, container stop): it drains in-flight requests, closes the audit writer, then flushes and closes its logs (see **Shutdown** under [Log delivery guarantees](#log-delivery-guarantees) for the full order). Only the first signal is acted on; a second `SIGINT` or `SIGTERM` is ignored rather than cutting the drain short. An orchestrator that escalates to `SIGKILL` after its grace period still terminates the process immediately. To stop the server cleanly, send `SIGINT` or `SIGTERM`, or use `scion server stop`.
+
+- **Early startup.** A `SIGINT` or `SIGTERM` that arrives during early startup, before signal handling is installed, normally ends the process without a drain, as before. If the server installs its signal handling while such a signal is still being handled, it may instead run the graceful shutdown.
+- **Foreground runtime broker** (`scion broker start --foreground`). When the broker owns its port record (the normal case), it saves the record and then installs its own `SIGTERM` handler. Once that handler is installed, a `SIGTERM` removes the port record; the process then either ends (if the server has not installed its signal handling yet) or runs the single graceful shutdown. The record removal and the start of the graceful shutdown run concurrently, with no order between them. A `SIGTERM` that arrives after the record is saved but before the broker's handler is installed ends the process by default and can leave the record behind. On a normal exit the broker also removes its record.
+- **Other signals.** Signals the server does not handle keep their default behavior. For other termination signals, for example `SIGHUP` or `SIGQUIT`, that ends the process without a drain.
+
+If the Hub fails to start (for example, when operational settings cannot be loaded), the server logs `Hub server failed to start: <error>`, flushes its logs, and exits with status 1.
+
+### Log delivery guarantees
+
+Server logging is best effort. Losses in the modes below are counted, never retried, and there is no exactly-once delivery: a record can be lost, and on some platforms it can appear twice (see **Duplicates** below). This section describes what the code guarantees; nothing here is a measured ingestion rate.
+
+**Local acceptance is not remote ingestion.** A record counts as written when the local handler accepts it: the stdout write returned, or the Cloud Logging client put the entry in its in-memory buffer (8 MiB for application logs). The client sends buffered entries to Cloud Logging later, in the background. Nothing in the Hub confirms that an entry reached Cloud Logging, so no metric reports a delivery ratio for the Cloud path.
+
+**Paths.**
+
+- **stdout** (plain JSON, or Cloud Logging JSON with `SCION_LOG_GCP=true`): written synchronously by the logging call. On Cloud Run and GKE the platform ships stdout to Cloud Logging; on other hosts that depends on the host's log agent (for example the Ops Agent on Compute Engine). That shipping is outside the Hub.
+- **Direct Cloud Logging** (`SCION_CLOUD_LOGGING=true`): the client library buffers and sends entries asynchronously. A circuit breaker probes the client by flushing it every 30 seconds; after 3 consecutive failed flushes it opens and the Hub stops feeding the Cloud path (stdout logging continues where a stdout handler is configured; see the `circuit_open` row). It probes again at the first 30-second check at least 60 seconds after opening (about 90 seconds with the defaults, and about every 90 seconds while probes keep failing) and closes when a probe succeeds. The request log (`scion_request_log`) and message log (`scion-messages`) share the same client and circuit.
+- **Decision-log audit records** (`scion.audit`, only when the `hub.authorization_decision_audit_v2` experiment is on): queued on a bounded asynchronous writer (2,048 records, 2 MiB) with one worker, a 2-second write budget per record and a 5-second drain at shutdown. The worker writes to the same handler chain as other logs, so the stdout and Cloud rules above apply after it.
+
+**Loss modes.** Each loss mode below increments `scion.logging.write.failures{writer, reason}`. Losses outside these modes are not counted, for example: a process ended by a termination signal it does not handle (for example `SIGINT` or `SIGTERM` before `scion server start` installs its signal handling, or `SIGHUP` or `SIGQUIT` at any time; see **Shutdown**), a process killed by `SIGKILL` or the OOM killer, an unrecovered panic, a failed stdout write outside the audit writer, an OTel log export failure, and a request-log file write failure.
+
+| `writer` | `reason` | Meaning |
+| :--- | :--- | :--- |
+| `audit` | `queue_full` | The writer's queue was full (record count or bytes); the new record was dropped. |
+| `audit` | `oversize` | The record exceeded the per-record limits; it was rejected, not truncated. |
+| `audit` | `unsupported` | The record held a value kind the writer does not copy; it was rejected. |
+| `audit` | `closed` | The record arrived after the writer closed (shutdown). |
+| `audit` | `error` | The inner handler returned an error or panicked. |
+| `audit` | `timeout` | The write exceeded its 2-second budget. The record may still be written later; it is counted once, as a timeout. |
+| `audit` | `shutdown` | The record was still queued when the 5-second shutdown drain ended. |
+| `cloud` | `error` | The Cloud Logging client reported an error (a failed batch send, an invalid or oversized entry). One count per reported error, not per record. Under an error storm the client skips some reports, so this undercounts. |
+| `cloud` | `queue_full` | The client's buffer was full and it dropped the entry. |
+| `cloud` | `circuit_open` | The record was dropped from the Cloud path because the circuit breaker was open or probing. Application and message logs still go to stdout, except on Cloud Run, where the Hub leaves out their stdout handler (see **Duplicates**). The request log has no stdout copy while Cloud Logging is on; it keeps a file copy only if `SCION_SERVER_REQUEST_LOG_PATH` is set. Otherwise the dropped record is lost from Cloud Logging and stdout (an OTel log copy, when OTel logging is enabled, is unaffected). |
+| `cloud` | `flush_error` | A periodic, probe or shutdown flush failed, timed out, or was skipped because an earlier flush was still running. A failed flush usually reports errors the client already counted as `error`, so the two can count the same incident. |
+
+`scion.logging.write.records{writer="audit"}` counts records the audit writer's handler accepted. There is no `records` series for `writer="cloud"`, because a client buffer accept is not ingestion. Cloud Logging client errors are counted in `scion.logging.write.failures{writer=cloud,reason=error|queue_full}` and printed once to stderr as `logging client: <error>`. They are deliberately not sent through the structured logger (stdout JSON, OTel or Cloud Logging), to avoid feeding errors back into a failing Cloud Logging pipeline. Under an error storm the client drops some errors before the hook, so the count may be low.
+
+**State signals.**
+
+- `scion.logging.writer.stalled{writer}` is 1 while an audit write has been in flight longer than its budget. Records keep queuing, then drop as `queue_full`.
+- `scion.logging.writer.circuit_open{writer="cloud"}` is 1 while the circuit breaker is open or probing.
+- `scion.logging.queue.depth{writer}` and `scion.logging.write.late_returns{writer}` (writes that finished after being counted as timeouts; not failures).
+- `/healthz` key `audit_log_writer`: `healthy`, `degraded: recent write failures` (a failure in the last 5 minutes), `degraded: writer stalled` or `degraded: writer closed`.
+- `/healthz` key `cloud_logging`, present only when direct Cloud Logging is configured: `healthy`, `degraded: circuit open` or `degraded: recent write failures` (any `writer="cloud"` failure in the last 5 minutes).
+
+Both health keys are non-critical: they can make `/healthz` report `degraded`, never `unhealthy`, and they do not affect `/readyz`. The metrics are exported only when Hub metrics export is on (`server.hub.gcp_project_id`, metric group `SCION_METRICS_LOGGING`); the counters and health keys work without it. `deploy/monitoring/alert-policies.yaml` defines WARNING policies for write failures, a stalled writer and an open circuit. They take effect only when applied to Cloud Monitoring.
+
+**Shutdown.** On a graceful shutdown (which signals trigger it, and when, is described in [Shutdown and Signals](#shutdown-and-signals)) the Hub drains its servers, closes the audit writer (up to 5 seconds), flushes and shuts down metrics and traces, then flushes the message and request logs, stops the circuit breaker, and flushes and closes the Cloud Logging client. Because the metric exporter has already shut down, failures counted during these final log flushes are never exported; a failed final flush of the main Cloud log still prints `error flushing Cloud Logging: ...` to stderr. A process that ends without a graceful shutdown skips these steps, for example: a `SIGINT` or `SIGTERM` during early startup, another termination signal the server does not handle (for example `SIGHUP` or `SIGQUIT`), or `SIGKILL`. Queued audit records and buffered Cloud Logging entries are then lost and not counted. A Hub startup failure (`Hub server failed to start`) returns an error instead of exiting immediately, so the deferred log flush runs before the process exits with status 1. Known third-party hazard (pre-existing, not observed): in the Cloud Logging client (`cloud.google.com/go/logging` v1.13.2), a record logged after the client is closed whose send then fails reports the error on a closed channel, which panics; whether this can happen during Hub shutdown has not been determined.
+
+**Duplicates.** When direct Cloud Logging is on and the `K_SERVICE` environment variable is set (Cloud Run), the Hub leaves out the stdout handler for application logs and the message log, so it sends each of those records on one path only (the direct client) and does not itself create a duplicate. Without `K_SERVICE` (GKE, Compute Engine, other hosts) both paths stay on. If that platform also ships stdout to Cloud Logging, each record can appear twice, once per path. This follows from the code; it has not been observed on a deployment. To avoid it there, turn off one of the two paths: direct Cloud Logging, or the platform's stdout collection.
 
 ### Boolean Environment Variable Parsing (`parseBoolEnv`)
 
@@ -361,17 +972,32 @@ For server and infrastructure configurations, Scion parses several boolean envir
 
 ### Hub Endpoint Resolution
 
+The operator-configured Hub endpoint is resolved from the environment, flags and `settings.yaml`. When no operator setting pins it (`SCION_SERVER_HUB_ENDPOINT`, `SCION_SERVER_BASE_URL` or `--base-url`), a `server.hub.public_url` saved in the database through the admin API replaces it at startup; see [`server.hub.public_url`: environment first](/scion/reference/admin-settings/#serverhubpublic_url-environment-first).
+
 When `server.hub.public_url` is not explicitly set, the Hub endpoint injected into agents is resolved in this order:
 
-1. `SCION_SERVER_HUB_PUBLIC_URL` or `server.hub.public_url` — explicit Hub public URL.
+1. `SCION_SERVER_HUB_ENDPOINT` or `server.hub.public_url` — explicit Hub public URL.
 2. Project-level `hub.endpoint` setting.
 3. `SCION_SERVER_BASE_URL` — the server's public base URL (also used for OAuth redirects).
 4. **IAP Audience Derivation** (in Hosted HA mode with IAP authentication):
    - For **Cloud Run** IAP audiences (`/projects/<number>/locations/<region>/services/<service>`), Scion can auto-derive the Hub's URL using the legacy Cloud Run URL format (`https://<service>-<number>.<region>.run.app`). Newer Cloud Run services use a different URL format (`https://<service>-<hash>-<region>.a.run.app`) where the hash cannot be derived from the project number — for those services, set `SCION_SERVER_BASE_URL` explicitly instead of relying on auto-derivation.
+     The derived URL is the IAP front end, which the Hub's own host does not serve. On a co-located broker (for example, the single-node VM deployment), agents dispatched to Docker therefore receive `http://scion-hub.internal:<hub listen port>` instead. That hostname is mapped to the Docker host gateway, so the agents reach the Hub directly while staying on bridge networking. Agents dispatched to Podman receive `http://host.containers.internal:<port>`, which Podman resolves itself. On rootless Podman 5.0 to 5.2 with pasta networking, that name can be missing or unreachable (fixed in Podman 5.3). A host-gateway mapping has the same gap there, so upgrade Podman if agents cannot reach the Hub. This applies whatever the broker's default runtime is, including Docker or Podman runtime profiles on a Kubernetes-default broker. Agents dispatched to Kubernetes runtime profiles, Cloud Run, or Apple container still receive the derived URL.
    - For **GKE/GCLB** backend-service IAP audiences (`/projects/<number>/global/backendServices/<id>`), a URL cannot be derived from the ID. If `SCION_SERVER_BASE_URL` (or other explicit URL settings) is not set, Scion will log a warning at startup and fall back to `localhost`, which is likely unreachable from dispatched agents.
 5. Auto-computed `http://localhost:{port}` (last resort).
 
 For local development where the Hub runs on `localhost` but agents are in containers, set `server.broker.container_hub_endpoint` to a container-accessible address like `http://host.containers.internal:8080`.
+
+The endpoint resolved above (or `server.hub.agent_endpoint`, if set — see below) is what the co-located broker then forwards to the container, applying its own bridging rules (host-gateway mapping for a hostname on co-located Docker, no rewrite for an already-reachable IP, and the `cloudrun-sandbox` runtime's own link-local logic).
+
+#### Splitting the agent endpoint from the public URL
+
+`server.hub.agent_endpoint` overrides the endpoint above for agents only — invite links, chat-bridge links, the OIDC issuer default, and the `cloudrun_invoker` audience default keep reading `public_url`. Use it when agents must reach the Hub on an address that would be wrong for a human clicking a link, such as an internal VPC IP in a topology where a proxy fronts the Hub for users. When unset, agents receive the Hub's regular endpoint — `public_url`, or the endpoint the Hub resolves above when `public_url` is itself unset.
+
+The value must be `scheme://host[:port]` only: `http` or `https`, an IP literal or a hostname of letters, digits, `_`, `-`, and `.` (Docker Compose-style service names such as `scion_hub` are accepted), and an optional port — no path, query, fragment, or credentials (a trailing `/` is stripped from an otherwise-bare URL). The Hub rejects anything else at startup with an error naming `server.hub.agent_endpoint`.
+
+**Scope: this value is injected into agents on every runtime broker attached to this Hub, including remote brokers.** Only set it if every broker's agents can reach the address and it is this Hub on each of those networks — otherwise agents dispatched from a remote broker will send their Hub credentials to whatever answers at that address on their own network.
+
+**Security:** with an `http://` value, agent bearer tokens, and the secrets and tokens agents fetch from the Hub, travel **unencrypted** on the network between agents and the Hub. Use `https://` unless that network is trusted and isolated (for example, a private VPC subnet with no untrusted tenants).
 
 ## Notification channels
 
@@ -543,61 +1169,76 @@ Settings required before the database connection exists, or that are restart-bou
 | Database | `database.*` |
 | Listeners | `hub.port`, `hub.host`, `hub.read_timeout`, `hub.write_timeout`, `broker.*` |
 | Auth stack | `auth.mode`, `auth.dev_mode`, `auth.dev_token`, `auth.dev_token_file`, `auth.proxy.*`, `auth.transport.*`, `oauth.*`, `oidc_login.*` |
-| Secrets/storage | `secrets.*`, `storage.*`, `workspace_storage.*` |
+| Secrets/storage | `secrets.*`, `storage.*`, `workspace_storage.*`, `shared_dir_storage.*` |
 | Identity/mode | `mode`, `env`, `hub.hub_id`, `hub.gcp_project_id` |
-| Logging | `log_level`, `log_format` |
+| Logging | `log_level`, `log_format` (`log_format` is accepted but ignored) |
 | CORS | `hub.cors.*`, `broker.cors` |
 | Messaging/plugins | `message_broker.*`, `plugins.*` |
+| Async agent create | `hub.async_agent_launch`, `hub.launch_timeout`, `hub.launch_keepalive_seconds` |
+| Diagnostics | `hub.perf_trace` |
+| Membership standing | `hub.membership_sweep_report_only` |
+| Heartbeat reconcile | `hub.missing_agent_grace` |
+| Conduit relay | `hub.conduit.*` |
+| Port proxy | `hub.port_proxy.*` |
 
-### Layer 1 — Operational (Postgres `hub_settings` table)
+### Layer 1 — Operational (`hub_settings` table)
 
-Settings that can be changed at runtime and are shared across all replicas. Stored as section-per-row in the `hub_settings` table. In SQLite/workstation mode, these fall back to `settings.yaml` (unchanged behavior), except for the `maintenance` section which is runtime/API-only and has no `settings.yaml` representation (ephemeral in file/SQLite mode).
+Settings that can be changed at runtime and are shared across all replicas. Stored as section-per-row in the `hub_settings` table of the Hub database on every driver, SQLite included. `settings.yaml` only seeds them and is the fallback for a section with no database row (see the [Admin Settings Model](/scion/reference/admin-settings/)). The `maintenance` section is runtime/API-only: it has no `settings.yaml` representation and starts from `admin_mode` until a row exists.
 
 | Section | Contents |
 | :--- | :--- |
-| `access` | `admin_emails`, `user_access_mode`, `authorized_domains` |
-| `lifecycle` | `auto_suspend_stalled`, `soft_delete_retention`, `soft_delete_retain_files` |
+| `access` | `admin_emails`, `user_access_mode`, `authorized_domains`, `default_user_role` |
+| `lifecycle` | `auto_suspend_stalled`, `stalled_threshold`, `soft_delete_retention`, `soft_delete_retain_files`, `start_claim_lease_ttl`, `start_max_duration`, `start_unconfirmed_hold`, `start_create_unconfirmed_hold` |
 | `maintenance` | `admin_mode`, `maintenance_message` (durable + cluster-wide) |
 | `telemetry` | Full `telemetry.*` subtree (enabled, cloud, hub, local, filter, resource) |
-| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources`, `default_model`, `default_thinking_level`, `default_max_agent_role`, `default_agent_role` |
+| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources`, `default_model`, `default_thinking_level`, `default_max_agent_role`, `default_agent_role`, `default_runtime_broker`, `default_timezone`, `default_gcp_identity_mode`, `default_gcp_identity_service_account_id` |
 | `federation` | `enabled`, `trusted_issuers[]`, `algorithms`, `refresh_interval`, `debounce_interval` |
-| `endpoints` | `hub.public_url`, `image_registry` |
+| `endpoints` | `hub.public_url`, `hub.hub_name`, `hub.monitoring_dashboard_url`, `image_registry` |
 | `github_app` | `app_id`, `api_base_url`, `webhooks_enabled`, `installation_url`, `private_key_path` |
 | `notifications` | `notification_channels[]` |
 | `project_defaults` | `default_scratchpad` |
+| `auto_expose_ports` | `enabled` |
+| `quotas` | `enforce_broker_quotas` |
+| `agent_secrets` | `user_scope_only` |
+| `runtimes` | The whole `runtimes` map |
+| `profiles` | The whole `profiles` map |
+| `harness_configs` | The whole `harness_configs` map |
 | *(reserved)* `global_defaults` | Reserved for future hub-resource design — not implemented |
+
+`agent_defaults.default_timezone` is the Hub default `TZ` for agent containers: an IANA zone name, used only when the agent has no pin and no `TZ` environment variable applies. Empty means no default (the image default, UTC). An invalid name or `Local` is rejected with `422`. In `settings.yaml`, and in the `PUT /api/v1/admin/server-config` request body, it is the top-level `default_timezone` field. It does not change how times are stored or displayed. See [Times and Timezones](/scion/reference/times-and-timezones/#hub-default-timezone).
 
 ### Precedence
 
-In Postgres mode, the effective value for any Layer-1 key is resolved in this order (highest priority first):
+On every driver, the effective value for any Layer-1 key is resolved in this order (highest priority first):
 
-1. **`SCION_SERVER_*` environment variable** — node-local escape hatch
-2. **`hub_settings` DB row** — cluster-shared, set via admin API
-3. **`settings.yaml` Layer-1 fields** — fallback when key absent in DB
-4. **Compiled defaults**
+1. **`hub_settings` DB row** — cluster-shared, set via admin API. A row fully owns its section.
+2. **Bootstrap merge** — used only when the section has no row: `SCION_SERVER_*`, then `settings.yaml`, then `SCION_SEED_*`, then compiled defaults. `settings.yaml` is the global `~/.scion/settings.yaml`; see [`--config` and the bootstrap merge](/scion/reference/admin-settings/#configuration-precedence) for how a `--config` location takes part.
+
+A `SCION_SERVER_*` variable on a Layer-1 key therefore does not override a row an admin has saved. It only changes the seed (re-synced into seeded rows at restart) and the fallback, and it is deprecated for Layer-1 keys in favour of `SCION_SEED_*`.
 
 ### Seeding and Migration
 
-- **First startup**: the first replica to start seeds `hub_settings` from its local `settings.yaml` (Layer-1 keys only) under an advisory lock. Subsequent replicas see the seed marker and skip.
-- **Seeding reads file values only** — environment overrides are not baked into shared state.
+- **Every start**: the replica that takes the seed advisory lock syncs `hub_settings` (Layer-1 sections only) from its bootstrap merge: `SCION_SEED_*`, `settings.yaml`, then `SCION_SERVER_*`. A missing section is created, a section no admin has edited (seeded) is re-synced when its content differs, and an edited (managed) section is not touched. A replica that finds the lock held skips the sync.
 - **DB wins**: once a section is seeded/written to DB, the DB row fully owns that section. Omitted fields within the section fall to compiled defaults, not to the file.
-- **Rollback safety**: older builds ignore the `hub_settings` table entirely and read files — rolling back reverts to pre-change behavior.
+- **Rollback safety**: older builds ignore the `hub_settings` table entirely and read files — rolling back reverts to pre-change behavior. This covers operational settings only: other stored data is rewritten one way, so a binary rollback after a newer build has started is unsupported. See [Hub Upgrade and Binary Rollback](/scion/reference/hub-upgrade-rollback/).
 
 ### Environment Override Warnings
 
 Because env overrides on Layer-1 keys reintroduce per-node drift, the system warns administrators:
 
-- `GET /api/v1/admin/server-config` includes an `env_overrides` array listing which Layer-1 keys are overridden by env vars on the serving node.
+- `GET /api/v1/admin/server-config` includes an `env_overrides` array listing every key, Layer-0 or Layer-1, that a `SCION_SERVER_*` variable sets on the serving node.
 - A startup `WARN` log lists any overridden Layer-1 keys.
-- The admin UI renders a visible warning banner when env overrides are detected.
+- The admin UI renders a visible warning banner when env overrides are detected, and an "Overridden by environment on this node" badge on each affected field, or on the section for the `runtimes` and `profiles` maps.
 
 ### Admin API Behavior Notes
 
-**PUT partitioning**: The request body is partitioned by the section registry. Layer-1 fields (including `runtimes`, `profiles`, and `harness_configs`) are written to DB sections in the `hub_settings` table as whole-map JSONB documents. Layer-0 fields trigger a `422` rejection. Unclassified fields (non-registered settings) are ignored and reported in `ignored_keys`.
+**PUT partitioning**: The request body is partitioned by the section registry. Layer-1 fields (including `runtimes`, `profiles`, and `harness_configs`) are written to DB sections in the `hub_settings` table as whole-map JSONB documents. Layer-0 fields trigger a `422` rejection. A key the Hub would not persist (an unknown key at any depth, a flat dotted key such as `"server.hub.auto_suspend_stalled"` at the top level, or a field with no storage) is also rejected: the response is `422` with `error: unpersisted_keys_rejected` and the offending paths in `keys`, and nothing is saved. Fields whose value equals what `GET` returns are treated as echoes and accepted, so sending the `GET` body back still succeeds. In DB mode a partial PUT keeps the agent lifecycle settings it omits, and a concurrent write to those settings returns `409 Conflict`.
 
-**Revision CAS**: The request body may include `expected_revisions` — a map of section name to expected revision number. On mismatch, the response is `409 Conflict` with the conflicting sections and their current revisions. Omitted sections use last-writer-wins semantics. Sections are written in alphabetical order for deterministic partial-apply behavior.
+**Revision CAS**: The request body may include `expected_revisions` — a map of section name to expected revision number. On mismatch, the response is `409 Conflict` with the conflicting sections and their current revisions. Omitted sections use last-writer-wins semantics. The `access` section is the exception: it is merged onto the current row, and a concurrent change to that row between read and write returns 409 even without `expected_revisions`. Sections are written in alphabetical order for deterministic partial-apply behavior.
 
-**Presence-aware clearing**: The PUT handler distinguishes **omitted** fields (preserve current DB value) from **explicitly-sent empty values** (`""`, `[]`, `null`) which **clear** the field. This enables clearing admin_emails, user_access_mode, authorized_domains, notification_channels, and public_url without sending every field.
+**Presence-aware clearing**: The PUT handler distinguishes **omitted** fields (preserve current DB value) from **explicitly-sent empty values** (`""`, `[]`, `null`) which **clear** the field. This enables clearing admin_emails, user_access_mode, authorized_domains, default_user_role, notification_channels, public_url, and monitoring_dashboard_url without sending every field.
+
+**Masked secrets**: `GET /api/v1/admin/server-config` masks secrets (OAuth client secrets, GitHub App keys, notification channel parameters, and other credentials). A PUT may send a masked placeholder back only inside a block that exactly matches the stored block once masked; the Hub then keeps the stored secret. The block is the structure the secret sits in (for example one OAuth provider, the GitHub App, or one notification channel). To change any field of such a block, send every secret in that block in clear. Any other placeholder is rejected with `400`, so it is never stored over a real value. The admin web UI leaves unedited masked blocks out of its saves.
 
 **Maintenance durability**: `PUT /api/v1/admin/maintenance` writes to the `maintenance` section in DB, making admin/maintenance mode durable across restarts and propagated to all replicas. `SCION_SERVER_ADMINMODE` env var still force-enables per node for break-glass access. In file/SQLite mode, maintenance changes are ephemeral (in-memory only, lost on restart). Use `SCION_SERVER_ADMINMODE=true` env var for persistent control.
 
@@ -616,11 +1257,15 @@ When these fields are explicitly set to `false` in the DB, they are correctly ap
 
 The `gcp_iam_check_mode` setting controls whether the Hub verifies that a caller holds the `iam.serviceAccounts.actAs` IAM permission on a GCP service account before allowing it to be assigned to an agent. This uses the [GCP Policy Troubleshooter v3 API](https://cloud.google.com/policy-intelligence/docs/troubleshoot-access).
 
+:::caution[Use enforce when agents receive GCP identities]
+Set `gcp_iam_check_mode: enforce` on any Hub where agents receive GCP identities. In the default `"off"` mode, Scion roles alone decide which project-scoped service accounts a user can assign: the `project-owner`, `project-admin` and `project-member` roles hold `gcp_service_account.assign`, so every owner, admin and member of a project can assign any verified project-scoped service account in that project to an agent, with no GCP IAM `iam.serviceAccounts.actAs` check on the caller. In `"enforce"` mode the Hub also requires the caller's own `actAs` grant on the target service account.
+:::
+
 ### Values
 
 | Value | Behaviour |
 | :--- | :--- |
-| `"off"` (default) | No IAM check. Any member who can see a service account can assign it. Assignment is gated by Hub policy only. |
+| `"off"` (default) | No GCP IAM check. Project owners, admins and members can assign any **verified project-scoped** service account in their project to an agent on Scion role authority alone, with no GCP IAM `iam.serviceAccounts.actAs` check on the caller. Hub-scoped service accounts remain unassignable in `"off"`. See the caution above. |
 | `"enforce"` | The Hub calls Policy Troubleshooter to verify the caller has `actAs`. Denials are enforced. |
 
 ### Configuration
@@ -637,6 +1282,19 @@ Or via environment variable:
 ```bash
 export SCION_SERVER_HUB_GCPIAMCHECKMODE=enforce
 ```
+
+An unset value takes the default shown above. A value that is set but not recognised (for example a typo) takes the stricter value instead: `"enforce"` for `gcp_iam_check_mode` and `"fail-closed"` for `gcp_iam_deny_unknown_policy`, with a warning in the Hub log.
+
+### Changing the Settings from the Admin UI
+
+On a Hub with database-backed settings (every driver), `gcp_iam_check_mode` and `gcp_iam_deny_unknown_policy` are the `gcp_iam` operational settings section. A hub admin edits them on the **GCP Identity** tab of **Admin > Server Config** (or with `PUT /api/v1/admin/server-config`), and the change applies on every replica without a restart. The value in `settings.yaml` or the environment is the deploy-time value the Hub starts from; a saved value overrides it in either direction.
+
+- Only a hub admin signed in with an interactive session can change these settings or reset the section. User access tokens, federated users, agents and brokers are refused with `403`.
+- A saved value must be one of the values listed above; an empty or unrecognised value is rejected with `422` and nothing is saved.
+- A change that moves either setting to its less strict value is refused with `409` while hub-scoped service account assignment is configured: the hub default GCP identity mode is **Assign**, or any hub-scoped service account is registered. Resetting the section to its deploy-time value follows the same rule.
+- Every change is recorded in the mutation audit log (`hub_setting_update`) with the caller, time, old and new value, and the surface (`server-config` or `section-reset`) before it is written. If the record cannot be written, the change is not made.
+- Each other replica applies the change on reload only if the stored values are valid and the change passes the same rule. A change that moves either setting to its less strict value must also be named by the latest audit record for each changed key, and that write must not be recorded as not made. The replica then records `hub_setting_apply` (surface `reload`, with the original caller, or the hub itself when no audited write names the change). Otherwise the replica keeps the values it applied, logs an error and records `hub_setting_apply_refused` once. This covers a stored value that cannot be used and a less strict value that no audited write names, including one left by a row that changes or disappears. If the settings store cannot be read, the Hub keeps the values it last applied.
+- The page shows the values the Hub applies, and marks a key that an environment variable sets on this node.
 
 ### Enablement Checklist
 

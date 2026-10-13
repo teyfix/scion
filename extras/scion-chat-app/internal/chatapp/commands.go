@@ -28,8 +28,10 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/extras/scion-chat-app/internal/identity"
 	"github.com/GoogleCloudPlatform/scion/extras/scion-chat-app/internal/state"
+	agentstate "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 )
 
 // eventUserLookup returns user info from the ChatEvent itself, using the
@@ -496,14 +498,14 @@ func (r *CommandRouter) handleAgentAction(ctx context.Context, event *ChatEvent,
 		card := Card{
 			Header: CardHeader{
 				Title:    agent.Name,
-				Subtitle: fmt.Sprintf("Project: %s | %s", link.ProjectSlug, agent.Activity),
+				Subtitle: fmt.Sprintf("Project: %s | %s", link.ProjectSlug, agentstate.Activity(agent.Activity).DisplayLabel()),
 			},
 			Sections: []CardSection{
 				{
 					Widgets: []Widget{
 						{Type: WidgetKeyValue, Label: "Slug", Content: agent.Slug},
 						{Type: WidgetKeyValue, Label: "Phase", Content: agent.Phase},
-						{Type: WidgetKeyValue, Label: "Activity", Content: agent.Activity},
+						{Type: WidgetKeyValue, Label: "Activity", Content: agentstate.Activity(agent.Activity).DisplayLabel()},
 						{Type: WidgetKeyValue, Label: "Template", Content: agent.Template},
 					},
 				},
@@ -517,15 +519,16 @@ func (r *CommandRouter) handleAgentAction(ctx context.Context, event *ChatEvent,
 		_, err = r.messenger.SendCard(ctx, event.SpaceID, card)
 		return nil, err
 	case "start":
-		if err := agents.Start(ctx, agentID); err != nil {
+		if _, err := agents.Start(ctx, agentID); err != nil {
 			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to start agent: %v", err))
 		}
 		return nil, r.reply(ctx, event, fmt.Sprintf("Agent `%s` started.", agentID))
 	case "stop":
-		if err := agents.Stop(ctx, agentID); err != nil {
+		resp, err := agents.Stop(ctx, agentID)
+		if err != nil {
 			return nil, r.reply(ctx, event, fmt.Sprintf("Failed to stop agent: %v", err))
 		}
-		return nil, r.reply(ctx, event, fmt.Sprintf("Agent `%s` stopped.", agentID))
+		return nil, r.reply(ctx, event, stopReplyText(agentID, resp))
 	case "logs":
 		logs, err := agents.GetLogs(ctx, agentID, &hubclient.GetLogsOptions{Tail: 50})
 		if err != nil {
@@ -615,7 +618,7 @@ func (r *CommandRouter) cmdList(ctx context.Context, event *ChatEvent, args []st
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("*Agents in %s:*\n", proj.Slug))
 	for _, a := range agents.Agents {
-		status := a.Activity
+		status := agentstate.Activity(a.Activity).DisplayLabel()
 		if status == "" {
 			status = a.Phase
 		}
@@ -666,14 +669,14 @@ func (r *CommandRouter) cmdStatus(ctx context.Context, event *ChatEvent, args []
 	card := Card{
 		Header: CardHeader{
 			Title:    agent.Name,
-			Subtitle: fmt.Sprintf("Project: %s | %s", link.ProjectSlug, agent.Activity),
+			Subtitle: fmt.Sprintf("Project: %s | %s", link.ProjectSlug, agentstate.Activity(agent.Activity).DisplayLabel()),
 		},
 		Sections: []CardSection{
 			{
 				Widgets: []Widget{
 					{Type: WidgetKeyValue, Label: "Slug", Content: agent.Slug},
 					{Type: WidgetKeyValue, Label: "Phase", Content: agent.Phase},
-					{Type: WidgetKeyValue, Label: "Activity", Content: agent.Activity},
+					{Type: WidgetKeyValue, Label: "Activity", Content: agentstate.Activity(agent.Activity).DisplayLabel()},
 					{Type: WidgetKeyValue, Label: "Template", Content: agent.Template},
 				},
 			},
@@ -703,7 +706,7 @@ func (r *CommandRouter) cmdStart(ctx context.Context, event *ChatEvent, args []s
 		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
 	}
 
-	if err := client.ProjectAgents(link.ProjectID).Start(ctx, args[0]); err != nil {
+	if _, err := client.ProjectAgents(link.ProjectID).Start(ctx, args[0]); err != nil {
 		return textResponse(event, fmt.Sprintf("Failed to start agent: %v", err)), nil
 	}
 	return textResponse(event, fmt.Sprintf("Agent `%s` started.", args[0])), nil
@@ -724,10 +727,20 @@ func (r *CommandRouter) cmdStop(ctx context.Context, event *ChatEvent, args []st
 		return textResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
 	}
 
-	if err := client.ProjectAgents(link.ProjectID).Stop(ctx, args[0]); err != nil {
+	resp, err := client.ProjectAgents(link.ProjectID).Stop(ctx, args[0])
+	if err != nil {
 		return textResponse(event, fmt.Sprintf("Failed to stop agent: %v", err)), nil
 	}
-	return textResponse(event, fmt.Sprintf("Agent `%s` stopped.", args[0])), nil
+	return textResponse(event, stopReplyText(args[0], resp)), nil
+}
+
+// stopReplyText is the reply to a successful stop. A stop the Hub queued
+// for an offline broker has not run yet, so it is not reported as done.
+func stopReplyText(agent string, resp *hubclient.LifecycleResponse) string {
+	if resp != nil && resp.Queued {
+		return fmt.Sprintf("Agent `%s`: stop queued; it runs when the agent's broker reconnects.", agent)
+	}
+	return fmt.Sprintf("Agent `%s` stopped.", agent)
 }
 
 func (r *CommandRouter) cmdCreate(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
@@ -752,6 +765,15 @@ func (r *CommandRouter) cmdCreate(ctx context.Context, event *ChatEvent, args []
 		return textResponse(event, fmt.Sprintf("Failed to create agent: %v", err)), nil
 	}
 	return textResponse(event, fmt.Sprintf("Agent `%s` created (ID: `%s`).", createResp.Agent.Slug, createResp.Agent.ID)), nil
+}
+
+// projectSubscriptionPattern returns the broker subscription pattern used to
+// receive all messages for a project. Both cmdLink (subscribe) and cmdUnlink
+// (cancel) must build the pattern the same way, or unlink cannot cancel the
+// subscription link created; routing both through this one function keeps
+// them from drifting apart.
+func projectSubscriptionPattern(projectID string) string {
+	return projectkeys.ProjectPattern(projectID)
 }
 
 func (r *CommandRouter) cmdLink(ctx context.Context, event *ChatEvent, args []string) (*EventResponse, error) {
@@ -795,7 +817,7 @@ func (r *CommandRouter) cmdLink(ctx context.Context, event *ChatEvent, args []st
 	// Subscribe to all project messages; observe mode filtering is
 	// applied at delivery time in HandleBrokerMessage.
 	if r.broker != nil {
-		pattern := fmt.Sprintf("scion.grove.%s.>", proj.ID)
+		pattern := projectSubscriptionPattern(proj.ID)
 		if err := r.broker.RequestSubscription(pattern); err != nil {
 			r.log.Warn("failed to request project subscription", "project_id", proj.ID, "error", err)
 		}
@@ -815,7 +837,7 @@ func (r *CommandRouter) cmdUnlink(ctx context.Context, event *ChatEvent, args []
 
 	// Cancel broker subscription (must match the pattern used during link).
 	if r.broker != nil {
-		pattern := fmt.Sprintf("scion.grove.%s.>", link.ProjectID)
+		pattern := projectSubscriptionPattern(link.ProjectID)
 		if err := r.broker.CancelSubscription(pattern); err != nil {
 			r.log.Warn("failed to cancel project subscription", "project_id", link.ProjectID, "error", err)
 		}
@@ -1001,7 +1023,7 @@ func (r *CommandRouter) showDeleteConfirmation(ctx context.Context, event *ChatE
 					{Type: WidgetText, Content: fmt.Sprintf("Are you sure you want to delete agent *%s*?\n\nThis action cannot be undone.", agent.Slug)},
 					{Type: WidgetKeyValue, Label: "Name", Content: agent.Name},
 					{Type: WidgetKeyValue, Label: "Phase", Content: agent.Phase},
-					{Type: WidgetKeyValue, Label: "Activity", Content: agent.Activity},
+					{Type: WidgetKeyValue, Label: "Activity", Content: agentstate.Activity(agent.Activity).DisplayLabel()},
 				},
 			},
 		},
@@ -1030,12 +1052,17 @@ func (r *CommandRouter) executeDelete(ctx context.Context, event *ChatEvent, age
 		return updateMessageResponse(event, "Authentication required. Use `/scionAdmin register` first."), nil
 	}
 
-	if err := client.ProjectAgents(link.ProjectID).Delete(ctx, agentID, nil); err != nil {
+	res, err := hubclient.DeleteWithResult(ctx, client.ProjectAgents(link.ProjectID), agentID, nil)
+	if err != nil {
 		return updateMessageResponse(event, fmt.Sprintf("Failed to delete agent: %v", err)), nil
 	}
 	deletedName := agentSlug
 	if deletedName == "" {
 		deletedName = agentID
+	}
+	if res.Accepted {
+		// 202: the hub is still deleting the agent in the background.
+		return updateMessageResponse(event, fmt.Sprintf("Deleting agent `%s`… the Hub is finishing the delete in the background.", deletedName)), nil
 	}
 	return updateMessageResponse(event, fmt.Sprintf("Agent `%s` deleted.", deletedName)), nil
 }
@@ -1117,7 +1144,7 @@ func (r *CommandRouter) cmdSubscribe(ctx context.Context, event *ChatEvent, args
 						ActionID: filterID,
 						Options: []SelectOption{
 							{Label: "Completed", Value: "COMPLETED"},
-							{Label: "Waiting for Input", Value: "WAITING_FOR_INPUT"},
+							{Label: "Waiting on Parent", Value: "WAITING_FOR_INPUT"},
 							{Label: "Error", Value: "ERROR"},
 							{Label: "Stalled", Value: "STALLED"},
 							{Label: "Limits Exceeded", Value: "LIMITS_EXCEEDED"},
@@ -1624,7 +1651,7 @@ func (r *CommandRouter) cmdThread(ctx context.Context, event *ChatEvent, args []
 	}
 
 	// Start the agent.
-	if err := client.ProjectAgents(link.ProjectID).Start(ctx, createResp.Agent.Slug); err != nil {
+	if _, err := client.ProjectAgents(link.ProjectID).Start(ctx, createResp.Agent.Slug); err != nil {
 		return textResponse(event, fmt.Sprintf("Agent `%s` created but failed to start: %v", createResp.Agent.Slug, err)), nil
 	}
 

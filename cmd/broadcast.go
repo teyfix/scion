@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
@@ -32,10 +31,13 @@ import (
 )
 
 var (
-	bcastAll        bool
-	bcastInterrupt  bool
-	bcastVisibility string
+	bcastAll       bool
+	bcastInterrupt bool
 )
+
+// broadcastQueuedHook, if set (tests only), is called each time a broadcast
+// fan-out send has to wait for a free slot (see boundedFanOut).
+var broadcastQueuedHook func()
 
 // broadcastCmd represents the broadcast command
 var broadcastCmd = &cobra.Command{
@@ -53,16 +55,6 @@ Examples:
   scion broadcast --interrupt "Stop immediately and report status"`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Validate --visibility if provided.
-		if bcastVisibility != "" {
-			switch bcastVisibility {
-			case "normal", "verbose", "full":
-				// valid
-			default:
-				return fmt.Errorf("invalid --visibility value %q: must be one of: normal, verbose, full", bcastVisibility)
-			}
-		}
-
 		message := strings.Join(args, " ")
 
 		// Check Hub availability
@@ -129,9 +121,6 @@ func broadcastViaHub(hubCtx *HubContext, message string) error {
 	if err != nil {
 		return wrapHubError(fmt.Errorf("failed to list agents via Hub: %w", err))
 	}
-	if resp == nil {
-		return fmt.Errorf("failed to list agents via Hub: server returned empty response")
-	}
 
 	if len(resp.Agents) == 0 {
 		fmt.Println("No running agents found to broadcast to.")
@@ -142,11 +131,10 @@ func broadcastViaHub(hubCtx *HubContext, message string) error {
 		fmt.Printf("Broadcasting message to %d agents...\n", len(resp.Agents))
 	}
 
-	var wg sync.WaitGroup
-	for _, a := range resp.Agents {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
+	// ptone/scion#3521: at most maxFanOutConcurrency sends in flight at once.
+	boundedFanOut(context.Background(), len(resp.Agents), maxFanOutConcurrency, broadcastQueuedHook,
+		func(i int) {
+			name := resp.Agents[i].Name
 			ctx, cancel := context.WithTimeout(context.Background(), broadcastHubSendTimeout)
 			defer cancel()
 
@@ -157,11 +145,9 @@ func broadcastViaHub(hubCtx *HubContext, message string) error {
 				return
 			}
 			if !isJSONOutput() {
-				fmt.Printf("Message delivered to agent '%s' via Hub.\n", name)
+				fmt.Printf("Message accepted for agent '%s' via Hub.\n", name)
 			}
-		}(a.Name)
-	}
-	wg.Wait()
+		}, func(int) {})
 	return nil
 }
 
@@ -212,21 +198,17 @@ func broadcastLocal(message string) error {
 	}
 
 	fmt.Printf("Broadcasting message to %d agents...\n", len(targets))
-	var wg sync.WaitGroup
-	for _, target := range targets {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
+	boundedFanOut(context.Background(), len(targets), maxFanOutConcurrency, broadcastQueuedHook,
+		func(i int) {
+			name := targets[i]
 			sendCtx, sendCancel := context.WithTimeout(context.Background(), broadcastMessageTimeout)
 			defer sendCancel()
 			if err := mgr.Message(sendCtx, name, "", message, bcastInterrupt); err != nil {
 				fmt.Printf("Warning: failed to send message to agent '%s': %s\n", name, err)
 				return
 			}
-			fmt.Printf("Message delivered to agent '%s'.\n", name)
-		}(target)
-	}
-	wg.Wait()
+			fmt.Printf("Message sent to agent '%s'.\n", name)
+		}, func(int) {})
 	return nil
 }
 
@@ -235,15 +217,11 @@ func buildBroadcastMessage(sender, message string) *messages.StructuredMessage {
 	msg := messages.NewInstruction(sender, "", message)
 	msg.Broadcasted = true
 	msg.Urgent = bcastInterrupt
-	if bcastVisibility != "" {
-		msg.Visibility = bcastVisibility
-	}
 	return msg
 }
 
 func init() {
 	broadcastCmd.Flags().BoolVarP(&bcastAll, "all", "a", false, "Send to all running agents across all projects (global broadcast)")
 	broadcastCmd.Flags().BoolVarP(&bcastInterrupt, "interrupt", "i", false, "Interrupt the harness before sending the message")
-	broadcastCmd.Flags().StringVar(&bcastVisibility, "visibility", "", "Message visibility: normal, verbose, or full")
 	rootCmd.AddCommand(broadcastCmd)
 }

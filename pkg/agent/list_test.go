@@ -19,11 +19,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
@@ -249,7 +252,7 @@ func TestListNonRunningAgentIncludesHarnessConfig(t *testing.T) {
 
 	mgr := NewManager(mock)
 	agents, err := mgr.List(context.Background(), map[string]string{
-		"scion.grove_path": projectPath,
+		"scion.project_path": projectPath,
 	})
 	if err != nil {
 		t.Fatalf("List() error: %v", err)
@@ -406,6 +409,84 @@ func TestListReconcilesPhaseWithContainerStatus(t *testing.T) {
 	}
 }
 
+// TestListRuntimeStartingPhase: a runtime entry reporting Phase and
+// ContainerStatus "starting" (a start the runtime has not confirmed, for
+// example one interrupted by a crash) is listed as starting, whatever
+// agent-info.json holds: "created" from provisioning, a previous run's
+// stopped, error or running, or nothing at all (ptone/scion#4756). The
+// broker heartbeat lists agents through the same Manager.List.
+func TestListRuntimeStartingPhase(t *testing.T) {
+	tests := []struct {
+		name         string
+		writeInfo    bool
+		infoPhase    string
+		infoActivity string
+	}{
+		{name: "created from provisioning", writeInfo: true, infoPhase: string(state.PhaseCreated)},
+		{name: "provisioning", writeInfo: true, infoPhase: string(state.PhaseProvisioning)},
+		{name: "previous run stopped", writeInfo: true, infoPhase: string(state.PhaseStopped)},
+		{name: "previous run error", writeInfo: true, infoPhase: string(state.PhaseError)},
+		{name: "previous run running", writeInfo: true, infoPhase: string(state.PhaseRunning), infoActivity: string(state.ActivityThinking)},
+		{name: "already starting", writeInfo: true, infoPhase: string(state.PhaseStarting)},
+		{name: "no agent-info.json", writeInfo: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			projectPath := filepath.Join(tmpDir, ".scion")
+			agentName := "starting-agent"
+			agentHome := filepath.Join(projectPath, "agents", agentName, "home")
+			if err := os.MkdirAll(agentHome, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.writeInfo {
+				infoData, _ := json.MarshalIndent(api.AgentInfo{Name: agentName, Phase: tc.infoPhase, Activity: tc.infoActivity}, "", "  ")
+				if err := os.WriteFile(filepath.Join(agentHome, "agent-info.json"), infoData, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(projectPath, "agents", agentName, "scion-agent.json"), []byte("{}"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			mock := &runtime.MockRuntime{
+				ListFunc: func(_ context.Context, _ map[string]string) ([]api.AgentInfo, error) {
+					return []api.AgentInfo{{
+						Name:            agentName,
+						ProjectPath:     projectPath,
+						Phase:           string(state.PhaseStarting),
+						ContainerStatus: "starting",
+					}}, nil
+				},
+			}
+
+			agents, err := NewManager(mock).List(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("List() error: %v", err)
+			}
+			var found []api.AgentInfo
+			for _, a := range agents {
+				if a.Name == agentName {
+					found = append(found, a)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("listed %d entries for the agent, want exactly 1: %+v", len(found), found)
+			}
+			if found[0].Phase != string(state.PhaseStarting) {
+				t.Errorf("Phase = %q, want %q", found[0].Phase, state.PhaseStarting)
+			}
+			if found[0].Activity != "" {
+				t.Errorf("Activity = %q, want empty", found[0].Activity)
+			}
+			if found[0].ContainerStatus != "starting" {
+				t.Errorf("ContainerStatus = %q, want %q", found[0].ContainerStatus, "starting")
+			}
+		})
+	}
+}
+
 func TestListPreservesRuntimeTerminalStateForKubernetes(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	nonZero := 1
@@ -479,7 +560,7 @@ func TestListPreservesRuntimeTerminalStateForKubernetes(t *testing.T) {
 
 			mgr := NewManager(mock)
 			agents, err := mgr.List(context.Background(), map[string]string{
-				"scion.grove_path": projectPath,
+				"scion.project_path": projectPath,
 			})
 			if err != nil {
 				t.Fatalf("List() error: %v", err)
@@ -804,7 +885,7 @@ func TestListLegacyEndedWithExitCode(t *testing.T) {
 
 			mgr := NewManager(mock)
 			agents, err := mgr.List(context.Background(), map[string]string{
-				"scion.grove_path": projectPath,
+				"scion.project_path": projectPath,
 			})
 			if err != nil {
 				t.Fatalf("List() error: %v", err)
@@ -866,7 +947,356 @@ func TestPersistAgentInfoState_AtomicallyRewritesAndPreservesMode(t *testing.T) 
 	if fi.Mode().Perm() != 0600 {
 		t.Fatalf("mode = %o, want %o", fi.Mode().Perm(), os.FileMode(0600))
 	}
-	if _, err := os.Stat(infoPath + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("temp file should not remain, stat err = %v", err)
+	tempFiles, err := filepath.Glob(filepath.Join(tmpDir, ".agent-info.json.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tempFiles) != 0 {
+		t.Fatalf("temp files should not remain: %v", tempFiles)
+	}
+}
+
+// writeCreatedAgentDir lays out an on-disk agent directory (no container)
+// under projectPath, the shape List's created-agent scan recognises.
+func writeCreatedAgentDir(t *testing.T, projectPath, name string) {
+	t.Helper()
+	agentHome := filepath.Join(projectPath, "agents", name, "home")
+	if err := os.MkdirAll(agentHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+	infoData, err := json.Marshal(api.AgentInfo{Name: name, Phase: "created"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentHome, "agent-info.json"), infoData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "agents", name, "scion-agent.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func listedNames(agents []api.AgentInfo) []string {
+	names := make([]string, 0, len(agents))
+	for _, a := range agents {
+		names = append(names, a.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestListCreatedAgentScanHonoursNameFilter covers the created-agent
+// (no container) on-disk scan: a "scion.name" filter must select only the
+// matching agent directory, exactly as the runtime label filter does for
+// containers, and must never fall back to other agents in the project.
+func TestListCreatedAgentScanHonoursNameFilter(t *testing.T) {
+	tests := []struct {
+		name   string
+		agents []string
+		filter string
+		want   []string
+	}{
+		{name: "valid name among two agents", agents: []string{"alpha", "beta"}, filter: "beta", want: []string{"beta"}},
+		{name: "unknown name among two agents", agents: []string{"alpha", "beta"}, filter: "gamma", want: []string{}},
+		{name: "unknown name with a single agent", agents: []string{"alpha"}, filter: "gamma", want: []string{}},
+		{name: "empty name does not match", agents: []string{"alpha"}, filter: "", want: []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projectPath := filepath.Join(t.TempDir(), ".scion")
+			for _, n := range tt.agents {
+				writeCreatedAgentDir(t, projectPath, n)
+			}
+
+			mgr := NewManager(&runtime.MockRuntime{})
+			agents, err := mgr.List(context.Background(), map[string]string{
+				"scion.name":         tt.filter,
+				"scion.project_path": projectPath,
+			})
+			if err != nil {
+				t.Fatalf("List() error: %v", err)
+			}
+			got := listedNames(agents)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("List() names = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestListCreatedAgentScanWithoutNameFilterUnchanged pins the behaviour
+// existing callers rely on: with no "scion.name" filter, every created
+// agent in the project is returned.
+func TestListCreatedAgentScanWithoutNameFilterUnchanged(t *testing.T) {
+	projectPath := filepath.Join(t.TempDir(), ".scion")
+	for _, n := range []string{"alpha", "beta", "gamma"} {
+		writeCreatedAgentDir(t, projectPath, n)
+	}
+
+	mgr := NewManager(&runtime.MockRuntime{})
+	agents, err := mgr.List(context.Background(), map[string]string{
+		"scion.agent":        "true",
+		"scion.project_path": projectPath,
+	})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	want := []string{"alpha", "beta", "gamma"}
+	if got := listedNames(agents); !reflect.DeepEqual(got, want) {
+		t.Errorf("List() names = %v, want %v", got, want)
+	}
+}
+
+// writeCreatedAgentDirWithInfo is writeCreatedAgentDir with a caller-supplied
+// agent-info.json payload.
+func writeCreatedAgentDirWithInfo(t *testing.T, projectPath string, info api.AgentInfo) {
+	t.Helper()
+	writeCreatedAgentDir(t, projectPath, info.Name)
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "agents", info.Name, "home", "agent-info.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeHubLinkedSettings links the project at projectPath (its .scion
+// directory) to Hub project hubProjectID.
+func writeHubLinkedSettings(t *testing.T, projectPath, hubProjectID string) {
+	t.Helper()
+	if err := os.MkdirAll(projectPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]interface{}{
+		"hub": map[string]interface{}{"projectId": hubProjectID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "settings.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestListCreatedAgentScanFilterParity covers every filter key the runtime
+// layer applies, evaluated by the on-disk created-agent scan through the
+// shared matcher. Each case also carries scion.project_path, which is what
+// enables the scan.
+func TestListCreatedAgentScanFilterParity(t *testing.T) {
+	tests := []struct {
+		name      string
+		hubLinked string // Hub project ID written to settings; "" = unlinked
+		filter    func(projectPath string) map[string]string
+		want      []string
+	}{
+		{name: "scion.agent true matches", filter: func(string) map[string]string { return map[string]string{"scion.agent": "true"} }, want: []string{"alpha", "beta"}},
+		{name: "scion.agent false matches nothing", filter: func(string) map[string]string { return map[string]string{"scion.agent": "false"} }, want: []string{}},
+		{name: "scion.name selects one", filter: func(string) map[string]string { return map[string]string{"scion.name": "alpha"} }, want: []string{"alpha"}},
+		{name: "scion.project matching name", filter: func(p string) map[string]string { return map[string]string{"scion.project": config.GetProjectName(p)} }, want: []string{"alpha", "beta"}},
+		{name: "scion.project other name", filter: func(string) map[string]string { return map[string]string{"scion.project": "some-other-project"} }, want: []string{}},
+		{name: "scion.project_id matches linked project", hubLinked: "hub-proj-1", filter: func(string) map[string]string { return map[string]string{"scion.project_id": "hub-proj-1"} }, want: []string{"alpha", "beta"}},
+		{name: "scion.project_id other ID on linked project", hubLinked: "hub-proj-1", filter: func(string) map[string]string { return map[string]string{"scion.project_id": "hub-proj-2"} }, want: []string{}},
+		{name: "scion.project_id on unlinked project", filter: func(string) map[string]string { return map[string]string{"scion.project_id": "hub-proj-1"} }, want: []string{}},
+		{name: "scion.project_id ignores the local project-id marker in agent-info", filter: func(string) map[string]string { return map[string]string{"scion.project_id": "local-marker-id"} }, want: []string{}},
+		{name: "status never matches", filter: func(string) map[string]string { return map[string]string{"status": "created"} }, want: []string{}},
+		{name: "scion.template selects one", filter: func(string) map[string]string { return map[string]string{"scion.template": "tmpl-b"} }, want: []string{"beta"}},
+		{name: "scion.harness_config selects one", filter: func(string) map[string]string { return map[string]string{"scion.harness_config": "hc-a"} }, want: []string{"alpha"}},
+		{name: "agent_id is unknown before start", filter: func(string) map[string]string { return map[string]string{"agent_id": "alpha"} }, want: []string{}},
+		{name: "all keys combined", hubLinked: "hub-proj-1", filter: func(p string) map[string]string {
+			return map[string]string{"scion.agent": "true", "scion.name": "beta", "scion.project": config.GetProjectName(p), "scion.project_id": "hub-proj-1"}
+		}, want: []string{"beta"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			projectPath := filepath.Join(tmp, "proj", ".scion")
+			if tt.hubLinked != "" {
+				writeHubLinkedSettings(t, projectPath, tt.hubLinked)
+			}
+			writeCreatedAgentDirWithInfo(t, projectPath, api.AgentInfo{Name: "alpha", Phase: "created", Template: "tmpl-a", HarnessConfig: "hc-a", ProjectID: "local-marker-id"})
+			writeCreatedAgentDirWithInfo(t, projectPath, api.AgentInfo{Name: "beta", Phase: "created", Template: "tmpl-b", HarnessConfig: "hc-b", ProjectID: "local-marker-id"})
+
+			filter := tt.filter(projectPath)
+			filter["scion.project_path"] = projectPath
+
+			mgr := NewManager(&runtime.MockRuntime{})
+			agents, err := mgr.List(context.Background(), filter)
+			if err != nil {
+				t.Fatalf("List() error: %v", err)
+			}
+			if got := listedNames(agents); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("List(%v) names = %v, want %v", filter, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestListCreatedAgentScanMatchesRuntimeFilter pins parity directly: a
+// runtime that filters containers with the shared matcher, given a
+// container carrying exactly the labels a started agent gets, must agree
+// with the on-disk scan on every filter.
+func TestListCreatedAgentScanMatchesRuntimeFilter(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	createdPath := filepath.Join(tmp, "proj", ".scion")
+	writeHubLinkedSettings(t, createdPath, "hub-proj-1")
+	writeCreatedAgentDirWithInfo(t, createdPath, api.AgentInfo{Name: "alpha", Phase: "created", Template: "tmpl-a", HarnessConfig: "hc-a"})
+
+	containerLabels := map[string]string{
+		"scion.agent":          "true",
+		"scion.name":           "alpha",
+		"scion.template":       "tmpl-a",
+		"scion.harness_config": "hc-a",
+		"scion.harness_auth":   "",
+		"scion.project":        config.GetProjectName(createdPath),
+		"scion.project_id":     "hub-proj-1",
+		"scion.project_path":   createdPath,
+	}
+	rt := &runtime.MockRuntime{ListFunc: func(_ context.Context, filter map[string]string) ([]api.AgentInfo, error) {
+		if runtime.LabelsMatchFilter(containerLabels, filter) {
+			return []api.AgentInfo{{Name: "alpha", ContainerID: "c1", Labels: containerLabels}}, nil
+		}
+		return nil, nil
+	}}
+
+	filters := []map[string]string{
+		{"scion.agent": "true"},
+		{"scion.name": "alpha"},
+		{"scion.name": "other"},
+		{"scion.project": config.GetProjectName(createdPath)},
+		{"scion.project": "other"},
+		{"scion.project_id": "hub-proj-1"},
+		{"scion.project_id": "hub-proj-2"},
+		{"status": "running"},
+		{"scion.template": "tmpl-a"},
+		{"scion.template": "other"},
+		{"scion.harness_config": "hc-a"},
+		{"agent_id": "x"},
+	}
+	matched := 0
+	for _, f := range filters {
+		f["scion.project_path"] = createdPath
+		running, err := NewManager(rt).List(context.Background(), f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := NewManager(&runtime.MockRuntime{}).List(context.Background(), f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(running) != len(created) {
+			t.Errorf("filter %v: runtime path returned %d agents, on-disk scan returned %d", f, len(running), len(created))
+		}
+		if len(created) > 0 {
+			matched++
+		}
+	}
+	if matched == 0 || matched == len(filters) {
+		t.Errorf("matched %d of %d filters; the fixture must exercise both outcomes", matched, len(filters))
+	}
+}
+
+// TestListLocalProvisionedOnly covers ptone/scion#2875: a container-less
+// local agent in phase "created" was provisioned but never started.
+func TestListLocalProvisionedOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		info api.AgentInfo
+		want bool
+	}{
+		{name: "created, never started", info: api.AgentInfo{Phase: "created"}, want: true},
+		{name: "stopped", info: api.AgentInfo{Phase: "stopped"}, want: false},
+		{name: "error", info: api.AgentInfo{Phase: "error"}, want: false},
+		{name: "created but soft-deleted", info: api.AgentInfo{Phase: "created", DeletedAt: time.Now()}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projectPath := filepath.Join(t.TempDir(), ".scion")
+			tt.info.Name = "po-agent"
+			writeCreatedAgentDirWithInfo(t, projectPath, tt.info)
+
+			agents, err := NewManager(&runtime.MockRuntime{}).List(context.Background(), map[string]string{
+				"scion.project_path": projectPath,
+			})
+			if err != nil {
+				t.Fatalf("List() error: %v", err)
+			}
+			if len(agents) != 1 {
+				t.Fatalf("List() returned %d agents, want 1", len(agents))
+			}
+			if got := agents[0].ProvisionedOnly; got != tt.want {
+				t.Errorf("ProvisionedOnly = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A vanished-pod report (the previous pod, removed by a preemption) must not
+// rewrite agent-info.json: a start may be provisioning the next generation,
+// and its live pod (runtime phase "") takes its phase from that file.
+func TestListVanishedPodReportDoesNotTouchAgentInfo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmpDir := t.TempDir()
+	projectPath := filepath.Join(tmpDir, ".scion")
+	agentName := "k8s-agent"
+	agentHome := filepath.Join(projectPath, "agents", agentName, "home")
+	if err := os.MkdirAll(agentHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+	infoData, _ := json.MarshalIndent(api.AgentInfo{
+		Name: agentName, Phase: string(state.PhaseCreated), Runtime: "kubernetes",
+	}, "", "  ")
+	infoPath := filepath.Join(agentHome, "agent-info.json")
+	if err := os.WriteFile(infoPath, infoData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "agents", agentName, "scion-agent.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var entry api.AgentInfo
+	mock := &runtime.MockRuntime{
+		ListFunc: func(_ context.Context, _ map[string]string) ([]api.AgentInfo, error) {
+			return []api.AgentInfo{entry}, nil
+		},
+	}
+	mgr := NewManager(mock)
+	filter := map[string]string{"scion.project_path": projectPath}
+
+	entry = api.AgentInfo{
+		Name: agentName, ProjectPath: projectPath, Runtime: "kubernetes",
+		Phase: string(state.PhaseError), ExitReason: string(state.ExitReasonPreempted),
+		ContainerStatus: "deleted (Preempted)", VanishedPodReport: true,
+	}
+	agents, err := mgr.List(context.Background(), filter)
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(agents) != 1 || agents[0].Phase != string(state.PhaseError) || agents[0].ExitReason != string(state.ExitReasonPreempted) {
+		t.Fatalf("tombstone entry = %+v, want its own error phase and reason", agents)
+	}
+	data, err := os.ReadFile(infoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk api.AgentInfo
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Phase != string(state.PhaseCreated) {
+		t.Fatalf("agent-info.json phase = %q, want it unchanged (%q)", onDisk.Phase, state.PhaseCreated)
+	}
+
+	// The new generation's pod, still pending (runtime phase ""), keeps the
+	// on-disk phase.
+	entry = api.AgentInfo{Name: agentName, ProjectPath: projectPath, Runtime: "kubernetes", ContainerStatus: "Pending"}
+	agents, err = mgr.List(context.Background(), filter)
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(agents) != 1 || agents[0].Phase != string(state.PhaseCreated) {
+		t.Fatalf("live pending entry = %+v, want phase %q", agents, state.PhaseCreated)
 	}
 }

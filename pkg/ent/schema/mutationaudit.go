@@ -60,6 +60,44 @@ func (MutationAudit) Fields() []ent.Field {
 			Optional(),
 		field.String("can_delegate_reason").
 			Optional(),
+
+		// E.2a additive fields (ptone/scion#2127, plan §3.3). All optional,
+		// default "".
+		field.String("credential_name").
+			Optional(),
+		field.String("credential_boundary_kind").
+			Optional(),
+		field.String("credential_boundary_project_id").
+			Optional(),
+		field.String("credential_labels").
+			Optional(),
+		field.String("correlation_id").
+			Optional(),
+		field.String("executor_kind").
+			Optional(),
+		field.String("executor_id").
+			Optional(),
+
+		// Agent delegation block (.design/agent-delegation.md §18.1). All
+		// optional, default "", and written only by the agent delegation
+		// paths (grant issuance, credential exchange, revocation); every
+		// other writer leaves them empty.
+		field.String("actor_agent_id").
+			Optional(),
+		field.String("authorizing_user_id").
+			Optional(),
+		field.String("source_grant_id").
+			Optional(),
+		field.String("parent_grant_id").
+			Optional(),
+		field.String("delegation_edge_id").
+			Optional(),
+		field.String("exchange_agent_credential_id").
+			Optional(),
+		field.String("actor_kind").
+			Optional(),
+		field.String("agent_delegation_code").
+			Optional(),
 	}
 }
 
@@ -76,6 +114,8 @@ func (MutationAudit) Indexes() []ent.Index {
 		index.Fields("actor_credential_id"),
 		// Target queries
 		index.Fields("target_type", "target_id"),
+		// Request correlation (E.2a)
+		index.Fields("correlation_id"),
 	}
 }
 

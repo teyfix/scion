@@ -25,15 +25,41 @@
  * - Attachments: chip showing basename, full path on hover, NOT clickable
  * - Text/code attachments: a short read-only preview slice with expand + download
  * - Image attachments: an inline thumbnail with a hover expand + download toolbar
+ * - Artifact references: chips (title · vN · owner, or "Artifact unavailable")
+ *   and linkified scion://artifact/ URLs, both opening an in-place preview
  * - Badges: urgent, broadcasted, channel provenance
  */
 
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
+import { styleMap } from 'lit/directives/style-map.js';
 import { apiFetch } from '../../../client/api.js';
 import { getMarkdownRenderer } from '../../../utils/markdown.js';
+import { formatInstant, formatInstantWithZone } from '../../../utils/time.js';
+import { DisplayZoneController } from '../../../utils/display-zone-controller.js';
 import { getLanguageFromPath } from '../code-editor.js';
 import { hashColor, getInitials } from './chat-avatar.js';
+import {
+  CONTAINER_PATH_PATTERN,
+  extensionOf,
+  isRecognizedFilePath,
+  isMarkdownFileName,
+  formatFileSize,
+  GCS_URI_PATTERN,
+  buildGcsLinkHtml,
+  parseGcsUri,
+  resolveGcsMatch,
+  ARTIFACT_REF_PATTERN,
+  buildArtifactLinkHtml,
+} from '../../../utils/chat-file-links.js';
+import { isFeatureEnabled } from '../../../utils/feature-flags.js';
+import {
+  ARTIFACTS_FLAG,
+  orderArtifactRefs,
+  type MessageArtifactRef,
+} from '../../../client/artifacts.js';
+import './chat-file-preview.js';
+import type { PreviewTarget } from './chat-file-preview.js';
 import '../code-editor.js';
 import '../markdown-preview.js';
 
@@ -43,6 +69,55 @@ export interface AttachmentRefInfo {
   name: string;
   mime: string;
   size: number;
+  /** Pixel width of an image attachment, when the server knows it. */
+  width?: number;
+  /** Pixel height of an image attachment, when the server knows it. */
+  height?: number;
+}
+
+/** The largest box an inline image thumbnail is drawn in, in CSS px. */
+export const IMAGE_THUMB_MAX_WIDTH_PX = 320;
+export const IMAGE_THUMB_MAX_HEIGHT_PX = 240;
+
+/** Intrinsic pixel size of an image. */
+export interface ImageSize {
+  width: number;
+  height: number;
+}
+
+/** The intrinsic size of an image attachment, when its reference carries one. */
+export function knownImageSize(ref: AttachmentRefInfo): ImageSize | null {
+  if (ref.width && ref.height && ref.width > 0 && ref.height > 0) {
+    return { width: ref.width, height: ref.height };
+  }
+  return null;
+}
+
+/**
+ * The inline style that reserves an image thumbnail's box before it loads.
+ * A known size scales down to fit the thumbnail box, keeping its aspect
+ * ratio, and still narrows with the bubble (max-width: 100% in the
+ * stylesheet). An unknown size reserves the whole 4:3 thumbnail box and
+ * keeps it once the image loads, showing the image inside it at its own
+ * shape (object-fit: contain in the stylesheet), so a load never moves the
+ * thread. The box has a definite width: a percentage would resolve against
+ * the shrink-to-fit button around the image and collapse the box to
+ * nothing until the image arrives.
+ */
+export function imageThumbStyle(size: ImageSize | null): Record<string, string> {
+  if (!size) {
+    return {
+      width: `${IMAGE_THUMB_MAX_WIDTH_PX}px`,
+      aspectRatio: `${IMAGE_THUMB_MAX_WIDTH_PX} / ${IMAGE_THUMB_MAX_HEIGHT_PX}`,
+    };
+  }
+  const scale = Math.min(
+    1,
+    IMAGE_THUMB_MAX_WIDTH_PX / size.width,
+    IMAGE_THUMB_MAX_HEIGHT_PX / size.height
+  );
+  const width = Math.max(1, Math.round(size.width * scale));
+  return { width: `${width}px`, aspectRatio: `${size.width} / ${size.height}` };
 }
 
 /** Image MIME types rendered inline. */
@@ -154,7 +229,8 @@ const ENTITY_PATTERNS: EntityPattern[] = [
   },
   // Bare UUIDs preceded by "session" (case-insensitive)
   {
-    regex: /\bsession\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b/gi,
+    regex:
+      /\bsession\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b/gi,
     linkBuilder: (m) => {
       const uuid = m[1];
       return `session <a class="entity-link" href="/sessions/${encodeURIComponent(uuid)}" title="Open session ${uuid}">${uuid}</a>`;
@@ -168,15 +244,75 @@ const ENTITY_PATTERNS: EntityPattern[] = [
       return `commit <a class="entity-link" href="/commits/${encodeURIComponent(sha)}" title="View commit ${sha}">${sha}</a>`;
     },
   },
-  // File paths: /workspace/... and /scion-volumes/... container paths
+  // File paths: /workspace/... and /scion-volumes/... container paths.
+  // The pattern and the "is this actually a file" rule are shared with the
+  // recent-files recorder (utils/chat-file-links.ts) so both agree on what
+  // counts as a recognized path.
   {
-    regex: /(?:\/scion-volumes\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)*|\/workspace\/(?:\.scion-volumes\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)*|[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)*))/g,
+    regex: CONTAINER_PATH_PATTERN,
     linkBuilder: (m) => {
       const path = m[0];
+      if (!isRecognizedFilePath(path)) {
+        return path;
+      }
       return `<a class="entity-link path-link" data-file-path="${path.replace(/"/g, '&quot;')}" href="javascript:void(0)" title="Open ${path.replace(/"/g, '&quot;')}">${path}</a>`;
     },
   },
 ];
+
+/**
+ * gs:// object link pattern, appended only for a message that is eligible
+ * per the gate below (the `web.gcs_links` experiment and agent-sent) —
+ * never for a user-sent message. Leftmost-wins in `styleEntityLinksInText`
+ * means this still beats a `path-link` match starting later in the same
+ * match (e.g. `gs://bkt/workspace/x.md`, where the file-path pattern would
+ * otherwise match the `/workspace/x.md` tail): both patterns are tried and
+ * the one that starts earliest wins, and the gs:// match always starts at
+ * or before the `/workspace/...` substring it contains.
+ */
+const GCS_ENTITY_PATTERN: EntityPattern = {
+  regex: GCS_URI_PATTERN,
+  linkBuilder: (m) => {
+    const boundary = m[1];
+    const bucket = m[2];
+    const resolved = resolveGcsMatch(m);
+    // No valid object at this occurrence (a directory-like trailing '/', or
+    // the fragment/query/param continuation rule) — leave the raw matched
+    // text unchanged rather than linking a truncated name.
+    if (!resolved) return m[0];
+    return boundary + buildGcsLinkHtml(bucket, resolved.object) + resolved.suffix;
+  },
+};
+
+/**
+ * scion://artifact/ reference pattern, appended only while the hub.artifacts
+ * experiment is on (otherwise there is nothing to open). The link opens the
+ * artifact preview in place; what the viewer sees is decided by the hub's
+ * read check when the preview loads.
+ */
+const ARTIFACT_SKIP_REGION =
+  '<pre\\b[^>]*>[\\s\\S]*?</pre>|<code\\b[^>]*>[\\s\\S]*?</code>|<a\\b[^>]*>[\\s\\S]*?</a>|<[^>]+>';
+
+/**
+ * Turn scion://artifact/ references into links. Runs before @mention
+ * styling, so a version suffix (`@2`) stays part of the reference, and
+ * skips code, existing links and tags.
+ */
+function styleArtifactLinks(htmlStr: string): string {
+  const linkify = (text: string): string =>
+    text.replace(new RegExp(ARTIFACT_REF_PATTERN.source, 'g'), (whole, id: string, seq?: string) =>
+      buildArtifactLinkHtml(whole, { id: id.toLowerCase(), seq: seq ? Number(seq) : 0 })
+    );
+  const skip = new RegExp(ARTIFACT_SKIP_REGION, 'gi');
+  let out = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = skip.exec(htmlStr)) !== null) {
+    out += linkify(htmlStr.slice(cursor, match.index)) + match[0];
+    cursor = match.index + match[0].length;
+  }
+  return out + linkify(htmlStr.slice(cursor));
+}
 
 /**
  * Apply entity link patterns to a text segment (outside code/HTML regions).
@@ -184,16 +320,24 @@ const ENTITY_PATTERNS: EntityPattern[] = [
  * tried left-to-right through the string; the first match at each position
  * wins. This is intentionally simple: it scans linearly and does not try to
  * handle overlapping matches from different patterns.
+ *
+ * `includeGcs` appends {@link GCS_ENTITY_PATTERN} for this call only — the
+ * gate (the web.gcs_links experiment && the real sender is an agent) is
+ * evaluated once per render by the caller, not baked into a shared, mutable
+ * pattern list.
  */
-function styleEntityLinksInText(text: string): string {
+function styleEntityLinksInText(text: string, includeGcs: boolean): string {
   // Collect all matches from all patterns, then sort by position.
   const replacements: { start: number; end: number; replacement: string }[] = [];
 
-  for (const pattern of ENTITY_PATTERNS) {
+  const patterns = includeGcs ? [...ENTITY_PATTERNS, GCS_ENTITY_PATTERN] : ENTITY_PATTERNS;
+  for (const pattern of patterns) {
     // Clone the regex so each call starts from index 0.
     // Ensure the global flag is always set so re.exec() advances lastIndex
     // and cannot loop infinitely on a zero-width or non-advancing match.
-    const flags = pattern.regex.flags.includes('g') ? pattern.regex.flags : pattern.regex.flags + 'g';
+    const flags = pattern.regex.flags.includes('g')
+      ? pattern.regex.flags
+      : pattern.regex.flags + 'g';
     const re = new RegExp(pattern.regex.source, flags);
     let m: RegExpExecArray | null;
     let prevIndex = 0;
@@ -231,28 +375,113 @@ function styleEntityLinksInText(text: string): string {
  *
  * Follows the exact same skip-region approach as `styleMentions()`.
  */
-function styleEntityLinks(htmlStr: string): string {
-  const skip = new RegExp(MENTION_SKIP_REGION, 'gi');
+function styleEntityLinks(htmlStr: string, includeGcs: boolean): string {
+  const skip = new RegExp(ENTITY_SKIP_REGION, 'gi');
   let out = '';
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = skip.exec(htmlStr)) !== null) {
-    out += styleEntityLinksInText(htmlStr.slice(cursor, match.index)) + match[0];
+    out += styleEntityLinksInText(htmlStr.slice(cursor, match.index), includeGcs) + match[0];
     cursor = match.index + match[0].length;
   }
-  return out + styleEntityLinksInText(htmlStr.slice(cursor));
+  return out + styleEntityLinksInText(htmlStr.slice(cursor), includeGcs);
 }
 
-/** Lowercase extension including the dot, or '' when the name has none. */
-function extensionOf(name: string): string {
-  const dot = name.lastIndexOf('.');
-  return dot > 0 ? name.slice(dot).toLowerCase() : '';
+// ---------------------------------------------------------------------------
+// GitHub shortform issue/PR references (owner/repo#N) — auto-link to the
+// GitHub issue page. GitHub redirects /issues/N to /pull/N for PRs, so the
+// issues URL is correct for both.
+// ---------------------------------------------------------------------------
+
+/**
+ * Matches `owner/repo#123` shortform GitHub references:
+ *   - Owner: a GitHub username/org, `[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})`.
+ *   - Repo: `[A-Za-z0-9._-]+`, excluding a repo made up of only dots (`.`,
+ *     `..`, ...) — GitHub forbids those as repo names, and without the
+ *     exclusion they'd produce a wrong link that the browser silently
+ *     resolves to a different URL. A repo merely starting with a dot, like
+ *     the real `.github` repo, is unaffected: `(?!\.+#)` only rejects dots
+ *     running all the way to `#`.
+ *   - Number: one or more digits after `#`.
+ *
+ * The leading group captures the boundary before the owner instead of using
+ * a lookbehind assertion, and the replacement re-emits it unchanged (see
+ * `styleGithubRefsInText`). A captured boundary is exactly equivalent to a
+ * lookbehind here, because the boundary can never itself be part of a valid
+ * match, but it parses on every JS engine that supports `u`-flag `\p{…}`
+ * classes — lookbehind additionally needs Safari 16.4+ (Mar 2023), and this
+ * is the only regex in `web/src` that would otherwise require it. A
+ * lookbehind that an older Safari can't parse is a `SyntaxError` at parse
+ * time, which would fail the whole `chat-message` module, not just ref
+ * linking — too large a blast radius for a linkifier.
+ *
+ * The boundary must be the start of the string, or a character that is not
+ * a Unicode letter, digit, `_`, `/`, `.`, or `-`. That is what keeps
+ * `foo/bar#1` from double-linking inside a URL or file path, keeps
+ * `a/b/c#12` from also matching the shorter `b/c#12` tail (a repo can never
+ * contain `/`, so a match starting at `a` fails structurally, and a match
+ * starting at `b` or `c` is blocked by the preceding `/`), keeps a
+ * scheme-less host like `example.com/foo#12` or a dotted prefix like
+ * `user.name/repo#1` from matching (blocked by the `.` exclusion, since a
+ * GitHub owner can never follow a `.`), keeps a hyphenated prefix like
+ * `user.foo-bar/repo#1` from sliding past the `.` and matching `bar/repo#1`
+ * at the `-` instead (blocked by the `-` exclusion), and — using
+ * `\p{L}`/`\p{N}` with the `u` flag rather than ASCII `\w` — keeps a
+ * non-ASCII prefix like `äptone` from letting `ptone/scion#1` match
+ * mid-word. The trailing negative lookahead excludes a following Unicode
+ * letter, digit, or `_`, so `#2217a` and `#12é` cannot be split into a ref
+ * plus stray text.
+ */
+const GITHUB_REF_REGEX =
+  /(^|[^\p{L}\p{N}_/.-])([A-Za-z0-9][A-Za-z0-9-]{0,38})\/(?!\.+#)([A-Za-z0-9._-]+)#(\d+)(?![\p{L}\p{N}_])/gu;
+
+/** Apply the GitHub-ref pattern to a text segment (outside code/HTML regions). */
+function styleGithubRefsInText(text: string): string {
+  return text.replace(
+    GITHUB_REF_REGEX,
+    (_full, boundary: string, owner: string, repo: string, number: string) => {
+      const ref = `${owner}/${repo}#${number}`;
+      const url = `https://github.com/${owner}/${repo}/issues/${number}`;
+      return `${boundary}<a class="entity-link gh-ref-link" href="${url}" target="_blank" rel="noopener noreferrer" title="Open ${ref} on GitHub">${ref}</a>`;
+    }
+  );
+}
+
+/**
+ * Skip regions for GitHub-ref processing. Unlike ENTITY_SKIP_REGION, this
+ * also skips inline `<code>` spans in full — a shortform reference inside
+ * backticks is literal text, not a link. `<pre>` fences and existing `<a>`
+ * elements are also skipped in full, so a ref inside a fenced code block, an
+ * existing markdown link, or an already-autolinked URL is never re-linked.
+ *
+ * This intentionally does not reuse ENTITY_SKIP_REGION: that region skips
+ * `<pre>` but deliberately leaves inline `<code>` open, because a file path
+ * inside backticks is still meant to link (see its own doc comment) — the
+ * opposite of what this feature needs — so the two skip lists must diverge.
+ */
+const GITHUB_REF_SKIP_REGION =
+  '<pre\\b[^>]*>[\\s\\S]*?</pre>|<a\\b[^>]*>[\\s\\S]*?</a>|<code\\b[^>]*>[\\s\\S]*?</code>|<[^>]+>';
+
+/**
+ * Post-process rendered markdown to turn `owner/repo#123` shortform
+ * references into links to the GitHub issue page, leaving code blocks,
+ * inline code, and existing links untouched.
+ */
+function styleGithubRefs(htmlStr: string): string {
+  const skip = new RegExp(GITHUB_REF_SKIP_REGION, 'gi');
+  let out = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = skip.exec(htmlStr)) !== null) {
+    out += styleGithubRefsInText(htmlStr.slice(cursor, match.index)) + match[0];
+    cursor = match.index + match[0].length;
+  }
+  return out + styleGithubRefsInText(htmlStr.slice(cursor));
 }
 
 /** True when the file is a Markdown document. */
 function isMarkdownFile(name: string): boolean {
-  const ext = extensionOf(name);
-  return ext === '.md' || ext === '.markdown';
+  return isMarkdownFileName(name);
 }
 
 /**
@@ -324,13 +553,6 @@ function attachmentURL(id: string): string {
   return `/api/v1/chat/attachments/${encodeURIComponent(id)}`;
 }
 
-/** Format file size for display. */
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 /**
  * Spans of rendered markdown that @mention styling must step over: code
  * regions, whose text is literal, and HTML tags, whose attributes must not be
@@ -343,6 +565,17 @@ function formatFileSize(bytes: number): string {
 const MENTION_SKIP_REGION = '<pre\\b[^>]*>[\\s\\S]*?</pre>|<code\\b[^>]*>[\\s\\S]*?</code>|<[^>]+>';
 
 /**
+ * Skip regions for entity-link processing. Like MENTION_SKIP_REGION but
+ * does NOT skip inline <code> spans, so file paths inside backticks
+ * are still auto-linked. Fenced code blocks (<pre>) are still skipped.
+ * Anchor elements (`<a>…</a>`) are skipped in full, including their text
+ * content, so a path already inside a link is never re-wrapped in a nested
+ * `<a>` — the `<a>` pattern must come before the generic `<[^>]+>` pattern
+ * so the full anchor element is consumed first.
+ */
+const ENTITY_SKIP_REGION = '<pre\\b[^>]*>[\\s\\S]*?</pre>|<a\\b[^>]*>[\\s\\S]*?</a>|<[^>]+>';
+
+/**
  * Wrap @mentions in styled, clickable spans.
  *
  * The captured slug is limited to `[\w.-]` so it can never break out of the
@@ -350,7 +583,7 @@ const MENTION_SKIP_REGION = '<pre\\b[^>]*>[\\s\\S]*?</pre>|<code\\b[^>]*>[\\s\\S
  */
 function styleMentionsInText(text: string): string {
   return text.replace(
-    /@([\w.-]+)/g,
+    /@([\w.-]+(?:@[\w.-]+)?)/g,
     '<span class="mention clickable" data-mention="$1">@$1</span>'
   );
 }
@@ -375,6 +608,13 @@ function styleMentions(htmlStr: string): string {
 
 @customElement('scion-chat-message')
 export class ScionChatMessage extends LitElement {
+  /**
+   * Re-renders this message when the effective display zone changes
+   * (review R2-1), so a thread already on screen when the preference
+   * loads or changes doesn't stay stuck in the browser zone.
+   */
+  readonly _zone = new DisplayZoneController(this);
+
   /** The message body text. */
   @property()
   body = '';
@@ -387,6 +627,16 @@ export class ScionChatMessage extends LitElement {
   @property({ type: Boolean })
   fromAgent = false;
 
+  /**
+   * Whether the message's actual sender is an agent, independent of
+   * `fromAgent`. v2 chat-thread computes `fromAgent` as "not me" (any
+   * sender other than the current viewer, including another *user*) for
+   * layout purposes; gs:// linkification needs the real sender kind, since
+   * "user-sent messages never link" means any user, not just the viewer.
+   */
+  @property({ type: Boolean })
+  senderIsAgent = false;
+
   /** Whether the message is plain text (no markdown rendering). */
   @property({ type: Boolean })
   plain = false;
@@ -398,6 +648,15 @@ export class ScionChatMessage extends LitElement {
   /** Sender unique ID for avatar colour hashing (avoids collisions from similar names). */
   @property()
   senderId = '';
+
+  /**
+   * The store message id, set by chat-thread from the rendered message's
+   * `id`. Carried on a `gcs-link-click` event so the hub can derive the
+   * sender's SA from a message the viewer is authorized to read, without a
+   * client-supplied agent or SA identifier.
+   */
+  @property()
+  messageId = '';
 
   /** Sender display name for v2 multi-sender rendering. */
   @property()
@@ -423,10 +682,6 @@ export class ScionChatMessage extends LitElement {
   @property()
   channel = '';
 
-  /** Visibility level: "normal", "verbose", or "full". */
-  @property()
-  visibility = 'normal';
-
   /** Message type (e.g. "assistant-reply", "state-change"). */
   @property()
   messageType = '';
@@ -440,8 +695,17 @@ export class ScionChatMessage extends LitElement {
   dispatchFailureReason = '';
 
   /**
+   * Machine-readable dispatch failure code, e.g. "agent_unreachable"
+   * (nc-delivery-unreachable). May be empty for history rows sent before this
+   * field existed; renderDeliveryState() falls back to matching the reason
+   * prefix in that case.
+   */
+  @property()
+  dispatchFailureCode = '';
+
+  /**
    * True when the DM peer's read watermark has reached this message. Replaces
-   * the single-check "Delivered" indicator with a double-check "Seen".
+   * the single-check "Accepted" indicator with a double-check "Seen".
    */
   @property({ type: Boolean })
   seen = false;
@@ -461,23 +725,12 @@ export class ScionChatMessage extends LitElement {
   @property({ type: Array })
   attachmentRefs: AttachmentRefInfo[] = [];
 
-  // ---- Phase-3 properties ----
-
-  /** Whether this is the current user's message. */
-  @property({ type: Boolean })
-  isOwn = false;
-
-  /** Whether edit is allowed (no agent in reply chain). */
-  @property({ type: Boolean })
-  canEdit = false;
-
-  /** Whether delete is allowed (no agent in reply chain). */
-  @property({ type: Boolean })
-  canDelete = false;
-
-  /** Message ID for copy-link and event dispatch. */
-  @property()
-  messageId = '';
+  /**
+   * Artifact references on this message, as the hub resolved them for the
+   * viewer (ptone/scion#3224). An unavailable one carries no title.
+   */
+  @property({ type: Array })
+  artifactRefs: MessageArtifactRef[] = [];
 
   /** Reply preview data: the message this one is replying to. */
   @property({ type: Object })
@@ -491,20 +744,32 @@ export class ScionChatMessage extends LitElement {
   @property()
   deletedAt = '';
 
+  /** Sender's project slug for cross-project provenance display. */
+  @property()
+  senderProjectSlug = '';
+
+  /** The signed-in user's id; the artifact preview shows their artifacts' owner as "You". */
+  @property()
+  currentUserId = '';
+
   @state()
   private renderedHtml = '';
-
-  /** Whether the action bar is pinned visible (for touch devices). */
-  @state()
-  private actionBarPinned = false;
 
   /** Preview load state per attachment ID. Replaced, never mutated. */
   @state()
   private previews: ReadonlyMap<string, PreviewState> = new Map();
 
-  /** Attachment shown in the full-height overlay, if any. */
+  /**
+   * Target shown in the full-height overlay, if any. Built once, at open
+   * time, and kept as the same object reference across this component's
+   * re-renders — `<scion-chat-file-preview>` refetches and resets its
+   * Source/Rendered toggle whenever `.target` changes identity, so rebuilding
+   * a fresh object literal here on every render (reactions, read receipts,
+   * SSE edits, a parent re-render) would spuriously refetch and reset an
+   * overlay the user already has open.
+   */
   @state()
-  private expanded: AttachmentRefInfo | null = null;
+  private expandedTarget: PreviewTarget | null = null;
 
   /**
    * Per-attachment toggle: true = show raw source, false/absent = show
@@ -555,7 +820,7 @@ export class ScionChatMessage extends LitElement {
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       font-weight: 700;
       color: #fff;
       flex-shrink: 0;
@@ -583,28 +848,38 @@ export class ScionChatMessage extends LitElement {
     }
 
     .sender-name {
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       font-weight: 600;
       color: var(--scion-text, #1e293b);
     }
 
     .msg-time {
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       color: var(--scion-text-muted, #64748b);
       white-space: nowrap;
     }
 
     .routed-to {
       color: var(--scion-text-muted, #64748b);
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       font-weight: 400;
+    }
+
+    .cross-project-label {
+      font-size: var(--chat-fs-sm);
+      font-weight: 400;
+      color: var(--sl-color-success-700, #15803d);
+      background: var(--sl-color-success-50, #f0fdf4);
+      padding: 0 0.375rem;
+      border-radius: 0.25rem;
+      white-space: nowrap;
     }
 
     .bubble-content {
       padding: 0.5rem 0.75rem;
       border-radius: 0.75rem;
       line-height: 1.5;
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
       word-break: break-word;
     }
 
@@ -621,7 +896,7 @@ export class ScionChatMessage extends LitElement {
     }
 
     .from-user .bubble-header {
-      flex-direction: row-reverse;
+      justify-content: flex-end;
     }
 
     /* Pre-formatted (plain) text */
@@ -659,13 +934,13 @@ export class ScionChatMessage extends LitElement {
     }
 
     .md-content h1 {
-      font-size: 1.25rem;
+      font-size: var(--chat-fs-4xl);
     }
     .md-content h2 {
-      font-size: 1.125rem;
+      font-size: var(--chat-fs-3xl);
     }
     .md-content h3 {
-      font-size: 1rem;
+      font-size: var(--chat-fs-2xl);
     }
 
     .md-content a {
@@ -700,7 +975,7 @@ export class ScionChatMessage extends LitElement {
       background: none;
       border: none;
       padding: 0;
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
     }
 
     /* Syntax-highlighted code blocks (#1049) */
@@ -718,9 +993,9 @@ export class ScionChatMessage extends LitElement {
       top: 0.375rem;
       right: 0.375rem;
       padding: 0.125rem 0.5rem;
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       font-family: inherit;
-      line-height: 1.25rem;
+      line-height: var(--chat-lh-tight);
       border: 1px solid var(--scion-border, #e2e8f0);
       border-radius: 0.25rem;
       background: var(--scion-bg-subtle, #f1f5f9);
@@ -773,11 +1048,28 @@ export class ScionChatMessage extends LitElement {
       text-decoration: underline;
     }
 
+    /* A wide table scrolls sideways inside its own box rather than
+       squashing its columns or widening the message. The wrapper is added
+       after render (wrapTables) so the table keeps its table semantics. */
+    .md-table-scroll {
+      max-width: 100%;
+      overflow-x: auto;
+      margin: 0.5em 0;
+    }
+
     .md-content table {
       border-collapse: collapse;
-      width: 100%;
-      margin: 0.5em 0;
-      font-size: 0.8125rem;
+      min-width: 100%;
+      font-size: var(--chat-fs-md);
+    }
+
+    .md-table-scroll:focus-visible {
+      outline: 2px solid var(--scion-primary, #3b82f6);
+      outline-offset: 2px;
+    }
+
+    .md-table-scroll > table {
+      margin: 0;
     }
 
     .md-content th,
@@ -785,6 +1077,15 @@ export class ScionChatMessage extends LitElement {
       border: 1px solid var(--scion-border, #e2e8f0);
       padding: 0.375em 0.5em;
       text-align: left;
+    }
+
+    /* On a phone, columns keep a readable width and the wrapper scrolls
+       past that; on wider screens tables size to their content as before. */
+    @media (max-width: 768px) {
+      .md-content th,
+      .md-content td {
+        min-width: 6em;
+      }
     }
 
     .md-content th {
@@ -803,11 +1104,11 @@ export class ScionChatMessage extends LitElement {
       display: inline-block;
       padding: 0 0.375rem;
       border-radius: 0.25rem;
-      font-size: 0.625rem;
+      font-size: var(--chat-fs-xs);
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.03em;
-      line-height: 1.25rem;
+      line-height: var(--chat-lh-tight);
     }
 
     .badge-urgent {
@@ -841,13 +1142,13 @@ export class ScionChatMessage extends LitElement {
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
       border-radius: 0.375rem;
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       color: var(--scion-text-muted, #64748b);
       cursor: default;
     }
 
     .attachment-chip sl-icon {
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
     }
 
     /* W7: Inline image attachments */
@@ -862,6 +1163,8 @@ export class ScionChatMessage extends LitElement {
     .image-preview-wrapper {
       position: relative;
       display: inline-flex;
+      max-width: 100%;
+      min-width: 0;
     }
 
     .image-actions {
@@ -892,7 +1195,7 @@ export class ScionChatMessage extends LitElement {
 
     .image-actions sl-icon-button::part(base) {
       padding: 0.25rem;
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
       color: #ffffff;
     }
 
@@ -903,6 +1206,8 @@ export class ScionChatMessage extends LitElement {
     /* The image is the button: no chrome of its own, just a focus ring. */
     .image-expand {
       display: inline-flex;
+      max-width: 100%;
+      min-width: 0;
       padding: 0;
       border: none;
       background: none;
@@ -915,9 +1220,15 @@ export class ScionChatMessage extends LitElement {
       outline-offset: 2px;
     }
 
+    /* The thumbnail box comes from imageThumbStyle(): its width and aspect
+       ratio are set before the image loads and kept after, so a late load
+       doesn't shift the thread; an image of another shape is letterboxed
+       inside it. The box never runs past the bubble on a narrow screen. */
     .attachment-image {
-      max-width: 320px;
-      max-height: 240px;
+      display: block;
+      max-width: 100%;
+      height: auto;
+      box-sizing: border-box;
       border-radius: 0.5rem;
       border: 1px solid var(--scion-border, #e2e8f0);
       cursor: pointer;
@@ -931,6 +1242,57 @@ export class ScionChatMessage extends LitElement {
     }
 
     /* W7: Download chips for non-image files */
+    .artifact-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.375rem;
+      margin-top: 0.375rem;
+    }
+
+    .artifact-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      max-width: 100%;
+      padding: 0.25rem 0.625rem;
+      background: var(--scion-surface, #fff);
+      border: 1px solid var(--scion-border, #cbd5e1);
+      border-radius: 0.5rem;
+      font: inherit;
+      font-size: var(--chat-fs-sm);
+      color: var(--scion-text, #0f172a);
+      cursor: pointer;
+    }
+
+    .artifact-chip:hover,
+    .artifact-chip:focus-visible {
+      border-color: var(--sl-color-primary-500, #3b82f6);
+      background: var(--sl-color-primary-50, #eff6ff);
+    }
+
+    .artifact-chip sl-icon {
+      flex: none;
+      font-size: var(--chat-fs-base);
+    }
+
+    .artifact-chip .artifact-title {
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .artifact-chip .artifact-meta {
+      flex: none;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    .artifact-chip.unavailable {
+      background: var(--scion-bg-subtle, #f1f5f9);
+      border-style: dashed;
+      color: var(--scion-text-muted, #64748b);
+    }
+
     .download-chip {
       display: inline-flex;
       align-items: center;
@@ -939,7 +1301,7 @@ export class ScionChatMessage extends LitElement {
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
       border-radius: 0.5rem;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text, #1e293b);
       cursor: pointer;
       text-decoration: none;
@@ -951,7 +1313,7 @@ export class ScionChatMessage extends LitElement {
     }
 
     .download-chip sl-icon {
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
       color: var(--scion-primary, #3b82f6);
     }
 
@@ -965,7 +1327,7 @@ export class ScionChatMessage extends LitElement {
 
     .download-chip .file-size {
       color: var(--scion-text-muted, #64748b);
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
     }
 
     /* Inline code/text previews for non-image attachments */
@@ -990,7 +1352,7 @@ export class ScionChatMessage extends LitElement {
       flex: 1;
       min-width: 0;
       font-family: var(--scion-font-mono, 'SF Mono', 'Fira Code', monospace);
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text, #1e293b);
       overflow: hidden;
       text-overflow: ellipsis;
@@ -998,7 +1360,7 @@ export class ScionChatMessage extends LitElement {
     }
 
     .preview-size {
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       color: var(--scion-text-muted, #64748b);
       white-space: nowrap;
     }
@@ -1010,7 +1372,7 @@ export class ScionChatMessage extends LitElement {
 
     .preview-actions sl-icon-button::part(base) {
       padding: 0.25rem;
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
       color: var(--scion-text-muted, #64748b);
     }
 
@@ -1058,38 +1420,16 @@ export class ScionChatMessage extends LitElement {
       align-items: center;
       gap: 0.5rem;
       padding: 0.75rem;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
     }
 
     .preview-placeholder sl-spinner {
-      font-size: 0.875rem;
+      font-size: var(--chat-fs-lg);
     }
 
     .preview-placeholder.error {
       color: var(--scion-danger-600, #dc2626);
-    }
-
-    .full-preview::part(panel) {
-      width: 90vw;
-      max-width: 900px;
-    }
-
-    .full-preview::part(body) {
-      padding-top: 0;
-    }
-
-    .full-preview .preview-placeholder {
-      padding: 2rem;
-    }
-
-    /* Fit the whole image in the panel rather than scrolling it. */
-    .full-preview .full-image {
-      display: block;
-      margin: 0 auto;
-      max-width: 100%;
-      max-height: 75vh;
-      object-fit: contain;
     }
 
     /* Verbose (recessed) rendering — no bubble, muted text, small label */
@@ -1098,7 +1438,7 @@ export class ScionChatMessage extends LitElement {
       padding: 0.25rem 0.75rem;
       border-radius: 0;
       color: var(--scion-text-muted, #64748b);
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
       font-style: italic;
     }
 
@@ -1106,7 +1446,7 @@ export class ScionChatMessage extends LitElement {
       display: inline-flex;
       align-items: center;
       gap: 0.25rem;
-      font-size: 0.625rem;
+      font-size: var(--chat-fs-xs);
       font-weight: 500;
       color: var(--scion-text-muted, #94a3b8);
       text-transform: uppercase;
@@ -1115,7 +1455,7 @@ export class ScionChatMessage extends LitElement {
     }
 
     .verbose-label sl-icon {
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
     }
 
     /* Full/trace rendering — collapsed details block */
@@ -1132,7 +1472,7 @@ export class ScionChatMessage extends LitElement {
 
     .trace-block summary {
       padding: 0.375rem 0.75rem;
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
       font-weight: 500;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -1143,12 +1483,12 @@ export class ScionChatMessage extends LitElement {
     }
 
     .trace-block summary sl-icon {
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
     }
 
     .trace-content {
       padding: 0.5rem 0.75rem;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-text-muted, #64748b);
       border-top: 1px solid var(--scion-border, #e2e8f0);
       white-space: pre-wrap;
@@ -1163,12 +1503,12 @@ export class ScionChatMessage extends LitElement {
       align-items: center;
       gap: 0.25rem;
       margin-top: 0.125rem;
-      font-size: 0.625rem;
+      font-size: var(--chat-fs-xs);
       color: var(--scion-text-muted, #94a3b8);
     }
 
     .delivery-state sl-icon {
-      font-size: 0.6875rem;
+      font-size: var(--chat-fs-sm);
     }
 
     .delivery-state.pending sl-icon {
@@ -1191,54 +1531,23 @@ export class ScionChatMessage extends LitElement {
       color: var(--scion-danger-600, #dc2626);
     }
 
-    /* ---- Phase-3: Message action bar ---- */
-    .message-actions {
-      position: absolute;
-      top: -12px;
-      right: 8px;
-      display: flex;
-      gap: 0.0625rem;
-      padding: 0.125rem;
-      border-radius: 0.375rem;
-      background: var(--scion-surface-100, #f1f5f9);
-      border: 1px solid var(--scion-neutral-200, #e2e8f0);
-      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-      opacity: 0;
-      visibility: hidden;
-      pointer-events: none;
-      transition: opacity 0.15s ease, visibility 0.15s ease;
-      z-index: 10;
+    /* F5 (p2a-r2 review): deferred (design agent-reincarnate §3.7) —
+       distinct from failed (not an error) and from pending (not a normal
+       in-flight send); a warning-toned, not danger-toned, indicator. */
+    .delivery-state.deferred {
+      color: var(--scion-warning-600, #d97706);
     }
 
-    .message-wrapper:hover .message-actions,
-    .message-wrapper:focus-within .message-actions,
-    .message-actions.pinned {
-      opacity: 1;
-      visibility: visible;
-      pointer-events: auto;
+    .delivery-state.deferred sl-icon {
+      color: var(--scion-warning-600, #d97706);
     }
 
-    @media (hover: none) {
-      .message-actions {
-        opacity: 0;
-        visibility: hidden;
-        pointer-events: none;
-      }
-      .message-actions.pinned {
-        opacity: 1;
-        visibility: visible;
-        pointer-events: auto;
-      }
+    .delivery-state.no-recipient {
+      color: var(--scion-warning-600, #d97706);
     }
 
-    .message-actions sl-icon-button::part(base) {
-      padding: 0.25rem;
-      font-size: 0.875rem;
-      color: var(--scion-neutral-600, #475569);
-    }
-
-    .message-actions sl-icon-button::part(base):hover {
-      color: var(--scion-primary-600, #2563eb);
+    .delivery-state.no-recipient sl-icon {
+      color: var(--scion-warning-600, #d97706);
     }
 
     /* ---- Phase-3: Reply preview quote block ---- */
@@ -1252,7 +1561,7 @@ export class ScionChatMessage extends LitElement {
       background: var(--scion-surface-50, #f8fafc);
       border-radius: 0 0.25rem 0.25rem 0;
       cursor: pointer;
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       color: var(--scion-neutral-500, #64748b);
       max-width: 100%;
       overflow: hidden;
@@ -1282,7 +1591,7 @@ export class ScionChatMessage extends LitElement {
 
     /* ---- Phase-3: Edited label ---- */
     .edited-label {
-      font-size: 0.625rem;
+      font-size: var(--chat-fs-xs);
       color: var(--scion-neutral-400, #94a3b8);
       margin-left: 0.25rem;
     }
@@ -1314,7 +1623,7 @@ export class ScionChatMessage extends LitElement {
     /* ---- Rich output: diff blocks (#1060) ---- */
     .diff-block {
       font-family: var(--scion-font-mono, 'SF Mono', 'Fira Code', monospace);
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
       line-height: 1.5;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
@@ -1376,7 +1685,7 @@ export class ScionChatMessage extends LitElement {
       border-radius: 0 0 0.375rem 0.375rem;
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--sl-color-primary-600, #2563eb);
-      font-size: 0.75rem;
+      font-size: var(--chat-fs-base);
       font-family: inherit;
       cursor: pointer;
       text-align: center;
@@ -1389,7 +1698,7 @@ export class ScionChatMessage extends LitElement {
     /* ---- Rich output: test results (#1060) ---- */
     .test-results {
       font-family: var(--scion-font-mono, 'SF Mono', 'Fira Code', monospace);
-      font-size: 0.8125rem;
+      font-size: var(--chat-fs-md);
       line-height: 1.5;
       background: var(--scion-bg-subtle, #f1f5f9);
       border: 1px solid var(--scion-border, #e2e8f0);
@@ -1419,6 +1728,27 @@ export class ScionChatMessage extends LitElement {
       padding-top: 0.25em;
       border-top: 1px solid var(--scion-border, #e2e8f0);
     }
+
+    /* The 70%-of-row cap reads as wasted space on a phone. Removing it
+       (rather than raising it) lets the bubble grow to whatever the flex
+       layout actually has left beside the avatar: .bubble is a flex child
+       of .message-wrapper alongside the fixed-width avatar and its gap, so
+       it is already bounded by the space those leave, with no separate
+       max-width needed to keep it off the avatar's column. */
+    @media (max-width: 768px) {
+      .bubble {
+        max-width: none;
+      }
+
+      .message-wrapper {
+        padding-left: 0.5rem;
+        padding-right: 0.5rem;
+      }
+
+      .bubble-content {
+        padding: 0.625rem 0.75rem;
+      }
+    }
   `;
 
   override connectedCallback(): void {
@@ -1431,11 +1761,6 @@ export class ScionChatMessage extends LitElement {
     this.previewObserver?.disconnect();
     this.previewObserver = null;
     this.observedPreviews = new WeakSet();
-    // Clean up touch long-press timer to prevent leaks on disconnect.
-    if (this.touchTimer) {
-      clearTimeout(this.touchTimer);
-      this.touchTimer = null;
-    }
   }
 
   override updated(changed: Map<string, unknown>): void {
@@ -1443,6 +1768,7 @@ export class ScionChatMessage extends LitElement {
       void this.renderContent();
     }
     if (changed.has('renderedHtml')) {
+      this.wrapTables();
       this.injectCopyButtons();
       this.injectSyntaxHighlighting();
       this.injectDiffBlocks();
@@ -1512,8 +1838,28 @@ export class ScionChatMessage extends LitElement {
     this.previews = next;
   }
 
+  /** Give each rendered markdown table its own sideways scroller. */
+  private wrapTables(): void {
+    this.shadowRoot?.querySelectorAll('.md-content table').forEach((table) => {
+      if (table.parentElement?.classList.contains('md-table-scroll')) return;
+      const wrapper = document.createElement('div');
+      wrapper.className = 'md-table-scroll';
+      // A keyboard user must be able to reach and scroll a wide table, and
+      // the scrolling region needs a name. Always focusable: whether it
+      // overflows changes with the viewport (rotation, resizing).
+      wrapper.tabIndex = 0;
+      wrapper.setAttribute('role', 'region');
+      const caption = table.querySelector('caption')?.textContent?.trim();
+      wrapper.setAttribute('aria-label', caption || 'Table');
+      table.replaceWith(wrapper);
+      wrapper.appendChild(table);
+    });
+  }
+
   /** Inject copy buttons on all code blocks inside rendered markdown. */
   private injectCopyButtons(): void {
+    /** A copy button that carries the timer that resets its label. */
+    type CopyButton = HTMLButtonElement & { _copyTimer?: ReturnType<typeof setTimeout> };
     this.shadowRoot?.querySelectorAll('.md-content pre').forEach((pre) => {
       if (pre.querySelector('.copy-btn')) return;
       const btn = document.createElement('button');
@@ -1523,9 +1869,9 @@ export class ScionChatMessage extends LitElement {
         const code = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
         void navigator.clipboard.writeText(code);
         btn.textContent = 'Copied!';
-        const prev = (btn as any)._copyTimer as ReturnType<typeof setTimeout> | undefined;
+        const prev = (btn as CopyButton)._copyTimer;
         if (prev) clearTimeout(prev);
-        (btn as any)._copyTimer = setTimeout(() => {
+        (btn as CopyButton)._copyTimer = setTimeout(() => {
           if (!this.isConnected) return;
           btn.textContent = 'Copy';
         }, 1500);
@@ -1565,7 +1911,7 @@ export class ScionChatMessage extends LitElement {
       pre.setAttribute('data-highlighted', 'true');
 
       // Create a readonly code editor and replace the <pre> in-place.
-      const editor = document.createElement('scion-code-editor') as import('../code-editor.js').ScionCodeEditor;
+      const editor = document.createElement('scion-code-editor');
       editor.content = content;
       editor.language = language;
       editor.readonly = true;
@@ -1593,7 +1939,8 @@ export class ScionChatMessage extends LitElement {
       // Heuristic: require a ---/+++ header pair or @@ hunk headers to
       // avoid false-positives on YAML lists, markdown checklists, and
       // code with @ decorators.
-      const hasHeaders = lines.some((l) => l.startsWith('--- ')) && lines.some((l) => l.startsWith('+++ '));
+      const hasHeaders =
+        lines.some((l) => l.startsWith('--- ')) && lines.some((l) => l.startsWith('+++ '));
       const hasHunks = lines.some((l) => l.startsWith('@@ '));
       const diffLineCount = lines.filter((l) => /^[-+@]/.test(l)).length;
       const looksLikeDiff = hasHeaders || (hasHunks && diffLineCount >= 3);
@@ -1686,9 +2033,8 @@ export class ScionChatMessage extends LitElement {
 
       // Heuristic: test output if it contains PASS/FAIL/ok lines that look
       // like Go test output or a generic "Tests:" summary line.
-      const testIndicators = lines.filter(
-        (l) =>
-          /^(ok\s|PASS|FAIL|--- PASS|--- FAIL|Tests:)/.test(l.trimStart())
+      const testIndicators = lines.filter((l) =>
+        /^(ok\s|PASS|FAIL|--- PASS|--- FAIL|Tests:)/.test(l.trimStart())
       ).length;
       if (testIndicators < 2) return;
 
@@ -1725,8 +2071,16 @@ export class ScionChatMessage extends LitElement {
       const renderer = await getMarkdownRenderer();
       if (taskId !== this.renderTaskId) return;
       let rendered = renderer.render(this.body);
+      if (isFeatureEnabled(ARTIFACTS_FLAG)) rendered = styleArtifactLinks(rendered);
       rendered = styleMentions(rendered);
-      rendered = styleEntityLinks(rendered);
+      // gs:// links are gated on the server-reported feature flag AND the
+      // message being agent-sent — a user-sent message never links, however
+      // the body happens to be spelled.
+      rendered = styleEntityLinks(
+        rendered,
+        this.senderIsAgent && isFeatureEnabled('web.gcs_links')
+      );
+      rendered = styleGithubRefs(rendered);
       this.renderedHtml = rendered;
     } catch {
       if (taskId !== this.renderTaskId) return;
@@ -1759,11 +2113,38 @@ export class ScionChatMessage extends LitElement {
   }
 
   /**
+   * A middle-click fires auxclick, not click: keep it from opening the
+   * artifact link's "#" href in a new tab. The preview opens on a plain
+   * click only.
+   */
+  private handleContentAuxClick(e: MouseEvent): void {
+    if ((e.target as HTMLElement | null)?.closest('.artifact-link[data-artifact-id]')) {
+      e.preventDefault();
+    }
+  }
+
+  /**
    * Unified click handler for .md-content: delegates to mention or path-link
    * handlers based on the click target.
    */
   private handleContentClick(e: MouseEvent): void {
-    // Check for path-link click first (more specific selector).
+    // Check for the more specific selectors first.
+    const artifactTarget = (e.target as HTMLElement | null)?.closest(
+      '.artifact-link[data-artifact-id]'
+    ) as HTMLElement | null;
+    if (artifactTarget) {
+      e.preventDefault();
+      e.stopPropagation();
+      const id = artifactTarget.dataset.artifactId ?? '';
+      const seq = Number(artifactTarget.dataset.artifactSeq ?? '0') || 0;
+      if (id) this.openArtifactPreview(id, seq);
+      return;
+    }
+    const gcsTarget = (e.target as HTMLElement | null)?.closest('.gcs-link[data-gcs-uri]');
+    if (gcsTarget) {
+      this.handleGcsLinkClick(e, gcsTarget as HTMLElement);
+      return;
+    }
     const pathTarget = (e.target as HTMLElement | null)?.closest('.path-link[data-file-path]');
     if (pathTarget) {
       this.handlePathLinkClick(e, pathTarget as HTMLElement);
@@ -1794,49 +2175,30 @@ export class ScionChatMessage extends LitElement {
     );
   }
 
-  // ---- Phase-3: Action bar and event helpers ----
+  /**
+   * Clicking a gs:// link parses `data-gcs-uri` and dispatches a composed
+   * `gcs-link-click` event carrying the bucket, object and this message's
+   * id. Unlike a path-link click, there is no project resolution and no
+   * chat-thread round-trip: chat-thread only ever assigns the event detail
+   * straight onto the preview target.
+   */
+  private handleGcsLinkClick(e: MouseEvent, target: HTMLElement): void {
+    e.preventDefault();
+    e.stopPropagation();
 
-  /** Render the hover action bar with contextual actions. */
-  private renderActionBar() {
-    const pinnedClass = this.actionBarPinned ? ' pinned' : '';
-    return html`
-      <div class="message-actions${pinnedClass}">
-        <sl-icon-button
-          name="reply"
-          label="Reply"
-          title="Reply"
-          @click=${this.handleReply}
-        ></sl-icon-button>
-        ${this.isOwn && this.canEdit
-          ? html`<sl-icon-button
-              name="pencil"
-              label="Edit"
-              title="Edit"
-              @click=${this.handleEdit}
-            ></sl-icon-button>`
-          : nothing}
-        ${this.isOwn && this.canDelete
-          ? html`<sl-icon-button
-              name="trash"
-              label="Delete"
-              title="Delete"
-              @click=${this.handleDelete}
-            ></sl-icon-button>`
-          : nothing}
-        <sl-icon-button
-          name="clipboard"
-          label="Copy text"
-          title="Copy message"
-          @click=${this.handleCopyText}
-        ></sl-icon-button>
-        <sl-icon-button
-          name="link-45deg"
-          label="Copy link"
-          title="Copy link"
-          @click=${this.handleCopyLink}
-        ></sl-icon-button>
-      </div>
-    `;
+    const uri = target.dataset.gcsUri;
+    if (!uri) return;
+    const parsed = parseGcsUri(uri);
+    if (!parsed) return;
+    const name = parsed.object.split('/').pop() || parsed.object;
+
+    this.dispatchEvent(
+      new CustomEvent('gcs-link-click', {
+        bubbles: true,
+        composed: true,
+        detail: { bucket: parsed.bucket, object: parsed.object, name, messageId: this.messageId },
+      })
+    );
   }
 
   /** Render the reply preview block above the bubble content. */
@@ -1851,59 +2213,6 @@ export class ScionChatMessage extends LitElement {
     `;
   }
 
-  private handleReply() {
-    this.dispatchEvent(
-      new CustomEvent('message-reply', {
-        bubbles: true,
-        composed: true,
-        detail: {
-          messageId: this.messageId,
-          senderName: this.senderName || this.sender,
-          content: this.body,
-        },
-      })
-    );
-  }
-
-  private handleEdit() {
-    this.dispatchEvent(
-      new CustomEvent('message-edit', {
-        bubbles: true,
-        composed: true,
-        detail: {
-          messageId: this.messageId,
-          content: this.body,
-        },
-      })
-    );
-  }
-
-  private handleDelete() {
-    this.dispatchEvent(
-      new CustomEvent('message-delete', {
-        bubbles: true,
-        composed: true,
-        detail: { messageId: this.messageId },
-      })
-    );
-  }
-
-  private handleCopyText() {
-    navigator.clipboard.writeText(this.body).catch(() => {
-      // Fallback: ignore clipboard failure silently.
-    });
-  }
-
-  private handleCopyLink() {
-    this.dispatchEvent(
-      new CustomEvent('message-copy-link', {
-        bubbles: true,
-        composed: true,
-        detail: { messageId: this.messageId },
-      })
-    );
-  }
-
   private handleScrollToMessage(messageId: string) {
     this.dispatchEvent(
       new CustomEvent('scroll-to-message', {
@@ -1914,44 +2223,13 @@ export class ScionChatMessage extends LitElement {
     );
   }
 
-  /** Touch handler for long-press to toggle action bar on mobile. */
-  private touchTimer: ReturnType<typeof setTimeout> | null = null;
-
-  private handleTouchStart() {
-    this.touchTimer = setTimeout(() => {
-      this.actionBarPinned = !this.actionBarPinned;
-    }, 500);
-
-    const clearTimer = () => {
-      if (this.touchTimer) {
-        clearTimeout(this.touchTimer);
-        this.touchTimer = null;
-      }
-      window.removeEventListener('touchend', clearTimer);
-      window.removeEventListener('touchmove', clearTimer);
-      window.removeEventListener('touchcancel', clearTimer);
-    };
-    window.addEventListener('touchend', clearTimer, { once: true });
-    window.addEventListener('touchmove', clearTimer, { once: true });
-    window.addEventListener('touchcancel', clearTimer, { once: true });
-  }
-
   override render() {
-    // Full/trace messages render as a collapsed details block.
-    if (this.visibility === 'full') {
-      return this.renderTraceBlock();
-    }
-
     const dirClass = this.fromAgent ? 'from-agent' : 'from-user';
-    const visClass = this.visibility === 'verbose' ? ' verbose' : '';
     const groupClass = !this.showHeader ? ' grouped' : '';
     const isDeleted = !!this.deletedAt;
 
     return html`
-      <div
-        class="message-wrapper ${dirClass}${visClass}${groupClass}"
-        @touchstart=${this.handleTouchStart}
-      >
+      <div class="message-wrapper ${dirClass}${groupClass}">
         ${this.showHeader && this.fromAgent
           ? html`<div class="avatar" style="background: ${this.getAvatarColor()}">
               ${this.getInitials()}
@@ -1960,23 +2238,17 @@ export class ScionChatMessage extends LitElement {
             ? html`<div class="avatar-spacer"></div>`
             : nothing}
         <div class="bubble">
-          ${!isDeleted ? this.renderActionBar() : nothing}
-          ${this.visibility === 'verbose'
-            ? html`
-                <span class="verbose-label">
-                  <sl-icon name="arrow-return-right"></sl-icon>
-                  assistant reply
-                </span>
-              `
-            : nothing}
-          ${this.showHeader && this.fromAgent && this.visibility !== 'verbose'
+          ${this.showHeader && this.fromAgent
             ? html`
                 <div class="bubble-header">
                   <span class="sender-name">${this.senderName || this.sender}</span>
+                  ${this.senderProjectSlug
+                    ? html`<span class="cross-project-label">${this.senderProjectSlug}</span>`
+                    : nothing}
                   ${this.routedTo
                     ? html`<span class="routed-to"> &rarr; ${this.routedTo}</span>`
                     : nothing}
-                  <span class="msg-time">${this.formatTime()}</span>
+                  <span class="msg-time" title=${this.formatTimeTitle()}>${this.formatTime()}</span>
                   ${this.editedAt ? html`<span class="edited-label">(edited)</span>` : nothing}
                 </div>
               `
@@ -1985,37 +2257,28 @@ export class ScionChatMessage extends LitElement {
             ? html`
                 <div class="bubble-header">
                   <span class="sender-name">${this.senderName || this.sender}</span>
+                  ${this.senderProjectSlug
+                    ? html`<span class="cross-project-label">${this.senderProjectSlug}</span>`
+                    : nothing}
                   <span class="routed-to"> &rarr; ${this.routedTo}</span>
-                  <span class="msg-time">${this.formatTime()}</span>
+                  <span class="msg-time" title=${this.formatTimeTitle()}>${this.formatTime()}</span>
                   ${this.editedAt ? html`<span class="edited-label">(edited)</span>` : nothing}
                 </div>
               `
             : nothing}
           ${this.replyPreview ? this.renderReplyPreview() : nothing}
           ${isDeleted
-            ? html`<div class="bubble-content"><span class="deleted-message">This message was deleted</span></div>`
+            ? html`<div class="bubble-content">
+                <span class="deleted-message">This message was deleted</span>
+              </div>`
             : html`<div class="bubble-content">${this.renderBody()}</div>`}
-          ${isDeleted ? nothing : this.renderDeliveryState()}
-          ${isDeleted ? nothing : this.renderBadges()}
           ${isDeleted ? nothing : this.renderAttachments()}
+          ${isDeleted ? nothing : this.renderArtifactChips()}
+          ${isDeleted ? nothing : this.renderBadges()}
+          ${isDeleted ? nothing : this.renderDeliveryState()}
         </div>
       </div>
       ${this.renderFullPreview()}
-    `;
-  }
-
-  /** Render a collapsed trace block for full-visibility messages. */
-  private renderTraceBlock() {
-    return html`
-      <div class="trace-block">
-        <details>
-          <summary>
-            <sl-icon name="code-slash"></sl-icon>
-            Trace — ${this.sender} at ${this.formatTime()}
-          </summary>
-          <div class="trace-content">${this.body}</div>
-        </details>
-      </div>
     `;
   }
 
@@ -2032,7 +2295,20 @@ export class ScionChatMessage extends LitElement {
             Sending
           </div>
         `;
+      case 'waking':
+        // Client-only state (chat-wake.ts): the user chose "Wake and send"
+        // and the hub is resuming the suspended agent before delivery.
+        return html`
+          <div class="delivery-state pending waking">
+            <sl-icon name="hourglass-split"></sl-icon>
+            Waking agent…
+          </div>
+        `;
       case 'dispatched':
+        // ptone/scion#4480: "dispatched" means the hub handed the message
+        // to the agent's runtime, which buffered it. It is not confirmation
+        // the agent read it, so it says "Accepted"; "Seen" needs the read
+        // watermark.
         return this.seen
           ? html`
               <div class="delivery-state seen">
@@ -2043,18 +2319,55 @@ export class ScionChatMessage extends LitElement {
           : html`
               <div class="delivery-state dispatched">
                 <sl-icon name="check2"></sl-icon>
-                Delivered
+                Accepted
               </div>
             `;
-      case 'failed':
+      case 'deferred':
+        // F5 (p2a-r2 review): design agent-reincarnate §3.7 — the
+        // recipient is mid-`scion reincarnate`. The message was saved to
+        // history for catch-up, not dropped and not yet dispatched.
+        // Distinct from "failed" (no icon/wording overlap) and from
+        // "pending" (that's a normal in-flight send, this is a deliberate
+        // hold).
+        return html`
+          <sl-tooltip
+            content="Agent is reincarnating; message saved and will be seen on catch-up"
+            hoist
+          >
+            <div class="delivery-state deferred">
+              <sl-icon name="pause-circle"></sl-icon>
+              Deferred: agent is reincarnating (saved)
+            </div>
+          </sl-tooltip>
+        `;
+      case 'no_recipient':
+        // A thread message that resolved no agent recipient: it was saved
+        // to the thread, but no agent was given it.
+        return html`
+          <sl-tooltip content="Mention an agent to send it to that agent" hoist>
+            <div class="delivery-state no-recipient">
+              <sl-icon name="info-circle"></sl-icon>
+              Not delivered to any agent, mention an agent to send it
+            </div>
+          </sl-tooltip>
+        `;
+      case 'failed': {
+        // nc-delivery-unreachable: distinguish "the agent can't receive this
+        // at all" from a generic dispatch failure. Prefer the machine-readable
+        // code; history rows sent before that field existed fall back to
+        // matching the reason prefix.
+        const isUnreachable =
+          this.dispatchFailureCode === 'agent_unreachable' ||
+          (!this.dispatchFailureCode && this.dispatchFailureReason.startsWith('Agent unreachable'));
         return html`
           <sl-tooltip content=${this.dispatchFailureReason || 'Delivery failed'} hoist>
             <div class="delivery-state failed">
               <sl-icon name="exclamation-triangle"></sl-icon>
-              Failed
+              ${isUnreachable ? 'Agent unreachable' : 'Failed'}
             </div>
           </sl-tooltip>
         `;
+      }
       default:
         return nothing;
     }
@@ -2067,6 +2380,7 @@ export class ScionChatMessage extends LitElement {
     return html`<div
       class="md-content"
       @click=${this.handleContentClick}
+      @auxclick=${(e: MouseEvent) => this.handleContentAuxClick(e)}
       .innerHTML=${this.renderedHtml}
     ></div>`;
   }
@@ -2140,6 +2454,7 @@ export class ScionChatMessage extends LitElement {
                         src=${attachmentURL(img.id)}
                         alt=${img.name}
                         loading="lazy"
+                        style=${styleMap(imageThumbStyle(knownImageSize(img)))}
                       />
                     </button>
                     <div class="image-actions">
@@ -2301,8 +2616,12 @@ export class ScionChatMessage extends LitElement {
     return html`<scion-markdown-preview .content=${state.text ?? ''}></scion-markdown-preview>`;
   }
 
-  /** Editor, spinner or error for one preview, depending on load state. */
-  private renderPreviewBody(ref: AttachmentRefInfo, state: PreviewState | undefined, full = false) {
+  /**
+   * Editor, spinner or error for the collapsed inline slice, clipped to the
+   * first lines — the full-height overlay now lives in the extracted
+   * `<scion-chat-file-preview>`, which fetches its own untruncated content.
+   */
+  private renderPreviewBody(ref: AttachmentRefInfo, state: PreviewState | undefined) {
     if (!state || state.status === 'loading') {
       return html`
         <div class="preview-placeholder">
@@ -2317,87 +2636,104 @@ export class ScionChatMessage extends LitElement {
     const text = state.text ?? '';
     return html`
       <scion-code-editor
-        .content=${full ? text : firstLines(text, PREVIEW_MAX_LINES)}
+        .content=${firstLines(text, PREVIEW_MAX_LINES)}
         language=${getLanguageFromPath(ref.name)}
         readonly
       ></scion-code-editor>
     `;
   }
 
-  /** Full-height overlay for the expanded attachment, when one is open. */
+  /**
+   * Full-height overlay for the expanded attachment, when one is open.
+   * Loading/error/markdown-toggle/copy/download state all live inside the
+   * reusable <scion-chat-file-preview>; this component only owns which
+   * attachment is open.
+   */
   private renderFullPreview() {
-    const ref = this.expanded;
-    if (!ref) return nothing;
-
-    const isMd = isMarkdownFile(ref.name);
-    const showSource = isMd && (this.mdSourceView.get(ref.id) ?? false);
-    const state = this.previews.get(ref.id);
-
+    const target = this.expandedTarget;
+    if (!target) return nothing;
     return html`
-      <sl-dialog
-        class="full-preview"
-        open
-        label=${ref.name}
-        @sl-after-hide=${(e: Event) => {
-          if (e.target === e.currentTarget) this.expanded = null;
+      <scion-chat-file-preview
+        .target=${target}
+        .currentUserId=${this.currentUserId}
+        @chat-file-preview-close=${() => {
+          this.expandedTarget = null;
         }}
-      >
-        ${IMAGE_MIMES.has(ref.mime)
-          ? html`<img class="full-image" src=${attachmentURL(ref.id)} alt=${ref.name} />`
-          : isMd && !showSource
-            ? this.renderMdPreviewBody(ref, state)
-            : this.renderPreviewBody(ref, state, true)}
-        <div slot="footer" style="display:flex;gap:0.5rem;align-items:center">
-          ${isMd
-            ? html`
-                <sl-button size="small" @click=${() => this.toggleMdSource(ref.id)}>
-                  <sl-icon slot="prefix" name=${showSource ? 'eye' : 'code'}></sl-icon>
-                  ${showSource ? 'Preview' : 'Source'}
-                </sl-button>
-              `
-            : nothing}
-          ${isMd && showSource
-            ? html`
-                <sl-button size="small" @click=${() => this.copyAttachmentText(ref.id)}>
-                  <sl-icon
-                    slot="prefix"
-                    name=${this.copiedIds.has(ref.id) ? 'check2' : 'clipboard'}
-                  ></sl-icon>
-                  ${this.copiedIds.has(ref.id) ? 'Copied!' : 'Copy'}
-                </sl-button>
-              `
-            : nothing}
-          <sl-button href=${attachmentURL(ref.id)} download=${ref.name}>
-            <sl-icon slot="prefix" name="download"></sl-icon>
-            Download
-          </sl-button>
-        </div>
-      </sl-dialog>
+      ></scion-chat-file-preview>
     `;
   }
 
-  /** Open the overlay, fetching the content if the slice has not yet. */
+  /**
+   * Artifact chips, in the order their references appear in the message
+   * text; references attached without appearing in the text follow, in the
+   * order the hub returned them (artifact id order for history). A readable
+   * artifact shows title · vN · owner; any other shows only "Artifact
+   * unavailable", and still opens the preview, which explains it.
+   */
+  private renderArtifactChips() {
+    if (!this.artifactRefs || this.artifactRefs.length === 0) return nothing;
+    if (!isFeatureEnabled(ARTIFACTS_FLAG)) return nothing;
+    const refs = orderArtifactRefs(this.artifactRefs, this.body ?? '');
+    return html`
+      <div class="artifact-chips">
+        ${refs.map((r) =>
+          r.available
+            ? html`<button
+                type="button"
+                class="artifact-chip"
+                title=${r.ref}
+                @click=${() => this.openArtifactPreview(r.id, r.seq ?? 0, r.title)}
+              >
+                <sl-icon name="file-earmark-richtext"></sl-icon>
+                <span class="artifact-title">${r.title}</span>
+                <span class="artifact-meta"
+                  >· v${r.version}${r.ownerName ? html` · ${r.ownerName}` : nothing}</span
+                >
+              </button>`
+            : html`<button
+                type="button"
+                class="artifact-chip unavailable"
+                @click=${() => this.openArtifactPreview(r.id, r.seq ?? 0)}
+              >
+                <sl-icon name="lock"></sl-icon>
+                <span>Artifact unavailable</span>
+              </button>`
+        )}
+      </div>
+    `;
+  }
+
+  /** Open the in-place preview of an artifact (D23); it loads under the viewer's own access. */
+  private openArtifactPreview(id: string, seq: number, title?: string): void {
+    this.expandedTarget = { kind: 'artifact', id, seq, name: title || 'Artifact' };
+  }
+
+  /** Open the overlay for an attachment; the preview component fetches its own content. */
   private openFullPreview(ref: AttachmentRefInfo): void {
-    this.expanded = ref;
-    // An image is shown by the browser straight from its URL; only text
-    // previews need the body pulled down.
-    if (!IMAGE_MIMES.has(ref.mime)) {
-      void this.loadPreview(ref.id);
-    }
+    this.expandedTarget = {
+      kind: 'attachment',
+      id: ref.id,
+      name: ref.name,
+      mime: ref.mime,
+      size: ref.size,
+    };
   }
 
   private formatTime(): string {
     if (!this.timestamp) return '';
-    try {
-      const d = new Date(this.timestamp);
-      return d.toLocaleTimeString('en', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-    } catch {
-      return '';
-    }
+    const formatted = formatInstant(this.timestamp, 'time');
+    return formatted || 'Invalid Date';
+  }
+
+  /**
+   * Full instant plus zone label for the `.msg-time` tooltip (review R1-3,
+   * AC4: "sees native chat timestamps in Tokyo time, with a zone label").
+   * Low-noise: surfaced as a `title`, not inline text, since every message
+   * in a thread shares the same effective zone.
+   */
+  private formatTimeTitle(): string {
+    if (!this.timestamp) return '';
+    return formatInstantWithZone(this.timestamp);
   }
 
   /** Deterministic colour from the sender ID (preferred) or slug/name fallback. */

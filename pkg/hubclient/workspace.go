@@ -82,6 +82,10 @@ type SyncToFinalizeResponse struct {
 	FilesApplied int `json:"filesApplied"`
 	// BytesTransferred is the total bytes transferred.
 	BytesTransferred int64 `json:"bytesTransferred"`
+	// Warnings lists non-fatal issues, e.g. uploaded files ignored because
+	// the project gives each agent an empty workspace directory
+	// (api.WarningEmptyPerAgentWorkspaceFilesIgnored).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // WorkspaceStatusResponse is the response from getting workspace status.
@@ -126,7 +130,7 @@ func (s *workspaceService) SyncFrom(ctx context.Context, agentID string, opts *S
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SyncFromResponse](resp)
+	return apiclient.DecodeRequired[SyncFromResponse](resp)
 }
 
 // SyncTo initiates upload of workspace to an agent.
@@ -141,7 +145,7 @@ func (s *workspaceService) SyncTo(ctx context.Context, agentID string, files []t
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SyncToResponse](resp)
+	return apiclient.DecodeRequired[SyncToResponse](resp)
 }
 
 // FinalizeSyncTo completes the sync-to operation after files are uploaded.
@@ -156,6 +160,7 @@ func (s *workspaceService) FinalizeSyncTo(ctx context.Context, agentID string, m
 	if err != nil {
 		return nil, err
 	}
+	// No body is valid here: callers treat a missing finalize body as empty.
 	return apiclient.DecodeResponse[SyncToFinalizeResponse](resp)
 }
 
@@ -165,7 +170,7 @@ func (s *workspaceService) GetStatus(ctx context.Context, agentID string) (*Work
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[WorkspaceStatusResponse](resp)
+	return apiclient.DecodeRequired[WorkspaceStatusResponse](resp)
 }
 
 // getTransferClient returns the transfer client, creating one if necessary.

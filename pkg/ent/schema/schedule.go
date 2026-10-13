@@ -35,6 +35,25 @@ type Schedule struct {
 	ent.Schema
 }
 
+// Mixin of the Schedule. InitiatorAttributionMixin is shared verbatim with
+// ScheduledEvent (E.2b) so the two schemas expose an identical attribution
+// column set.
+//
+// EffectCeilingMixin with the "authority_" prefix holds the frozen effect
+// ceiling of the authorization revision (store.EffectCeiling). It is written
+// together with the attribution and revision, and its zero value is
+// unrecorded.
+//
+// FixtureProvenanceMixin holds the creation-time test-identity provenance
+// stamp (fixture_root_id, fixture_issuer_id).
+func (Schedule) Mixin() []ent.Mixin {
+	return []ent.Mixin{
+		InitiatorAttributionMixin{},
+		EffectCeilingMixin{Prefix: "authority_"},
+		FixtureProvenanceMixin{},
+	}
+}
+
 // Fields of the Schedule.
 func (Schedule) Fields() []ent.Field {
 	return []ent.Field{
@@ -89,6 +108,6 @@ func (Schedule) Indexes() []ent.Index {
 // Annotations of the Schedule.
 func (Schedule) Annotations() []schema.Annotation {
 	return []schema.Annotation{
-		entsql.Annotation{Table: "schedules"},
+		entsql.Annotation{Table: "schedules", Checks: fixtureStampCheck("schedules")},
 	}
 }

@@ -1,0 +1,15 @@
+{
+  "auth_candidates": {
+    "schema_version": 1,
+    "explicit_type": "api-key",
+    "env_vars": [],
+    "env_secret_files": {},
+    "file_secret_files": {},
+    "files": []
+  },
+  "harness_config": {
+    "no_auth": {
+      "behavior": "allow"
+    }
+  }
+}

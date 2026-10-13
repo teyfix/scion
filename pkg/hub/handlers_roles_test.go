@@ -17,7 +17,6 @@
 package hub
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,19 +31,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// seedRolesTestUser creates a user in the store if it does not already exist.
-// The store requires user principals to exist before role bindings can reference them.
-func seedRolesTestUser(t *testing.T, s store.Store, id, email string) {
-	t.Helper()
-	ctx := context.Background()
-	if _, err := s.GetUser(ctx, id); err == nil {
-		return // already exists
-	}
-	require.NoError(t, s.CreateUser(ctx, &store.User{
-		ID: id, Email: email, DisplayName: email, Role: "member", Status: "active",
-	}))
-}
 
 // seedRolesTestAgent creates an agent in the store with a minimal project,
 // so role bindings referencing agent principals pass existence validation.
@@ -68,26 +54,6 @@ func seedRolesTestAgent(t *testing.T, s store.Store, agentID, projectID string) 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// createRoleViaAPI creates a role definition through the handler and returns it.
-func createRoleViaAPI(t *testing.T, srv *Server, req createRoleDefinitionRequest) *store.RoleDefinition {
-	t.Helper()
-	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/roles", req)
-	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
-	var def store.RoleDefinition
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&def))
-	return &def
-}
-
-// createBindingViaAPI creates a role binding through the handler and returns it.
-func createBindingViaAPI(t *testing.T, srv *Server, req createRoleBindingRequest) *store.RoleBinding {
-	t.Helper()
-	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/role-bindings", req)
-	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
-	var rb store.RoleBinding
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&rb))
-	return &rb
-}
 
 // ---------------------------------------------------------------------------
 // Tests: Role Definition CRUD
@@ -387,7 +353,7 @@ func TestRolesAPI_CreateRoleBinding_ProjectScopeMissingScopeID(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/role-bindings", createRoleBindingRequest{
 		RoleDefinitionID: role.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "u1",
+		PrincipalID:      "00000000-0000-0000-0000-0000000000a1",
 		ScopeType:        "project",
 		ScopeID:          "",
 	})
@@ -401,10 +367,11 @@ func TestRolesAPI_CreateRoleBinding_InvalidScopeType(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/role-bindings", createRoleBindingRequest{
 		RoleDefinitionID: "some-id",
 		PrincipalType:    "user",
-		PrincipalID:      "u1",
+		PrincipalID:      "00000000-0000-0000-0000-0000000000a1",
 		ScopeType:        "invalid",
 	})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "scopeType must be")
 }
 
 func TestRolesAPI_CreateRoleBinding_SuperAdmin_Blocked(t *testing.T) {
@@ -418,7 +385,7 @@ func TestRolesAPI_CreateRoleBinding_SuperAdmin_Blocked(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/role-bindings", createRoleBindingRequest{
 		RoleDefinitionID: rd.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "some-user",
+		PrincipalID:      "00000000-0000-0000-0000-0000000000a1",
 		ScopeType:        "system",
 	})
 	assert.Equal(t, http.StatusForbidden, rec.Code)
@@ -532,8 +499,23 @@ func TestRolesAPI_MethodNotAllowed_Bindings(t *testing.T) {
 
 // setupSortBindings creates three bindings with distinct principals, roles, and
 // scopes to exercise every sort axis.  It returns them keyed by a short label.
-func setupSortBindings(t *testing.T, srv *Server) map[string]*store.RoleBinding {
+func setupSortBindings(t *testing.T, srv *Server, s store.Store) map[string]*store.RoleBinding {
 	t.Helper()
+
+	// Create real user entities so principal ID validation passes.
+	aliceID := tid("sort-alice")
+	bobID := tid("sort-bob")
+	charlieID := tid("sort-charlie")
+	seedRolesTestUser(t, s, aliceID, "sort-alice@test.local")
+	seedRolesTestUser(t, s, bobID, "sort-bob@test.local")
+	seedRolesTestUser(t, s, charlieID, "sort-charlie@test.local")
+
+	// Create a real project for the project-scoped binding.
+	projID := tid("sort-proj-1")
+	err := s.CreateProject(t.Context(), &store.Project{
+		ID: projID, Name: "sort-proj-1", Slug: "sort-proj-1",
+	})
+	require.NoError(t, err)
 
 	roleA := createRoleViaAPI(t, srv, createRoleDefinitionRequest{
 		Name:        "sort-alpha-role",
@@ -554,21 +536,21 @@ func setupSortBindings(t *testing.T, srv *Server) map[string]*store.RoleBinding 
 	b1 := createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: roleA.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "alice",
+		PrincipalID:      aliceID,
 		ScopeType:        "system",
 	})
 	b2 := createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: roleB.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "bob",
+		PrincipalID:      bobID,
 		ScopeType:        "system",
 	})
 	b3 := createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: roleC.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "charlie",
+		PrincipalID:      charlieID,
 		ScopeType:        "project",
-		ScopeID:          "proj-1",
+		ScopeID:          projID,
 	})
 
 	return map[string]*store.RoleBinding{
@@ -579,8 +561,8 @@ func setupSortBindings(t *testing.T, srv *Server) map[string]*store.RoleBinding 
 }
 
 func TestRolesAPI_ListRoleBindings_SortByPrincipalAsc(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	rec := doRequest(t, srv, http.MethodGet,
 		"/api/v1/admin/role-bindings?sort_by=principal&sort_order=asc&limit=100", nil)
@@ -605,8 +587,8 @@ func TestRolesAPI_ListRoleBindings_SortByPrincipalAsc(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SortByPrincipalDesc(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	rec := doRequest(t, srv, http.MethodGet,
 		"/api/v1/admin/role-bindings?sort_by=principal&sort_order=desc&limit=100", nil)
@@ -629,8 +611,8 @@ func TestRolesAPI_ListRoleBindings_SortByPrincipalDesc(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SortByCreatedAsc(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	rec := doRequest(t, srv, http.MethodGet,
 		"/api/v1/admin/role-bindings?sort_by=created&sort_order=asc&limit=100", nil)
@@ -654,8 +636,8 @@ func TestRolesAPI_ListRoleBindings_SortByCreatedAsc(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SortByCreatedDesc(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	rec := doRequest(t, srv, http.MethodGet,
 		"/api/v1/admin/role-bindings?sort_by=created&sort_order=desc&limit=100", nil)
@@ -678,8 +660,8 @@ func TestRolesAPI_ListRoleBindings_SortByCreatedDesc(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SortByRole(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	rec := doRequest(t, srv, http.MethodGet,
 		"/api/v1/admin/role-bindings?sort_by=role&sort_order=asc&limit=100", nil)
@@ -726,7 +708,16 @@ func TestRolesAPI_ListRoleBindings_SortByRole(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SecondaryScopeOrdering(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+
+	// Create a real user and project so principal/scope validation passes.
+	scopeUserID := tid("scope-user")
+	seedRolesTestUser(t, s, scopeUserID, "scope-user@test.local")
+	projScopeID := tid("proj-scope-1")
+	err := s.CreateProject(t.Context(), &store.Project{
+		ID: projScopeID, Name: "proj-scope-1", Slug: "proj-scope-1",
+	})
+	require.NoError(t, err)
 
 	// Create two bindings with the same principal but different scopes.
 	role := createRoleViaAPI(t, srv, createRoleDefinitionRequest{
@@ -738,9 +729,9 @@ func TestRolesAPI_ListRoleBindings_SecondaryScopeOrdering(t *testing.T) {
 	bProj := createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: role.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "scope-user",
+		PrincipalID:      scopeUserID,
 		ScopeType:        "project",
-		ScopeID:          "proj-scope-1",
+		ScopeID:          projScopeID,
 	})
 
 	roleSys := createRoleViaAPI(t, srv, createRoleDefinitionRequest{
@@ -751,7 +742,7 @@ func TestRolesAPI_ListRoleBindings_SecondaryScopeOrdering(t *testing.T) {
 	bSys := createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: roleSys.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "scope-user",
+		PrincipalID:      scopeUserID,
 		ScopeType:        "system",
 	})
 
@@ -780,7 +771,13 @@ func TestRolesAPI_ListRoleBindings_SecondaryScopeOrdering(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_SortBeforePagination(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+
+	// Create real user entities so principal ID validation passes.
+	pageUserBID := tid("page-user-b")
+	pageUserAID := tid("page-user-a")
+	seedRolesTestUser(t, s, pageUserBID, "page-user-b@test.local")
+	seedRolesTestUser(t, s, pageUserAID, "page-user-a@test.local")
 
 	// Create enough bindings to span two pages (page size = 1).
 	role := createRoleViaAPI(t, srv, createRoleDefinitionRequest{
@@ -792,13 +789,13 @@ func TestRolesAPI_ListRoleBindings_SortBeforePagination(t *testing.T) {
 	createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: role.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "page-user-b",
+		PrincipalID:      pageUserBID,
 		ScopeType:        "system",
 	})
 	createBindingViaAPI(t, srv, createRoleBindingRequest{
 		RoleDefinitionID: role.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "page-user-a",
+		PrincipalID:      pageUserAID,
 		ScopeType:        "system",
 	})
 
@@ -841,8 +838,8 @@ func TestRolesAPI_ListRoleBindings_InvalidSortOrder(t *testing.T) {
 }
 
 func TestRolesAPI_ListRoleBindings_DefaultSortIsCreatedDesc(t *testing.T) {
-	srv, _ := testServer(t)
-	bindings := setupSortBindings(t, srv)
+	srv, s := testServer(t)
+	bindings := setupSortBindings(t, srv, s)
 
 	// No sort params: should default to created desc.
 	rec := doRequest(t, srv, http.MethodGet,
@@ -1176,7 +1173,7 @@ func TestRolesAPI_CreateRoleBinding_ProjectScope_UnknownSlug(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/role-bindings", createRoleBindingRequest{
 		RoleDefinitionID: role.ID,
 		PrincipalType:    "user",
-		PrincipalID:      "some-user",
+		PrincipalID:      "00000000-0000-0000-0000-0000000000a1",
 		ScopeType:        "project",
 		ScopeID:          "nonexistent-project-slug",
 	})
@@ -1270,79 +1267,6 @@ func TestRolesAPI_UpdateRoleDefinition_InvalidPermissions(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Helpers: Non-admin identity
 // ---------------------------------------------------------------------------
-
-const (
-	nonAdminUserID    = "11111111-1111-1111-1111-111111111111"
-	nonAdminUserEmail = "scoped-admin@test.local"
-)
-
-// doRequestAsIdentity performs an HTTP request with a custom identity injected
-// into the context. This bypasses the dev-auth super-admin fast-path by using
-// an AuthenticatedUser whose Role() != "admin", so that CanDelegate and
-// permission-based route guards are actually exercised.
-func doRequestAsIdentity(t *testing.T, srv *Server, identity Identity, method, path string, body interface{}) *httptest.ResponseRecorder {
-	t.Helper()
-	var bodyBytes []byte
-	if body != nil {
-		var err error
-		bodyBytes, err = json.Marshal(body)
-		if err != nil {
-			t.Fatalf("failed to marshal body: %v", err)
-		}
-	}
-
-	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	// Inject the custom identity directly into the context so the route
-	// guard and handler see a non-admin user instead of the DevUser.
-	ctx := contextWithIdentity(req.Context(), identity)
-	req = req.WithContext(ctx)
-
-	// Serve using the mux directly (bypassing auth middleware) since the
-	// identity is already in the context. The route guards and handlers
-	// call GetIdentityFromContext, which will find our injected identity.
-	rec := httptest.NewRecorder()
-	srv.mux.ServeHTTP(rec, req)
-	return rec
-}
-
-// setupNonAdminUser creates a non-admin user identity and grants it specific
-// permissions via a custom role binding. Returns the identity.
-//
-// The user gets a role binding granting the specified permissions at system scope.
-func setupNonAdminUser(t *testing.T, st store.Store, perms []string) *AuthenticatedUser {
-	t.Helper()
-	ctx := t.Context()
-
-	// Ensure the user exists in the store (CreateRoleBinding validates principal existence).
-	seedRolesTestUser(t, st, nonAdminUserID, nonAdminUserEmail)
-
-	user := NewAuthenticatedUser(nonAdminUserID, nonAdminUserEmail, "Scoped Admin", "member", "api")
-
-	// Create a custom role definition with the requested permissions.
-	rd, err := st.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name:        "test-scoped-admin-" + t.Name(),
-		Description: "Test scoped admin role",
-		ScopeType:   store.RoleScopeSystem,
-		Permissions: perms,
-		System:      false,
-	})
-	require.NoError(t, err)
-
-	// Bind it to our test user.
-	_, err = st.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      nonAdminUserID,
-		ScopeType:        store.RoleScopeSystem,
-		CreatedBy:        "test-setup",
-	})
-	require.NoError(t, err)
-
-	return user
-}
 
 // ---------------------------------------------------------------------------
 // Tests: Non-admin CanDelegate enforcement
@@ -2339,29 +2263,6 @@ func TestGenericDeleteBinding_NonSuperAdmin_StillWorks(t *testing.T) {
 // ---------------------------------------------------------------------------
 // R6: Credential boundary on generic DELETE super-admin bindings
 // ---------------------------------------------------------------------------
-
-// doDeleteBindingWithCredentialKind creates a request to the generic DELETE
-// role-bindings endpoint with a specific credential kind injected directly
-// into the context, bypassing the auth middleware.
-func doDeleteBindingWithCredentialKind(
-	t *testing.T, srv *Server, user *store.User,
-	credKind CredentialKind, bindingID string,
-) *httptest.ResponseRecorder {
-	t.Helper()
-
-	path := "/api/v1/admin/role-bindings/" + bindingID
-	req := httptest.NewRequest(http.MethodDelete, path, nil)
-
-	ctx := req.Context()
-	identity := NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "web")
-	ctx = contextWithIdentity(ctx, identity)
-	ctx = contextWithCredentialContext(ctx, CredentialContext{Kind: credKind})
-	req = req.WithContext(ctx)
-
-	rec := httptest.NewRecorder()
-	srv.handleAdminRoleBindingByID(rec, req)
-	return rec
-}
 
 // TestGenericDeleteBinding_SuperAdmin_BrokerDenied verifies that broker
 // credentials cannot delete super-admin bindings via the generic endpoint.
@@ -3403,4 +3304,98 @@ func TestSanitizeFilename(t *testing.T) {
 			assert.NotContains(t, got, "\\")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: reserved permissions are rejected in custom roles
+// ---------------------------------------------------------------------------
+
+// reservedTestPermission returns a Reserved registry permission ID, failing
+// the test if the registry has none.
+func reservedTestPermission(t *testing.T) string {
+	t.Helper()
+	ids := permissions.ReservedIDs()
+	if len(ids) == 0 {
+		t.Fatal("the permission registry has no Reserved row")
+	}
+	return ids[0]
+}
+
+func TestRolesAPI_CreateRoleDefinition_RejectsReservedPermission(t *testing.T) {
+	srv, _ := testServer(t)
+	reserved := reservedTestPermission(t)
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/roles", createRoleDefinitionRequest{
+		Name:        "reserved-create",
+		ScopeType:   "project",
+		Permissions: []string{"agent.read", reserved},
+	})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "permission "+reserved+" is reserved: nothing checks it yet")
+}
+
+func TestRolesAPI_UpdateRoleDefinition_RejectsReservedPermission(t *testing.T) {
+	srv, _ := testServer(t)
+	reserved := reservedTestPermission(t)
+
+	created := createRoleViaAPI(t, srv, createRoleDefinitionRequest{
+		Name:        "reserved-update",
+		ScopeType:   "project",
+		Permissions: []string{"agent.read"},
+	})
+	rec := doRequest(t, srv, http.MethodPut, "/api/v1/admin/roles/"+created.ID, updateRoleDefinitionRequest{
+		Name:        "reserved-update",
+		Permissions: []string{"agent.read", reserved},
+	})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "permission "+reserved+" is reserved")
+}
+
+// TestRolesAPI_DuplicateRoleDefinition_RejectsReservedPermission: a custom
+// role stored before its permission was reserved cannot be copied.
+func TestRolesAPI_DuplicateRoleDefinition_RejectsReservedPermission(t *testing.T) {
+	srv, s := testServer(t)
+	reserved := reservedTestPermission(t)
+
+	source, err := s.CreateRoleDefinition(context.Background(), &store.RoleDefinition{
+		Name: "reserved-dup-source", ScopeType: store.RoleScopeProject, Permissions: []string{"agent.read", reserved},
+	})
+	require.NoError(t, err)
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/roles/"+source.ID+"/duplicate", duplicateRoleDefinitionRequest{
+		Name: "reserved-dup-target",
+	})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "permission "+reserved+" is reserved")
+}
+
+func TestRolesAPI_ImportRoles_RejectsReservedPermission(t *testing.T) {
+	srv, _ := testServer(t)
+	reserved := reservedTestPermission(t)
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/admin/roles/import", roleImportRequest{
+		Version: "1",
+		Roles: []exportedRole{
+			{Name: "reserved-import", ScopeType: "project", Permissions: []string{"agent.read", reserved}},
+			{Name: "plain-import", ScopeType: "project", Permissions: []string{"agent.read"}},
+		},
+	})
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var resp roleImportResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, 1, resp.Created)
+	assert.Equal(t, 1, resp.Errors)
+	require.Len(t, resp.Items, 2)
+	assert.Equal(t, "error", resp.Items[0].Status)
+	assert.Contains(t, resp.Items[0].Reason, "permission "+reserved+" is reserved")
+	assert.Equal(t, "created", resp.Items[1].Status)
+}
+
+func TestValidateRolePermissionIDs_ReservedRejectedConstraintsUnaffected(t *testing.T) {
+	reserved := reservedTestPermission(t)
+	require.NoError(t, validateRolePermissionIDs([]string{"agent.read"}))
+	require.ErrorContains(t, validateRolePermissionIDs([]string{"agent.read", reserved}), "is reserved")
+	require.ErrorContains(t, validateRolePermissionIDs([]string{"fake.perm"}), "invalid permission IDs")
+	// Access constraint ceilings restrict rather than grant, so they may
+	// still list a reserved permission.
+	require.NoError(t, validatePermissionIDs([]string{reserved}))
 }

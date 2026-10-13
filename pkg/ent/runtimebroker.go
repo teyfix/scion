@@ -3,6 +3,7 @@
 package ent
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -42,10 +43,16 @@ type RuntimeBroker struct {
 	Resources string `json:"resources,omitempty"`
 	// Runtimes holds the value of the "runtimes" field.
 	Runtimes string `json:"runtimes,omitempty"`
+	// DefaultProfile holds the value of the "default_profile" field.
+	DefaultProfile string `json:"default_profile,omitempty"`
+	// WorkspaceStorage holds the value of the "workspace_storage" field.
+	WorkspaceStorage string `json:"workspace_storage,omitempty"`
+	// Health holds the value of the "health" field.
+	Health string `json:"health,omitempty"`
 	// Labels holds the value of the "labels" field.
-	Labels string `json:"labels,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 	// Annotations holds the value of the "annotations" field.
-	Annotations string `json:"annotations,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 	// Endpoint holds the value of the "endpoint" field.
 	Endpoint string `json:"endpoint,omitempty"`
 	// CreatedBy holds the value of the "created_by" field.
@@ -62,6 +69,12 @@ type RuntimeBroker struct {
 	ConnectedSessionID *string `json:"connected_session_id,omitempty"`
 	// ConnectedAt holds the value of the "connected_at" field.
 	ConnectedAt *time.Time `json:"connected_at,omitempty"`
+	// RuntimeTargetID holds the value of the "runtime_target_id" field.
+	RuntimeTargetID *string `json:"runtime_target_id,omitempty"`
+	// RuntimeTargetType holds the value of the "runtime_target_type" field.
+	RuntimeTargetType string `json:"runtime_target_type,omitempty"`
+	// RuntimeTargetDisplayName holds the value of the "runtime_target_display_name" field.
+	RuntimeTargetDisplayName string `json:"runtime_target_display_name,omitempty"`
 	// Created holds the value of the "created" field.
 	Created time.Time `json:"created,omitempty"`
 	// Updated holds the value of the "updated" field.
@@ -74,11 +87,13 @@ func (*RuntimeBroker) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case runtimebroker.FieldLabels, runtimebroker.FieldAnnotations:
+			values[i] = new([]byte)
 		case runtimebroker.FieldAutoProvide:
 			values[i] = new(sql.NullBool)
 		case runtimebroker.FieldLockVersion:
 			values[i] = new(sql.NullInt64)
-		case runtimebroker.FieldName, runtimebroker.FieldSlug, runtimebroker.FieldMode, runtimebroker.FieldVersion, runtimebroker.FieldStatus, runtimebroker.FieldConnectionState, runtimebroker.FieldCapabilities, runtimebroker.FieldSupportedHarnesses, runtimebroker.FieldResources, runtimebroker.FieldRuntimes, runtimebroker.FieldLabels, runtimebroker.FieldAnnotations, runtimebroker.FieldEndpoint, runtimebroker.FieldCreatedBy, runtimebroker.FieldGcpHostServiceAccountEmail, runtimebroker.FieldGcpHostProjectID, runtimebroker.FieldConnectedHubID, runtimebroker.FieldConnectedSessionID:
+		case runtimebroker.FieldName, runtimebroker.FieldSlug, runtimebroker.FieldMode, runtimebroker.FieldVersion, runtimebroker.FieldStatus, runtimebroker.FieldConnectionState, runtimebroker.FieldCapabilities, runtimebroker.FieldSupportedHarnesses, runtimebroker.FieldResources, runtimebroker.FieldRuntimes, runtimebroker.FieldDefaultProfile, runtimebroker.FieldWorkspaceStorage, runtimebroker.FieldHealth, runtimebroker.FieldEndpoint, runtimebroker.FieldCreatedBy, runtimebroker.FieldGcpHostServiceAccountEmail, runtimebroker.FieldGcpHostProjectID, runtimebroker.FieldConnectedHubID, runtimebroker.FieldConnectedSessionID, runtimebroker.FieldRuntimeTargetID, runtimebroker.FieldRuntimeTargetType, runtimebroker.FieldRuntimeTargetDisplayName:
 			values[i] = new(sql.NullString)
 		case runtimebroker.FieldLastHeartbeat, runtimebroker.FieldConnectedAt, runtimebroker.FieldCreated, runtimebroker.FieldUpdated:
 			values[i] = new(sql.NullTime)
@@ -178,17 +193,39 @@ func (_m *RuntimeBroker) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.Runtimes = value.String
 			}
-		case runtimebroker.FieldLabels:
+		case runtimebroker.FieldDefaultProfile:
 			if value, ok := values[i].(*sql.NullString); !ok {
-				return fmt.Errorf("unexpected type %T for field labels", values[i])
+				return fmt.Errorf("unexpected type %T for field default_profile", values[i])
 			} else if value.Valid {
-				_m.Labels = value.String
+				_m.DefaultProfile = value.String
+			}
+		case runtimebroker.FieldWorkspaceStorage:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field workspace_storage", values[i])
+			} else if value.Valid {
+				_m.WorkspaceStorage = value.String
+			}
+		case runtimebroker.FieldHealth:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field health", values[i])
+			} else if value.Valid {
+				_m.Health = value.String
+			}
+		case runtimebroker.FieldLabels:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field labels", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.Labels); err != nil {
+					return fmt.Errorf("unmarshal field labels: %w", err)
+				}
 			}
 		case runtimebroker.FieldAnnotations:
-			if value, ok := values[i].(*sql.NullString); !ok {
+			if value, ok := values[i].(*[]byte); !ok {
 				return fmt.Errorf("unexpected type %T for field annotations", values[i])
-			} else if value.Valid {
-				_m.Annotations = value.String
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.Annotations); err != nil {
+					return fmt.Errorf("unmarshal field annotations: %w", err)
+				}
 			}
 		case runtimebroker.FieldEndpoint:
 			if value, ok := values[i].(*sql.NullString); !ok {
@@ -242,6 +279,25 @@ func (_m *RuntimeBroker) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ConnectedAt = new(time.Time)
 				*_m.ConnectedAt = value.Time
+			}
+		case runtimebroker.FieldRuntimeTargetID:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field runtime_target_id", values[i])
+			} else if value.Valid {
+				_m.RuntimeTargetID = new(string)
+				*_m.RuntimeTargetID = value.String
+			}
+		case runtimebroker.FieldRuntimeTargetType:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field runtime_target_type", values[i])
+			} else if value.Valid {
+				_m.RuntimeTargetType = value.String
+			}
+		case runtimebroker.FieldRuntimeTargetDisplayName:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field runtime_target_display_name", values[i])
+			} else if value.Valid {
+				_m.RuntimeTargetDisplayName = value.String
 			}
 		case runtimebroker.FieldCreated:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -329,11 +385,20 @@ func (_m *RuntimeBroker) String() string {
 	builder.WriteString("runtimes=")
 	builder.WriteString(_m.Runtimes)
 	builder.WriteString(", ")
+	builder.WriteString("default_profile=")
+	builder.WriteString(_m.DefaultProfile)
+	builder.WriteString(", ")
+	builder.WriteString("workspace_storage=")
+	builder.WriteString(_m.WorkspaceStorage)
+	builder.WriteString(", ")
+	builder.WriteString("health=")
+	builder.WriteString(_m.Health)
+	builder.WriteString(", ")
 	builder.WriteString("labels=")
-	builder.WriteString(_m.Labels)
+	builder.WriteString(fmt.Sprintf("%v", _m.Labels))
 	builder.WriteString(", ")
 	builder.WriteString("annotations=")
-	builder.WriteString(_m.Annotations)
+	builder.WriteString(fmt.Sprintf("%v", _m.Annotations))
 	builder.WriteString(", ")
 	builder.WriteString("endpoint=")
 	builder.WriteString(_m.Endpoint)
@@ -368,6 +433,17 @@ func (_m *RuntimeBroker) String() string {
 		builder.WriteString("connected_at=")
 		builder.WriteString(v.Format(time.ANSIC))
 	}
+	builder.WriteString(", ")
+	if v := _m.RuntimeTargetID; v != nil {
+		builder.WriteString("runtime_target_id=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	builder.WriteString("runtime_target_type=")
+	builder.WriteString(_m.RuntimeTargetType)
+	builder.WriteString(", ")
+	builder.WriteString("runtime_target_display_name=")
+	builder.WriteString(_m.RuntimeTargetDisplayName)
 	builder.WriteString(", ")
 	builder.WriteString("created=")
 	builder.WriteString(_m.Created.Format(time.ANSIC))

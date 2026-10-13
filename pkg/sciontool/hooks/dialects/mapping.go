@@ -191,13 +191,13 @@ func applyFieldPath(data map[string]interface{}, field, path string, ed *hooks.E
 		if v := resolveFieldPath(data, path); v != "" {
 			ed.Error = v
 		}
+	case "model":
+		if v := resolveFieldPath(data, path); v != "" {
+			ed.Model = v
+		}
 	case "file_path":
 		if v := resolveFieldPath(data, path); v != "" {
 			ed.FilePath = v
-		}
-	case "assistant_text":
-		if v := resolveFieldPath(data, path); v != "" {
-			ed.AssistantText = v
 		}
 	case "input_tokens":
 		if v := resolveFieldPathInt64(data, path); v > 0 {
@@ -210,6 +210,14 @@ func applyFieldPath(data map[string]interface{}, field, path string, ed *hooks.E
 	case "cached_tokens":
 		if v := resolveFieldPathInt64(data, path); v > 0 {
 			ed.CachedTokens = v
+		}
+	case "cache_write_tokens":
+		if v := resolveFieldPathInt64(data, path); v > 0 {
+			ed.CacheWriteTokens = v
+		}
+	case "reasoning_tokens":
+		if v := resolveFieldPathInt64(data, path); v > 0 {
+			ed.ReasoningTokens = v
 		}
 	case "success":
 		if val, found := resolveFieldPathBool(data, path); found {
@@ -250,14 +258,21 @@ func resolveFieldPathRaw(data map[string]interface{}, path string) string {
 	return string(b)
 }
 
-// resolveFieldPathBool walks a dotted path and returns a boolean value.
+// resolveFieldPathBool walks a dotted path and returns a boolean value. A
+// bool is returned as is. A string counts as a status word: only "success"
+// (any case) is true, every other string is false. This covers harnesses
+// that report a tool result's outcome as a string (Copilot's
+// toolResult.resultType). Any other type, or a missing value, is not found.
 func resolveFieldPathBool(data map[string]interface{}, path string) (bool, bool) {
 	val := walkPath(data, path)
 	if val == nil {
 		return false, false
 	}
-	if b, ok := val.(bool); ok {
-		return b, true
+	switch v := val.(type) {
+	case bool:
+		return v, true
+	case string:
+		return strings.EqualFold(v, "success"), true
 	}
 	return false, false
 }

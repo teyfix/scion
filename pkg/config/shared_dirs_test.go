@@ -173,13 +173,13 @@ func TestGetSharedDirsBasePath_GitProject(t *testing.T) {
 	agentsDir := filepath.Join(projectConfigDir, "agents")
 	require.NoError(t, os.MkdirAll(agentsDir, 0755))
 
-	// Create a git project dir with grove-id file
+	// Create a git project dir with a project-id file. GetSharedDirsBasePath
+	// resolves the external config dir through ReadProjectID.
 	projectDir := filepath.Join(tmpDir, "myproject", ".scion")
 	require.NoError(t, os.MkdirAll(projectDir, 0755))
 
-	// Write grove-id
 	projectID := "abc12345-test-id"
-	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "grove-id"), []byte(projectID+"\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "project-id"), []byte(projectID+"\n"), 0644))
 
 	basePath, err := GetSharedDirsBasePath(projectDir)
 	require.NoError(t, err)

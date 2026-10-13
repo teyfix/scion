@@ -22,6 +22,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -30,27 +32,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 )
-
-func setupTestBrokerAuthService(t *testing.T) (*BrokerAuthService, store.Store) {
-	t.Helper()
-
-	s, err := newTestStore(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate store: %v", err)
-	}
-
-	config := DefaultBrokerAuthConfig()
-	svc := NewBrokerAuthService(config, s)
-	t.Cleanup(svc.Close)
-
-	return svc, s
-}
 
 func TestBrokerRegistrationAndJoin(t *testing.T) {
 	svc, _ := setupTestBrokerAuthService(t)
@@ -118,6 +103,211 @@ func TestBrokerRegistrationAndJoin(t *testing.T) {
 	}
 }
 
+// TestCompleteBrokerJoin_PersistsCapabilities is a regression test for the
+// pre-existing gap where BrokerJoinRequest.Capabilities was accepted on the
+// wire but never read: a broker reporting "reprovision" at join time must
+// have that reach store.RuntimeBroker.Capabilities, since the hub's
+// `scion reincarnate` broker-capability gate (design §5) reads it from there.
+func TestCompleteBrokerJoin_PersistsCapabilities(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	req := CreateBrokerRegistrationRequest{Name: "cap-test-host"}
+	resp, err := svc.CreateBrokerRegistration(ctx, req, "admin-user-id")
+	if err != nil {
+		t.Fatalf("CreateBrokerRegistration failed: %v", err)
+	}
+
+	joinReq := BrokerJoinRequest{
+		BrokerID:     resp.BrokerID,
+		JoinToken:    resp.JoinToken,
+		Hostname:     "cap-test-host",
+		Version:      "1.0.0",
+		Capabilities: []string{"sync", "attach", "reprovision", "some-future-capability"},
+	}
+	if _, err := svc.CompleteBrokerJoin(ctx, joinReq, "http://localhost:9810"); err != nil {
+		t.Fatalf("CompleteBrokerJoin failed: %v", err)
+	}
+
+	broker, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if broker.Capabilities == nil {
+		t.Fatal("expected broker.Capabilities to be set")
+	}
+	if !broker.Capabilities.Sync || !broker.Capabilities.Attach || !broker.Capabilities.Reprovision {
+		t.Errorf("expected sync/attach/reprovision all true, got %+v", broker.Capabilities)
+	}
+	if broker.Capabilities.WebPTY {
+		t.Errorf("expected webPty false (not in the reported list), got true")
+	}
+}
+
+// TestCompleteBrokerJoin_PersistsAsyncLaunchCapability covers the new
+// "asynclaunch" capability string (design t1-async-create-v11.md §3.2, §7
+// P1b-1): capabilitiesFromStrings parses it into
+// store.BrokerCapabilities.AsyncLaunch, exactly like the existing
+// "reprovision" case. Nothing else about CompleteBrokerJoin changes: the
+// capability is stored and nothing reads it yet (dispatchLaunching's use of
+// it is P1b-3), so this also demonstrates that advertising the bit has no
+// behavior effect on its own.
+func TestCompleteBrokerJoin_PersistsAsyncLaunchCapability(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	req := CreateBrokerRegistrationRequest{Name: "cap-test-host-async"}
+	resp, err := svc.CreateBrokerRegistration(ctx, req, "admin-user-id")
+	if err != nil {
+		t.Fatalf("CreateBrokerRegistration failed: %v", err)
+	}
+
+	joinReq := BrokerJoinRequest{
+		BrokerID:     resp.BrokerID,
+		JoinToken:    resp.JoinToken,
+		Hostname:     "cap-test-host-async",
+		Version:      "1.0.0",
+		Capabilities: []string{"sync", "attach", "asynclaunch"},
+	}
+	joinResp, err := svc.CompleteBrokerJoin(ctx, joinReq, "http://localhost:9810")
+	if err != nil {
+		t.Fatalf("CompleteBrokerJoin failed: %v", err)
+	}
+	if joinResp.SecretKey == "" {
+		t.Error("SecretKey should not be empty; advertising asynclaunch must not disturb the rest of the join")
+	}
+
+	broker, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if broker.Capabilities == nil {
+		t.Fatal("expected broker.Capabilities to be set")
+	}
+	if !broker.Capabilities.Sync || !broker.Capabilities.Attach || !broker.Capabilities.AsyncLaunch {
+		t.Errorf("expected sync/attach/asyncLaunch all true, got %+v", broker.Capabilities)
+	}
+	if broker.Capabilities.Reprovision {
+		t.Errorf("expected reprovision false (not in the reported list), got true")
+	}
+}
+
+// TestCapabilitiesFromStrings_AsyncLaunchAliases covers both accepted wire
+// spellings ("asynclaunch" and "async_launch") and that an unrecognized name
+// is ignored rather than rejected (design §5's old-broker/old-hub
+// compatibility rule, unchanged by this addition).
+func TestCapabilitiesFromStrings_AsyncLaunchAliases(t *testing.T) {
+	for _, name := range []string{"asynclaunch", "ASYNCLAUNCH", "async_launch", " async_launch "} {
+		caps := capabilitiesFromStrings([]string{name})
+		if !caps.AsyncLaunch {
+			t.Errorf("capabilitiesFromStrings([%q]).AsyncLaunch = false, want true", name)
+		}
+	}
+
+	caps := capabilitiesFromStrings([]string{"sync", "some-future-capability"})
+	if caps.AsyncLaunch {
+		t.Error("expected AsyncLaunch false when not reported")
+	}
+	if !caps.Sync {
+		t.Error("expected Sync true")
+	}
+}
+
+// TestCapabilitiesFromStrings_EmptyPerAgentWorkspace covers the
+// "emptyPerAgentWorkspace" capability string a remote broker reports at
+// join (design #2703 P2), including the case-folded and snake_case forms.
+func TestCapabilitiesFromStrings_EmptyPerAgentWorkspace(t *testing.T) {
+	for _, name := range []string{"emptyPerAgentWorkspace", "emptyperagentworkspace", "empty_per_agent_workspace", " EMPTY_PER_AGENT_WORKSPACE "} {
+		if !capabilitiesFromStrings([]string{name}).EmptyPerAgentWorkspace {
+			t.Errorf("capabilitiesFromStrings([%q]).EmptyPerAgentWorkspace = false, want true", name)
+		}
+	}
+	if capabilitiesFromStrings([]string{"sync", "attach", "reprovision"}).EmptyPerAgentWorkspace {
+		t.Error("expected EmptyPerAgentWorkspace false when not reported")
+	}
+}
+
+// TestCapabilitiesFromStrings_ReprovisionEmptyPerAgent covers the
+// "reprovisionEmptyPerAgent" capability (miller79/scion#167): the join-time
+// string in its case-folded and snake_case forms, that neither Reprovision
+// nor EmptyPerAgentWorkspace implies it, and the heartbeat's JSON round trip
+// from the broker's hubclient struct into the hub's store struct.
+func TestCapabilitiesFromStrings_ReprovisionEmptyPerAgent(t *testing.T) {
+	for _, name := range []string{"reprovisionEmptyPerAgent", "reprovisionemptyperagent", "reprovision_empty_per_agent", " REPROVISION_EMPTY_PER_AGENT "} {
+		if !capabilitiesFromStrings([]string{name}).ReprovisionEmptyPerAgent {
+			t.Errorf("capabilitiesFromStrings([%q]).ReprovisionEmptyPerAgent = false, want true", name)
+		}
+	}
+	if capabilitiesFromStrings([]string{"sync", "attach", "reprovision", "emptyPerAgentWorkspace"}).ReprovisionEmptyPerAgent {
+		t.Error("expected ReprovisionEmptyPerAgent false when not reported")
+	}
+
+	for _, want := range []bool{true, false} {
+		raw, err := json.Marshal(hubclient.BrokerCapabilities{Reprovision: true, ReprovisionEmptyPerAgent: want})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got store.BrokerCapabilities
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.ReprovisionEmptyPerAgent != want {
+			t.Errorf("heartbeat round trip: ReprovisionEmptyPerAgent = %v, want %v (json %s)", got.ReprovisionEmptyPerAgent, want, raw)
+		}
+	}
+}
+
+// TestCompleteBrokerJoin_NoCapabilitiesLeavesExisting verifies an empty
+// capabilities list on join (e.g. an old CLI that predates the field) does
+// not wipe out a capability set recorded by a previous join.
+func TestCompleteBrokerJoin_NoCapabilitiesLeavesExisting(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	req := CreateBrokerRegistrationRequest{Name: "cap-test-host-2"}
+	resp, err := svc.CreateBrokerRegistration(ctx, req, "admin-user-id")
+	if err != nil {
+		t.Fatalf("CreateBrokerRegistration failed: %v", err)
+	}
+
+	// First join reports reprovision support.
+	if _, err := svc.CompleteBrokerJoin(ctx, BrokerJoinRequest{
+		BrokerID:     resp.BrokerID,
+		JoinToken:    resp.JoinToken,
+		Hostname:     "cap-test-host-2",
+		Version:      "1.0.0",
+		Capabilities: []string{"reprovision"},
+	}, "http://localhost:9810"); err != nil {
+		t.Fatalf("first CompleteBrokerJoin failed: %v", err)
+	}
+
+	// Re-registration flow: create + join again, this time with no
+	// capabilities in the request (simulating an older client).
+	resp2, err := svc.CreateBrokerRegistration(ctx, CreateBrokerRegistrationRequest{
+		Name:     "cap-test-host-2",
+		BrokerID: resp.BrokerID,
+	}, "admin-user-id")
+	if err != nil {
+		t.Fatalf("second CreateBrokerRegistration failed: %v", err)
+	}
+	if _, err := svc.CompleteBrokerJoin(ctx, BrokerJoinRequest{
+		BrokerID:  resp2.BrokerID,
+		JoinToken: resp2.JoinToken,
+		Hostname:  "cap-test-host-2",
+		Version:   "1.0.0",
+	}, "http://localhost:9810"); err != nil {
+		t.Fatalf("second CompleteBrokerJoin failed: %v", err)
+	}
+
+	broker, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if broker.Capabilities == nil || !broker.Capabilities.Reprovision {
+		t.Errorf("expected reprovision capability to survive a join with no capabilities field, got %+v", broker.Capabilities)
+	}
+}
+
 func TestJoinWithInvalidToken(t *testing.T) {
 	svc, _ := setupTestBrokerAuthService(t)
 	ctx := context.Background()
@@ -148,12 +338,9 @@ func TestJoinWithInvalidToken(t *testing.T) {
 
 func TestJoinWithExpiredToken(t *testing.T) {
 	// Create service with short token expiry
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
-	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate store: %v", err)
 	}
 
 	config := DefaultBrokerAuthConfig()
@@ -328,12 +515,9 @@ func TestValidateBrokerSignature_InvalidSignature(t *testing.T) {
 
 func TestValidateBrokerSignature_ClockSkew(t *testing.T) {
 	// Create service with short clock skew tolerance
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
-	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate store: %v", err)
 	}
 
 	config := DefaultBrokerAuthConfig()
@@ -1061,63 +1245,6 @@ func TestBrokerReregistration_MergesLabels(t *testing.T) {
 // X-Scion-On-Behalf-Of tests
 // =============================================================================
 
-// setupSignedBrokerRequest creates a broker with a secret and returns a helper
-// function that produces signed requests with the given method, path, and body.
-func setupSignedBrokerRequest(t *testing.T, svc *BrokerAuthService, s store.Store) (brokerID string, signReq func(method, path string, headers map[string]string) *http.Request) {
-	t.Helper()
-	ctx := context.Background()
-
-	brokerID = uuid.New().String()
-	broker := &store.RuntimeBroker{
-		ID:      brokerID,
-		Name:    "obo-test-broker",
-		Slug:    "obo-test-broker",
-		Status:  store.BrokerStatusOnline,
-		Created: time.Now(),
-		Updated: time.Now(),
-	}
-	if err := s.CreateRuntimeBroker(ctx, broker); err != nil {
-		t.Fatalf("failed to create runtime broker: %v", err)
-	}
-
-	secretKey := []byte("obo-test-secret-key-32-bytes!!!!")
-	secret := &store.BrokerSecret{
-		BrokerID:  brokerID,
-		SecretKey: secretKey,
-		Algorithm: store.BrokerSecretAlgorithmHMACSHA256,
-		Status:    store.BrokerSecretStatusActive,
-	}
-	if err := s.CreateBrokerSecret(ctx, secret); err != nil {
-		t.Fatalf("failed to create broker secret: %v", err)
-	}
-
-	nonceCounter := 0
-	signReq = func(method, path string, extraHeaders map[string]string) *http.Request {
-		nonceCounter++
-		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-		nonce := "obo-nonce-" + strconv.Itoa(nonceCounter)
-
-		req := httptest.NewRequest(method, path, nil)
-		req.Header.Set(HeaderBrokerID, brokerID)
-		req.Header.Set(HeaderTimestamp, timestamp)
-		req.Header.Set(HeaderNonce, nonce)
-
-		for k, v := range extraHeaders {
-			req.Header.Set(k, v)
-		}
-
-		canonicalString := svc.buildCanonicalString(req, timestamp, nonce)
-		h := hmac.New(sha256.New, secretKey)
-		h.Write(canonicalString)
-		signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
-		req.Header.Set(HeaderSignature, signature)
-
-		return req
-	}
-
-	return brokerID, signReq
-}
-
 func TestBrokerAuthMiddleware_OnBehalfOf_NoHeader(t *testing.T) {
 	svc, s := setupTestBrokerAuthService(t)
 	_, signReq := setupSignedBrokerRequest(t, svc, s)
@@ -1433,5 +1560,179 @@ func TestBrokerReregistration_HostSAEmail_NormalizedToLowercase(t *testing.T) {
 	if broker.GCPHostServiceAccountEmail != want {
 		t.Errorf("host SA email should be lowercased on re-registration:\n  got:  %q\n  want: %q",
 			broker.GCPHostServiceAccountEmail, want)
+	}
+}
+
+// ============================================================================
+// CreateBrokerRegistrationForAuthorizedMatch / ForAuthorizedNew: the pinned
+// entry points used by the HTTP handler after it authorizes a re-registration
+// or first-time registration request. Each must refuse rather than mutate
+// when the lookup performed here disagrees with what the caller was
+// authorized against.
+// ============================================================================
+
+// TestCreateBrokerRegistrationForAuthorizedMatch_IDMismatchRefused covers the
+// case where the caller was authorized against one broker ID, but the lookup
+// performed here resolves to a different broker (e.g. the authorized broker
+// was renamed or deleted and a different one now matches the request).
+func TestCreateBrokerRegistrationForAuthorizedMatch_IDMismatchRefused(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	resp, err := svc.CreateBrokerRegistration(ctx, CreateBrokerRegistrationRequest{Name: "pin-mismatch-host"}, "owner")
+	if err != nil {
+		t.Fatalf("initial registration failed: %v", err)
+	}
+	before, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	beforeAutoProvide := before.AutoProvide
+
+	_, err = svc.CreateBrokerRegistrationForAuthorizedMatch(ctx, CreateBrokerRegistrationRequest{
+		Name:        "pin-mismatch-host",
+		AutoProvide: !beforeAutoProvide,
+	}, "someone-else", "a-different-broker-id-than-was-matched", true)
+	if !errors.Is(err, ErrBrokerRegistrationAuthorizationStale) {
+		t.Fatalf("expected ErrBrokerRegistrationAuthorizationStale, got: %v", err)
+	}
+
+	after, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if after.AutoProvide != beforeAutoProvide {
+		t.Errorf("broker must not be mutated when the authorized ID does not match the lookup")
+	}
+}
+
+// TestCreateBrokerRegistrationForAuthorizedMatch_AutoProvidePin covers the
+// auto-provide pin: a caller admitted only to keep auto-provide on
+// (autoProvideAuthorized=false) is refused when the re-read broker has
+// auto-provide off, and proceeds when it is still on.
+func TestCreateBrokerRegistrationForAuthorizedMatch_AutoProvidePin(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stored      bool
+		authorized  bool
+		wantStale   bool
+		wantStored  bool
+		requestedOn bool
+	}{
+		{name: "keep on, stored off", stored: false, authorized: false, requestedOn: true, wantStale: true, wantStored: false},
+		{name: "keep on, stored on", stored: true, authorized: false, requestedOn: true, wantStale: false, wantStored: true},
+		{name: "turn on with broker.auto_provide, stored off", stored: false, authorized: true, requestedOn: true, wantStale: false, wantStored: true},
+		{name: "turn off, stored on", stored: true, authorized: false, requestedOn: false, wantStale: false, wantStored: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, s := setupTestBrokerAuthService(t)
+			ctx := context.Background()
+
+			broker := &store.RuntimeBroker{
+				ID:          tid("pin-autoprovide-broker"),
+				Name:        "pin-autoprovide-host",
+				Slug:        "pin-autoprovide-host",
+				Status:      store.BrokerStatusOffline,
+				AutoProvide: tc.stored,
+				CreatedBy:   "owner",
+			}
+			if err := s.CreateRuntimeBroker(ctx, broker); err != nil {
+				t.Fatalf("CreateRuntimeBroker failed: %v", err)
+			}
+
+			_, err := svc.CreateBrokerRegistrationForAuthorizedMatch(ctx, CreateBrokerRegistrationRequest{
+				Name:        "pin-autoprovide-host",
+				AutoProvide: tc.requestedOn,
+			}, "owner", broker.ID, tc.authorized)
+			if tc.wantStale {
+				if !errors.Is(err, ErrBrokerRegistrationAuthorizationStale) {
+					t.Fatalf("expected ErrBrokerRegistrationAuthorizationStale, got: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			after, err := s.GetRuntimeBroker(ctx, broker.ID)
+			if err != nil {
+				t.Fatalf("GetRuntimeBroker failed: %v", err)
+			}
+			if after.AutoProvide != tc.wantStored {
+				t.Errorf("AutoProvide = %v, want %v", after.AutoProvide, tc.wantStored)
+			}
+		})
+	}
+}
+
+// TestCreateBrokerRegistrationForAuthorizedMatch_EmptyIDRefused covers the
+// caller-error case: an empty expectedExistingBrokerID can never be
+// satisfied, so the call must refuse without touching the store.
+func TestCreateBrokerRegistrationForAuthorizedMatch_EmptyIDRefused(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	resp, err := svc.CreateBrokerRegistration(ctx, CreateBrokerRegistrationRequest{Name: "pin-empty-host"}, "owner")
+	if err != nil {
+		t.Fatalf("initial registration failed: %v", err)
+	}
+	before, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	beforeAutoProvide := before.AutoProvide
+
+	_, err = svc.CreateBrokerRegistrationForAuthorizedMatch(ctx, CreateBrokerRegistrationRequest{
+		Name:        "pin-empty-host",
+		AutoProvide: !beforeAutoProvide,
+	}, "someone-else", "", true)
+	if err == nil {
+		t.Fatal("expected an error for an empty expectedExistingBrokerID, got nil")
+	}
+
+	after, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if after.AutoProvide != beforeAutoProvide {
+		t.Errorf("broker must not be mutated when expectedExistingBrokerID is empty")
+	}
+}
+
+// TestCreateBrokerRegistrationForAuthorizedNew_ExistingMatchRefused covers
+// the create-path race: the caller was authorized for a first-time
+// registration because no broker matched at authorization time, but by the
+// time this call performs its own lookup, a broker with the same name now
+// exists (e.g. registered concurrently by someone else). That existing
+// broker must be left alone, not implicitly re-registered.
+func TestCreateBrokerRegistrationForAuthorizedNew_ExistingMatchRefused(t *testing.T) {
+	svc, s := setupTestBrokerAuthService(t)
+	ctx := context.Background()
+
+	resp, err := svc.CreateBrokerRegistration(ctx, CreateBrokerRegistrationRequest{Name: "pin-new-host"}, "original-owner")
+	if err != nil {
+		t.Fatalf("initial registration failed: %v", err)
+	}
+	before, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	beforeAutoProvide := before.AutoProvide
+
+	_, err = svc.CreateBrokerRegistrationForAuthorizedNew(ctx, CreateBrokerRegistrationRequest{
+		Name:        "pin-new-host",
+		AutoProvide: !beforeAutoProvide,
+	}, "late-arriving-caller")
+	if !errors.Is(err, ErrBrokerRegistrationAuthorizationStale) {
+		t.Fatalf("expected ErrBrokerRegistrationAuthorizationStale, got: %v", err)
+	}
+
+	after, err := s.GetRuntimeBroker(ctx, resp.BrokerID)
+	if err != nil {
+		t.Fatalf("GetRuntimeBroker failed: %v", err)
+	}
+	if after.AutoProvide != beforeAutoProvide {
+		t.Errorf("the existing broker must not be mutated by a call authorized only for a new registration")
+	}
+	if after.CreatedBy != "original-owner" {
+		t.Errorf("the existing broker's owner must not change; got CreatedBy=%q", after.CreatedBy)
 	}
 }

@@ -6,19 +6,24 @@ package handlers
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/telemetry"
-	"github.com/google/uuid"
-	otellog "go.opentelemetry.io/otel/log"
+	"github.com/GoogleCloudPlatform/scion/pkg/telemetrycontract"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestNewTelemetryHandler(t *testing.T) {
+	scrubTelemetryEnv(t)
 	// Test with nil TracerProvider (should use noop)
 	h := NewTelemetryHandler(nil, nil, nil)
 	if h == nil {
@@ -29,7 +34,8 @@ func TestNewTelemetryHandler(t *testing.T) {
 	}
 }
 
-func TestNewTelemetryHandler_WithRedactor(t *testing.T) {
+func TestNewTelemetryHandler_AcceptsLegacyRedactorArgument(t *testing.T) {
+	scrubTelemetryEnv(t)
 	redactor := telemetry.NewRedactor(telemetry.RedactionConfig{
 		Redact: []string{"prompt"},
 		Hash:   []string{"session_id"},
@@ -39,12 +45,10 @@ func TestNewTelemetryHandler_WithRedactor(t *testing.T) {
 	if h == nil {
 		t.Fatal("NewTelemetryHandler should not return nil")
 	}
-	if h.redactor == nil {
-		t.Error("handler should have a redactor")
-	}
 }
 
 func TestTelemetryHandler_HandleNilEvent(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	// Should not panic on nil event
@@ -54,7 +58,27 @@ func TestTelemetryHandler_HandleNilEvent(t *testing.T) {
 	}
 }
 
+func TestTelemetryHandler_MetricAttrsPreferCanonicalProject(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_PROJECT_ID", "canonical-project")
+	h := NewTelemetryHandler(nil, nil, nil)
+	attrs := h.metricAttrs()
+	foundProject := false
+	for _, attr := range attrs {
+		if string(attr.Key) == "project_id" {
+			foundProject = true
+			if attr.Value.AsString() != "canonical-project" {
+				t.Fatalf("project_id = %q, want canonical-project", attr.Value.AsString())
+			}
+		}
+	}
+	if !foundProject {
+		t.Fatal("project_id metric dimension missing")
+	}
+}
+
 func TestTelemetryHandler_HandleUnknownEvent(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	event := &hooks.Event{
@@ -69,6 +93,7 @@ func TestTelemetryHandler_HandleUnknownEvent(t *testing.T) {
 }
 
 func TestTelemetryHandler_HandleToolStart(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	event := &hooks.Event{
@@ -88,6 +113,7 @@ func TestTelemetryHandler_HandleToolStart(t *testing.T) {
 }
 
 func TestTelemetryHandler_HandleToolStartEnd(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	// Start event
@@ -117,6 +143,7 @@ func TestTelemetryHandler_HandleToolStartEnd(t *testing.T) {
 }
 
 func TestTelemetryHandler_HandleSessionEvents(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	events := []struct {
@@ -141,33 +168,8 @@ func TestTelemetryHandler_HandleSessionEvents(t *testing.T) {
 	}
 }
 
-func TestTelemetryHandler_SessionEndWithoutStartUsesLifecycleIdentity(t *testing.T) {
-	h := NewTelemetryHandler(nil, nil, nil)
-
-	var summary telemetry.SessionSummary
-	h.OnSessionEnd = func(got telemetry.SessionSummary) {
-		summary = got
-	}
-
-	if err := h.Handle(&hooks.Event{
-		Name: hooks.EventSessionEnd,
-		Data: hooks.EventData{Reason: "container_stop"},
-	}); err != nil {
-		t.Fatalf("Handle session-end: %v", err)
-	}
-
-	if _, err := uuid.Parse(summary.SessionID); err != nil {
-		t.Fatalf("session ID %q is not a UUID: %v", summary.SessionID, err)
-	}
-	if summary.StartedAt.IsZero() {
-		t.Fatal("session start time is zero")
-	}
-	if summary.EndedAt.Before(summary.StartedAt) {
-		t.Fatalf("ended at %s is before started at %s", summary.EndedAt, summary.StartedAt)
-	}
-}
-
 func TestTelemetryHandler_Flush(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
 
 	// Start some events without ending them
@@ -188,6 +190,7 @@ func TestTelemetryHandler_Flush(t *testing.T) {
 }
 
 func TestSpanMapping(t *testing.T) {
+	scrubTelemetryEnv(t)
 	expectedMappings := map[string]string{
 		hooks.EventSessionStart:     "agent.session.start",
 		hooks.EventSessionEnd:       "agent.session.end",
@@ -209,26 +212,6 @@ func TestSpanMapping(t *testing.T) {
 	}
 }
 
-func TestTelemetryHandler_RedactionApplied(t *testing.T) {
-	redactor := telemetry.NewRedactor(telemetry.RedactionConfig{
-		Redact: []string{"prompt", "tool_input", "tool_output"},
-		Hash:   []string{"session_id"},
-	})
-
-	h := NewTelemetryHandler(nil, nil, redactor)
-
-	// Test that redactor is properly referenced
-	if h.redactor == nil {
-		t.Fatal("redactor should be set")
-	}
-	if !h.redactor.ShouldRedact("prompt") {
-		t.Error("redactor should redact 'prompt'")
-	}
-	if !h.redactor.ShouldHash("session_id") {
-		t.Error("redactor should hash 'session_id'")
-	}
-}
-
 // recordingProcessor captures log records for test assertions.
 type recordingProcessor struct {
 	mu      sync.Mutex
@@ -242,8 +225,9 @@ func (p *recordingProcessor) OnEmit(_ context.Context, record *sdklog.Record) er
 	return nil
 }
 
-func (p *recordingProcessor) Shutdown(context.Context) error   { return nil }
-func (p *recordingProcessor) ForceFlush(context.Context) error { return nil }
+func (p *recordingProcessor) Enabled(context.Context, sdklog.EnabledParameters) bool { return true }
+func (p *recordingProcessor) Shutdown(context.Context) error                         { return nil }
+func (p *recordingProcessor) ForceFlush(context.Context) error                       { return nil }
 
 func (p *recordingProcessor) Records() []sdklog.Record {
 	p.mu.Lock()
@@ -254,6 +238,7 @@ func (p *recordingProcessor) Records() []sdklog.Record {
 }
 
 func TestTelemetryHandler_NilLoggerProvider(t *testing.T) {
+	scrubTelemetryEnv(t)
 	// Handler with nil LoggerProvider should process events without error
 	h := NewTelemetryHandler(nil, nil, nil)
 	if h.logger != nil {
@@ -273,6 +258,7 @@ func TestTelemetryHandler_NilLoggerProvider(t *testing.T) {
 }
 
 func TestTelemetryHandler_WithLoggerProvider(t *testing.T) {
+	scrubTelemetryEnv(t)
 	proc := &recordingProcessor{}
 	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	defer func() { _ = lp.Shutdown(context.Background()) }()
@@ -308,13 +294,13 @@ func TestTelemetryHandler_WithLoggerProvider(t *testing.T) {
 
 	// Check that event attributes are present in the log record
 	found := map[string]string{}
-	rec.WalkAttributes(func(kv otellog.KeyValue) bool {
-		found[kv.Key] = kv.Value.AsString()
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		found[string(kv.Key)] = kv.Value.AsString()
 		return true
 	})
 
-	if found["event.name"] != hooks.EventSessionStart {
-		t.Errorf("event.name = %q, want %q", found["event.name"], hooks.EventSessionStart)
+	if found["event.name"] != "agent.session.start" {
+		t.Errorf("event.name = %q, want %q", found["event.name"], "agent.session.start")
 	}
 	if found["session_id"] != "sess-abc" {
 		t.Errorf("session_id = %q, want %q", found["session_id"], "sess-abc")
@@ -324,7 +310,8 @@ func TestTelemetryHandler_WithLoggerProvider(t *testing.T) {
 	}
 }
 
-func TestTelemetryHandler_LogRedaction(t *testing.T) {
+func TestTelemetryHandler_LeavesPolicyTransformationToReceiver(t *testing.T) {
+	scrubTelemetryEnv(t)
 	proc := &recordingProcessor{}
 	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	defer func() { _ = lp.Shutdown(context.Background()) }()
@@ -354,26 +341,23 @@ func TestTelemetryHandler_LogRedaction(t *testing.T) {
 
 	found := map[string]string{}
 	rec := &records[0]
-	rec.WalkAttributes(func(kv otellog.KeyValue) bool {
-		found[kv.Key] = kv.Value.AsString()
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		found[string(kv.Key)] = kv.Value.AsString()
 		return true
 	})
 
-	// Prompt should be redacted
-	if found["prompt"] != "[REDACTED]" {
-		t.Errorf("prompt = %q, want [REDACTED]", found["prompt"])
+	// Producers retain raw values so the receiver is the single authoritative
+	// policy boundary and hashes each accepted field exactly once.
+	if found["prompt"] != "my secret prompt" {
+		t.Errorf("prompt = %q, want unprocessed producer value", found["prompt"])
 	}
-
-	// Session ID should be hashed (not the original value)
-	if found["session_id"] == "sess-secret" {
-		t.Error("session_id should be hashed, not plaintext")
-	}
-	if found["session_id"] == "" {
-		t.Error("session_id should be present as hashed value")
+	if found["session_id"] != "sess-secret" {
+		t.Errorf("session_id = %q, want unprocessed producer value", found["session_id"])
 	}
 }
 
 func TestTelemetryHandler_LogRecordIncludesFilePath(t *testing.T) {
+	scrubTelemetryEnv(t)
 	proc := &recordingProcessor{}
 	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	defer func() { _ = lp.Shutdown(context.Background()) }()
@@ -401,9 +385,9 @@ func TestTelemetryHandler_LogRecordIncludesFilePath(t *testing.T) {
 
 	found := map[string]string{}
 	rec := &records[0]
-	rec.WalkAttributes(func(kv otellog.KeyValue) bool {
-		if kv.Value.Kind() == otellog.KindString {
-			found[kv.Key] = kv.Value.AsString()
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		if kv.Value.Type() == attribute.STRING {
+			found[string(kv.Key)] = kv.Value.AsString()
 		}
 		return true
 	})
@@ -417,6 +401,7 @@ func TestTelemetryHandler_LogRecordIncludesFilePath(t *testing.T) {
 }
 
 func TestTelemetryHandler_LogRecordIncludesTokens(t *testing.T) {
+	scrubTelemetryEnv(t)
 	proc := &recordingProcessor{}
 	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	defer func() { _ = lp.Shutdown(context.Background()) }()
@@ -444,9 +429,9 @@ func TestTelemetryHandler_LogRecordIncludesTokens(t *testing.T) {
 
 	found := map[string]int64{}
 	rec := &records[0]
-	rec.WalkAttributes(func(kv otellog.KeyValue) bool {
-		if kv.Value.Kind() == otellog.KindInt64 {
-			found[kv.Key] = kv.Value.AsInt64()
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		if kv.Value.Type() == attribute.INT64 {
+			found[string(kv.Key)] = kv.Value.AsInt64()
 		}
 		return true
 	})
@@ -463,6 +448,7 @@ func TestTelemetryHandler_LogRecordIncludesTokens(t *testing.T) {
 }
 
 func TestNewTelemetryHandler_WithMeterProvider(t *testing.T) {
+	scrubTelemetryEnv(t)
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -471,14 +457,8 @@ func TestNewTelemetryHandler_WithMeterProvider(t *testing.T) {
 	if h == nil {
 		t.Fatal("NewTelemetryHandler should not return nil")
 	}
-	if h.tokensInput == nil {
-		t.Error("tokensInput instrument should be initialized")
-	}
-	if h.tokensOutput == nil {
-		t.Error("tokensOutput instrument should be initialized")
-	}
-	if h.tokensCached == nil {
-		t.Error("tokensCached instrument should be initialized")
+	if h.usageTokens == nil {
+		t.Error("usageTokens instrument should be initialized")
 	}
 	if h.toolCalls == nil {
 		t.Error("toolCalls instrument should be initialized")
@@ -498,9 +478,10 @@ func TestNewTelemetryHandler_WithMeterProvider(t *testing.T) {
 }
 
 func TestTelemetryHandler_NilMeterProviderNoInstruments(t *testing.T) {
+	scrubTelemetryEnv(t)
 	h := NewTelemetryHandler(nil, nil, nil)
-	if h.tokensInput != nil {
-		t.Error("tokensInput should be nil without MeterProvider")
+	if h.usageTokens != nil {
+		t.Error("usageTokens should be nil without MeterProvider")
 	}
 	if h.toolCalls != nil {
 		t.Error("toolCalls should be nil without MeterProvider")
@@ -508,6 +489,7 @@ func TestTelemetryHandler_NilMeterProviderNoInstruments(t *testing.T) {
 }
 
 func TestTelemetryHandler_ToolMetrics(t *testing.T) {
+	scrubTelemetryEnv(t)
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -558,6 +540,11 @@ func TestTelemetryHandler_ToolMetrics(t *testing.T) {
 }
 
 func TestTelemetryHandler_ModelMetrics(t *testing.T) {
+	scrubTelemetryEnv(t)
+	// Usage (gen_ai.api.calls / scion.usage.tokens) is gated by
+	// SCION_USAGE_SOURCE=hooks (design D10 vetting gate); see
+	// TestTelemetryHandler_UsageSourceGate for the unset/native states.
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -607,6 +594,7 @@ func TestTelemetryHandler_ModelMetrics(t *testing.T) {
 }
 
 func TestTelemetryHandler_SessionMetrics(t *testing.T) {
+	scrubTelemetryEnv(t)
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -640,7 +628,60 @@ func TestTelemetryHandler_SessionMetrics(t *testing.T) {
 	}
 }
 
+func TestSessionMetricScopesSeparateHookAndLifecycleSources(t *testing.T) {
+	scrubTelemetryEnv(t)
+	for _, tc := range []struct {
+		name, scope string
+		newHandler  func(metric.MeterProvider) *TelemetryHandler
+	}{
+		{"hook", hookMetricScope, func(mp metric.MeterProvider) *TelemetryHandler { return NewTelemetryHandler(nil, nil, nil, mp) }},
+		{"lifecycle", telemetry.LifecycleMetricScope, func(mp metric.MeterProvider) *TelemetryHandler {
+			return NewLifecycleTelemetryHandler(nil, nil, nil, mp)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			defer func() { _ = mp.Shutdown(context.Background()) }()
+			if err := tc.newHandler(mp).Handle(&hooks.Event{Name: hooks.EventSessionEnd}); err != nil {
+				t.Fatal(err)
+			}
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(context.Background(), &rm); err != nil {
+				t.Fatal(err)
+			}
+			if len(rm.ScopeMetrics) != 1 || rm.ScopeMetrics[0].Scope.Name != tc.scope || len(rm.ScopeMetrics[0].Metrics) != 1 || rm.ScopeMetrics[0].Metrics[0].Name != "agent.session.count" {
+				t.Fatalf("session metric scope or name changed: %+v", rm.ScopeMetrics)
+			}
+		})
+	}
+}
+
+// usageTokenTotals sums scion.usage.tokens data points by their token_type
+// attribute value.
+func usageTokenTotals(rm metricdata.ResourceMetrics) map[string]int64 {
+	totals := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != telemetrycontract.MetricUsageTokens {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, point := range sum.DataPoints {
+				tokenType, _ := point.Attributes.Value(attribute.Key(telemetrycontract.TokenTypeLabel))
+				totals[tokenType.AsString()] += point.Value
+			}
+		}
+	}
+	return totals
+}
+
 func TestTelemetryHandler_TokenMetricsOnModelEnd(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -680,26 +721,372 @@ func TestTelemetryHandler_TokenMetricsOnModelEnd(t *testing.T) {
 		}
 	}
 
-	if !found["gen_ai.tokens.input"] {
-		t.Error("expected gen_ai.tokens.input metric to be recorded")
+	totals := usageTokenTotals(rm)
+	if totals[telemetrycontract.TokenTypeInput] != 1500 {
+		t.Errorf("expected %s token_type=%s = 1500, got %d", telemetrycontract.MetricUsageTokens, telemetrycontract.TokenTypeInput, totals[telemetrycontract.TokenTypeInput])
 	}
-	if !found["gen_ai.tokens.output"] {
-		t.Error("expected gen_ai.tokens.output metric to be recorded")
+	if totals[telemetrycontract.TokenTypeOutput] != 500 {
+		t.Errorf("expected %s token_type=%s = 500, got %d", telemetrycontract.MetricUsageTokens, telemetrycontract.TokenTypeOutput, totals[telemetrycontract.TokenTypeOutput])
 	}
-	if !found["gen_ai.tokens.cached"] {
-		t.Error("expected gen_ai.tokens.cached metric to be recorded")
+	// "cached" maps to the canonical "cache_read" (design §3.5).
+	if totals[telemetrycontract.TokenTypeCacheRead] != 200 {
+		t.Errorf("expected %s token_type=%s = 200, got %d", telemetrycontract.MetricUsageTokens, telemetrycontract.TokenTypeCacheRead, totals[telemetrycontract.TokenTypeCacheRead])
 	}
-	if !found["gen_ai.api.calls"] {
+	if !found[telemetrycontract.MetricAPICalls] {
 		t.Error("expected gen_ai.api.calls metric to be recorded")
+	}
+	for _, oldName := range []string{"gen_ai.tokens.input", "gen_ai.tokens.output", "gen_ai.tokens.cached", "scion.hook.tokens.input", "scion.hook.tokens.output", "scion.hook.tokens.cached"} {
+		if found[oldName] {
+			t.Errorf("normalized hook emitted retired token name %s", oldName)
+		}
 	}
 }
 
-func TestTelemetryHandler_TokenMetricsOnSessionEnd(t *testing.T) {
+// TestTelemetryHandler_UsageTokenLabelsMatchContract asserts that every
+// scion.usage.tokens point the real handler emits carries exactly the
+// contract's producer label set -- UsageTokenPointAttrs(harness, model) plus
+// token_type -- and nothing else, on both the paired and unpaired model-end
+// paths. This is the handler-side complement to
+// pkg/sciontool/telemetry.TestHookUsageTokensPassStrictGCPCloudAdmission,
+// which guards the UsageTokenPointAttrs helper against real GCP admission
+// but never runs recordTokenMetrics itself (the two packages can't import
+// each other in tests; see that test's doc comment). Without this test nothing
+// would catch a regression where the handler goes back to including
+// agent_id/project_id, since the admission test would keep passing.
+//
+// gen_ai.api.calls is asserted to still carry agent_id and project_id in the
+// same run, documenting the intended asymmetry: it keeps them for Cloud
+// descriptor compatibility (design §3.2); scion.usage.tokens does not,
+// because its GCP allowlist doesn't permit them.
+func TestTelemetryHandler_UsageTokenLabelsMatchContract(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
+	t.Setenv("SCION_AGENT_ID", "agent-1")
+	t.Setenv("SCION_PROJECT_ID", "project-1")
+	t.Setenv("SCION_HARNESS", "muse-code")
+	t.Setenv("SCION_MODEL", "test-model")
+
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
 	h := NewTelemetryHandler(nil, nil, nil, mp)
+
+	// Paired path.
+	if err := h.Handle(&hooks.Event{Name: hooks.EventModelStart, Data: hooks.EventData{}}); err != nil {
+		t.Fatalf("Handle model-start error: %v", err)
+	}
+	if err := h.Handle(&hooks.Event{
+		Name: hooks.EventModelEnd,
+		Data: hooks.EventData{Success: true, InputTokens: 100, OutputTokens: 50, CachedTokens: 10},
+	}); err != nil {
+		t.Fatalf("Handle model-end error: %v", err)
+	}
+	// Unpaired path (recordUnpairedEndMetrics): a second model-end with no
+	// matching start, the normal hook-per-process case.
+	if err := h.Handle(&hooks.Event{
+		Name: hooks.EventModelEnd,
+		Data: hooks.EventData{Success: true, InputTokens: 5, OutputTokens: 2, CachedTokens: 1},
+	}); err != nil {
+		t.Fatalf("Handle unpaired model-end error: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+
+	wantTokenKeys := map[string]bool{
+		telemetrycontract.HarnessLabel:   true,
+		telemetrycontract.ModelLabel:     true,
+		telemetrycontract.TokenTypeLabel: true,
+	}
+	sawUsageTokenPoint := false
+	sawAPICallPoint := false
+	// Both model-end events share the same attribute set, so the SDK merges
+	// them into one series per token_type: summed totals prove both the
+	// paired (input=100, output=50, cached=10) and unpaired (input=5,
+	// output=2, cached=1) calls actually contributed, which the key-set
+	// check alone doesn't show.
+	tokenTotals := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case telemetrycontract.MetricUsageTokens:
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("%s: unexpected data type %T", m.Name, m.Data)
+				}
+				for _, point := range sum.DataPoints {
+					sawUsageTokenPoint = true
+					gotKeys := map[string]bool{}
+					for _, kv := range point.Attributes.ToSlice() {
+						gotKeys[string(kv.Key)] = true
+					}
+					if len(gotKeys) != len(wantTokenKeys) {
+						t.Errorf("%s point attribute keys = %v, want exactly %v", m.Name, gotKeys, wantTokenKeys)
+						continue
+					}
+					for key := range wantTokenKeys {
+						if !gotKeys[key] {
+							t.Errorf("%s point attribute keys = %v, missing %q", m.Name, gotKeys, key)
+						}
+					}
+					if tokenType, ok := point.Attributes.Value(attribute.Key(telemetrycontract.TokenTypeLabel)); ok {
+						tokenTotals[tokenType.AsString()] += point.Value
+					}
+				}
+			case telemetrycontract.MetricAPICalls:
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("%s: unexpected data type %T", m.Name, m.Data)
+				}
+				for _, point := range sum.DataPoints {
+					sawAPICallPoint = true
+					if _, ok := point.Attributes.Value(attribute.Key("agent_id")); !ok {
+						t.Errorf("%s point missing agent_id (intended asymmetry vs. %s)", m.Name, telemetrycontract.MetricUsageTokens)
+					}
+					if _, ok := point.Attributes.Value(attribute.Key("project_id")); !ok {
+						t.Errorf("%s point missing project_id (intended asymmetry vs. %s)", m.Name, telemetrycontract.MetricUsageTokens)
+					}
+				}
+			}
+		}
+	}
+	if !sawUsageTokenPoint {
+		t.Fatalf("expected at least one %s point", telemetrycontract.MetricUsageTokens)
+	}
+	if !sawAPICallPoint {
+		t.Fatalf("expected at least one %s point", telemetrycontract.MetricAPICalls)
+	}
+	wantTotals := map[string]int64{
+		telemetrycontract.TokenTypeInput:     105, // 100 (paired) + 5 (unpaired)
+		telemetrycontract.TokenTypeOutput:    52,  // 50 (paired) + 2 (unpaired)
+		telemetrycontract.TokenTypeCacheRead: 11,  // 10 (paired) + 1 (unpaired)
+	}
+	for tokenType, want := range wantTotals {
+		if got := tokenTotals[tokenType]; got != want {
+			t.Errorf("token_type=%s total = %d, want %d (both the paired and unpaired model-end must have contributed)", tokenType, got, want)
+		}
+	}
+}
+
+// TestTelemetryHandler_RecordsCacheWriteAndReasoningTokens pins design §3.7
+// "Hook token plumbing" (GoogleCloudPlatform/scion#2057 review): a model-end
+// with all five token fields populated emits exactly five
+// scion.usage.tokens points -- input, output, cache_read, cache_write and
+// reasoning -- each with the exact contract label set
+// {harness, model, token_type}, gated the same way as the other three by
+// SCION_USAGE_SOURCE (none when unset or native, all five when hooks).
+func TestTelemetryHandler_RecordsCacheWriteAndReasoningTokens(t *testing.T) {
+	scrubTelemetryEnv(t)
+	for _, tc := range []struct {
+		name            string
+		usageSource     string
+		wantTokenPoints int
+	}{
+		{name: "unset (vetting gate default)", usageSource: "", wantTokenPoints: 0},
+		{name: "native (deriver owns usage)", usageSource: "native", wantTokenPoints: 0},
+		{name: "hooks (opted in)", usageSource: "hooks", wantTokenPoints: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SCION_USAGE_SOURCE", tc.usageSource)
+			t.Setenv("SCION_HARNESS", "test-harness")
+			t.Setenv("SCION_MODEL", "test-model")
+
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			defer func() { _ = mp.Shutdown(context.Background()) }()
+
+			h := NewTelemetryHandler(nil, nil, nil, mp)
+			// Unpaired model-end (recordUnpairedEndMetrics): the normal
+			// hook-per-process case, same as
+			// TestTelemetryHandler_UnpairedModelEnd.
+			if err := h.Handle(&hooks.Event{
+				Name: hooks.EventModelEnd,
+				Data: hooks.EventData{
+					Success:          true,
+					InputTokens:      100,
+					OutputTokens:     50,
+					CachedTokens:     10,
+					CacheWriteTokens: 30,
+					ReasoningTokens:  15,
+				},
+			}); err != nil {
+				t.Fatalf("Handle model-end error: %v", err)
+			}
+
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(context.Background(), &rm); err != nil {
+				t.Fatalf("Collect error: %v", err)
+			}
+
+			wantTokenKeys := map[string]bool{
+				telemetrycontract.HarnessLabel:   true,
+				telemetrycontract.ModelLabel:     true,
+				telemetrycontract.TokenTypeLabel: true,
+			}
+			gotByType := map[string]int64{}
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != telemetrycontract.MetricUsageTokens {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					if !ok {
+						t.Fatalf("%s: unexpected data type %T", m.Name, m.Data)
+					}
+					for _, point := range sum.DataPoints {
+						gotKeys := map[string]bool{}
+						for _, kv := range point.Attributes.ToSlice() {
+							gotKeys[string(kv.Key)] = true
+						}
+						if len(gotKeys) != len(wantTokenKeys) {
+							t.Errorf("point attribute keys = %v, want exactly %v", gotKeys, wantTokenKeys)
+							continue
+						}
+						for key := range wantTokenKeys {
+							if !gotKeys[key] {
+								t.Errorf("point attribute keys = %v, missing %q", gotKeys, key)
+							}
+						}
+						if tokenType, ok := point.Attributes.Value(attribute.Key(telemetrycontract.TokenTypeLabel)); ok {
+							gotByType[tokenType.AsString()] = point.Value
+						}
+					}
+				}
+			}
+
+			if len(gotByType) != tc.wantTokenPoints {
+				t.Fatalf("%s token points = %d (%v), want %d", telemetrycontract.MetricUsageTokens, len(gotByType), gotByType, tc.wantTokenPoints)
+			}
+			if tc.wantTokenPoints == 0 {
+				return
+			}
+			want := map[string]int64{
+				telemetrycontract.TokenTypeInput:      100,
+				telemetrycontract.TokenTypeOutput:     50,
+				telemetrycontract.TokenTypeCacheRead:  10,
+				telemetrycontract.TokenTypeCacheWrite: 30,
+				telemetrycontract.TokenTypeReasoning:  15,
+			}
+			for tokenType, want := range want {
+				if got := gotByType[tokenType]; got != want {
+					t.Errorf("token_type=%s = %d, want %d", tokenType, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestTelemetryHandler_UsageSourceGate pins design D4/D10 and the Phase 2 AC:
+// hook-sourced usage (gen_ai.api.calls, scion.usage.tokens) is recorded only
+// when SCION_USAGE_SOURCE=hooks. It is suppressed both when the variable is
+// unset (the vetting-gate default) and when it is "native" (the deriver owns
+// usage instead). Tool and session hook metrics are unaffected in every case.
+func TestTelemetryHandler_UsageSourceGate(t *testing.T) {
+	scrubTelemetryEnv(t)
+	for _, tc := range []struct {
+		name        string
+		usageSource string
+		wantUsage   bool
+	}{
+		{name: "unset (vetting gate default)", usageSource: "", wantUsage: false},
+		{name: "native (deriver owns usage)", usageSource: "native", wantUsage: false},
+		{name: "hooks (opted in)", usageSource: "hooks", wantUsage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// An empty value is equivalent to unset for usageHookRecordingEnabled
+			// (both compare != "hooks"), and t.Setenv restores the previous
+			// value automatically, so this also covers the true-unset default.
+			t.Setenv("SCION_USAGE_SOURCE", tc.usageSource)
+
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			defer func() { _ = mp.Shutdown(context.Background()) }()
+
+			h := NewTelemetryHandler(nil, nil, nil, mp)
+
+			// Paired model-start/model-end.
+			if err := h.Handle(&hooks.Event{Name: hooks.EventModelStart, Data: hooks.EventData{}}); err != nil {
+				t.Fatalf("Handle model-start error: %v", err)
+			}
+			if err := h.Handle(&hooks.Event{
+				Name: hooks.EventModelEnd,
+				Data: hooks.EventData{Success: true, InputTokens: 100, OutputTokens: 50},
+			}); err != nil {
+				t.Fatalf("Handle model-end error: %v", err)
+			}
+			// Unpaired model-end: the normal hook-per-process case
+			// (recordUnpairedEndMetrics), gated the same way as the paired
+			// path above.
+			if err := h.Handle(&hooks.Event{
+				Name: hooks.EventModelEnd,
+				Data: hooks.EventData{Success: true, InputTokens: 10, OutputTokens: 5},
+			}); err != nil {
+				t.Fatalf("Handle unpaired model-end error: %v", err)
+			}
+			if err := h.Handle(&hooks.Event{Name: hooks.EventToolStart, Data: hooks.EventData{ToolName: "Bash"}}); err != nil {
+				t.Fatalf("Handle tool-start error: %v", err)
+			}
+			if err := h.Handle(&hooks.Event{Name: hooks.EventToolEnd, Data: hooks.EventData{ToolName: "Bash", Success: true}}); err != nil {
+				t.Fatalf("Handle tool-end error: %v", err)
+			}
+			// session-end: agent.session.count must be recorded in every
+			// state, since the gate is scoped to usage only (D4, narrow).
+			if err := h.Handle(&hooks.Event{Name: hooks.EventSessionEnd, Data: hooks.EventData{Reason: "user_exit"}}); err != nil {
+				t.Fatalf("Handle session-end error: %v", err)
+			}
+
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(context.Background(), &rm); err != nil {
+				t.Fatalf("Collect error: %v", err)
+			}
+
+			found := map[string]bool{}
+			var foundAPIDuration bool
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					found[m.Name] = true
+					if m.Name == "gen_ai.api.duration" {
+						foundAPIDuration = true
+					}
+				}
+			}
+
+			if found[telemetrycontract.MetricAPICalls] != tc.wantUsage {
+				t.Errorf("%s recorded=%v, want %v", telemetrycontract.MetricAPICalls, found[telemetrycontract.MetricAPICalls], tc.wantUsage)
+			}
+			if found[telemetrycontract.MetricUsageTokens] != tc.wantUsage {
+				t.Errorf("%s recorded=%v, want %v", telemetrycontract.MetricUsageTokens, found[telemetrycontract.MetricUsageTokens], tc.wantUsage)
+			}
+			// gen_ai.api.duration is not part of the usage contract (design
+			// D4 "the switch covers only usage"), so it is unaffected.
+			if !foundAPIDuration {
+				t.Error("expected gen_ai.api.duration to be recorded regardless of SCION_USAGE_SOURCE")
+			}
+			// Tool and session metrics are unaffected either way (D4, narrow).
+			if !found["agent.tool.calls"] {
+				t.Error("expected agent.tool.calls to be recorded regardless of SCION_USAGE_SOURCE")
+			}
+			if !found[telemetrycontract.MetricSessionCount] {
+				t.Error("expected agent.session.count to be recorded regardless of SCION_USAGE_SOURCE")
+			}
+		})
+	}
+}
+
+func TestTelemetryHandler_SessionTotalsDoNotDuplicateModelTokens(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	h := NewTelemetryHandler(nil, nil, nil, mp)
+	if err := h.Handle(&hooks.Event{Name: hooks.EventModelEnd, Data: hooks.EventData{Success: true, InputTokens: 1500, OutputTokens: 500}}); err != nil {
+		t.Fatal(err)
+	}
 
 	// session-end with cumulative token usage
 	if err := h.Handle(&hooks.Event{
@@ -728,15 +1115,14 @@ func TestTelemetryHandler_TokenMetricsOnSessionEnd(t *testing.T) {
 	if !found["agent.session.count"] {
 		t.Error("expected agent.session.count metric to be recorded")
 	}
-	if !found["gen_ai.tokens.input"] {
-		t.Error("expected gen_ai.tokens.input metric to be recorded on session-end")
-	}
-	if !found["gen_ai.tokens.output"] {
-		t.Error("expected gen_ai.tokens.output metric to be recorded on session-end")
+	totals := usageTokenTotals(rm)
+	if totals[telemetrycontract.TokenTypeInput] != 1500 || totals[telemetrycontract.TokenTypeOutput] != 500 {
+		t.Errorf("session totals duplicated model increments: input=%d output=%d", totals[telemetrycontract.TokenTypeInput], totals[telemetrycontract.TokenTypeOutput])
 	}
 }
 
 func TestTelemetryHandler_UnpairedToolEnd(t *testing.T) {
+	scrubTelemetryEnv(t)
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -771,6 +1157,8 @@ func TestTelemetryHandler_UnpairedToolEnd(t *testing.T) {
 }
 
 func TestTelemetryHandler_UnpairedModelEnd(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -801,18 +1189,21 @@ func TestTelemetryHandler_UnpairedModelEnd(t *testing.T) {
 		}
 	}
 
-	if !found["gen_ai.api.calls"] {
+	if !found[telemetrycontract.MetricAPICalls] {
 		t.Error("expected gen_ai.api.calls metric from unpaired model-end")
 	}
-	if !found["gen_ai.tokens.input"] {
-		t.Error("expected gen_ai.tokens.input metric from unpaired model-end")
+	totals := usageTokenTotals(rm)
+	if totals[telemetrycontract.TokenTypeInput] != 1000 {
+		t.Errorf("expected scion.usage.tokens token_type=input from unpaired model-end, got %d", totals[telemetrycontract.TokenTypeInput])
 	}
-	if !found["gen_ai.tokens.output"] {
-		t.Error("expected gen_ai.tokens.output metric from unpaired model-end")
+	if totals[telemetrycontract.TokenTypeOutput] != 300 {
+		t.Errorf("expected scion.usage.tokens token_type=output from unpaired model-end, got %d", totals[telemetrycontract.TokenTypeOutput])
 	}
 }
 
 func TestTelemetryHandler_NoTokenMetricsWhenZero(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_USAGE_SOURCE", "hooks")
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
@@ -834,9 +1225,83 @@ func TestTelemetryHandler_NoTokenMetricsWhenZero(t *testing.T) {
 
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name == "gen_ai.tokens.input" || m.Name == "gen_ai.tokens.output" || m.Name == "gen_ai.tokens.cached" {
+			if m.Name == telemetrycontract.MetricUsageTokens {
 				t.Errorf("did not expect %s metric when token counts are zero", m.Name)
 			}
 		}
+	}
+}
+
+// TestTelemetryHandler_ModelAttributeOnSpansAndLogs pins that hook spans
+// and log records carry a `model` attribute when, and only when, the event
+// payload named one (EventData.Model, ptone/scion#2242). Unlike the usage
+// metric label, they never fall back to SCION_MODEL or "unknown".
+func TestTelemetryHandler_ModelAttributeOnSpansAndLogs(t *testing.T) {
+	scrubTelemetryEnv(t)
+	t.Setenv("SCION_MODEL", "configured-model")
+
+	cases := []struct {
+		name      string
+		model     string
+		wantModel string // "" means the attribute must be absent
+	}{
+		{"payload model", "provider/model-x", "provider/model-x"},
+		{"no payload model", "", ""},
+		{"whitespace payload model", "  ", ""},
+		{"long payload model is truncated", strings.Repeat("m", 200), strings.Repeat("m", telemetrycontract.MaxModelLabelBytes)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sr := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+			defer func() { _ = tp.Shutdown(context.Background()) }()
+			proc := &recordingProcessor{}
+			lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+			defer func() { _ = lp.Shutdown(context.Background()) }()
+
+			h := NewTelemetryHandler(tp, lp, nil)
+			for _, name := range []string{hooks.EventModelStart, hooks.EventModelEnd} {
+				if err := h.Handle(&hooks.Event{Name: name, Data: hooks.EventData{Model: tc.model}}); err != nil {
+					t.Fatalf("Handle(%s): %v", name, err)
+				}
+			}
+
+			spans := sr.Ended()
+			if len(spans) != 1 {
+				t.Fatalf("ended spans = %d, want 1 (paired model-start/model-end)", len(spans))
+			}
+			var spanModel string
+			var spanHasModel bool
+			for _, kv := range spans[0].Attributes() {
+				if string(kv.Key) == telemetrycontract.ModelLabel {
+					spanModel, spanHasModel = kv.Value.AsString(), true
+				}
+			}
+			if tc.wantModel == "" && spanHasModel {
+				t.Errorf("span has model attribute %q, want none", spanModel)
+			}
+			if tc.wantModel != "" && spanModel != tc.wantModel {
+				t.Errorf("span model attribute = %q, want %q", spanModel, tc.wantModel)
+			}
+
+			records := proc.Records()
+			if len(records) != 2 {
+				t.Fatalf("log records = %d, want 2", len(records))
+			}
+			for i := range records {
+				found := map[string]string{}
+				records[i].WalkAttributes(func(kv attribute.KeyValue) bool {
+					found[string(kv.Key)] = kv.Value.AsString()
+					return true
+				})
+				got, ok := found[telemetrycontract.ModelLabel]
+				if tc.wantModel == "" && ok {
+					t.Errorf("log record %d has model attribute %q, want none", i, got)
+				}
+				if tc.wantModel != "" && got != tc.wantModel {
+					t.Errorf("log record %d model attribute = %q, want %q", i, got, tc.wantModel)
+				}
+			}
+		})
 	}
 }

@@ -19,7 +19,6 @@ package hub
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,45 +27,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// trackingEventPublisher records PublishAgentStatus calls for test assertions.
-type trackingEventPublisher struct {
-	noopEventPublisher
-	mu     sync.Mutex
-	agents []*store.Agent
-}
-
-func (t *trackingEventPublisher) PublishAgentStatus(_ context.Context, agent *store.Agent) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.agents = append(t.agents, agent)
-}
-
-func (t *trackingEventPublisher) publishedAgents() []*store.Agent {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	result := make([]*store.Agent, len(t.agents))
-	copy(result, t.agents)
-	return result
-}
-
-//nolint:unused // Kept for test diagnostics when extending heartbeat timeout cases.
-func (t *trackingEventPublisher) reset() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.agents = nil
-}
-
 func setupHeartbeatTestServer(t *testing.T) (*Server, store.Store, *trackingEventPublisher) {
 	t.Helper()
 
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 
 	ep := &trackingEventPublisher{}
 
@@ -94,13 +61,12 @@ func TestAgentHeartbeatTimeoutHandler_MarksStaleAgents(t *testing.T) {
 
 	// Create a running agent with a heartbeat
 	staleAgent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "stale-runner",
-		Name:       "Stale Runner",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "stale-runner",
+		Name:      "Stale Runner",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, staleAgent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -115,13 +81,12 @@ func TestAgentHeartbeatTimeoutHandler_MarksStaleAgents(t *testing.T) {
 
 	// Create a stopped agent (terminal — should not be affected)
 	stoppedAgent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "stopped-agent",
-		Name:       "Stopped Agent",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseStopped),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "stopped-agent",
+		Name:      "Stopped Agent",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseStopped),
 	}
 	if err := s.CreateAgent(ctx, stoppedAgent); err != nil {
 		t.Fatalf("failed to create stopped agent: %v", err)
@@ -188,7 +153,6 @@ func TestAgentHeartbeatTimeoutHandler_ClearedBySubsequentHeartbeat(t *testing.T)
 		Template:  "claude",
 		ProjectID: project.ID,
 		Phase:     string(state.PhaseRunning), Activity: string(state.ActivityOffline),
-		Visibility: store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)

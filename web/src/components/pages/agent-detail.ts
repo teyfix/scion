@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { isAgentPrivileged, agentUsesNvidiaGPU } from '../../shared/types.js';
 
 /**
  * Agent detail page component
@@ -22,6 +23,7 @@
  */
 
 import { LitElement, html, css, nothing } from 'lit';
+import type { TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type {
@@ -31,30 +33,46 @@ import type {
   AgentInlineConfig,
   TelemetryConfig,
   GCPIdentityConfig,
+  GCPServiceAccount,
   Project,
   Notification,
   Subscription,
   AgentMetricsSummary,
+  RuntimeBroker,
 } from '../../shared/types.js';
+import type { AgentLifecycleAction } from '../../shared/types.js';
 import {
   can,
   canLifecycle,
+  canMessageAgent,
   isTerminalAvailable,
-  getAgentDisplayStatus,
   isAgentRunning,
-  isAgentPrivileged,
-  agentUsesNvidiaGPU,
+  RESUME_BEST_EFFORT_CONFIRM_MESSAGE,
+  lifecycleActionRequestInit,
 } from '../../shared/types.js';
 
 interface AgentNotificationsResponse {
   userNotifications: Notification[];
   agentNotifications: Notification[];
 }
-import type { StatusType } from '../shared/status-badge.js';
+import { agentStatusBadge, stateLabel } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { agentPlacementView } from './agent-placement.js';
+import {
+  gcpModeLabel,
+  gcpModeVariant,
+  gcpVerificationDisplay,
+  matchingAccount,
+} from '../../shared/gcp-identity-display.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import { stateManager } from '../../client/state.js';
+import { AgentSeedEpoch } from '../../client/agent-seed-epoch.js';
 import '../shared/status-badge.js';
+import '../shared/detail-header.js';
+import { DeletionLeaseController } from '../shared/deletion-badge.js';
+import '../shared/deletion-banner.js';
+import { runAgentDelete, lifecycleActionErrorMessage } from '../../client/agent-delete.js';
+import type { AgentDeleteRequest } from '../../client/agent-delete.js';
 import '../shared/message-mode-badge.js';
 import '../shared/messageability-indicator.js';
 import {
@@ -62,14 +80,14 @@ import {
   getMessageModeDisplay,
   MESSAGE_MODE_DISPLAY,
 } from '../../shared/message-mode.js';
-import type { MessageMode, AgentMessageabilityDetail } from '../../shared/types.js';
+import type { DeletionInfo, MessageMode, AgentMessageabilityDetail } from '../../shared/types.js';
 import '../shared/agent-log-viewer.js';
 import type { ScionAgentLogViewer } from '../shared/agent-log-viewer.js';
 import '../shared/agent-message-viewer.js';
 import type { ScionAgentMessageViewer } from '../shared/agent-message-viewer.js';
 import '../shared/chat/chat-thread.js';
 import type { ScionChatThread } from '../shared/chat/chat-thread.js';
-import { isFeatureEnabled } from '../../utils/feature-flags.js';
+import { isFeatureEnabled, AGENT_EDIT_FLAG } from '../../utils/feature-flags.js';
 import '../shared/hash-display.js';
 import '../shared/quick-message-dialog.js';
 import '../shared/cascade-mode-dialog.js';
@@ -77,6 +95,12 @@ import '../shared/effective-role-provenance.js';
 import '../shared/effective-access-boundary-notice.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
+import { terminalHref } from '../../client/open-terminal.js';
+import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
+import { formatNumber } from '../../utils/format-number.js';
+import { DisplayZoneController } from '../../utils/display-zone-controller.js';
+import { DEFAULT_TRIGGERS } from '../../shared/notification-triggers.js';
+import { navigateTo, stripBasePath } from '../../client/navigation.js';
 
 /**
  * Parse a Go-style duration string (e.g. "2h30m", "1h", "45m", "90s") into
@@ -105,6 +129,19 @@ function parseDuration(s: string): number {
 }
 
 /**
+ * How long to show the client-side "deleted" state before SPA-navigating
+ * away, after a successful delete (or an SSE `deleted` event for this
+ * agent). Exported (rather than a magic number) so tests can reason about
+ * it and use fake timers.
+ */
+export const DELETE_REDIRECT_DELAY_MS = 1000;
+
+/** Body of the Reincarnate confirm dialog (ptone/scion#3707). */
+export const REINCARNATE_CONFIRM_MESSAGE =
+  'The agent will be stopped and re-provisioned with its current settings and template. ' +
+  'Any work running in its current session is interrupted.';
+
+/**
  * Format seconds as "Xh Ym Zs".
  */
 function formatDurationHMS(totalSeconds: number): string {
@@ -121,6 +158,14 @@ function formatDurationHMS(totalSeconds: number): string {
 
 @customElement('scion-page-agent-detail')
 export class ScionPageAgentDetail extends LitElement {
+  /** Re-renders absolute times when the display timezone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
+  /** Lease timer for this agent's delete view (ptone/scion#2483 N4). */
+  private readonly deletionLease = new DeletionLeaseController(this, () =>
+    this.agent ? [this.agent] : []
+  );
+
   @property({ type: Object })
   pageData: PageData | null = null;
 
@@ -136,11 +181,27 @@ export class ScionPageAgentDetail extends LitElement {
   @state()
   private project: Project | null = null;
 
+  /**
+   * The Runtime Broker row of a pinned (flat) agent's Runtime Broker, for the
+   * placement card's target display name and connection status. Null for an
+   * unpinned agent, before it loads, or when it cannot be read.
+   */
+  @state()
+  private placementBroker: RuntimeBroker | null = null;
+
   @state()
   private error: string | null = null;
 
   @state()
   private actionLoading: Record<string, boolean> = {};
+
+  /**
+   * True once this agent has been deleted (either by this page or by an
+   * SSE `deleted` event). Shows a brief client-side-only "deleted" view
+   * before the SPA redirect fires.
+   */
+  @state()
+  private deleted = false;
 
   @state()
   private userNotifications: Notification[] = [];
@@ -163,9 +224,31 @@ export class ScionPageAgentDetail extends LitElement {
   @state()
   private cascadeDialogOpen = false;
 
+  /**
+   * True while a confirmed reincarnate request is in flight; drives the
+   * button's loading state (ptone/scion#3707).
+   */
+  @state()
+  private reincarnating = false;
+
+  /**
+   * Double-submit guard: true from the first click until the request
+   * settles, including while the confirm dialog is open. Not rendered, so
+   * no spinner shows behind the dialog.
+   */
+  private reincarnateBusy = false;
+
+  /** The hub's error text from the last failed reincarnate, if any. */
+  @state()
+  private reincarnateError: string | null = null;
+
   /** Whether the Chat|Log toggle is in "chat" mode (vs "log" mode). */
   @state()
   private chatViewActive = true;
+
+  /** Current user ID for constructing the DM conversation key. */
+  @state()
+  private currentUserId = '';
 
   /** Whether the native chat feature flag is enabled. */
   private get nativeChatEnabled(): boolean {
@@ -175,56 +258,32 @@ export class ScionPageAgentDetail extends LitElement {
   @state()
   private metricsSummary: AgentMetricsSummary | null = null;
 
+  /**
+   * Registered record of the agent's assigned GCP service account, for the
+   * GCP Identity card's display name and verification status
+   * (ptone/scion#4017). Null until loaded, or when it cannot be loaded.
+   */
+  @state()
+  private gcpServiceAccount: GCPServiceAccount | null = null;
+
+  /** True while the record above is being fetched. */
+  @state()
+  private gcpServiceAccountLoading = false;
+
+  /** `projectId/serviceAccountId` the record above was requested for; '' for none. */
+  private gcpServiceAccountKey = '';
+
   static override styles = css`
     :host {
       display: block;
     }
 
-    /* ---- Back link ---- */
-    .back-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--scion-text-muted, #64748b);
-      text-decoration: none;
-      font-size: 0.875rem;
-      margin-bottom: 1rem;
-    }
-    .back-link:hover {
-      color: var(--scion-primary, #3b82f6);
-    }
-
-    /* ---- Header ---- */
-    .header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      margin-bottom: 1.5rem;
-      gap: 1rem;
-    }
-    .header-info {
-      flex: 1;
-    }
-    .header-title {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      margin-bottom: 0.5rem;
-    }
-    .header-title sl-icon {
-      color: var(--scion-primary, #3b82f6);
-      font-size: 1.5rem;
-    }
-    .header h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--scion-text, #1e293b);
-      margin: 0;
-    }
+    /* ---- Header (layout in scion-detail-header) ---- */
     .header-meta {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 1rem;
+      gap: 0.5rem 1rem;
       margin-top: 0.5rem;
     }
     .template-badge {
@@ -236,6 +295,9 @@ export class ScionPageAgentDetail extends LitElement {
       border-radius: var(--scion-radius, 0.5rem);
       font-size: 0.875rem;
       color: var(--scion-text-muted, #64748b);
+      /* One long template name breaks inside its own item. */
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
     .project-link,
     .broker-link {
@@ -245,18 +307,25 @@ export class ScionPageAgentDetail extends LitElement {
       color: var(--scion-text-muted, #64748b);
       text-decoration: none;
       font-size: 0.875rem;
+      /* One long project or broker name breaks inside its own item. */
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    /* The icon keeps its size when a long name wraps beside it. */
+    .template-badge sl-icon,
+    .project-link sl-icon,
+    .broker-link sl-icon {
+      flex-shrink: 0;
     }
     .project-link:hover,
     .broker-link:hover {
       color: var(--scion-primary, #3b82f6);
     }
-    .header-actions {
-      display: flex;
-      gap: 0.5rem;
-      flex-shrink: 0;
+    /* ---- Error banner ---- */
+    scion-deletion-banner.deletion-banner {
+      margin-bottom: 1.5rem;
     }
 
-    /* ---- Error banner ---- */
     .agent-error-banner {
       background: var(--sl-color-danger-50, #fef2f2);
       border: 1px solid var(--sl-color-danger-200, #fecaca);
@@ -299,6 +368,14 @@ export class ScionPageAgentDetail extends LitElement {
     }
 
     /* ---- Cards ---- */
+    .reincarnate-help {
+      margin: 0 0 1rem;
+      color: var(--scion-text-secondary, #475569);
+      font-size: 0.875rem;
+    }
+    .reincarnate-error {
+      margin-bottom: 1rem;
+    }
     .card {
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
@@ -345,6 +422,37 @@ export class ScionPageAgentDetail extends LitElement {
     .info-value.mono {
       font-family: var(--scion-font-mono, monospace);
       font-size: 0.875rem;
+    }
+    .info-subvalue {
+      font-size: 0.8125rem;
+      color: var(--scion-text-muted, #64748b);
+      margin-top: 0.125rem;
+      word-break: break-all;
+    }
+    .info-subvalue.mono {
+      font-family: var(--scion-font-mono, monospace);
+    }
+    /* Messaging: the mode select needs more room than an info-grid column
+       gives it, so this card wraps instead of letting the select overlap the
+       reachability column. */
+    .messaging-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+    }
+    .messaging-grid .messaging-mode {
+      flex: 1 1 280px;
+      min-width: 0;
+    }
+    .messaging-grid .messaging-reach {
+      flex: 1 1 200px;
+      min-width: 0;
+    }
+    /* Cap the select, not its column, so a read-only mode description can
+       use the full column width. */
+    .messaging-mode sl-select {
+      width: 100%;
+      max-width: 360px;
     }
 
     /* ---- Task summary ---- */
@@ -597,24 +705,19 @@ export class ScionPageAgentDetail extends LitElement {
       text-decoration: underline;
       color: #22c55e;
     }
-
-    /* ---- Visibility badge ---- */
-    .visibility-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.25rem;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.8125rem;
-      font-weight: 500;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
   `;
 
   private boundOnAgentsUpdated = this.onAgentsUpdated.bind(this);
   private boundOnProjectsUpdated = this.onProjectsUpdated.bind(this);
   private relativeTimeInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Pending SPA-redirect timer for the deleted state; cancellable on
+   * disconnect. `@state()` so `renderDeletedState` re-renders (dropping
+   * "Redirecting…") the moment the timer fires or is cleared, not just when
+   * `deleted` changes.
+   */
+  @state()
+  private deleteRedirectTimer: ReturnType<typeof setTimeout> | null = null;
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -626,22 +729,23 @@ export class ScionPageAgentDetail extends LitElement {
     }
     void this.loadData();
 
-    stateManager.addEventListener('agents-updated', this.boundOnAgentsUpdated as EventListener);
-    stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated as EventListener);
+    stateManager.addEventListener('agents-updated', this.boundOnAgentsUpdated);
+    stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated);
 
     this.relativeTimeInterval = setInterval(() => this.requestUpdate(), 15000);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    stateManager.removeEventListener('agents-updated', this.boundOnAgentsUpdated as EventListener);
-    stateManager.removeEventListener(
-      'projects-updated',
-      this.boundOnProjectsUpdated as EventListener
-    );
+    stateManager.removeEventListener('agents-updated', this.boundOnAgentsUpdated);
+    stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated);
     if (this.relativeTimeInterval) {
       clearInterval(this.relativeTimeInterval);
       this.relativeTimeInterval = null;
+    }
+    if (this.deleteRedirectTimer) {
+      clearTimeout(this.deleteRedirectTimer);
+      this.deleteRedirectTimer = null;
     }
   }
 
@@ -649,7 +753,117 @@ export class ScionPageAgentDetail extends LitElement {
     const updatedAgent = stateManager.getAgent(this.agentId);
     if (updatedAgent && this.agent) {
       this.agent = { ...this.agent, ...updatedAgent };
+      return;
     }
+    // The agent is missing from stateManager's map. That alone does not
+    // mean it was deleted: setScope() clears the map before this page's
+    // own reseed lands at the end of loadData (which awaits the project,
+    // auth/me, notification and subscription fetches first), and
+    // removeAgent() prunes stale rows without a tombstone. Either way, an
+    // unrelated `agents-updated` flush during that window would otherwise
+    // be read as "this agent was deleted". Key on the authoritative
+    // tombstone instead of absence. (No `!this.deleted` guard here:
+    // `showDeletedStateThenRedirect` already no-ops once `deleted` is true.)
+    if (!updatedAgent && this.agent && stateManager.getDeletedAgentIds().has(this.agentId)) {
+      this.showDeletedStateThenRedirect();
+    }
+  }
+
+  /**
+   * True while this element is still attached AND the app's current route
+   * is still this agent's detail page. Guards the deferred SPA-redirect in
+   * {@link showDeletedStateThenRedirect}: `renderRoute` (main.ts) keeps the
+   * previous page connected-but-hidden behind `/terminals`, so
+   * `isConnected` alone cannot distinguish "visible" from "hidden behind
+   * another route". The base path is stripped the same way the router does
+   * (so this works behind a reverse proxy), then the app path must be
+   * exactly this agent's route. Trailing slashes are stripped first so
+   * `/agents/<id>/` still counts as this agent's route.
+   */
+  private isOnThisAgentRoute(): boolean {
+    if (!this.isConnected || typeof window === 'undefined') return false;
+    const appPath = stripBasePath(window.location.pathname).replace(/\/+$/, '');
+    return appPath === `/agents/${this.agentId}`;
+  }
+
+  /**
+   * Where the deleted-state redirect (and its link/back-link fallbacks) go:
+   * the agent's project page if known, otherwise the agents list. Shared by
+   * the deferred redirect timer, `renderDeletedState` and `renderError` so
+   * they cannot disagree about the destination computed from the same
+   * `this.project`. Deliberately *not* captured at schedule time: the timer
+   * re-reads this getter when it fires, so a project that finishes loading
+   * after the delete but before the 1s redirect still wins. The two can only
+   * differ in that window, and both destinations are valid.
+   */
+  private get redirectTarget(): string {
+    return this.project ? `/projects/${this.project.id}` : '/agents';
+  }
+
+  /**
+   * Show a brief client-side-only "deleted" state, then SPA-navigate to the
+   * project page (or /agents if there is no project). Used both for a
+   * delete/force-delete initiated from this page and for an SSE `deleted`
+   * event removing this agent elsewhere. The timer is cancellable so a
+   * disconnect (or a test using fake timers) does not leak it. The redirect
+   * itself only fires while this page is still the active route — see
+   * `isOnThisAgentRoute` — so it never pulls the user out of `/terminals`.
+   * When the redirect is skipped (or the element is disconnected and
+   * reconnected with no timer left to fire), `renderDeletedState` still
+   * offers a link out instead of leaving the page on "Redirecting…" forever.
+   */
+  private showDeletedStateThenRedirect(): void {
+    if (this.deleted) return;
+    this.deleted = true;
+    this.deleteRedirectTimer = setTimeout(() => {
+      this.deleteRedirectTimer = null;
+      if (this.isOnThisAgentRoute()) {
+        navigateTo(this.redirectTarget);
+      }
+    }, DELETE_REDIRECT_DELAY_MS);
+  }
+
+  /**
+   * Delete through the shared helper (ptone/scion#2483 phase 2): the header
+   * Delete button (`event` for the Alt-key bypass), and the failure
+   * banner's Retry (no confirm) and Force. On 204 show the deleted state and
+   * redirect. On 202 stay with "Deleting…" (the helper applied the
+   * response's view); the SSE `deleted` event then runs
+   * `showDeletedStateThenRedirect` through `onAgentsUpdated`, as it does for
+   * a delete started elsewhere.
+   */
+  private async deleteAgent(opts: AgentDeleteRequest = {}): Promise<void> {
+    if (!this.agent) return;
+    const outcome = await runAgentDelete({
+      agentId: this.agentId,
+      agentName: this.agent.name,
+      ...opts,
+      onBusy: (busy): void => {
+        this.actionLoading = { ...this.actionLoading, delete: busy };
+      },
+    });
+    if (outcome.kind === 'deleted') {
+      this.showDeletedStateThenRedirect();
+    } else if (outcome.kind === 'failed') {
+      showToast(outcome.message);
+    }
+  }
+
+  /** Failure banner with Retry and Force, under the header. */
+  private renderDeletionBanner(): TemplateResult | typeof nothing {
+    const agent = this.agent;
+    const view = agent ? this.deletionLease.view(agent) : null;
+    if (!agent || view?.state !== 'failed') return nothing;
+    return html`<scion-deletion-banner
+      class="deletion-banner"
+      live
+      .deletion=${view}
+      agent-name=${agent.name}
+      ?can-delete=${can(agent._capabilities, 'delete')}
+      ?busy=${this.actionLoading['delete'] || false}
+      @deletion-retry=${(): void => void this.deleteAgent({ confirm: false })}
+      @deletion-force=${(): void => void this.deleteAgent({ force: true })}
+    ></scion-deletion-banner>`;
   }
 
   private onProjectsUpdated(): void {
@@ -661,9 +875,62 @@ export class ScionPageAgentDetail extends LitElement {
     }
   }
 
+  override willUpdate(changed: Map<PropertyKey, unknown>): void {
+    super.willUpdate(changed);
+    if (changed.has('agent')) this.syncGCPServiceAccount();
+  }
+
+  /**
+   * Keeps `gcpServiceAccount` in step with the agent's applied identity.
+   * Fetches only when the assigned account changes, so live agent updates
+   * do not refetch it.
+   */
+  private syncGCPServiceAccount(): void {
+    const identity = this.agent?.appliedConfig?.gcpIdentity;
+    const saId = identity?.metadataMode === 'assign' ? identity.serviceAccountId || '' : '';
+    const projectId = this.agent?.projectId || '';
+    const key = saId && projectId ? `${projectId}/${saId}` : '';
+    if (key === this.gcpServiceAccountKey) return;
+    this.gcpServiceAccountKey = key;
+    this.gcpServiceAccount = null;
+    this.gcpServiceAccountLoading = Boolean(key);
+    if (key) void this.loadGCPServiceAccount(projectId, saId, key);
+  }
+
+  /**
+   * Loads the assigned account through the agent's project. The nested
+   * by-id route answers for both project-scoped accounts and hub-scoped
+   * accounts usable from the project, which are the accounts an agent can be
+   * assigned. Any failure leaves the record null, which the card shows as
+   * verification unknown.
+   */
+  private async loadGCPServiceAccount(projectId: string, saId: string, key: string): Promise<void> {
+    try {
+      // A refused lookup is shown inline as Unknown, so it must not also
+      // raise the global access-denied toast.
+      const res = await apiFetch(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/gcp-service-accounts/${encodeURIComponent(saId)}`,
+        { suppressAccessDeniedToast: true }
+      );
+      if (!res.ok) return;
+      const account = (await res.json()) as GCPServiceAccount;
+      if (key === this.gcpServiceAccountKey) this.gcpServiceAccount = account;
+    } catch {
+      // Optional: the card shows verification as unknown.
+    } finally {
+      if (key === this.gcpServiceAccountKey) this.gcpServiceAccountLoading = false;
+    }
+  }
+
   private async loadData(): Promise<void> {
     this.loading = true;
     this.error = null;
+    // Opened before the agent request, so a live change that lands while
+    // any request below is in flight is re-applied over the agent response
+    // when it is seeded.
+    let epoch = new AgentSeedEpoch();
+    let epochGeneration = stateManager.scopeGeneration;
+    const agentId = this.agentId;
 
     try {
       // Use SSR-prefetched agent data when available to avoid a redundant fetch.
@@ -693,8 +960,31 @@ export class ScionPageAgentDetail extends LitElement {
         });
       }
 
+      // A scope change (this setScope, or another) discards the epoch's
+      // store epoch: reopen it for the requests below.
+      if (stateManager.scopeGeneration !== epochGeneration) {
+        epoch.close();
+        epoch = new AgentSeedEpoch();
+        epochGeneration = stateManager.scopeGeneration;
+      }
+
       // Fetch project and notifications in parallel — they are independent.
       const parallel: Promise<void>[] = [];
+
+      // A pinned (flat) agent's placement card reads its Runtime Broker row.
+      const pinnedBrokerId = this.agent.pinnedRuntimeTarget?.runtimeBrokerId;
+      if (pinnedBrokerId) {
+        parallel.push(
+          apiFetch(`/api/v1/runtime-brokers/${encodeURIComponent(pinnedBrokerId)}`)
+            .then(async (res) => {
+              this.placementBroker = res.ok ? ((await res.json()) as RuntimeBroker) : null;
+            })
+            .catch(() => {
+              // The placement card falls back to the stored pin alone.
+              this.placementBroker = null;
+            })
+        );
+      }
 
       if (this.agent.projectId) {
         const projectId = this.agent.projectId;
@@ -707,6 +997,25 @@ export class ScionPageAgentDetail extends LitElement {
             })
             .catch(() => {
               // Project loading is optional
+            })
+        );
+      }
+
+      // Resolve current user ID for the DM conversation key.
+      // Use pageData first, fall back to auth/me endpoint.
+      if (this.pageData?.user?.id) {
+        this.currentUserId = this.pageData.user.id;
+      } else if (!this.currentUserId) {
+        parallel.push(
+          apiFetch('/api/v1/auth/me')
+            .then(async (res) => {
+              if (res.ok) {
+                const data = (await res.json()) as { id?: string };
+                if (data.id) this.currentUserId = data.id;
+              }
+            })
+            .catch(() => {
+              // User ID resolution is optional; chat will degrade gracefully
             })
         );
       }
@@ -734,9 +1043,7 @@ export class ScionPageAgentDetail extends LitElement {
                 const data = (await subRes.json()) as
                   | Subscription[]
                   | { subscriptions?: Subscription[] };
-                const subs = Array.isArray(data)
-                  ? data
-                  : (data as { subscriptions?: Subscription[] }).subscriptions || [];
+                const subs = Array.isArray(data) ? data : data.subscriptions || [];
                 const match = subs.find((s) => s.scope === 'agent' && s.agentId === this.agentId);
                 if (match) {
                   this.subscribed = true;
@@ -753,9 +1060,9 @@ export class ScionPageAgentDetail extends LitElement {
       await Promise.all(parallel);
 
       // Load metrics summary (non-blocking).
-      this.loadMetricsSummary();
+      void this.loadMetricsSummary();
 
-      stateManager.seedAgents([this.agent]);
+      this.seedAgent(this.agent, agentId, epoch, epochGeneration);
       if (this.project) {
         stateManager.seedProjects([this.project]);
         dispatchPageTitle(this, this.agent.name, this.project.name || this.agent.projectId);
@@ -766,6 +1073,7 @@ export class ScionPageAgentDetail extends LitElement {
       console.error('Failed to load agent:', err);
       this.error = err instanceof Error ? err.message : 'Failed to load agent';
     } finally {
+      epoch.close();
       this.loading = false;
     }
   }
@@ -782,19 +1090,8 @@ export class ScionPageAgentDetail extends LitElement {
   }
 
   private formatDate(dateString: string): string {
-    try {
-      if (this.isZeroDate(dateString)) return '—';
-      const date = new Date(dateString);
-      return new Intl.DateTimeFormat('en', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-      }).format(date);
-    } catch {
-      return dateString;
-    }
+    if (this.isZeroDate(dateString)) return '—';
+    return formatInstantWithZone(dateString) || dateString;
   }
 
   private isZeroDate(dateString: string): boolean {
@@ -804,78 +1101,27 @@ export class ScionPageAgentDetail extends LitElement {
   }
 
   private formatRelativeTime(dateString: string): string {
-    try {
-      if (this.isZeroDate(dateString)) return '—';
-      const date = new Date(dateString);
-      const diffMs = Date.now() - date.getTime();
-      const diffSeconds = Math.round(diffMs / 1000);
-      const diffMinutes = Math.round(diffMs / (1000 * 60));
-      const diffHours = Math.round(diffMs / (1000 * 60 * 60));
-      const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-
-      const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-
-      if (Math.abs(diffSeconds) < 60) {
-        return rtf.format(-diffSeconds, 'second');
-      } else if (Math.abs(diffMinutes) < 60) {
-        return rtf.format(-diffMinutes, 'minute');
-      } else if (Math.abs(diffHours) < 24) {
-        return rtf.format(-diffHours, 'hour');
-      } else {
-        return rtf.format(-diffDays, 'day');
-      }
-    } catch {
-      return dateString;
-    }
+    if (this.isZeroDate(dateString)) return '—';
+    return formatRelative(dateString);
   }
 
-  private async handleAction(
-    action: 'start' | 'stop' | 'suspend' | 'resume' | 'delete',
-    event?: MouseEvent
-  ): Promise<void> {
+  private async handleAction(action: AgentLifecycleAction, event?: MouseEvent): Promise<void> {
     if (!this.agent) return;
 
-    if (action === 'delete') {
-      if (!event?.altKey && !(await showConfirm('Are you sure you want to delete this agent?'))) {
+    if (action === 'force-resume') {
+      if (
+        !(await showConfirm(RESUME_BEST_EFFORT_CONFIRM_MESSAGE, {
+          title: 'Resume (best effort)',
+          confirmText: 'Resume',
+          variant: 'primary',
+        }))
+      ) {
         return;
       }
-      this.actionLoading = { ...this.actionLoading, delete: true };
+    }
 
-      try {
-        const response = await apiFetch(`/api/v1/agents/${this.agentId}`, {
-          method: 'DELETE',
-        });
-
-        if (!response.ok) {
-          // If the broker is unreachable (502/503), offer a force-delete fallback.
-          if (response.status === 502 || response.status === 503) {
-            const forceConfirmed = await showConfirm(
-              'Delete failed — the broker may be unreachable. Force delete this agent? This will remove the hub record without notifying the broker.',
-              { title: 'Force Delete', confirmText: 'Force Delete', variant: 'danger' }
-            );
-            if (forceConfirmed) {
-              const forceResponse = await apiFetch(`/api/v1/agents/${this.agentId}?force=true`, {
-                method: 'DELETE',
-              });
-              if (!forceResponse.ok) {
-                throw new Error(
-                  await extractApiError(forceResponse, 'Failed to force delete agent')
-                );
-              }
-              window.location.href = this.project ? `/projects/${this.project.id}` : '/agents';
-              return;
-            }
-          }
-          throw new Error(await extractApiError(response, 'Failed to delete agent'));
-        }
-
-        window.location.href = this.project ? `/projects/${this.project.id}` : '/agents';
-      } catch (err) {
-        console.error('Failed to delete agent:', err);
-        showToast(err instanceof Error ? err.message : 'Failed to delete agent');
-      } finally {
-        this.actionLoading = { ...this.actionLoading, delete: false };
-      }
+    if (action === 'delete') {
+      await this.deleteAgent({ event });
       return;
     }
 
@@ -884,6 +1130,7 @@ export class ScionPageAgentDetail extends LitElement {
       stop: 'stopping',
       suspend: 'stopping',
       resume: 'starting',
+      'force-resume': 'starting',
     };
     this.agent = {
       ...this.agent,
@@ -895,13 +1142,14 @@ export class ScionPageAgentDetail extends LitElement {
       stop: `/api/v1/agents/${this.agentId}/stop`,
       suspend: `/api/v1/agents/${this.agentId}/suspend`,
       resume: `/api/v1/agents/${this.agentId}/start`,
+      'force-resume': `/api/v1/agents/${this.agentId}/start`,
     };
 
     try {
-      const response = await apiFetch(actionUrls[action], { method: 'POST' });
+      const response = await apiFetch(actionUrls[action], lifecycleActionRequestInit(action));
 
       if (!response.ok) {
-        throw new Error(await extractApiError(response, `Failed to ${action} agent`));
+        throw new Error(await lifecycleActionErrorMessage(response, `Failed to ${action} agent`));
       }
 
       this.backgroundRefresh();
@@ -934,7 +1182,7 @@ export class ScionPageAgentDetail extends LitElement {
             scope: 'agent',
             agentId: this.agentId,
             projectId: this.agent.projectId,
-            triggerActivities: ['COMPLETED', 'WAITING_FOR_INPUT', 'LIMITS_EXCEEDED'],
+            triggerActivities: [...DEFAULT_TRIGGERS],
           }),
         });
         if (res.ok) {
@@ -957,11 +1205,42 @@ export class ScionPageAgentDetail extends LitElement {
   }
 
   private async fetchAndMergeAgent(): Promise<void> {
-    const agentResponse = await apiFetch(`/api/v1/agents/${this.agentId}`);
-    if (!agentResponse.ok) return;
+    const epoch = new AgentSeedEpoch();
+    const epochGeneration = stateManager.scopeGeneration;
+    const agentId = this.agentId;
+    try {
+      const agentResponse = await apiFetch(`/api/v1/agents/${agentId}`);
+      if (!agentResponse.ok) return;
 
-    this.agent = (await agentResponse.json()) as Agent;
-    stateManager.seedAgents([this.agent]);
+      const agent = (await agentResponse.json()) as Agent;
+      this.seedAgent(agent, agentId, epoch, epochGeneration);
+    } finally {
+      epoch.close();
+    }
+  }
+
+  /**
+   * Seed the store with an agent response read under `epoch`, so live
+   * changes that landed while the request was in flight are re-applied
+   * over it, and show the result. A scope change since the epoch opened
+   * means the user left this view: the response may belong to a scope the
+   * store no longer holds, so it is not seeded, and it is shown only if
+   * the page still shows the agent it was requested for (`agentId`).
+   */
+  private seedAgent(
+    agent: Agent,
+    agentId: string,
+    epoch: AgentSeedEpoch,
+    epochGeneration: number
+  ): void {
+    if (stateManager.scopeGeneration !== epochGeneration) {
+      if (this.agentId === agentId) this.agent = agent;
+      return;
+    }
+    const seeded = epoch.seed([agent], { partial: false });
+    // Empty when the agent was deleted while the request was in flight;
+    // the deleted state then follows from the store's tombstone.
+    this.agent = seeded.agents[0] ?? agent;
   }
 
   private handleTabShow(e: CustomEvent<{ name: string }>): void {
@@ -990,14 +1269,14 @@ export class ScionPageAgentDetail extends LitElement {
     this.chatViewActive = mode === 'chat';
     // Trigger load for the newly active view
     if (this.chatViewActive) {
-      this.updateComplete.then(() => {
+      void this.updateComplete.then(() => {
         const chatThread = this.shadowRoot?.querySelector(
           'scion-chat-thread'
         ) as ScionChatThread | null;
         chatThread?.loadHistory();
       });
     } else {
-      this.updateComplete.then(() => {
+      void this.updateComplete.then(() => {
         const viewer = this.shadowRoot?.querySelector(
           'scion-agent-message-viewer'
         ) as ScionAgentMessageViewer | null;
@@ -1011,6 +1290,10 @@ export class ScionPageAgentDetail extends LitElement {
   // ---------------------------------------------------------------------------
 
   override render() {
+    if (this.deleted) {
+      return this.renderDeletedState();
+    }
+
     if (this.loading) {
       return this.renderLoading();
     }
@@ -1020,12 +1303,7 @@ export class ScionPageAgentDetail extends LitElement {
     }
 
     return html`
-      <a href="${this.project ? `/projects/${this.project.id}` : '/agents'}" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        ${this.project ? `To ${this.project.name}` : 'Back to Agents'}
-      </a>
-
-      ${this.renderHeader()}
+      ${this.renderHeader()} ${this.renderDeletionBanner()}
       ${this.agent.phase === 'error' && (this.agent.detail?.message || this.agent.message)
         ? html`
             <div class="agent-error-banner">
@@ -1066,6 +1344,7 @@ export class ScionPageAgentDetail extends LitElement {
       <scion-quick-message-dialog
         agentId=${this.agentId}
         agentName=${this.agent.name || ''}
+        userId=${this.currentUserId}
         ?open=${this.quickMessageOpen}
         @sl-request-close=${() => {
           this.quickMessageOpen = false;
@@ -1118,7 +1397,7 @@ export class ScionPageAgentDetail extends LitElement {
         <scion-agent-message-viewer
           agentId=${this.agentId}
           agentName=${agent.name || ''}
-          ?canSend=${can(agent._capabilities, 'attach') &&
+          ?canSend=${canMessageAgent(agent._capabilities) &&
           agent._messageability?.canMessage !== false}
           ?cloudLogging=${agent.cloudLogging || false}
         ></scion-agent-message-viewer>
@@ -1150,7 +1429,13 @@ export class ScionPageAgentDetail extends LitElement {
       <scion-chat-thread
         agentId=${this.agentId}
         agentName=${agent.name || ''}
-        ?canSend=${can(agent._capabilities, 'attach') &&
+        .conversationKey=${this.currentUserId
+          ? `dm:agent:${this.agentId}:user:${this.currentUserId}`
+          : ''}
+        .projectId=${agent.projectId || ''}
+        .currentUserId=${this.currentUserId}
+        ?isDM=${true}
+        ?canSend=${canMessageAgent(agent._capabilities) &&
         agent._messageability?.canMessage !== false}
         ?showVisibilityToggle=${true}
         style="display: ${this.chatViewActive ? '' : 'none'}"
@@ -1158,7 +1443,8 @@ export class ScionPageAgentDetail extends LitElement {
       <scion-agent-message-viewer
         agentId=${this.agentId}
         agentName=${agent.name || ''}
-        ?canSend=${can(agent._capabilities, 'attach') &&
+        .projectId=${agent.projectId || ''}
+        ?canSend=${canMessageAgent(agent._capabilities) &&
         agent._messageability?.canMessage !== false}
         ?cloudLogging=${agent.cloudLogging || false}
         style="display: ${this.chatViewActive ? 'none' : ''}"
@@ -1170,53 +1456,69 @@ export class ScionPageAgentDetail extends LitElement {
   // Header
   // ---------------------------------------------------------------------------
 
+  /**
+   * The header badge shows only a live delete; a failed one (abandoned
+   * included) shows the failure banner under the header instead.
+   */
+  private deletingView(agent: Agent): DeletionInfo | null {
+    const view = this.deletionLease.view(agent);
+    return view?.state === 'deleting' ? view : null;
+  }
+
   private renderHeader() {
     const agent = this.agent!;
+    // While the hub is deleting, hide every lifecycle action and Delete.
+    const deleting = this.deletionLease.isDeleting(agent);
+    const lifecycleOk = canLifecycle(agent._capabilities) && !deleting;
     return html`
-      <div class="header">
-        <div class="header-info">
-          <div class="header-title">
-            <sl-icon name="cpu"></sl-icon>
-            <h1>${agent.name}</h1>
-            <scion-status-badge
-              status=${getAgentDisplayStatus(agent) as StatusType}
-              label=${getAgentDisplayStatus(agent)}
-            ></scion-status-badge>
-            <scion-message-mode-badge
-              mode=${agent.messageMode || 'project'}
-              size="medium"
-            ></scion-message-mode-badge>
-            ${isAgentPrivileged(agent)
-              ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
-              : ''}
-            ${agentUsesNvidiaGPU(agent)
-              ? html`<scion-status-badge status="neutral" icon="gpu">GPU</scion-status-badge>`
-              : ''}
-          </div>
-          <div class="header-meta">
-            <span class="template-badge">
-              <sl-icon name="code-square"></sl-icon>
-              ${agent.template}
-            </span>
-            ${this.project
-              ? html`
-                  <a href="/projects/${this.project.id}" class="project-link">
-                    <sl-icon name="folder"></sl-icon>
-                    ${this.project.name}
-                  </a>
-                `
-              : ''}
-            ${agent.runtimeBrokerId
-              ? html`
-                  <a href="/brokers/${agent.runtimeBrokerId}" class="broker-link">
-                    <sl-icon name="hdd-rack"></sl-icon>
-                    ${agent.runtimeBrokerName || agent.runtimeBrokerId}
-                  </a>
-                `
-              : ''}
-          </div>
+      <scion-detail-header heading=${agent.name}>
+        <scion-back-link
+          slot="back"
+          href="${this.project ? `/projects/${this.project.id}` : '/agents'}"
+          >${this.project ? `To ${this.project.name}` : 'Back to Agents'}</scion-back-link
+        >
+        <sl-icon slot="icon" name="cpu"></sl-icon>
+        ${agentStatusBadge(agent)}
+        <scion-deletion-badge .deletion=${this.deletingView(agent)} live></scion-deletion-badge>
+        <scion-message-mode-badge
+          mode=${agent.messageMode || 'project'}
+          size="medium"
+        ></scion-message-mode-badge>
+        <div slot="meta" class="header-meta">
+          <span class="template-badge">
+            <sl-icon name="code-square"></sl-icon>
+            ${agent.template}
+          </span>
+          ${this.project
+            ? html`
+                <a href="/projects/${this.project.id}" class="project-link">
+                  <sl-icon name="folder"></sl-icon>
+                  ${this.project.name}
+                </a>
+              `
+            : ''}
+          ${agent.runtimeBrokerId
+            ? html`
+                <a href="/brokers/${agent.runtimeBrokerId}" class="broker-link">
+                  <sl-icon name="hdd-rack"></sl-icon>
+                  ${agent.runtimeBrokerName || agent.runtimeBrokerId}
+                </a>
+              `
+            : ''}
         </div>
-        <div class="header-actions">
+        <div slot="actions" class="header-actions">
+          <sl-tooltip content="See this agent in graph">
+            <a
+              href="/agents/graph?project=${encodeURIComponent(
+                agent.projectId
+              )}&focus=${encodeURIComponent(this.agentId)}"
+              style="text-decoration: none;"
+            >
+              <sl-button variant="default" size="small">
+                <sl-icon slot="prefix" name="diagram-3"></sl-icon>
+              </sl-button>
+            </a>
+          </sl-tooltip>
           ${agent.messageMode === 'none'
             ? nothing
             : agent._messageability?.canMessage === false
@@ -1230,7 +1532,7 @@ export class ScionPageAgentDetail extends LitElement {
                     </sl-button>
                   </sl-tooltip>
                 `
-              : can(agent._capabilities, 'attach')
+              : canMessageAgent(agent._capabilities)
                 ? html`
                     <sl-button
                       variant="default"
@@ -1247,7 +1549,7 @@ export class ScionPageAgentDetail extends LitElement {
                 : nothing}
           ${can(agent._capabilities, 'attach')
             ? html`
-                <a href="/agents/${this.agentId}/terminal" style="text-decoration: none;">
+                <a href=${terminalHref(this.agentId)} style="text-decoration: none;">
                   <sl-button
                     variant="primary"
                     size="small"
@@ -1261,7 +1563,7 @@ export class ScionPageAgentDetail extends LitElement {
             : nothing}
           ${isAgentRunning(agent)
             ? html`
-                ${canLifecycle(agent._capabilities)
+                ${lifecycleOk
                   ? html`
                       ${agent.harnessCapabilities?.resume?.support !== 'no'
                         ? html`
@@ -1293,7 +1595,7 @@ export class ScionPageAgentDetail extends LitElement {
                   : nothing}
               `
             : agent.phase === 'suspended'
-              ? canLifecycle(agent._capabilities)
+              ? lifecycleOk
                 ? html`
                     <sl-button
                       variant="success"
@@ -1307,8 +1609,23 @@ export class ScionPageAgentDetail extends LitElement {
                     </sl-button>
                   `
                 : nothing
-              : canLifecycle(agent._capabilities)
+              : lifecycleOk
                 ? html`
+                    ${agent.phase === 'error'
+                      ? html`
+                          <sl-button
+                            variant="default"
+                            outline
+                            size="small"
+                            ?loading=${this.actionLoading['force-resume']}
+                            ?disabled=${this.actionLoading['force-resume']}
+                            @click=${() => this.handleAction('force-resume')}
+                          >
+                            <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+                            Resume (best effort)
+                          </sl-button>
+                        `
+                      : nothing}
                     <sl-button
                       variant="success"
                       size="small"
@@ -1321,7 +1638,7 @@ export class ScionPageAgentDetail extends LitElement {
                     </sl-button>
                   `
                 : nothing}
-          ${agent.phase === 'created'
+          ${agent.phase === 'created' || can(agent._capabilities, 'update')
             ? html`
                 <a href="/agents/${this.agentId}/configure" style="text-decoration: none;">
                   <sl-button variant="default" size="small">
@@ -1331,17 +1648,21 @@ export class ScionPageAgentDetail extends LitElement {
                 </a>
               `
             : nothing}
-          <sl-tooltip content="See this agent in graph">
-            <a
-              href="/agents/graph?project=${agent.projectId}&focus=${this.agentId}"
-              style="text-decoration: none;"
-            >
-              <sl-button variant="default" size="small">
-                <sl-icon slot="prefix" name="diagram-3"></sl-icon>
-              </sl-button>
-            </a>
-          </sl-tooltip>
-          ${can(agent._capabilities, 'delete')
+          ${isFeatureEnabled(AGENT_EDIT_FLAG) && can(agent._capabilities, 'update')
+            ? html`
+                <a
+                  href="/agents/${this.agentId}/edit"
+                  style="text-decoration: none;"
+                  data-testid="edit-agent"
+                >
+                  <sl-button variant="default" size="small">
+                    <sl-icon slot="prefix" name="pencil-square"></sl-icon>
+                    Edit
+                  </sl-button>
+                </a>
+              `
+            : nothing}
+          ${can(agent._capabilities, 'delete') && !deleting
             ? html`
                 <sl-button
                   variant="danger"
@@ -1355,7 +1676,7 @@ export class ScionPageAgentDetail extends LitElement {
               `
             : nothing}
         </div>
-      </div>
+      </scion-detail-header>
     `;
   }
 
@@ -1367,8 +1688,9 @@ export class ScionPageAgentDetail extends LitElement {
     const agent = this.agent!;
     return html`
       ${this.renderCurrentStateCard(agent)} ${this.renderCurrentTaskCard(agent)}
-      ${this.renderLimitsUsageCard(agent)} ${this.renderConnectivityCard(agent)}
-      ${this.renderExposedPortsCard(agent)} ${this.renderNotificationsCard()}
+      ${this.renderLimitsUsageCard(agent)} ${this.renderPlacementCard(agent)}
+      ${this.renderConnectivityCard(agent)} ${this.renderExposedPortsCard(agent)}
+      ${this.renderNotificationsCard()}
     `;
   }
 
@@ -1403,11 +1725,15 @@ export class ScionPageAgentDetail extends LitElement {
           <div class="info-item">
             <span class="info-label">Phase</span>
             <span class="info-value">
-              <scion-status-badge
-                status=${agent.phase as StatusType}
-                label=${agent.phase}
+              ${agentStatusBadge(agent, {
+                status: agent.phase,
+                label: agent.phase,
+                size: 'small',
+              })}
+              <scion-deletion-badge
+                .deletion=${this.deletionLease.view(agent)}
                 size="small"
-              ></scion-status-badge>
+              ></scion-deletion-badge>
             </span>
           </div>
           <div class="info-item">
@@ -1415,8 +1741,8 @@ export class ScionPageAgentDetail extends LitElement {
             <span class="info-value">
               ${agent.activity
                 ? html`<scion-status-badge
-                      status=${agent.activity as StatusType}
-                      label=${agent.activity}
+                      status=${agent.activity}
+                      label=${stateLabel(agent.activity)}
                       size="small"
                     ></scion-status-badge
                     >${(agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ||
@@ -1530,6 +1856,82 @@ export class ScionPageAgentDetail extends LitElement {
     `;
   }
 
+  /**
+   * Placement of a pinned (flat Runtime Broker) agent, from stored data: the
+   * Runtime Broker and runtime target it is pinned to, with the Runtime
+   * Broker's connection status and the agent's failed runtime operations as
+   * two separate indicators. Unpinned agents render nothing here.
+   */
+  private renderPlacementCard(agent: Agent): TemplateResult | typeof nothing {
+    const view = agentPlacementView(agent, this.placementBroker);
+    if (!view) return nothing;
+    return html`
+      <div class="card placement-card">
+        <h3 class="card-title">Placement</h3>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="info-label">Runtime Broker</span>
+            <span class="info-value">
+              <a href="/brokers/${view.runtimeBrokerId}" class="broker-link"
+                >${view.runtimeBrokerName}</a
+              >
+            </span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Runtime Target</span>
+            <span class="info-value placement-target"
+              >${view.targetLabel}${view.targetLabel !== view.targetType
+                ? ` (${view.targetType})`
+                : ''}</span
+            >
+          </div>
+          <div class="info-item">
+            <span class="info-label">Target ID</span>
+            <span class="info-value mono placement-target-id">${view.targetId}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Runtime Broker Connection</span>
+            <span class="info-value placement-connection">
+              <scion-status-badge
+                status=${view.connection.status}
+                label=${view.connection.detail
+                  ? `${view.connection.label} (${view.connection.detail})`
+                  : view.connection.label}
+                size="small"
+              ></scion-status-badge>
+            </span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Last Runtime Operation</span>
+            <span class="info-value placement-runtime-op">
+              <scion-status-badge
+                status=${view.lastRuntimeOperation.status}
+                label=${view.lastRuntimeOperation.label}
+                size="small"
+              ></scion-status-badge>
+              ${view.lastRuntimeOperation.detail
+                ? html`<span class="placement-runtime-op-detail"
+                    >${view.lastRuntimeOperation.detail}</span
+                  >`
+                : nothing}
+            </span>
+          </div>
+          ${view.stale
+            ? html`
+                <div class="info-item placement-stale">
+                  <span class="info-label">Placement</span>
+                  <span class="info-value">
+                    Pinned to a different Runtime Broker than the agent's current one; starts are
+                    refused until the placement is repaired.
+                  </span>
+                </div>
+              `
+            : nothing}
+        </div>
+      </div>
+    `;
+  }
+
   private renderConnectivityCard(agent: Agent) {
     const candidates = [
       agent.lastSeen,
@@ -1555,9 +1957,7 @@ export class ScionPageAgentDetail extends LitElement {
                   <span class="info-label">Connection State</span>
                   <span class="info-value">
                     <scion-status-badge
-                      status=${agent.connectionState === 'connected'
-                        ? ('success' as StatusType)
-                        : ('danger' as StatusType)}
+                      status=${agent.connectionState === 'connected' ? 'success' : 'danger'}
                       label=${agent.connectionState}
                       size="small"
                     ></scion-status-badge>
@@ -1574,23 +1974,35 @@ export class ScionPageAgentDetail extends LitElement {
     const ports = agent.exposedPorts;
     if (!ports || ports.length === 0) return nothing;
 
+    // Opening a port goes through the port proxy, which the hub authorizes
+    // with agent.port_access. Fail closed: without the capability, list the
+    // ports but offer no link that would only return 403 (ptone/scion#2540).
+    const canOpen = can(agent._capabilities, 'port_access');
+
     return html`
       <div class="card">
         <h3 class="card-title">Exposed Ports</h3>
+        ${canOpen
+          ? nothing
+          : html`<p class="port-no-access" style="color: var(--scion-text-muted, #64748b);">
+              You don't have port access on this agent.
+            </p>`}
         <div class="info-grid">
           ${ports.map(
             (p) => html`
               <div class="info-item">
                 <span class="info-label"> :${p.port}${p.label ? ` (${p.label})` : ''} </span>
                 <span class="info-value">
-                  <a
-                    href="/api/v1/agents/${agent.id}/ports/${p.port}/proxy/"
-                    target="_blank"
-                    rel="noopener"
-                    class="port-link"
-                  >
-                    Open in new tab
-                  </a>
+                  ${canOpen
+                    ? html`<a
+                        href="/api/v1/agents/${agent.id}/ports/${p.port}/proxy/"
+                        target="_blank"
+                        rel="noopener"
+                        class="port-link"
+                      >
+                        Open in new tab
+                      </a>`
+                    : html`<span style="color: var(--scion-text-muted, #64748b);">—</span>`}
                 </span>
               </div>
             `
@@ -1621,27 +2033,27 @@ export class ScionPageAgentDetail extends LitElement {
         <div class="info-grid">
           <div class="info-item">
             <span class="info-label">TOTAL SESSIONS</span>
-            <span class="info-value">${m.totalSessions.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalSessions)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">INPUT TOKENS</span>
-            <span class="info-value">${m.totalTokensInput.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalTokensInput)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">OUTPUT TOKENS</span>
-            <span class="info-value">${m.totalTokensOutput.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalTokensOutput)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">CACHED TOKENS</span>
-            <span class="info-value">${m.totalTokensCached.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalTokensCached)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">REASONING TOKENS</span>
-            <span class="info-value">${m.totalTokensReasoning.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalTokensReasoning)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">AVG TOKENS / SESSION</span>
-            <span class="info-value">${m.avgTokensPerSession.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.avgTokensPerSession)}</span>
           </div>
         </div>
       </div>
@@ -1651,7 +2063,7 @@ export class ScionPageAgentDetail extends LitElement {
         <div class="info-grid">
           <div class="info-item">
             <span class="info-label">TOTAL TOOL CALLS</span>
-            <span class="info-value">${m.totalToolCalls.toLocaleString()}</span>
+            <span class="info-value">${formatNumber(m.totalToolCalls)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">AVG DURATION</span>
@@ -1725,7 +2137,7 @@ export class ScionPageAgentDetail extends LitElement {
     const inline = cfg?.inlineConfig;
 
     return html`
-      ${this.renderIdentityCard(agent)}
+      ${this.renderIdentityCard(agent)} ${this.renderReincarnateCard(agent)}
       <scion-effective-role-provenance
         principalType="agent"
         principalId=${this.agentId}
@@ -1738,9 +2150,89 @@ export class ScionPageAgentDetail extends LitElement {
       ></scion-effective-access-boundary-notice>
       ${this.renderMessagingCard()} ${this.renderLabelsCard(agent)}
       ${this.renderHarnessModelCard(agent, cfg, inline)} ${this.renderRuntimeCard(agent, inline)}
-      ${this.renderGCPIdentityCard(cfg?.gcpIdentity)} ${this.renderConfigLimitsCard(inline)}
-      ${this.renderTelemetryCard(inline?.telemetry)} ${this.renderInitialTaskCard(cfg)}
+      ${this.renderGCPIdentityCard(
+        cfg?.gcpIdentity,
+        this.gcpServiceAccount,
+        this.gcpServiceAccountLoading
+      )}
+      ${this.renderConfigLimitsCard(inline)} ${this.renderTelemetryCard(inline?.telemetry)}
+      ${this.renderInitialTaskCard(cfg)}
     `;
+  }
+
+  /**
+   * Reincarnate action (ptone/scion#3707). The hub authorizes a user's
+   * reincarnate with the same `agent.lifecycle` permission as start/stop
+   * (authorizeAgentReincarnate), and the agent payload carries no separate
+   * `reincarnate` capability, so the card is gated on `lifecycle` exactly
+   * like the header's lifecycle buttons, and hidden while a delete runs.
+   */
+  private renderReincarnateCard(agent: Agent): TemplateResult | typeof nothing {
+    if (!canLifecycle(agent._capabilities) || this.deletionLease.isDeleting(agent)) {
+      return nothing;
+    }
+    return html`
+      <div class="card reincarnate-card">
+        <h3 class="card-title">Reincarnate</h3>
+        <p class="reincarnate-help">
+          Stop this agent and provision it again from its current settings and template. Use this to
+          apply configuration changes.
+        </p>
+        ${this.reincarnateError
+          ? html`<sl-alert variant="danger" open class="reincarnate-error">
+              <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
+              ${this.reincarnateError}
+            </sl-alert>`
+          : nothing}
+        <sl-button
+          size="small"
+          variant="default"
+          ?loading=${this.reincarnating}
+          ?disabled=${this.reincarnating}
+          @click=${() => void this.handleReincarnate()}
+        >
+          <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+          Reincarnate
+        </sl-button>
+      </div>
+    `;
+  }
+
+  /**
+   * Confirm, then POST the reincarnate action on the agent-scoped route the
+   * page uses for every other lifecycle action. The hub decodes a JSON body
+   * (an empty body is a 400), so an empty object is sent. A second click
+   * while the confirm is open or the request runs is ignored.
+   */
+  private async handleReincarnate(): Promise<void> {
+    if (!this.agent || this.reincarnateBusy) return;
+    this.reincarnateBusy = true;
+    try {
+      const confirmed = await showConfirm(REINCARNATE_CONFIRM_MESSAGE, {
+        title: 'Reincarnate agent',
+        confirmText: 'Reincarnate',
+      });
+      if (!confirmed) return;
+
+      this.reincarnating = true;
+      this.reincarnateError = null;
+      const response = await apiFetch(`/api/v1/agents/${this.agentId}/reincarnate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (!response.ok) {
+        throw new Error(await lifecycleActionErrorMessage(response, 'Failed to reincarnate agent'));
+      }
+      this.backgroundRefresh();
+    } catch (err) {
+      console.error('Failed to reincarnate agent:', err);
+      this.reincarnateError = err instanceof Error ? err.message : 'Failed to reincarnate agent';
+      this.backgroundRefresh();
+    } finally {
+      this.reincarnating = false;
+      this.reincarnateBusy = false;
+    }
   }
 
   private renderMessagingCard() {
@@ -1753,8 +2245,8 @@ export class ScionPageAgentDetail extends LitElement {
     return html`
       <div class="card">
         <h3 class="card-title">Messaging</h3>
-        <div class="info-grid">
-          <div class="info-item">
+        <div class="messaging-grid">
+          <div class="info-item messaging-mode">
             <span class="info-label">Message Mode</span>
             <span class="info-value">
               ${canSetMode
@@ -1766,7 +2258,6 @@ export class ScionPageAgentDetail extends LitElement {
                         const newMode = (e.target as HTMLSelectElement).value as MessageMode;
                         void this.handleModeChange(newMode, e.target as HTMLElement);
                       }}
-                      style="min-width: 280px; max-width: 360px;"
                     >
                       ${(Object.keys(MESSAGE_MODE_DISPLAY) as MessageMode[]).map(
                         (mode) => html`
@@ -1781,6 +2272,15 @@ export class ScionPageAgentDetail extends LitElement {
                         `
                       )}
                     </sl-select>
+                    ${(agent.messageMode || 'project') === 'hub'
+                      ? html`<div
+                          style="font-size: 0.75rem; color: var(--sl-color-neutral-500); margin-top: 0.25rem; max-width: 360px;"
+                        >
+                          Hub mode: sends within this project and to permitted agents in other
+                          projects. External messaging requires the Hub cross-project switch to be
+                          enabled.
+                        </div>`
+                      : nothing}
                   `
                 : html`
                     <scion-message-mode-badge
@@ -1790,16 +2290,23 @@ export class ScionPageAgentDetail extends LitElement {
                     <span style="margin-left: 0.5em; color: var(--sl-color-neutral-600);">
                       ${modeDisplay.description}
                     </span>
+                    ${(agent.messageMode || 'project') === 'hub'
+                      ? html`<div
+                          style="font-size: 0.75rem; color: var(--sl-color-neutral-500); margin-top: 0.25rem;"
+                        >
+                          External messaging requires the Hub cross-project switch to be enabled.
+                        </div>`
+                      : nothing}
                   `}
             </span>
           </div>
           ${messageability && 'reachableAgentCount' in messageability
             ? html`
-                <div class="info-item">
+                <div class="info-item messaging-reach">
                   <span class="info-label">Reachability</span>
                   <span class="info-value">
-                    Can message: ${messageability.reachableAgentCount} agents,
-                    ${messageability.reachableUserCount} users
+                    Can reach ${messageability.reachableAgentCount} agents,
+                    ${messageability.reachableUserCount} users in this project
                   </span>
                 </div>
               `
@@ -1853,7 +2360,7 @@ export class ScionPageAgentDetail extends LitElement {
    */
   private async handleModeChange(newMode: MessageMode, selectEl: HTMLElement): Promise<void> {
     const agent = this.agent!;
-    const oldMode = (agent.messageMode || 'project') as MessageMode;
+    const oldMode = agent.messageMode || 'project';
     if (newMode === oldMode) return;
 
     const revertSelect = () => {
@@ -1907,6 +2414,13 @@ export class ScionPageAgentDetail extends LitElement {
       });
 
       if (!response.ok) {
+        // Detect hub mode grant denial: server returns 403 when the caller
+        // lacks full-role + current-hub-mode authority to grant hub.
+        if (response.status === 403 && newMode === 'hub') {
+          throw new Error(
+            'Cannot grant Hub mode: the granting agent or user must have full role and already be in Hub mode.'
+          );
+        }
         throw new Error(await extractApiError(response, 'Failed to change message mode.'));
       }
 
@@ -1981,16 +2495,6 @@ export class ScionPageAgentDetail extends LitElement {
                               : 'neutral'}
                       >${agent.appliedConfig.agentRole}</sl-badge
                     >
-                  </span>
-                </div>
-              `
-            : ''}
-          ${agent.visibility
-            ? html`
-                <div class="info-item">
-                  <span class="info-label">Visibility</span>
-                  <span class="info-value">
-                    <span class="visibility-badge">${agent.visibility}</span>
                   </span>
                 </div>
               `
@@ -2084,7 +2588,10 @@ export class ScionPageAgentDetail extends LitElement {
   private renderRuntimeCard(agent: Agent, inline: AgentInlineConfig | undefined) {
     const image = agent.image || inline?.image || agent.appliedConfig?.image;
     const branch = inline?.branch;
-    const profile = agent.appliedConfig?.profile;
+    // A pinned (flat) agent has no Runtime Broker Profile; its placement
+    // card shows the runtime target instead.
+    const profile = agent.pinnedRuntimeTarget ? undefined : agent.appliedConfig?.profile;
+
     const isPrivileged = agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
     const nvidiaGpu = agent.appliedConfig?.nvidiaGpu;
     const requireGpu = agent.appliedConfig?.requireGpu;
@@ -2096,7 +2603,18 @@ export class ScionPageAgentDetail extends LitElement {
 
     return html`
       <div class="card">
-        <h3 class="card-title">Runtime Environment</h3>
+        <h3 class="card-title">
+          Runtime Environment
+          ${isAgentPrivileged(agent) ? html`<sl-badge variant="neutral">Privileged</sl-badge>` : ''}
+          ${agentUsesNvidiaGPU(agent)
+            ? html`<scion-status-badge
+                status="neutral"
+                icon="gpu"
+                label="GPU"
+                size="small"
+              ></scion-status-badge>`
+            : ''}
+        </h3>
         <div class="info-grid">
           ${agent.runtimeBrokerId
             ? html`
@@ -2207,15 +2725,32 @@ export class ScionPageAgentDetail extends LitElement {
     `;
   }
 
-  private renderGCPIdentityCard(gcpIdentity: GCPIdentityConfig | undefined) {
+  /**
+   * GCP Identity card. `account` is the registered record of the assigned
+   * service account, when it could be loaded; it supplies the display name
+   * and the verification status (ptone/scion#4017). Without it the card
+   * falls back to the email from the agent payload and shows verification
+   * as unknown; `accountLoading` says the record is still being fetched.
+   */
+  private renderGCPIdentityCard(
+    gcpIdentity: GCPIdentityConfig | undefined,
+    account: GCPServiceAccount | null = null,
+    accountLoading = false
+  ) {
     if (!gcpIdentity) return nothing;
 
-    const modeVariant =
-      gcpIdentity.metadataMode === 'assign'
-        ? 'primary'
-        : gcpIdentity.metadataMode === 'passthrough'
-          ? 'warning'
-          : 'neutral';
+    const mode = gcpIdentity.metadataMode;
+    const record = matchingAccount(gcpIdentity, account);
+    const email = gcpIdentity.serviceAccountEmail || record?.email || '';
+    const displayName = record?.displayName?.trim() || '';
+    const hasAccount = mode === 'assign' && Boolean(gcpIdentity.serviceAccountId || email);
+    const verification = gcpVerificationDisplay(record, accountLoading);
+    const verificationBadge = html`<sl-badge
+      class="gcp-verification"
+      data-state=${verification.state}
+      variant=${verification.variant}
+      >${verification.label}</sl-badge
+    >`;
 
     return html`
       <div class="card">
@@ -2224,17 +2759,40 @@ export class ScionPageAgentDetail extends LitElement {
           <div class="info-item">
             <span class="info-label">Metadata Mode</span>
             <span class="info-value">
-              <sl-badge variant=${modeVariant}>${gcpIdentity.metadataMode}</sl-badge>
+              <sl-badge class="gcp-mode" variant=${gcpModeVariant(mode)}
+                >${gcpModeLabel(mode)}</sl-badge
+              >
             </span>
           </div>
-          ${gcpIdentity.serviceAccountEmail
+          ${email || displayName
             ? html`
                 <div class="info-item">
                   <span class="info-label">Service Account</span>
-                  <span class="info-value mono">${gcpIdentity.serviceAccountEmail}</span>
+                  ${displayName
+                    ? html`
+                        <span class="info-value gcp-sa-name">${displayName}</span>
+                        ${email
+                          ? html`<span class="info-subvalue mono gcp-sa-email">${email}</span>`
+                          : nothing}
+                      `
+                    : html`<span class="info-value mono gcp-sa-email">${email}</span>`}
                 </div>
               `
-            : ''}
+            : nothing}
+          ${hasAccount
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Verification</span>
+                  <span class="info-value">
+                    ${verification.detail
+                      ? html`<sl-tooltip content=${verification.detail}
+                          >${verificationBadge}</sl-tooltip
+                        >`
+                      : verificationBadge}
+                  </span>
+                </div>
+              `
+            : nothing}
           ${gcpIdentity.projectId
             ? html`
                 <div class="info-item">
@@ -2242,7 +2800,7 @@ export class ScionPageAgentDetail extends LitElement {
                   <span class="info-value mono">${gcpIdentity.projectId}</span>
                 </div>
               `
-            : ''}
+            : nothing}
         </div>
       </div>
     `;
@@ -2283,9 +2841,8 @@ export class ScionPageAgentDetail extends LitElement {
     const filter = telemetry.filter;
     const cloud = telemetry.cloud;
     const hub = telemetry.hub;
-    const local = telemetry.local;
 
-    const hasDestinations = cloud || hub || local;
+    const hasDestinations = cloud || hub;
     const hasFilter = filter?.events || filter?.attributes || filter?.sampling;
 
     return html`
@@ -2329,20 +2886,6 @@ export class ScionPageAgentDetail extends LitElement {
                           <span class="info-value"
                             >${hub.enabled === false ? 'Disabled' : 'Enabled'}${hub.report_interval
                               ? ` (${hub.report_interval})`
-                              : ''}</span
-                          >
-                        </div>
-                      `
-                    : ''}
-                  ${local
-                    ? html`
-                        <div class="info-item">
-                          <span class="info-label">Local</span>
-                          <span class="info-value"
-                            >${local.enabled === false ? 'Disabled' : 'Enabled'}${local.file
-                              ? html`<br /><span class="mono" style="font-size: 0.8rem"
-                                    >${local.file}</span
-                                  >`
                               : ''}</span
                           >
                         </div>
@@ -2569,12 +3112,36 @@ export class ScionPageAgentDetail extends LitElement {
     `;
   }
 
+  /**
+   * Brief client-side-only state shown after a successful delete (or an
+   * SSE `deleted` event for this agent), before the SPA redirect fires.
+   * Action buttons are not rendered here, so there is nothing left to
+   * click on the way out. "Redirecting…" is shown only while
+   * `deleteRedirectTimer` is still pending; once it has fired (or was
+   * skipped — hidden behind `/terminals`, see `isOnThisAgentRoute` — or
+   * never re-armed after a disconnect/reconnect while deleted), the copy
+   * drops back to a plain statement so the page never claims a redirect
+   * that is not actually coming. The link covers all of those cases, so
+   * the user always has a way out.
+   */
+  private renderDeletedState(): TemplateResult {
+    const targetLabel = this.project ? `Go to ${this.project.name}` : 'Go to Agents';
+    return html`
+      <div class="loading-state" data-testid="agent-deleted-state">
+        <sl-icon name="trash"></sl-icon>
+        <p>Agent deleted.${this.deleteRedirectTimer ? ' Redirecting…' : ''}</p>
+        <scion-back-link href="${this.redirectTarget}" data-testid="agent-deleted-link"
+          >${targetLabel}</scion-back-link
+        >
+      </div>
+    `;
+  }
+
   private renderError() {
     return html`
-      <a href="${this.project ? `/projects/${this.project.id}` : '/agents'}" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        ${this.project ? `To ${this.project.name}` : 'Back to Agents'}
-      </a>
+      <scion-back-link href="${this.redirectTarget}"
+        >${this.project ? `To ${this.project.name}` : 'Back to Agents'}</scion-back-link
+      >
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

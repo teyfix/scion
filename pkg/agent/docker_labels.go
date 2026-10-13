@@ -21,7 +21,6 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 )
 
 // BuildScopedLabelVars constructs the scoped variable map for dynamic label expansion.
@@ -86,7 +85,7 @@ func ExpandAndValidateDockerLabels(labels map[string]string, vars map[string]str
 			return nil, fmt.Errorf("label key %q expanded to empty string", originalKey)
 		}
 
-		if projectcompat.IsReservedInternalLabel(expandedKey) {
+		if isReservedDockerLabel(expandedKey) {
 			return nil, fmt.Errorf("label key %q (expanded: %q) collides with reserved internal label", originalKey, expandedKey)
 		}
 
@@ -143,4 +142,8 @@ func expandScopedVars(input string, vars map[string]string) (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+func isReservedDockerLabel(key string) bool {
+	return strings.HasPrefix(key, "scion.") || key == api.LabelAgentID || key == "agent_name" || key == "project_id" || key == "project_name"
 }

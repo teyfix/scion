@@ -45,6 +45,11 @@ const (
 	conversationID = "99999999-9999-9999-9999-999999999999"
 	roleDefID      = "aa000000-0000-0000-0000-000000000001"
 	limitDefID     = "bb000000-0000-0000-0000-000000000001"
+	constraintID   = "ac100000-0000-0000-0000-000000000001"
+	// groupConversationID is a group conversation (chat thread) filed into
+	// threadGroupID.
+	groupConversationID = "99999999-9999-9999-9999-999999999998"
+	threadGroupID       = "7a000000-0000-0000-0000-000000000001"
 )
 
 // baseTime is a fixed timestamp so the generated fixture is byte-reproducible
@@ -113,13 +118,13 @@ func Spec() []TableFixture {
 				"project_id": projectID, "labels": unicodeJSON,
 				"applied_config": nestedConfigJSON,
 				"created_at":     baseTime, "updated_at": baseTime,
-				"phase": "running", "visibility": "private", "state_version": 1,
+				"phase": "running", "state_version": 1,
 			},
 			{ // soft-deleted agent (deleted_at populated)
 				"id": "33333333-3333-3333-3333-3333333333aa", "agent_id": "33333333-3333-3333-3333-3333333333aa",
 				"name": "deleted-worker", "template": "claude", "project_id": projectID,
 				"created_at": baseTime, "updated_at": baseTime, "deleted_at": baseTime,
-				"phase": "stopped", "visibility": "private", "state_version": 2,
+				"phase": "stopped", "state_version": 2,
 			},
 		}},
 
@@ -153,13 +158,24 @@ func Spec() []TableFixture {
 		}},
 		{Table: "access_constraints", Rows: []row{
 			{
-				"id": "ac100000-0000-0000-0000-000000000001", "name": "fixture-max-perms",
+				"id": constraintID, "name": "fixture-max-perms",
 				"subject_kind": "principal", "subject_principal_type": "user",
 				"subject_principal_id": userID,
 				"scope_type":           "system", "scope_id": "",
 				"maximum_permissions": `["agent.read","agent.list"]`,
 				"disabled":            false,
 				"created":             baseTime, "updated": baseTime,
+			},
+		}},
+		{Table: "access_constraint_history", Rows: []row{
+			{
+				"event_id": "ae100000-0000-4000-8000-000000000001", "constraint_id": constraintID,
+				"occurred_at": baseTime, "operation": "create",
+				"actor_kind": "user", "actor_id": userID,
+				"correlation_id": "fixture-access-constraint-create",
+				"after_revision": int64(1), "classification": "tighten",
+				"impact_counts_json":  `{"agents":1,"users":1,"projects":0}`,
+				"changed_fields_json": `["maximum_permissions"]`,
 			},
 		}},
 		{Table: "access_policies", Rows: []row{
@@ -200,7 +216,7 @@ func Spec() []TableFixture {
 			{
 				"id": "7e000000-0000-0000-0000-000000000001", "name": "claude", "slug": "claude",
 				"harness": "claude", "image": "scion/claude:latest", "config": nestedConfigJSON,
-				"scope": "global", "status": "active", "visibility": "public",
+				"scope": "global", "status": "active",
 				"created_at": baseTime, "updated_at": baseTime,
 			},
 		}},
@@ -208,7 +224,7 @@ func Spec() []TableFixture {
 			{
 				"id": "4a000000-0000-0000-0000-000000000001", "name": "claude-web", "slug": "claude-web",
 				"harness": "claude", "config": nestedConfigJSON, "scope": "global",
-				"status": "active", "visibility": "public", "created_at": baseTime, "updated_at": baseTime,
+				"status": "active", "created_at": baseTime, "updated_at": baseTime,
 			},
 		}},
 
@@ -237,6 +253,12 @@ func Spec() []TableFixture {
 			{ // BLOB column
 				"broker_id": brokerID, "secret_key": []byte{0x01, 0x02, 0x03, 0x04, 0xfe, 0xff},
 				"algorithm": "hmac-sha256", "created_at": baseTime, "status": "active",
+			},
+		}},
+		{Table: "broker_reported_runs", Rows: []row{
+			{ // an entry of the fixture agent reported off its assigned broker
+				"id": "b7000000-0000-0000-0000-000000000001", "agent_id": agentID,
+				"run_id": "fixture-run-1", "broker_id": brokerID, "seen_at": baseTime,
 			},
 		}},
 		{Table: "broker_join_tokens", Rows: []row{
@@ -347,7 +369,7 @@ func Spec() []TableFixture {
 			{
 				"id": "54000000-0000-0000-0000-000000000001", "name": "Reviewer",
 				"slug": "reviewer", "description": "Review code", "tags": `["code","review"]`,
-				"scope": "global", "status": "active", "visibility": "public",
+				"scope": "global", "status": "active",
 			},
 		}},
 		{Table: "skill_versions", Rows: []row{
@@ -401,6 +423,23 @@ func Spec() []TableFixture {
 				"create_time": baseTime, "update_time": baseTime,
 			},
 		}},
+		{Table: "broker_settings", Rows: []row{
+			{ // exercises the non-NULL updated_by path; hub_settings above
+				// already covers the NULL case for this same document shape.
+				"id": "b5000000-0000-0000-0000-000000000001", "broker_id": brokerID,
+				"value": `{"maxAgents":5}`, "revision": int64(1), "updated_by": userID,
+				"create_time": baseTime, "update_time": baseTime,
+			},
+		}},
+		{Table: "launch_reaper_states", Rows: []row{
+			{ // the single row the launch reaper reads/writes (id is fixed:
+				// launchReaperStateID in pkg/store/entadapter/launch_reaper.go);
+				// populated ok_at/armed_since exercise the non-NULL path, the
+				// nil-means-disarmed NULL path is exercised by production code
+				// creating the row with both unset on its first tick.
+				"id": "agent-launch-reaper", "ok_at": baseTime, "armed_since": baseTime.Add(-time.Hour),
+			},
+		}},
 		{Table: "integration_configs", Rows: []row{
 			{
 				"id": "ic000000-0000-0000-0000-000000000001", "integration": "github",
@@ -448,6 +487,104 @@ func Spec() []TableFixture {
 			},
 		}},
 
+		// ---- Agent delegation grants and delegated credentials ----
+		{Table: "agent_delegation_grants", Rows: []row{
+			{ // active hub-bounded grant; optional fields left NULL
+				"id": "ae000000-0000-0000-0000-000000000001", "agent_id": agentID,
+				"agent_project_id": projectID, "agent_generation": 0, "agent_state_version": 1,
+				"issuer_user_id": userID, "boundary_kind": "hub",
+				"ceiling_version": 1, "ceiling_permission_ids": `["agent.read"]`,
+				"name": "fixture-hub-grant", "allow_subdelegation": false, "depth": 0,
+				"max_credential_ttl_seconds": 900, "expires_at": baseTime.Add(7 * 24 * time.Hour),
+				"created": baseTime, "issuance_audit_id": "ae100000-0000-0000-0000-000000000001",
+			},
+			{ // revoked project-bounded grant with every optional field set
+				"id": "ae000000-0000-0000-0000-000000000002", "agent_id": agentID,
+				"agent_project_id": projectID, "agent_generation": 2, "agent_state_version": 7,
+				"issuer_user_id": userID, "boundary_kind": "project", "boundary_project_id": projectID,
+				"ceiling_version": 1, "ceiling_permission_ids": `["agent.read"]`,
+				"name": "fixture-project-grant", "purpose": "nightly report 📊",
+				"labels": unicodeJSON, "allow_subdelegation": false, "depth": 0,
+				"max_credential_ttl_seconds": 3600, "expires_at": baseTime.Add(30 * 24 * time.Hour),
+				"created": baseTime, "last_exchanged_at": baseTime.Add(time.Hour),
+				"revoked_at": baseTime.Add(2 * time.Hour), "revoked_by": userID, "revoke_reason": "test",
+				"issuance_audit_id":   "ae100000-0000-0000-0000-000000000002",
+				"revocation_audit_id": "ae100000-0000-0000-0000-000000000003",
+			},
+		}},
+		{Table: "agent_delegated_credentials", Rows: []row{
+			{
+				"id": "af000000-0000-0000-0000-000000000001", "grant_id": "ae000000-0000-0000-0000-000000000001",
+				"agent_id": agentID, "key_hash": "sha256:fixture-delegated-key-hash", "prefix": "scion_adt_",
+				"audience": "scion-hub", "ceiling_permission_ids": `["agent.read"]`,
+				"exchange_agent_credential_id": "ac000000-0000-0000-0000-000000000001",
+				"issued_at":                    baseTime, "expires_at": baseTime.Add(15 * time.Minute),
+			},
+		}},
+
+		// ---- Agent holds ----
+		{Table: "agent_holds", Rows: []row{
+			{ // active hold
+				"id": "ad000000-0000-0000-0000-000000000001", "agent_id": agentID,
+				"project_id": projectID, "cause": "owner_access_ended",
+				"root_principal_type": "user", "root_principal_id": userID,
+				"trigger": "member_remove", "actor_kind": "user", "actor_id": userID,
+				"correlation_id": "fixture-agent-hold-active", "created_at": baseTime,
+			},
+			{ // cleared hold kept as history
+				"id": "ad000000-0000-0000-0000-000000000002", "agent_id": agentID,
+				"project_id": projectID, "cause": "owner_access_ended",
+				"root_principal_type": "user", "root_principal_id": userID,
+				"trigger": "member_role_change", "actor_kind": "user", "actor_id": userID,
+				"correlation_id": "fixture-agent-hold-cleared",
+				"created_at":     baseTime.Add(-time.Hour), "cleared_at": baseTime.Add(-time.Minute),
+				"cleared_by_kind": "user", "cleared_by_id": userID,
+				"clear_reason": "access restored",
+			},
+		}},
+
+		// ---- Membership loss checks ----
+		{Table: "membership_loss_checks", Rows: []row{
+			{
+				"id": "ae000000-0000-0000-0000-000000000001", "user_id": userID,
+				"project_id": projectID, "trigger": "member_remove",
+				"actor_kind": "user", "actor_id": userID,
+				"correlation_id": "fixture-membership-loss-check",
+				"created_at":     baseTime, "attempts": 0, "last_error": "",
+			},
+		}},
+
+		// ---- Agent reincarnations ----
+		{Table: "agent_reincarnations", Rows: []row{
+			{ // completed record with both config snapshots
+				"id": "ar000000-0000-0000-0000-000000000001", "agent_id": agentID,
+				"from_generation": 1, "to_generation": 2,
+				"requested_by": userID, "requested_at": baseTime,
+				"updated_at": baseTime, "completed_at": baseTime.Add(time.Minute),
+				"state": "completed", "error": "",
+				"previous_applied_config": nestedConfigJSON,
+				"new_applied_config":      nestedConfigJSON,
+				"handoff":                 "handoff notes: naïve café 北京 🚀",
+			},
+		}},
+
+		// ---- Agent runtime observations (start claims) ----
+		{Table: "agent_recoveries", Rows: []row{
+			{
+				"id": agentID, "broker_id": brokerID, "observed_state": "absent",
+				"observed_target": "docker", "observed_at": baseTime,
+				"first_absent_at": baseTime, "observed_in_flight": false,
+			},
+		}},
+
+		// ---- Broker per-target complete inventory times ----
+		{Table: "broker_target_inventories", Rows: []row{
+			{
+				"id": "bt000000-0000-0000-0000-000000000001", "broker_id": brokerID,
+				"target": "docker", "last_complete_inventory_at": baseTime,
+			},
+		}},
+
 		// ---- Agent session metrics ----
 		{Table: "agent_session_metrics", Rows: []row{
 			{
@@ -476,6 +613,12 @@ func Spec() []TableFixture {
 				"kind": "direct", "surface": "native",
 				"drift_state": "active", "last_activity_at": baseTime, "created_at": baseTime,
 			},
+			{ // a group conversation (thread), the only kind a thread group holds
+				"id": groupConversationID, "project_id": projectID,
+				"kind": "group", "surface": "native", "external_ref": "thread:fixture-release",
+				"display_name": "release-notes",
+				"drift_state":  "active", "last_activity_at": baseTime, "created_at": baseTime,
+			},
 		}},
 		{Table: "conversation_participants", Rows: []row{
 			{
@@ -485,13 +628,21 @@ func Spec() []TableFixture {
 			},
 		}},
 
-		// ---- Decision audits ----
-		{Table: "decision_audits", Rows: []row{
+		// ---- Thread groups (ptone/scion#4424) ----
+		{Table: "thread_groups", Rows: []row{
+			{ // non-ASCII name: name_key is store.ThreadGroupNameKey(name)
+				"id": threadGroupID, "project_id": projectID,
+				"name": "Équipe Release", "name_key": "équipe release",
+				"created_by": userID, "created_by_kind": "user",
+				"created_at": baseTime, "updated_at": baseTime,
+			},
+		}},
+		{Table: "thread_group_members", Rows: []row{
 			{
-				"id": "da000000-0000-0000-0000-000000000001", "timestamp": baseTime,
-				"principal_kind": "user", "principal_id": userID,
-				"resource_type": "agent", "permission": "read",
-				"result": "allow", "reason": "owner", "sampled": false,
+				"id":       "7b000000-0000-0000-0000-000000000001",
+				"group_id": threadGroupID, "project_id": projectID,
+				"conversation_id": groupConversationID,
+				"added_by":        userID, "added_at": baseTime,
 			},
 		}},
 
@@ -503,6 +654,36 @@ func Spec() []TableFixture {
 				"delegate_type": "agent", "delegate_id": agentID,
 				"scope_type": "project", "scope_id": projectID,
 				"role": "creator", "active": true, "grandfathered": false,
+			},
+		}},
+
+		// ---- Agent service-account assignments ----
+		{Table: "agent_service_account_assignments", Rows: []row{
+			{
+				"id":       "da000000-0000-0000-0000-000000000001",
+				"agent_id": agentID, "project_id": projectID,
+				"service_account_id": "sa-fixture", "origin": "create_explicit",
+				"active": true,
+			},
+		}},
+
+		// ---- Delegation adoptions (recognized edge; NULL original edge) ----
+		{Table: "delegation_adoptions", Rows: []row{
+			{
+				"id":        "dd000000-0000-0000-0000-000000000001",
+				"cohort_id": "dc000000-0000-0000-0000-000000000001",
+				"origin":    "boot_migration", "policy_version": 1,
+				"original_edge_id": nil,
+				"adopted_edge_id":  "de000000-0000-0000-0000-000000000001",
+				"delegate_id":      agentID,
+				"delegator_type":   "user", "delegator_id": userID,
+				"scope_id": projectID, "role": "creator", "depth": 1,
+				"status": "recognized", "reason": "",
+				"before_fingerprint": "", "after_summary": "",
+				"actor_kind": "", "actor_id": "",
+				"reverted_by_kind": "", "reverted_by_id": "", "revert_summary": "",
+				"reverted_at": nil,
+				"created":     baseTime, "updated": baseTime,
 			},
 		}},
 
@@ -592,6 +773,139 @@ func Spec() []TableFixture {
 				"limit_definition_id": limitDefID,
 				"subject_id":          projectID, "scope_type": "project", "scope_id": projectID,
 				"resource_id": agentID, "reserved": 1, "created_at": baseTime,
+			},
+		}},
+
+		// ---- Agent identity keys ----
+		{Table: "agent_identity_keys", Rows: []row{
+			{
+				"id": "a1d00000-0000-0000-0000-000000000001", "project_id": projectID,
+				"key": "worker", "agent_id": agentID,
+			},
+		}},
+
+		// ---- External identities ----
+		{Table: "external_identities", Rows: []row{
+			{ // NULL email exercises the optional/informational field
+				"id":       "e1d00000-0000-0000-0000-000000000001",
+				"provider": "fixture-provider", "issuer": "https://issuer.fixture.example",
+				"subject": "fixture-subject-001", "user_id": userID,
+				"created_at": baseTime, "updated_at": baseTime,
+			},
+		}},
+
+		// ---- User terminal workspaces ----
+		{Table: "user_terminal_workspaces", Rows: []row{
+			{
+				"id":                 "c1d00000-0000-0000-0000-000000000001",
+				"user_id":            userID,
+				"agent_ids":          `["` + agentID + `"]`,
+				"frontmost_agent_id": agentID,
+				"schema_version":     1,
+				"revision":           1,
+				"update_time":        baseTime,
+			},
+		}},
+
+		// ---- Conduit session registry (relay_instances is the FK parent of
+		// conduit_sessions; conduit_principal_epochs is standalone) ----
+		{Table: "relay_instances", Rows: []row{
+			{ // NULL public_endpoint: internal-only relay
+				"instance_id": "relay-fixture-1", "generation": baseTime.UnixMilli(),
+				"internal_endpoint": "http://relay-fixture-1:9811",
+				"started_at":        baseTime, "last_seen": baseTime, "draining": false,
+			},
+		}},
+		{Table: "conduit_sessions", Rows: []row{
+			{ // agent session: project + exec_scope set, unicode capabilities JSON
+				"session_id":     "cs000000-0000-0000-0000-000000000001",
+				"principal_kind": "agent", "principal_id": agentID, "project_id": projectID,
+				"relay_instance_id": "relay-fixture-1", "relay_generation": baseTime.UnixMilli(),
+				"transport": "ws", "endpoint_incarnation": "inc-fixture-1",
+				"exec_scope": "scope-fixture-1", "connection_epoch": 1, "draining": false,
+				"capabilities": `{"stream_kinds":["pty"],"rpc":["exec"],"endpoint_incarnation":"inc-fixture-1",` +
+					`"exec_scope":"scope-fixture-1","transport_limits":{"max_frame":1048576,"idle_timeout_s":60},` +
+					`"incarnation_source":"launch_id","note":"naïve café 北京 😀"}`,
+				"connected_at": baseTime, "last_seen": baseTime,
+			},
+			{ // broker session: NULL project_id and exec_scope, default-ish capabilities
+				"session_id":     "cs000000-0000-0000-0000-000000000002",
+				"principal_kind": "broker", "principal_id": brokerID, "project_id": nil,
+				"relay_instance_id": "relay-fixture-1", "relay_generation": baseTime.UnixMilli(),
+				"transport": "ws", "endpoint_incarnation": "binc-fixture-1",
+				"exec_scope": nil, "connection_epoch": 1, "draining": true,
+				"capabilities": `{}`,
+				"connected_at": baseTime, "last_seen": baseTime,
+			},
+		}},
+		{Table: "conduit_principal_epochs", Rows: []row{
+			{"id": 1, "principal_kind": "agent", "principal_id": agentID, "epoch": 1},
+			{"id": 2, "principal_kind": "broker", "principal_id": brokerID, "epoch": 1},
+		}},
+
+		// ---- Hub-instance registry (health dashboard F3; standalone,
+		// primary key only) ----
+		{Table: "hub_instances", Rows: []row{
+			{ // live instance: NULL stopped_at, normalised checks, empty stats
+				"instance_id": "scion-hub-0-0b1f6c2e-5d4a-4c3b-9a8f-7e6d5c4b3a21",
+				"label":       "scion-hub-0", "version": "v1.2.3",
+				"started_at": baseTime, "last_seen": baseTime, "stopped_at": nil,
+				"status": "degraded",
+				"checks": `{"colocated_broker":"unhealthy","database":"healthy",` +
+					`"workspace_storage_mount_verification":"unavailable"}`,
+				"stats": `{}`,
+			},
+			{ // cleanly stopped instance: stopped_at set
+				"instance_id": "3c2b1a09-8f7e-4d6c-b5a4-938271605f4e",
+				"label":       "hub-host-1", "version": "v1.2.2",
+				"started_at": baseTime, "last_seen": baseTime, "stopped_at": baseTime,
+				"status": "healthy", "checks": `{"database":"healthy"}`,
+				"stats": `{}`,
+			},
+		}},
+
+		// ---- Test infrastructure marker (admin tier A0, ptone/scion#4240;
+		// single row, written only by `scion server test-infra mark`) ----
+		{Table: "test_infra_marker", Rows: []row{
+			{
+				"id": "test-infra-marker", "hub_id": "fixture-test-hub",
+				"class": "test", "created_at": baseTime,
+				"created_by_host": "fixture-host",
+				"attested":        `{"bucket":"fixture-bucket","broker_ids":["fixture-broker"]}`,
+				// A fixed placeholder, not a real key: 64 bytes, as the
+				// mark command writes.
+				"web_session_key": []byte(strings.Repeat("k", 64)),
+			},
+		}},
+
+		// ---- Test identity web-login codes (WS1, ptone/scion#4240) ----
+		{Table: "test_identity_login_codes", Rows: []row{
+			{
+				"id": "c0de0000-0000-0000-0000-000000000001", "user_id": userID,
+				"code_hash":            strings.Repeat("ab", 32),
+				"issued_by":            userID,
+				"issuer_credential_id": "",
+				"expires_at":           baseTime.Add(5 * time.Minute),
+				"consumed_at":          nil,
+				"created_at":           baseTime,
+			},
+		}},
+
+		// ---- Workload-bound issuer delegations (test identities phase X2,
+		// ptone/scion#4240): one live row (NULL revoked_at/revoked_by) and
+		// one revoked row ----
+		{Table: "test_identity_delegations", Rows: []row{
+			{
+				"id": "d1000000-0000-0000-0000-000000000001", "grantor_id": userID,
+				"workload_sub": "100000000000000000001", "scope": "test_identity:issue",
+				"member_cap": 5, "label": "fixture-window", "created_at": baseTime,
+				"expires_at": baseTime.Add(8 * time.Hour), "revoked_at": nil, "revoked_by": nil,
+			},
+			{
+				"id": "d1000000-0000-0000-0000-000000000002", "grantor_id": userID,
+				"workload_sub": "100000000000000000001", "scope": "test_identity:issue",
+				"member_cap": 2, "label": "", "created_at": baseTime,
+				"expires_at": baseTime.Add(time.Hour), "revoked_at": baseTime.Add(time.Minute), "revoked_by": userID,
 			},
 		}},
 	}

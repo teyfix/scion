@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -32,12 +33,100 @@ import (
 
 const harnessConfigsDirName = "harness-configs"
 
+// ErrHarnessConfigNotFound marks a FindHarnessConfigDir failure where the
+// named harness-config was not found in any searched location (template,
+// project, or global directories). Wrapped into the returned error so
+// callers (e.g. the runtime broker's create/provision handlers) can
+// classify an unresolvable name as a client-facing 4xx naming the resource,
+// instead of folding it into a generic 5xx (ptone/scion#1316 fault 3).
+var ErrHarnessConfigNotFound = errors.New("harness-config not found")
+
+// HarnessConfigNotFoundError is the typed form of ErrHarnessConfigNotFound
+// (errors.Is(err, ErrHarnessConfigNotFound) still matches). Error() keeps
+// the full diagnostic text, including every directory searched; Name is the
+// requested harness-config name, safe for client-facing messages
+// (ptone/scion#3113).
+type HarnessConfigNotFoundError struct {
+	Name     string
+	Searched []string
+}
+
+func (e *HarnessConfigNotFoundError) Error() string {
+	return fmt.Sprintf("harness-config %q not found (searched: %s): %s", e.Name, strings.Join(e.Searched, ", "), ErrHarnessConfigNotFound.Error())
+}
+
+func (e *HarnessConfigNotFoundError) Unwrap() error { return ErrHarnessConfigNotFound }
+
 // HarnessConfigDir represents a harness-config directory on disk.
 // Located at ~/.scion/harness-configs/<name>/ or .scion/harness-configs/<name>/
 type HarnessConfigDir struct {
 	Name   string             // Directory name (e.g., "claude", "gemini-experimental")
 	Path   string             // Absolute path to the directory
 	Config HarnessConfigEntry // Parsed config.yaml content
+	// Source records which resolution branch produced this directory (see
+	// HarnessConfigSource). Empty when loaded directly via
+	// LoadHarnessConfigDir outside the resolvers.
+	Source HarnessConfigSource
+}
+
+// HarnessConfigSource names the resolution branch a harness-config came from.
+// It is provenance only: it is reported on agent info so operators can tell
+// which branch supplied the bundle an agent ran (ptone/scion#620). It names
+// the branch, not who manages the content: only HarnessConfigSourceHubHydrated
+// guarantees the hub's harness-config record was used, but the other values do
+// not by themselves mean the content is unmanaged (see each constant).
+type HarnessConfigSource string
+
+const (
+	// HarnessConfigSourceHubHydrated is the hub harness-config record named
+	// by the dispatch, hydrated (or read from co-located storage) for it.
+	HarnessConfigSourceHubHydrated HarnessConfigSource = "hub-hydrated"
+	// HarnessConfigSourceTemplateBundled is a harness-configs/<name> directory
+	// inside one of the agent's template directories. That template may
+	// itself be hub-managed (hydrated for the dispatch) or local; this value
+	// does not distinguish the two.
+	HarnessConfigSourceTemplateBundled HarnessConfigSource = "template-bundled"
+	// HarnessConfigSourceBrokerLocal is a project-level or global
+	// harness-configs/<name> directory on the broker's filesystem. For a
+	// hub-native project the project directory is broker storage under
+	// ~/.scion/projects/<name>; either way, it is not the hub harness-config
+	// record the dispatch may have named.
+	HarnessConfigSourceBrokerLocal HarnessConfigSource = "broker-local"
+	// HarnessConfigSourceBuiltin is the synthetic "generic" entry, which has
+	// no directory at all.
+	HarnessConfigSourceBuiltin HarnessConfigSource = "builtin"
+	// HarnessConfigSourceUnresolved is reported when no harness-config
+	// directory was resolved at start (no name resolved, or the named one
+	// did not resolve, and the harness was built from settings or the bare
+	// harness type instead), so a stale earlier value is not left on the
+	// record.
+	HarnessConfigSourceUnresolved HarnessConfigSource = "unresolved"
+)
+
+// ResolveHarnessConfigDir is the single resolution order for an agent's
+// harness-config directory, shared by provisioning (pkg/agent), harness
+// construction (pkg/harness.Resolve) and the runtime broker's preflights
+// (auth/env-gather and the harness-config policy gate), so they all evaluate
+// the same bundle:
+//
+//  1. hydratedPath, when non-empty: the hub-hydrated copy for this dispatch.
+//     It is used unconditionally and never merged with an on-disk copy of
+//     the same name; a load failure is returned rather than falling back,
+//     because launch would not fall back either.
+//  2. Otherwise FindHarnessConfigDir: template-bundled, then project, then
+//     global directories (then the synthetic "generic" entry).
+//
+// The returned directory's Source records which branch resolved it.
+func ResolveHarnessConfigDir(hydratedPath, name, projectPath string, templatePaths ...string) (*HarnessConfigDir, error) {
+	if hydratedPath != "" {
+		hcDir, err := LoadHarnessConfigDir(hydratedPath)
+		if err != nil {
+			return nil, err
+		}
+		hcDir.Source = HarnessConfigSourceHubHydrated
+		return hcDir, nil
+	}
+	return FindHarnessConfigDir(name, projectPath, templatePaths...)
 }
 
 // LoadHarnessConfigDir loads a harness-config from an on-disk directory.
@@ -70,6 +159,12 @@ func LoadHarnessConfigDir(dirPath string) (*HarnessConfigDir, error) {
 	var entry HarnessConfigEntry
 	if err := yaml.Unmarshal(data, &entry); err != nil {
 		return nil, fmt.Errorf("failed to parse config.yaml: %w", err)
+	}
+
+	// The schema cannot express ordering; enforce it here so a bad thinking
+	// map fails at load like any other schema error.
+	if err := entry.Thinking.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config.yaml: %w", err)
 	}
 
 	name := filepath.Base(absPath)
@@ -114,6 +209,7 @@ func FindHarnessConfigDir(name string, projectPath string, templatePaths ...stri
 		searched = append(searched, tplHarnessConfigDir)
 		if info, err := os.Stat(tplHarnessConfigDir); err == nil && info.IsDir() {
 			if hcDir, err := LoadHarnessConfigDir(tplHarnessConfigDir); err == nil {
+				hcDir.Source = HarnessConfigSourceTemplateBundled
 				return hcDir, nil
 			}
 		}
@@ -125,6 +221,7 @@ func FindHarnessConfigDir(name string, projectPath string, templatePaths ...stri
 		searched = append(searched, projectHarnessConfigDir)
 		if info, err := os.Stat(projectHarnessConfigDir); err == nil && info.IsDir() {
 			if hcDir, err := LoadHarnessConfigDir(projectHarnessConfigDir); err == nil {
+				hcDir.Source = HarnessConfigSourceBrokerLocal
 				return hcDir, nil
 			}
 		}
@@ -137,6 +234,7 @@ func FindHarnessConfigDir(name string, projectPath string, templatePaths ...stri
 		searched = append(searched, globalHarnessConfigDir)
 		if info, err := os.Stat(globalHarnessConfigDir); err == nil && info.IsDir() {
 			if hcDir, err := LoadHarnessConfigDir(globalHarnessConfigDir); err == nil {
+				hcDir.Source = HarnessConfigSourceBrokerLocal
 				return hcDir, nil
 			}
 		}
@@ -149,10 +247,11 @@ func FindHarnessConfigDir(name string, projectPath string, templatePaths ...stri
 		return &HarnessConfigDir{
 			Name:   "generic",
 			Config: HarnessConfigEntry{Harness: "generic", Image: "scion-base:latest", User: "scion"},
+			Source: HarnessConfigSourceBuiltin,
 		}, nil
 	}
 
-	return nil, fmt.Errorf("harness-config %q not found (searched: %s)", name, strings.Join(searched, ", "))
+	return nil, &HarnessConfigNotFoundError{Name: name, Searched: searched}
 }
 
 // ListHarnessConfigDirs lists all available harness-configs.
@@ -265,7 +364,7 @@ func SeedHarnessConfig(targetDir string, h api.Harness, force bool) error {
 			return err
 		}
 
-		return SeedFileFromFS(embedsFS, basePath, relPath, targetPath, force, false)
+		return seedHarnessConfigFile(embedsFS, basePath, relPath, targetPath, force)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to seed harness-config files: %w", err)
@@ -328,9 +427,9 @@ func mapEmbedFileToHomePath(homeDir, configDir, fileName string) string {
 		return filepath.Join(homeDir, ".codex", "config.toml")
 	case "scion_notify.sh":
 		return filepath.Join(homeDir, ".codex", "scion_notify.sh")
-	case ".opencode.json":
+	case "opencode.json":
 		if configDir != "" {
-			return filepath.Join(homeDir, configDir, ".opencode.json")
+			return filepath.Join(homeDir, configDir, "opencode.json")
 		}
 		return ""
 	default:
@@ -352,6 +451,9 @@ func mapEmbedFileToHomePath(homeDir, configDir, fileName string) string {
 // match the manifest ContentHash recorded by the Hub's sync machinery; for
 // local-only or built-in seeded configs it provides a stable local
 // revision useful for audit.
+//
+// Backups and atomic-write temp files (see IsHarnessConfigTransientFile) are
+// not part of the config and do not count towards the revision.
 //
 // Returns "" when dirPath is empty or unreadable. Errors hashing individual
 // files are skipped so a transient FS error does not block agent creation;
@@ -375,10 +477,18 @@ func ComputeHarnessConfigRevision(dirPath string) string {
 		".gitkeep":        true,
 	}
 	walk := func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
+		if walkErr != nil {
 			return nil
 		}
-		if skipBasenames[d.Name()] {
+		if d.IsDir() {
+			// Prune transient directories like transfer.CollectFiles does,
+			// so sync and revision see the same file set.
+			if path != dirPath && IsHarnessConfigTransientFile(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if skipBasenames[d.Name()] || IsHarnessConfigTransientFile(d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(dirPath, path)
@@ -457,7 +567,10 @@ func SeedHarnessConfigFromDir(targetDir string, sourceFS fs.FS, sourcePath strin
 		}
 	}
 
-	// Seed config.yaml (always overwrite to keep in sync with embedded defaults)
+	// Seed config.yaml (always overwrite to keep in sync with embedded
+	// defaults). Provisioner-owned scripts (provision.py, scion_harness.py,
+	// capture_auth.py) are likewise refreshed in the walk below. Other files
+	// are preserved unless force is set.
 	if err := seedFileFromGenericFS(sourceFS, sourcePath, "config.yaml", filepath.Join(targetDir, "config.yaml"), force, true); err != nil {
 		return fmt.Errorf("failed to seed config.yaml: %w", err)
 	}
@@ -493,7 +606,7 @@ func SeedHarnessConfigFromDir(targetDir string, sourceFS fs.FS, sourcePath strin
 			return err
 		}
 
-		return seedFileFromGenericFS(sourceFS, sourcePath, relPath, targetPath, force, false)
+		return seedHarnessConfigFile(sourceFS, sourcePath, relPath, targetPath, force)
 	})
 }
 
@@ -592,6 +705,6 @@ func SeedHarnessConfigFromFS(targetDir string, embedsFS embed.FS, basePath, conf
 			return err
 		}
 
-		return SeedFileFromFS(embedsFS, basePath, relPath, targetPath, force, false)
+		return seedHarnessConfigFile(embedsFS, basePath, relPath, targetPath, force)
 	})
 }

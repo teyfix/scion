@@ -20,11 +20,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -97,6 +95,48 @@ func TestWorkspaceWriteBlocked_GKESharedVolumeOnCloudRun(t *testing.T) {
 		},
 	}
 	assert.False(t, srv.workspaceWriteBlocked())
+}
+
+// A volume backend without a volume name has no mount point, so project
+// paths fall back to ephemeral local storage: writes must be blocked, the same
+// way for both volume backends (ptone/scion#1073).
+func TestWorkspaceWriteBlocked_VolumeBackendMissingVolumeName(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *config.V1WorkspaceStorageConfig
+	}{
+		{
+			name: "cloudrun-volume",
+			cfg: &config.V1WorkspaceStorageConfig{
+				Backend:        "cloudrun-volume",
+				CloudRunVolume: &config.V1CloudRunVolumeConfig{SubPathRoot: "projects"},
+			},
+		},
+		{
+			name: "cloudrun-volume nil block",
+			cfg:  &config.V1WorkspaceStorageConfig{Backend: "cloudrun-volume"},
+		},
+		{
+			name: "gke-shared-volume",
+			cfg: &config.V1WorkspaceStorageConfig{
+				Backend:         "gke-shared-volume",
+				GKESharedVolume: &config.V1GKESharedVolumeConfig{PVClaimName: "scion-workspaces"},
+			},
+		},
+		{
+			name: "gke-shared-volume nil block",
+			cfg:  &config.V1WorkspaceStorageConfig{Backend: "gke-shared-volume"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _ := testServer(t)
+			t.Setenv("K_SERVICE", "hub-service")
+			srv.config.WorkspaceStorageConfig = tt.cfg
+			assert.True(t, srv.workspaceWriteBlocked())
+		})
+	}
 }
 
 func TestWorkspaceWriteBlocked_NotOnCloudRun(t *testing.T) {
@@ -360,17 +400,6 @@ func TestServerHubManagedProjectPath_NFSPrefersNFSWhenBothExist(t *testing.T) {
 	assert.Equal(t, nfsDir, path)
 }
 
-// setVolumeMountBase points the platform volume mount base at dir for the
-// duration of the test, so a test can create the mount root that a real
-// deployment gets from Cloud Run or a Kubernetes pod spec. Tests in this
-// package do not run in parallel, so mutating the package-level seam is safe.
-func setVolumeMountBase(t *testing.T, dir string) {
-	t.Helper()
-	prev := volumeMountBase
-	volumeMountBase = dir
-	t.Cleanup(func() { volumeMountBase = prev })
-}
-
 // This test pins the literal default mount root: a deployment gets
 // /mnt/<volume_name> and the chart must mount the PVC there.
 func TestServerHubManagedProjectPath_GKESharedVolume(t *testing.T) {
@@ -503,8 +532,9 @@ func TestServerHubManagedProjectPath_GKESharedVolumeFallbackToLocal(t *testing.T
 	// unfixed code, which returns the same local path without ever consulting
 	// the volume — so asserting on it is what makes this test discriminate,
 	// and it is also the only coverage the warning has.
-	assert.Equal(t, 1, countWarningsForSlug(logs, slug))
-	assert.Contains(t, logs.String(), filepath.Join(mountBase, "workspace-vol"))
+	assertSingleLogLine(t, logs, ephemeralWarnMessage,
+		map[string]string{"backend": "gke-shared-volume", "reason": ephemeralPathReasonVolumeEmpty},
+		slug, mountBase, tmpHome, "slug=", "local_path=", "volume_path=")
 
 	// Repeated resolutions must not repeat the warning: this runs on the
 	// WebDAV, clone and cache paths.
@@ -517,7 +547,8 @@ func TestServerHubManagedProjectPath_GKESharedVolumeFallbackToLocal(t *testing.T
 	// A second project must still get its own warning. Suppression is per
 	// project, not per process: with a single shared key the first project to
 	// resolve would silence every other one, and every assertion above would
-	// still pass. This is the assertion that separates the two.
+	// still pass. This is the assertion that separates the two. The warning
+	// names neither slug, so the count is what tells the projects apart.
 	otherSlug := "gke-fallback-project-2"
 	otherLocalDir := filepath.Join(tmpHome, ".scion", "projects", otherSlug)
 	require.NoError(t, os.MkdirAll(otherLocalDir, 0755))
@@ -529,8 +560,10 @@ func TestServerHubManagedProjectPath_GKESharedVolumeFallbackToLocal(t *testing.T
 		assert.Equal(t, otherLocalDir, otherPath)
 	}
 	assert.Equal(t, 2, countEphemeralWarnings(logs))
-	assert.Equal(t, 1, countWarningsForSlug(logs, slug))
-	assert.Equal(t, 1, countWarningsForSlug(logs, otherSlug))
+	for _, line := range logLinesWithMessage(logs, ephemeralWarnMessage) {
+		assert.NotContains(t, line, slug)
+		assert.NotContains(t, line, otherSlug)
+	}
 }
 
 // A gke-shared-volume config without a volume name has no mount point to build
@@ -554,6 +587,64 @@ func TestServerHubManagedProjectPath_GKESharedVolumeMissingVolumeName(t *testing
 
 	expected := filepath.Join(tmpHome, ".scion", "projects", "my-project")
 	assert.Equal(t, expected, path)
+}
+
+// TestServerHubManagedProjectPath_CloudRunVolumeMissingVolumeName is the
+// regression test for ptone/scion#1073: an empty volume name must not build
+// the malformed /mnt/<subpath_root>/hub-projects/<slug> path. Like
+// gke-shared-volume, the config is treated as unset and the local path is
+// returned.
+func TestServerHubManagedProjectPath_CloudRunVolumeMissingVolumeName(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	mountBase := t.TempDir()
+	setVolumeMountBase(t, mountBase)
+
+	srv, _ := testServer(t)
+	srv.config.WorkspaceStorageConfig = &config.V1WorkspaceStorageConfig{
+		Backend:        "cloudrun-volume",
+		CloudRunVolume: &config.V1CloudRunVolumeConfig{SubPathRoot: "projects"},
+	}
+
+	path, err := srv.hubManagedProjectPath("my-project")
+	require.NoError(t, err)
+
+	expected := filepath.Join(tmpHome, ".scion", "projects", "my-project")
+	assert.Equal(t, expected, path)
+	assert.NotContains(t, path, mountBase)
+}
+
+// TestServerHubManagedProjectPath_CloudRunVolumeLocalFallbackWarns checks the
+// cloudrun-volume branch now shares the gke-shared-volume fallback: local
+// content is served while the volume is empty, and the ephemeral path is
+// reported once.
+func TestServerHubManagedProjectPath_CloudRunVolumeLocalFallbackWarns(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	mountBase := t.TempDir()
+	setVolumeMountBase(t, mountBase)
+
+	srv, _ := testServer(t)
+	logs := captureProjectsLog(t, srv)
+	srv.config.WorkspaceStorageConfig = &config.V1WorkspaceStorageConfig{
+		Backend:        "cloudrun-volume",
+		CloudRunVolume: &config.V1CloudRunVolumeConfig{VolumeName: "workspace-vol"},
+	}
+
+	localPath := filepath.Join(tmpHome, ".scion", "projects", "my-project")
+	require.NoError(t, os.MkdirAll(localPath, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(localPath, "README.md"), []byte("x"), 0644))
+
+	for i := 0; i < 2; i++ {
+		path, err := srv.hubManagedProjectPath("my-project")
+		require.NoError(t, err)
+		assert.Equal(t, localPath, path)
+	}
+	assertSingleLogLine(t, logs, ephemeralWarnMessage,
+		map[string]string{"backend": "cloudrun-volume", "reason": ephemeralPathReasonVolumeEmpty},
+		"my-project", mountBase, tmpHome, "slug=", "local_path=", "volume_path=")
 }
 
 // TestWorkspaceMountRoot covers the single resolver both the readiness check
@@ -709,7 +800,8 @@ func TestHealthCheck_NFSUnhealthy(t *testing.T) {
 	var resp HealthResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Contains(t, resp.Checks["workspace_storage"], "unhealthy")
-	assert.Equal(t, "degraded", resp.Status)
+	// Critical check: /readyz 503s on it, so /healthz reports unhealthy too.
+	assert.Equal(t, "unhealthy", resp.Status)
 }
 
 func TestReadiness_NFSUnavailable(t *testing.T) {
@@ -878,49 +970,11 @@ func TestCheckWorkspaceStorageHealth_MountPathPerBackend(t *testing.T) {
 // ephemeralWarnMessage is the message logged by warnEphemeralProjectPath.
 const ephemeralWarnMessage = "hub-managed project served from ephemeral local path"
 
-// countEphemeralWarnings returns how many ephemeral-path warnings were logged,
-// and countWarningsForSlug how many of those name the given slug.
-//
-// Parsed per line and per attribute rather than matched as a substring: a
-// substring match for `slug=<name> ` depends on slog attribute ORDER, so
-// reordering the attrs in warnEphemeralProjectPath would silently make these
-// assertions count zero and pass. An assertion whose whole job is to not pass
-// vacuously must not be the thing that quietly stops matching.
+// countEphemeralWarnings returns how many ephemeral-path warnings were logged.
+// The warning names no project, so tests tell projects apart by resolving
+// them in a fixed order and checking the running count.
 func countEphemeralWarnings(logs *bytes.Buffer) int {
-	return countWarningsForSlug(logs, "")
-}
-
-func countWarningsForSlug(logs *bytes.Buffer, slug string) int {
-	n := 0
-	for _, line := range strings.Split(logs.String(), "\n") {
-		if !strings.Contains(line, ephemeralWarnMessage) {
-			continue
-		}
-		if slug == "" {
-			n++
-			continue
-		}
-		for _, field := range strings.Fields(line) {
-			if key, value, found := strings.Cut(field, "="); found && key == "slug" {
-				if strings.Trim(value, `"`) == slug {
-					n++
-				}
-				break
-			}
-		}
-	}
-	return n
-}
-
-// captureProjectsLog redirects the projects subsystem logger into a buffer the
-// test can assert on.
-func captureProjectsLog(t *testing.T, srv *Server) *bytes.Buffer {
-	t.Helper()
-	buf := &bytes.Buffer{}
-	prev := srv.projectsLog
-	srv.projectsLog = slog.New(slog.NewTextHandler(buf, nil))
-	t.Cleanup(func() { srv.projectsLog = prev })
-	return buf
+	return len(logLinesWithMessage(logs, ephemeralWarnMessage))
 }
 
 // setContainerRootPath overrides the reference path isMountedVolume compares
@@ -1325,7 +1379,7 @@ func TestWarnEphemeralProjectPath_SuppressionClearedOnProjectDelete(t *testing.T
 	path, err := srv.hubManagedProjectPath(project.Slug)
 	require.NoError(t, err)
 	require.Equal(t, localDir, path)
-	require.Equal(t, 1, countWarningsForSlug(logs, project.Slug))
+	require.Equal(t, 1, countEphemeralWarnings(logs))
 
 	rec := doRequest(t, srv, http.MethodDelete, "/api/v1/projects/"+project.ID, nil)
 	require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
@@ -1333,14 +1387,14 @@ func TestWarnEphemeralProjectPath_SuppressionClearedOnProjectDelete(t *testing.T
 	// The delete resolves the slug once more to find the directory to remove.
 	// That resolution must still be suppressed, which is only true if the
 	// eviction runs after it.
-	assert.Equal(t, 1, countWarningsForSlug(logs, project.Slug),
+	assert.Equal(t, 1, countEphemeralWarnings(logs),
 		"the delete's own path resolution must not re-warn, and must not re-record the slug")
 
 	// The slug is now free and taken by a new project with local content.
 	seedLocal()
 	_, err = srv.hubManagedProjectPath(project.Slug)
 	require.NoError(t, err)
-	assert.Equal(t, 2, countWarningsForSlug(logs, project.Slug),
+	assert.Equal(t, 2, countEphemeralWarnings(logs),
 		"deleting the project should clear its warning suppression")
 }
 
@@ -1381,7 +1435,7 @@ func TestWarnEphemeralProjectPath_SuppressionClearedOnSlugMigration(t *testing.T
 	path, err := srv.hubManagedProjectPath(oldSlug)
 	require.NoError(t, err)
 	require.Equal(t, localDir, path)
-	require.Equal(t, 1, countWarningsForSlug(logs, oldSlug))
+	require.Equal(t, 1, countEphemeralWarnings(logs))
 
 	srv.migrateProjectSlug(t.Context(), &store.Project{
 		ID:   "rename-ephemeral-project",
@@ -1392,13 +1446,13 @@ func TestWarnEphemeralProjectPath_SuppressionClearedOnSlugMigration(t *testing.T
 	// The migration resolves the old slug on its way to renaming the directory.
 	// That resolution must still be suppressed, which is only true if the
 	// suppression is dropped after it rather than before.
-	assert.Equal(t, 1, countWarningsForSlug(logs, oldSlug),
+	assert.Equal(t, 1, countEphemeralWarnings(logs),
 		"the migration's own path resolution must not re-warn, and must not re-record the slug")
 
 	// The slug is now free and taken by another project with local content.
 	seedLocal()
 	_, err = srv.hubManagedProjectPath(oldSlug)
 	require.NoError(t, err)
-	assert.Equal(t, 2, countWarningsForSlug(logs, oldSlug),
+	assert.Equal(t, 2, countEphemeralWarnings(logs),
 		"migrating away from a slug should clear its warning suppression")
 }

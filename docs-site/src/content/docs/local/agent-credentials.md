@@ -182,7 +182,7 @@ Uses Google Cloud's Vertex AI endpoints with Application Default Credentials (AD
 - **Assigned GCP Identity** (Hub Mode): If the agent is assigned a Hub-managed GCP Service Account via metadata emulation, Vertex AI will automatically use it. This is the recommended and most secure approach.
 - **ADC JSON file** (Fallback/Local): Automatically discovered at `~/.config/gcloud/application_default_credentials.json` if present locally. In Hub mode, you can upload an ADC file via the `gcloud-adc` file secret or specify the `GOOGLE_APPLICATION_CREDENTIALS` environment variable pointing to a custom credential file.
 - `GOOGLE_CLOUD_PROJECT`: Your Google Cloud project ID.
-- `GOOGLE_CLOUD_REGION`: The region (e.g., `us-east5`). Required for Claude, optional but recommended for Gemini. `CLOUD_ML_REGION` and `GOOGLE_CLOUD_LOCATION` are accepted as alternatives.
+- `GOOGLE_CLOUD_REGION`: The region (e.g., `us-east5`). Required for Claude, optional but recommended for Gemini. `GOOGLE_CLOUD_LOCATION` and `CLOUD_ML_REGION` are accepted as alternatives. If more than one is set, Scion uses them in this order: `GOOGLE_CLOUD_LOCATION`, then `GOOGLE_CLOUD_REGION`, then `CLOUD_ML_REGION`. It prints a warning when `GOOGLE_CLOUD_LOCATION` and `GOOGLE_CLOUD_REGION` are both set to different values. Hermes checks `VERTEX_REGION` first. Hermes, Antigravity and OpenCode do not read `CLOUD_ML_REGION` directly (OpenCode also accepts `VERTEX_LOCATION`, last).
 
 **Local Setup:**
 ```bash
@@ -258,6 +258,10 @@ your host, where Scion discovers it and mounts it into the agent.
 | **Copilot** | `~/.copilot/config.json` | `COPILOT_CONFIG` |
 | **Antigravity** | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `AGY_TOKEN` |
 
+:::caution[Upgrading a Hub]
+Harness-config resolution changed in the 2026-10-06 release. Upgrade the Hub before, or together with, its Runtime Brokers. Existing agents that use `auth-file` must re-authenticate (or be re-created) once after the upgrade. Agents that authenticate with environment secrets are not affected.
+:::
+
 **Local Setup:**
 If you have run the harness's native authentication command (e.g. an OAuth login on your host), Scion will automatically detect the resulting credential file and mount it into the agent.
 
@@ -288,6 +292,16 @@ The fallback applies only to **automatic** resolution. If you selected an auth t
 [Explicit Path](#the-explicit-path), the fallback is disabled — the required credentials must be
 present or the agent fails to start with an actionable error.
 
+**Runtime Broker check before the container starts.** A Runtime Broker checks the staged auth
+candidates before it creates the container, and fails the start at once when the harness's
+provisioner would certainly reject it: an explicitly selected auth type whose credentials are all
+missing, or, for a harness that has no no-auth fallback, no satisfied auth type at all. The error
+names the harness and the accepted auth types and, for a selected auth type, the environment
+keys it looks for, never their values. An auth type that declares `required_files` is never
+rejected by this check, because a credential file can reach the container by routes the Runtime
+Broker cannot see (volumes, file secrets, a persistent home, pre-start hooks). All shipped harness
+configs declare a no-auth fallback, so for them only an explicit auth type can fail this way.
+
 :::note[Git Credentials and GCP Service Accounts in No-Auth Fallback]
 * **Git Credentials Exemption**: During a no-auth fallback (when LLM credentials are not yet found or captured), Scion previously suppressed all secrets. Now, Git credentials (specifically `GITHUB_TOKEN`) are **exempt from suppression**. Scion will resolve `GITHUB_TOKEN` from project secrets (with a fallback to user-scoped secrets) so that repository cloning in `clone-per-agent` workspaces succeeds even when running in no-auth fallback mode.
 * **GCP Service Account Check**: To prevent false no-auth fallback triggers, Scion skips explicit environment variable checks for GCP-backed auth types when a verified Google Cloud Service Account (SA) is assigned to the agent.
@@ -314,6 +328,15 @@ Credential capture supports scoping captured credentials to either the **project
     # Capture credentials to the project scope
     python3 ~/.scion/harness/capture_auth.py --scope project
     ```
+
+**Hub admins can restrict this to user scope only.** If the "Restrict agent-written secrets to
+profile scope" setting is on (Admin > Server Config, `agent_secrets.user_scope_only`), the hub
+rejects any project-scope write an agent attempts — capture included — with a 403, whatever
+harness, flag, or `--force` is used. In the Web UI, the Project option in the Capture Auth dialog
+is disabled with an explanation and Profile is preselected while the setting is on; retrying a
+rejected capture with `--scope user` (or via the CLI/Script path above) still works. This does not
+affect user-originated project writes made directly through the web UI or `scion hub secret set
+--project`.
 
 ### How capture works
 
@@ -413,7 +436,7 @@ needed.
 Two diagnostic commands help troubleshoot auth and connectivity:
 
 - **`scion doctor`** (host-side): checks host prerequisites — Git, tmux, the active container runtime (Docker/Podman daemon or Kubernetes cluster access), and related diagnostics. Supports `--format json`.
-- **`sciontool doctor`** (in-container): checks the *agent's* health from inside the container — required environment variables, the Hub token (presence, format, expiry), Hub reachability, token refresh, the GCP metadata server and token acquisition, and the GitHub App token. When the token check fails it prints a remediation hint pointing you at `scion reset-auth`.
+- **`sciontool doctor`** (in-container): checks the *agent's* health from inside the container — required environment variables, the Hub token (presence, format, expiry), Hub reachability, token validity (a read-only check that leaves the agent's token untouched), the GCP metadata server and token acquisition, and the GitHub App token. When the token check fails it prints a remediation hint pointing you at `scion reset-auth`.
 
 ## Agent Progeny & Secret Access
 
@@ -440,6 +463,12 @@ The harness couldn't find any usable credentials through the automatic implicit 
 
 ### "auth type selected but..."
 You have configured the **Explicit Path** (e.g., selecting `vertex-ai`) but the specific credentials required for that path (like `GOOGLE_CLOUD_PROJECT`) are missing. The explicit path disables fallback, so ensure all required sources for the chosen explicit type are provided.
+
+### "no auth method satisfied"
+The Runtime Broker refused the start before creating a container (see [No-Auth Fallback](#no-auth-fallback)). The message names the harness, the accepted auth types and, for a selected auth type, the credentials it looks for. Provide one of them as a Hub secret (`scion hub secret set`) or a Hub environment setting (`scion hub env set`), or select a different auth type with `--harness-auth`.
+
+### "agent secrets could not be resolved" or "agent environment settings could not be read"
+In Hub mode, create, start, restart, resume and waking an agent for a direct message fail closed with `503` when the Hub cannot resolve the agent's configured secrets or read its stored environment settings, instead of starting the agent without them. A start leaves the agent as it was, a restart leaves it stopped (its stop leg has already run), and a failed create is rolled back. A provision-only create still succeeds; the agent's later start fails closed. A reincarnation answers `202` and then fails at its start leg: it is recorded as failed with the same message and the previous config is restored. This points to a secret backend or database problem on the Hub, not a missing credential (an agent with no secrets or settings starts normally). Retry once the Hub's backend is healthy; the Hub's server log has the cause.
 
 ### "unknown auth type"
 The value you passed to `--harness-auth` (or `auth_selectedType`) is not one this harness supports. Valid universal types are `api-key`, `oauth-token`, `auth-file`, and `vertex-ai`, but each harness only accepts a subset — see the [auth capability matrix](/scion/supported-harnesses/#feature-capability-matrix).

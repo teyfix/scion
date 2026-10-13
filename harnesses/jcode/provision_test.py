@@ -223,6 +223,65 @@ class JcodeProvisionTest(unittest.TestCase):
             self.assertEqual(mcp["mcpServers"]["files"]["type"], "stdio")
             self.assertEqual(mcp["mcpServers"]["files"]["command"], "mcp-files")
 
+    def test_populated_empty_broker_envelope_honors_no_auth_allow(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, bundle = make_context(root, candidates={
+                "schema_version": 1, "explicit_type": "", "resolved_method": "none",
+                "env_vars": [], "env_secret_files": {}, "file_secret_files": {}, "files": [],
+            })
+            with temporary_home(home):
+                provision.provision(ctx)
+            with open(os.path.join(bundle, "outputs", "resolved-auth.json"), encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["method"], "none")
+
+    def test_explicit_missing_auth_never_falls_back_to_allow(self) -> None:
+        for auth_type in ("api-key", "auth-file"):
+            with self.subTest(auth_type=auth_type), tempfile.TemporaryDirectory() as root:
+                ctx, home, _ = make_context(root, candidates={
+                    "schema_version": 1, "explicit_type": auth_type,
+                    "env_vars": [], "env_secret_files": {}, "file_secret_files": {}, "files": [],
+                })
+                with temporary_home(home), self.assertRaises(scion_harness.ProvisionError):
+                    provision.provision(ctx)
+
+    def test_advertised_missing_api_key_is_not_no_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, _ = make_context(root, candidates={
+                "env_vars": ["OPENAI_API_KEY"],
+                "env_secret_files": {"OPENAI_API_KEY": os.path.join(root, "missing")},
+            })
+            with temporary_home(home), self.assertRaises(scion_harness.ProvisionError):
+                provision.provision(ctx)
+
+    def test_auth_and_outputs_follow_runtime_directory_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, bundle = make_context(root, candidates={
+                "explicit_type": "auth-file",
+                "file_secret_files": {"CODEX_AUTH": os.path.join(root, "bundle", "secrets", "CODEX_AUTH")},
+            })
+            private = os.path.join(root, "runtime-secrets")
+            outputs = os.path.join(root, "runtime-outputs")
+            os.makedirs(private)
+            content = '{"auth_mode":"oauth","tokens":{"access_token":"fixture"}}'
+            with open(os.path.join(private, "CODEX_AUTH"), "w", encoding="utf-8") as handle:
+                handle.write(content)
+            with temporary_home(home), patch.dict(os.environ, {
+                "SCION_HARNESS_SECRETS_DIR": private,
+                "SCION_HARNESS_OUTPUTS_DIR": outputs,
+            }), patch.object(scion_harness, "HARNESS_DIRS_ROOT", root):
+                provision.provision(ctx)
+            with open(os.path.join(home, ".codex", "auth.json"), encoding="utf-8") as handle:
+                self.assertEqual(handle.read().strip(), content)
+            with open(os.path.join(outputs, "resolved-auth.json"), encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["method"], "auth-file")
+            self.assertFalse(os.path.exists(os.path.join(bundle, "outputs", "resolved-auth.json")))
+
+    def test_explicit_invalid_auth_never_falls_back_to_allow(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, _ = make_context(root, candidates={"explicit_type": "nonexistent-method"})
+            with temporary_home(home), self.assertRaises(scion_harness.ProvisionError):
+                provision.provision(ctx)
+
     def test_api_key_output_uses_secret_reference(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             ctx, home, bundle = make_context(

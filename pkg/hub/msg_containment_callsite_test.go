@@ -38,130 +38,6 @@ import (
 // This is the mechanism that would have caught the B1 scheduled-message
 // bypass and will catch the next one.
 
-// effectCallSiteEntry describes one classified external-effect call site.
-type effectCallSiteEntry struct {
-	file     string // base filename (e.g. "server.go")
-	function string // enclosing function name
-	symbol   string // called function/method name
-	class    string // "guarded" or "exempt"
-	reason   string // why this classification is correct
-}
-
-// effectCallSiteClassifications is the authoritative classification map.
-// Every production call site of the four external-effect primitives must
-// appear here. "guarded" means messaging/dispatch authorization occurs
-// before the call; "exempt" means the call is intentionally unguarded
-// with a documented reason.
-var effectCallSiteClassifications = []effectCallSiteEntry{
-	// ---- dispatchWithBrokerRetry ----
-
-	// broker_routing.go: the primitive itself — calls DispatchAgentMessage
-	// in its retry loop. This is the wrapper, not a call site.
-	{file: "broker_routing.go", function: "dispatchWithBrokerRetry", symbol: "DispatchAgentMessage",
-		class: "exempt", reason: "primitive wrapper: the retry loop implementation itself"},
-
-	// handlers_agent_messaging.go: handleAgentMessage — guarded by routers
-	// at handlers_agents_core.go:2700 and handlers_projects_core.go:2529.
-	{file: "handlers_agent_messaging.go", function: "handleAgentMessage", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage called in both routers before this handler"},
-
-	// handlers_agent_messaging.go: handleGroupMessage — guarded at :1286.
-	{file: "handlers_agent_messaging.go", function: "handleGroupMessage", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage at handlers_agent_messaging.go:1286"},
-
-	// handlers_agent_messaging.go: broadcastDirect — guarded per-recipient
-	// at handlers_agent_messaging.go:1644.
-	{file: "handlers_agent_messaging.go", function: "broadcastDirect", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage per-recipient at handlers_agent_messaging.go:1644"},
-
-	// handlers_agent_messaging.go: publishBroadcastDeliveryFailed — derivative
-	// notice back to the original sender agent.
-	{file: "handlers_agent_messaging.go", function: "publishBroadcastDeliveryFailed", symbol: "DispatchAgentMessage",
-		class: "exempt", reason: "derivative: delivery-failure notice to original sender, not attacker-chosen target"},
-
-	// handlers_agent_messaging.go: processMentions — guarded at :1852.
-	{file: "handlers_agent_messaging.go", function: "processMentions", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage at handlers_agent_messaging.go:1852"},
-
-	// handlers_agent_messaging.go: wake-on-message DispatchAgentStart —
-	// guarded by the calling routers. Fragile derivative (see F-RS6-16).
-	{file: "handlers_agent_messaging.go", function: "handleAgentMessage", symbol: "DispatchAgentStart",
-		class: "guarded", reason: "guarded by calling routers; fragile derivative (F-RS6-16)"},
-
-	// handlers_broker_inbound.go: guarded at :164 (authorizeAgentMessage).
-	{file: "handlers_broker_inbound.go", function: "handleBrokerInbound", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage at handlers_broker_inbound.go:164"},
-
-	// handlers_chat_v2.go: sendAgentRouted primary — guarded at :1125.
-	{file: "handlers_chat_v2.go", function: "sendAgentRouted", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "authorizeAgentMessage at handlers_chat_v2.go:1125"},
-
-	// messagebroker.go: deliverToAgent — UNGUARDED internal surface.
-	// No authorizeAgentMessage call anywhere in this function.
-	// Classified as exempt pending full RS6 remediation.
-	{file: "messagebroker.go", function: "deliverToAgent", symbol: "dispatchWithBrokerRetry",
-		class: "exempt", reason: "UNGUARDED internal surface (F-RS6-07); no external reach identified; deferred to RS6/AH"},
-
-	// messagebroker.go: publishDeliveryFailed — derivative notice.
-	{file: "messagebroker.go", function: "publishDeliveryFailed", symbol: "DispatchAgentMessage",
-		class: "exempt", reason: "derivative: delivery-failure notice to original sender"},
-
-	// notifications.go: dispatchToAgent — UNGUARDED notification fan-out.
-	// Subscription-only authorization; revocation not re-evaluated.
-	{file: "notifications.go", function: "dispatchToAgent", symbol: "dispatchWithBrokerRetry",
-		class: "exempt", reason: "UNGUARDED notification fan-out (F-RS6-08); subscription-only authz; deferred to RS6/AH"},
-
-	// server.go: messageEventHandler — GUARDED after C1 containment.
-	// authorizeScheduledMessageFire calls authorizeAgentMessage before dispatch.
-	{file: "server.go", function: "messageEventHandler", symbol: "dispatchWithBrokerRetry",
-		class: "guarded", reason: "C1 containment: authorizeScheduledMessageFire before dispatch"},
-
-	// server.go: dispatchAgentEventHandler — guarded at server.go:3103
-	// (authorizeScheduledAgentCreate).
-	{file: "server.go", function: "dispatchAgentEventHandler", symbol: "DispatchAgentCreate",
-		class: "guarded", reason: "authorizeScheduledAgentCreate at server.go fire-time authorization"},
-
-	// reconcile.go: deliverMessage — dead code. The seam is assigned but
-	// never invoked in production.
-	{file: "reconcile.go", function: "deliverMessage", symbol: "DispatchAgentMessage",
-		class: "exempt", reason: "dead code: seam assigned at server.go but never invoked (F-RS6-18)"},
-
-	// reconcile.go: execDispatchStart — durable-intent replay. Replays
-	// a previously authorized dispatch.
-	{file: "reconcile.go", function: "execDispatchStart", symbol: "DispatchAgentStart",
-		class: "exempt", reason: "durable-intent replay of previously authorized dispatch"},
-
-	// reconcile.go: execDispatchCreate (via DispatchAgentCreateWithGather) —
-	// durable-intent replay.
-	{file: "reconcile.go", function: "execDispatchCreate", symbol: "DispatchAgentCreateWithGather",
-		class: "exempt", reason: "durable-intent replay of previously authorized dispatch"},
-
-	// handlers_agent_create_helpers.go: DispatchAgentStart calls in
-	// handleExistingAgent (multiple start calls for existing agent reuse).
-	{file: "handlers_agent_create_helpers.go", function: "handleExistingAgent", symbol: "DispatchAgentStart",
-		class: "guarded", reason: "called after authorization in the agent-create flow"},
-
-	// handlers_agent_lifecycle.go: DispatchAgentStart in handleAgentLifecycle.
-	{file: "handlers_agent_lifecycle.go", function: "handleAgentLifecycle", symbol: "DispatchAgentStart",
-		class: "guarded", reason: "authorizeAgentLifecycle at handlers_agent_lifecycle.go"},
-
-	// Explicit recovery reuses the authenticated lifecycle start dispatch.
-	{file: "handlers_agent_recovery.go", function: "DispatchAgentRecover", symbol: "DispatchAgentStart",
-		class: "guarded", reason: "authorized agent lifecycle routes; CAS admission in recoverAgentRuntime"},
-	{file: "handlers_agent_recovery.go", function: "recoverAgentRuntime", symbol: "DispatchAgentRecover",
-		class: "guarded", reason: "authorized agent lifecycle routes; CAS admission before broker mutation"},
-	{file: "reconcile.go", function: "execDispatchStart", symbol: "DispatchAgentRecover",
-		class: "exempt", reason: "durable-intent replay of admitted recovery with identity and generation fence"},
-
-	// handlers_agents_core.go: DispatchAgentCreateWithGather in createAgentInProject.
-	{file: "handlers_agents_core.go", function: "createAgentInProject", symbol: "DispatchAgentCreateWithGather",
-		class: "guarded", reason: "authorizeAgentCreate at handlers_agents_core.go"},
-
-	// workspace_handlers.go: DispatchAgentCreate in handleWorkspaceSyncToFinalize.
-	{file: "workspace_handlers.go", function: "handleWorkspaceSyncToFinalize", symbol: "DispatchAgentCreate",
-		class: "guarded", reason: "workspace agent creation with project authorization"},
-}
-
 // targetSymbols is the set of function/method names that constitute
 // external-effect emit primitives.
 var targetSymbols = map[string]bool{
@@ -169,7 +45,6 @@ var targetSymbols = map[string]bool{
 	"DispatchAgentMessage":          true,
 	"DispatchAgentCreate":           true,
 	"DispatchAgentStart":            true,
-	"DispatchAgentRecover":          true,
 	"DispatchAgentCreateWithGather": true,
 }
 
@@ -230,13 +105,6 @@ func TestExternalEffectCallSiteClassification(t *testing.T) {
 		len(discovered), guardedCount, exemptCount)
 }
 
-type effectCallSite struct {
-	file     string // base filename
-	function string // enclosing function name
-	symbol   string // called function/method name
-	line     int
-}
-
 // discoverEffectCallSites finds all production call sites of the target
 // symbols in non-test .go files under pkg/hub, including subpackages.
 // This fixes the directory-walk blind spot in create_message_enumeration_test.go
@@ -247,6 +115,12 @@ func discoverEffectCallSites(t *testing.T) []effectCallSite {
 	var sites []effectCallSite
 
 	// Walk pkg/hub and all subdirectories to avoid the subpackage blind spot.
+	// pkgmove:scan-covers pkg/hub/apierr
+	// recursive walk already includes pkg/hub/apierr.
+	// pkgmove:scan-covers pkg/hub/internal/principal
+	// recursive walk already includes pkg/hub/internal/principal.
+	// pkgmove:scan-covers pkg/hub/maintenance
+	// recursive walk already includes pkg/hub/maintenance (skips only testdata and vendor).
 	err := filepath.Walk(hubDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -302,15 +176,4 @@ func discoverEffectCallSites(t *testing.T) []effectCallSite {
 	}
 
 	return sites
-}
-
-// extractCallSymbol returns the function/method name from a call expression.
-func extractCallSymbol(call *ast.CallExpr) string {
-	switch fn := call.Fun.(type) {
-	case *ast.SelectorExpr:
-		return fn.Sel.Name
-	case *ast.Ident:
-		return fn.Name
-	}
-	return ""
 }

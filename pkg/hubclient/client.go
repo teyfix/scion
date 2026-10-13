@@ -18,9 +18,11 @@ package hubclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -97,11 +99,17 @@ type Client interface {
 	// Messages returns the user message inbox operations interface.
 	Messages() MessageService
 
+	// Conversations returns the conversation operations interface.
+	Conversations() ConversationService
+
 	// AllowList returns the allow list management operations interface.
 	AllowList() AllowListService
 
 	// Invites returns the invite code management operations interface.
 	Invites() InviteService
+
+	// Messaging returns the cross-project messaging operations interface.
+	Messaging() MessagingService
 
 	// ProjectInjectedSkills returns an InjectedSkillsService scoped to a project.
 	ProjectInjectedSkills(projectID string) InjectedSkillsService
@@ -119,8 +127,23 @@ type Client interface {
 	// the list of skills found at the given GitHub directory URL.
 	DiscoverSkillsDirectory(ctx context.Context, req DiscoverSkillsDirectoryRequest) (*DiscoverSkillsDirectoryResponse, error)
 
+	// Artifacts returns the artifact operations interface.
+	Artifacts() ArtifactService
+
+	// TestIdentities returns the hub test identity operations interface.
+	TestIdentities() TestIdentityService
+
+	// TestIdentityDelegations returns the workload issuer delegation
+	// operations interface.
+	TestIdentityDelegations() TestIdentityDelegationService
+
 	// Health checks API availability.
 	Health(ctx context.Context) (*HealthResponse, error)
+
+	// HealthSummary returns the admin health summary (GET
+	// /api/v1/admin/health/summary), the data behind the health dashboard.
+	// It needs hub.health.read and a user identity.
+	HealthSummary(ctx context.Context) (*HealthSummary, error)
 }
 
 // client is the concrete implementation of Client.
@@ -145,8 +168,13 @@ type client struct {
 	subscriptions         *subscriptionService
 	subscriptionTemplates *subscriptionTemplateService
 	messages              *messageService
+	conversations         *conversationService
 	allowList             *allowListService
 	invites               *inviteService
+	messaging             *messagingService
+	artifacts             *artifactService
+	testIdentities        *testIdentityService
+	testIdentityDelegs    *testIdentityDelegationService
 }
 
 // New creates a new Hub API client.
@@ -197,8 +225,13 @@ func New(baseURL string, opts ...Option) (Client, error) {
 	c.subscriptions = &subscriptionService{c: c}
 	c.subscriptionTemplates = &subscriptionTemplateService{c: c}
 	c.messages = &messageService{c: c}
+	c.conversations = &conversationService{c: c}
 	c.allowList = &allowListService{c: c}
 	c.invites = &inviteService{c: c}
+	c.messaging = &messagingService{c: c}
+	c.artifacts = &artifactService{c: c}
+	c.testIdentities = &testIdentityService{c: c}
+	c.testIdentityDelegs = &testIdentityDelegationService{c: c}
 
 	return c, nil
 }
@@ -313,6 +346,11 @@ func (c *client) Messages() MessageService {
 	return c.messages
 }
 
+// Conversations returns the conversation operations interface.
+func (c *client) Conversations() ConversationService {
+	return c.conversations
+}
+
 // AllowList returns the allow list management operations interface.
 func (c *client) AllowList() AllowListService {
 	return c.allowList
@@ -323,100 +361,63 @@ func (c *client) Invites() InviteService {
 	return c.invites
 }
 
-// get performs an HTTP GET request with fallback.
+// Messaging returns the cross-project messaging operations interface.
+func (c *client) Messaging() MessagingService {
+	return c.messaging
+}
+
+// Artifacts returns the artifact operations interface.
+func (c *client) Artifacts() ArtifactService {
+	return c.artifacts
+}
+
+// TestIdentities returns the hub test identity operations interface.
+func (c *client) TestIdentities() TestIdentityService {
+	return c.testIdentities
+}
+
+func (c *client) TestIdentityDelegations() TestIdentityDelegationService {
+	return c.testIdentityDelegs
+}
+
+// get performs an HTTP GET request.
 func (c *client) get(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
 	return c.getWithQuery(ctx, path, nil, headers)
 }
 
-// getWithQuery performs an HTTP GET request with query parameters and fallback.
+// getWithQuery performs an HTTP GET request with query parameters.
 func (c *client) getWithQuery(ctx context.Context, path string, query url.Values, headers http.Header) (*http.Response, error) {
-	resp, err := c.transport.GetWithQuery(ctx, path, query, headers)
-	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") {
-			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-			_ = resp.Body.Close()
-			resp, err = c.transport.GetWithQuery(ctx, legacyPath, query, headers)
-			c.checkForDeprecation(resp)
-			return resp, err
-		}
-	}
-	return resp, err
+	return c.transport.GetWithQuery(ctx, path, query, headers)
 }
 
-// post performs an HTTP POST request with fallback.
+// post performs an HTTP POST request.
 func (c *client) post(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
-	resp, err := c.transport.Post(ctx, path, body, headers)
-	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") {
-			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-			_ = resp.Body.Close()
-			resp, err = c.transport.Post(ctx, legacyPath, body, headers)
-			c.checkForDeprecation(resp)
-			return resp, err
-		}
-	}
-	return resp, err
+	return c.transport.Post(ctx, path, body, headers)
 }
 
-// put performs an HTTP PUT request with fallback.
+// postNoRetry performs an HTTP POST request exactly once: it bypasses the
+// transport's configured retry policy (including a client built with
+// WithRetry) and does not follow redirects. Used by operations — currently
+// only agent keys injection — for which the generic transport retry/redirect
+// behavior would risk sending a non-idempotent request more than once. See
+// apiclient.Transport.DoNoRetry.
+func (c *client) postNoRetry(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
+	return c.transport.PostNoRetry(ctx, path, body, headers)
+}
+
+// put performs an HTTP PUT request.
 func (c *client) put(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
-	resp, err := c.transport.Put(ctx, path, body, headers)
-	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") {
-			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-			_ = resp.Body.Close()
-			resp, err = c.transport.Put(ctx, legacyPath, body, headers)
-			c.checkForDeprecation(resp)
-			return resp, err
-		}
-	}
-	return resp, err
+	return c.transport.Put(ctx, path, body, headers)
 }
 
-// patch performs an HTTP PATCH request with fallback.
+// patch performs an HTTP PATCH request.
 func (c *client) patch(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
-	resp, err := c.transport.Patch(ctx, path, body, headers)
-	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") {
-			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-			_ = resp.Body.Close()
-			resp, err = c.transport.Patch(ctx, legacyPath, body, headers)
-			c.checkForDeprecation(resp)
-			return resp, err
-		}
-	}
-	return resp, err
+	return c.transport.Patch(ctx, path, body, headers)
 }
 
-// delete performs an HTTP DELETE request with fallback.
+// delete performs an HTTP DELETE request.
 func (c *client) delete(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
-	resp, err := c.transport.Delete(ctx, path, headers)
-	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") {
-			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-			_ = resp.Body.Close()
-			resp, err = c.transport.Delete(ctx, legacyPath, headers)
-			c.checkForDeprecation(resp)
-			return resp, err
-		}
-	}
-	return resp, err
-}
-
-// checkForDeprecation logs a warning if the response contains a Deprecation header.
-func (c *client) checkForDeprecation(resp *http.Response) {
-	if resp != nil && resp.Header.Get("Deprecation") == "true" {
-		path := ""
-		if resp.Request != nil {
-			path = resp.Request.URL.Path
-		}
-		util.Debugf("WARNING: Calling deprecated endpoint %s. Please update to /projects version.", path)
-	}
+	return c.transport.Delete(ctx, path, headers)
 }
 
 // isProxyIntercepted reports whether a 2xx response looks like a proxy
@@ -435,7 +436,10 @@ func isProxyIntercepted(resp *http.Response) bool {
 // HintProxyError returns err unchanged in most cases. If the error message
 // matches the pattern produced by apiclient.DecodeResponse when a proxy
 // intercepts a health endpoint and returns a non-JSON body, it appends a
-// diagnostic hint suggesting a Cloud Run / GFE configuration issue.
+// diagnostic hint suggesting a Cloud Run / GFE configuration issue. An
+// error wrapping apiclient.ErrNoContent (an empty body from a call that
+// needs one) gets the same hint, as an empty-body decode failure did before
+// apiclient.DecodeRequired.
 //
 // Note: the trigger ("failed to decode response") fires for any JSON decode
 // failure, including a genuinely malformed response from the hub server
@@ -447,7 +451,7 @@ func HintProxyError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if strings.Contains(err.Error(), "failed to decode response") {
+	if strings.Contains(err.Error(), "failed to decode response") || errors.Is(err, apiclient.ErrNoContent) {
 		return fmt.Errorf("%w\nHint: a reverse proxy may be intercepting "+
 			"/healthz and /health — check your Cloud Run or GFE configuration", err)
 	}
@@ -467,6 +471,8 @@ func (c *client) Health(ctx context.Context) (*HealthResponse, error) {
 			return nil, err
 		}
 	}
+	// Health is a reachability probe; several callers ignore the body, so a
+	// 204 still counts as reachable.
 	return apiclient.DecodeResponse[HealthResponse](resp)
 }
 
@@ -515,7 +521,13 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithRetry configures retry behavior.
+// WithRetry configures retry behavior: up to maxRetries further attempts
+// after a transport error or a 5xx response (see apiclient.Transport.Do).
+// Retries are off by default. A retry replays the whole request, body
+// included, and only the methods that use the no-retry send are exempt, so
+// enabling this on a client that issues non-idempotent writes can duplicate
+// them. Pinning those writes to the no-retry send is tracked in
+// ptone/scion#2955.
 func WithRetry(maxRetries int, wait time.Duration) Option {
 	return func(c *client) {
 		c.transport.MaxRetries = maxRetries
@@ -557,10 +569,11 @@ func WithAutoDevAuth() Option {
 }
 
 // WithAgentToken sets agent token authentication using the X-Scion-Agent-Token header.
-// Use this when authenticating as an agent (not a user) to the Hub API.
+// Use this when authenticating as an agent (not a user) to the Hub API. The
+// agent's run id (SCION_LAUNCH_ID), when set, is sent with it.
 func WithAgentToken(token string) Option {
 	return func(c *client) {
-		c.transport.Auth = &apiclient.AgentTokenAuth{Token: token}
+		c.transport.Auth = &apiclient.AgentTokenAuth{Token: token, RunID: os.Getenv("SCION_LAUNCH_ID")}
 	}
 }
 

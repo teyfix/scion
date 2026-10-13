@@ -23,6 +23,7 @@
 
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
+import { keyed } from 'lit/directives/keyed.js';
 
 import { can, type AdminUser, type UserRole } from '../../shared/types.js';
 import type { SecurityReviewDetail } from '../shared/security-review-dialog.js';
@@ -34,12 +35,14 @@ import '../shared/status-badge.js';
 import '../shared/effective-role-provenance.js';
 import '../shared/effective-access-boundary-notice.js';
 import '../shared/security-review-dialog.js';
-import { apiFetch, extractApiError } from '../../client/api.js';
+import { formatRelative } from '../../utils/time.js';
+import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
 
 type SortField = 'name' | 'created';
 type SortDir = 'asc' | 'desc';
 type AdminTab = 'users' | 'invites';
 type StatusFilter = 'all' | 'invited' | 'active' | 'suspended';
+type RoleFilter = 'all' | UserRole;
 
 interface ConfirmAction {
   title: string;
@@ -82,6 +85,51 @@ const EXPIRY_PRESETS = [
 
 const PAGE_SIZE = 50;
 
+/** Hub roles offered in the "Change role" submenu, in display order. */
+export const HUB_ROLE_OPTIONS: readonly UserRole[] = ['admin', 'member', 'viewer'];
+
+/** Display labels for hub roles. */
+export const HUB_ROLE_LABELS: Record<UserRole, string> = {
+  admin: 'Admin',
+  member: 'Member',
+  viewer: 'Viewer',
+};
+
+/** One-line meaning of each hub role, shown when confirming a role change. */
+export const HUB_ROLE_DESCRIPTIONS: Record<UserRole, string> = {
+  admin: 'Full administrative access to this hub.',
+  member: 'Can create projects, and works in any project they are added to.',
+  viewer:
+    'The same as Member, but cannot create projects (including cloning). Viewers can still be added to projects and work there according to their project role.',
+};
+
+/** How long a non-warning action feedback alert stays open. */
+const FEEDBACK_AUTO_CLOSE_MS = 5000;
+
+/** Variants of the page's action feedback alert. */
+type FeedbackVariant = 'success' | 'danger' | 'warning' | 'primary';
+
+/** Response body of POST /api/v1/users. */
+interface ProvisionUserResponse {
+  user: { id?: string; email: string; status: string };
+  created: boolean;
+  warnings?: string[];
+}
+
+/** Describes an advisory warning of POST /api/v1/users. */
+export function provisionWarningText(warning: string): string {
+  switch (warning) {
+    case 'reserved_identity':
+      return 'This email is a reserved platform identity; sign-in will be refused.';
+    case 'domain_not_authorized':
+      return "This email is outside the hub's authorized domains; sign-in will be refused.";
+    case 'sign_in_currently_blocked_by_access_mode':
+      return "The hub's access mode currently blocks all sign-ins.";
+    default:
+      return `Warning: ${warning}.`;
+  }
+}
+
 @customElement('scion-page-admin-users')
 export class ScionPageAdminUsers extends LitElement {
   @state()
@@ -121,13 +169,20 @@ export class ScionPageAdminUsers extends LitElement {
   private actionInProgress = false;
 
   @state()
-  private actionFeedback: { message: string; variant: 'success' | 'danger' } | null = null;
+  private actionFeedback: { message: string; variant: FeedbackVariant } | null = null;
 
   @state()
   private activeTab: AdminTab = 'users';
 
   @state()
   private statusFilter: StatusFilter = 'all';
+
+  /**
+   * Hub role filter. Invited users have no real role yet (it is assigned at
+   * first sign-in), so they are excluded from every role bucket.
+   */
+  @state()
+  private roleFilter: RoleFilter = 'all';
 
   // Invite user dialog state
   @state()
@@ -138,6 +193,14 @@ export class ScionPageAdminUsers extends LitElement {
 
   @state()
   private inviteUserNote = '';
+
+  /**
+   * Optional display name. When set, the invite dialog pre-registers the
+   * user through POST /api/v1/users, which stores the name; otherwise it
+   * uses the invite endpoint as before.
+   */
+  @state()
+  private inviteUserDisplayName = '';
 
   @state()
   private inviteUserInProgress = false;
@@ -420,6 +483,18 @@ export class ScionPageAdminUsers extends LitElement {
     }
 
     .meta-text {
+      font-size: 0.8125rem;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    .role-pending {
+      font-size: 0.75rem;
+      font-style: italic;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    .invite-role-hint {
+      margin: 0;
       font-size: 0.8125rem;
       color: var(--scion-text-muted, #64748b);
     }
@@ -763,6 +838,10 @@ export class ScionPageAdminUsers extends LitElement {
       if (this.statusFilter !== 'all') {
         params.set('status', this.statusFilter);
       }
+      const roleFilterActive = this.roleFilterActive;
+      if (roleFilterActive) {
+        params.set('role', this.roleFilter);
+      }
 
       const response = await apiFetch(`/api/v1/users?${params.toString()}`);
 
@@ -777,9 +856,18 @@ export class ScionPageAdminUsers extends LitElement {
         nextCursor?: string;
         totalCount?: number;
       };
-      this.users = Array.isArray(data) ? data : data.users || [];
+      let users: AdminUser[] = Array.isArray(data) ? (data as AdminUser[]) : data.users || [];
+      if (roleFilterActive) {
+        // The stored role on an invited row is a placeholder, so invited
+        // users never belong to a role bucket. The backend only filters by
+        // equality, so drop them here. The server's totalCount still
+        // includes invited rows, so it is only an upper bound; see
+        // countIsExact. Paging stays cursor-driven.
+        users = users.filter((u) => u.status !== 'invited');
+      }
+      this.users = users;
       this.nextCursor = (data as { nextCursor?: string }).nextCursor || null;
-      this.totalCount = (data as { totalCount?: number }).totalCount ?? this.users.length;
+      this.totalCount = (data as { totalCount?: number }).totalCount ?? users.length;
     } catch (err) {
       console.error('Failed to load users:', err);
       this.error = err instanceof Error ? err.message : 'Failed to load users';
@@ -890,23 +978,68 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private promptChangeRole(user: AdminUser, newRole: UserRole): void {
-    const action = newRole === 'admin' ? 'Promote' : 'Change role';
-    const roleLabel = newRole === 'admin' ? 'an admin' : `a ${newRole}`;
+    const label = HUB_ROLE_LABELS[newRole];
+    const currentLabel = HUB_ROLE_LABELS[user.role] ?? user.role;
+    const name = user.displayName || user.email;
     this.confirmAction = {
-      title: `${action} to ${newRole}`,
-      message: `Are you sure you want to make this user ${roleLabel}?`,
+      title: `Change role to ${label}`,
+      message: `Change ${name}'s hub role from ${currentLabel} to ${label}? ${label}: ${HUB_ROLE_DESCRIPTIONS[newRole]} Permissions change immediately.`,
       variant: newRole === 'admin' ? 'warning' : 'primary',
-      confirmLabel: action,
+      confirmLabel: `Make ${label}`,
       user,
       action: async () => {
-        const result = await this.updateUser(user.id, { role: newRole });
+        const result = await this.updateUser(user.id, { role: newRole }, name);
         if (result.securityReview) return;
-        this.showFeedback('success', `${user.displayName || user.email} is now ${roleLabel}.`);
+        this.showFeedback(
+          'success',
+          `${name} is now ${newRole === 'admin' ? 'an' : 'a'} ${label}.`
+        );
         void this.loadUsers(
           this.currentPage > 1 ? this.cursorHistory[this.cursorHistory.length - 1] : undefined
         );
       },
     };
+  }
+
+  private renderChangeRoleMenu(user: AdminUser) {
+    return html`<sl-menu-item class="change-role-item">
+      <sl-icon slot="prefix" name="people"></sl-icon>
+      Change role
+      <sl-menu
+        slot="submenu"
+        class="change-role-menu"
+        @sl-select=${(
+          e: CustomEvent<{ item: HTMLElement & { value: string; checked: boolean } }>
+        ) => this.handleChangeRoleSelect(user, e)}
+      >
+        ${HUB_ROLE_OPTIONS.map((role) => {
+          const current = user.role === role;
+          return html`<sl-menu-item
+            type="checkbox"
+            value=${role}
+            ?checked=${current}
+            ?disabled=${current}
+          >
+            ${HUB_ROLE_LABELS[role]}
+          </sl-menu-item>`;
+        })}
+      </sl-menu>
+    </sl-menu-item>`;
+  }
+
+  private handleChangeRoleSelect(
+    user: AdminUser,
+    e: CustomEvent<{ item: HTMLElement & { value: string; checked: boolean } }>
+  ): void {
+    const item = e.detail.item;
+    const role = item.value as UserRole;
+    // sl-menu toggles checkbox items before emitting sl-select. The check
+    // mark must keep showing the user's current role until the change is
+    // confirmed and the list reloads, so undo the toggle.
+    item.checked = role === user.role;
+    if (role !== user.role && HUB_ROLE_OPTIONS.includes(role)) {
+      this.promptChangeRole(user, role);
+    }
   }
 
   private promptToggleSuspend(user: AdminUser): void {
@@ -933,6 +1066,26 @@ export class ScionPageAdminUsers extends LitElement {
         );
         void this.loadUsers(
           this.currentPage > 1 ? this.cursorHistory[this.cursorHistory.length - 1] : undefined
+        );
+      },
+    };
+  }
+
+  private promptRevokeSession(user: AdminUser): void {
+    this.confirmAction = {
+      title: 'Revoke Sessions',
+      message: `Force ${user.email} to re-authenticate? This will sign them out of all active sessions.`,
+      variant: 'warning',
+      confirmLabel: 'Revoke Sessions',
+      user,
+      action: async () => {
+        const res = await apiFetch(`/api/v1/users/${user.id}/revoke-sessions`, {
+          method: 'POST',
+        });
+        if (!res.ok) throw new Error('Failed to revoke sessions');
+        this.showFeedback(
+          'success',
+          `All sessions for ${user.displayName || user.email} have been revoked.`
         );
       },
     };
@@ -977,11 +1130,50 @@ export class ScionPageAdminUsers extends LitElement {
     }
   }
 
-  private showFeedback(variant: 'success' | 'danger', message: string): void {
+  /**
+   * Shows the action feedback alert. The alert closes itself: every
+   * variant except `warning` after 5 seconds (the alert's `duration`); a
+   * warning (for example, sign-in for an invited email will be refused)
+   * stays until the admin closes it or another notice replaces it. Each
+   * notice renders a fresh alert element (see render), so an earlier
+   * notice's timer cannot close a newer one.
+   */
+  private showFeedback(variant: FeedbackVariant, message: string): void {
     this.actionFeedback = { variant, message };
-    setTimeout(() => {
-      this.actionFeedback = null;
-    }, 5000);
+  }
+
+  /**
+   * Renders one feedback notice. keyed() gives each notice its own alert
+   * element, and with it its own auto-close timer, so an earlier notice
+   * cannot hide a newer one.
+   */
+  private renderFeedbackAlert(feedback: { message: string; variant: FeedbackVariant }) {
+    return keyed(
+      feedback,
+      html`
+        <sl-alert
+          class="feedback-alert"
+          variant=${feedback.variant}
+          open
+          closable
+          .duration=${feedback.variant === 'warning' ? Infinity : FEEDBACK_AUTO_CLOSE_MS}
+          @sl-after-hide=${(): void => {
+            // Clear only this notice, never a newer one that replaced it.
+            if (this.actionFeedback === feedback) this.actionFeedback = null;
+          }}
+        >
+          <sl-icon
+            slot="icon"
+            name=${feedback.variant === 'success'
+              ? 'check-circle'
+              : feedback.variant === 'primary'
+                ? 'info-circle'
+                : 'exclamation-triangle'}
+          ></sl-icon>
+          ${feedback.message}
+        </sl-alert>
+      `
+    );
   }
 
   private isSelf(user: AdminUser): boolean {
@@ -989,30 +1181,8 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private formatRelativeTime(dateString: string | undefined): string {
-    if (!dateString) return 'Never';
-    try {
-      const date = new Date(dateString);
-      if (isNaN(date.getTime())) return 'Never';
-      const diffMs = Date.now() - date.getTime();
-      const diffSeconds = Math.round(diffMs / 1000);
-      const diffMinutes = Math.round(diffMs / (1000 * 60));
-      const diffHours = Math.round(diffMs / (1000 * 60 * 60));
-      const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-
-      const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-
-      if (Math.abs(diffSeconds) < 60) {
-        return rtf.format(-diffSeconds, 'second');
-      } else if (Math.abs(diffMinutes) < 60) {
-        return rtf.format(-diffMinutes, 'minute');
-      } else if (Math.abs(diffHours) < 24) {
-        return rtf.format(-diffHours, 'hour');
-      } else {
-        return rtf.format(-diffDays, 'day');
-      }
-    } catch {
-      return dateString;
-    }
+    if (!dateString || Number.isNaN(new Date(dateString).getTime())) return 'Never';
+    return formatRelative(dateString);
   }
 
   private getInitials(name: string): string {
@@ -1042,6 +1212,53 @@ export class ScionPageAdminUsers extends LitElement {
     return this.sortField === field ? (this.sortDir === 'asc' ? '▲' : '▼') : '▲';
   }
 
+  /** True when the role filter applies to the loaded list (never for Status: Invited). */
+  private get roleFilterActive(): boolean {
+    return this.roleFilter !== 'all' && this.statusFilter !== 'invited';
+  }
+
+  /** True when there is more than one page, judged from the cursors as well as the total. */
+  private get hasMultiplePages(): boolean {
+    return this.totalCount > PAGE_SIZE || this.currentPage > 1 || !!this.nextCursor;
+  }
+
+  /**
+   * True when invited rows may have been dropped client-side from the loaded
+   * list: the role filter is on and no status filter excludes them on the
+   * server (Status: Invited already disables the role filter).
+   */
+  private get invitedDroppedClientSide(): boolean {
+    return this.roleFilterActive && this.statusFilter === 'all';
+  }
+
+  /**
+   * Whether the user count can be shown as exact. When invited rows are
+   * dropped client-side, the server total over-counts unless the whole
+   * result fits on this one page.
+   */
+  private get countIsExact(): boolean {
+    return !this.invitedDroppedClientSide || !this.hasMultiplePages;
+  }
+
+  /** The exact user count, or null when only an upper bound is known. */
+  private get exactUserCount(): number | null {
+    if (!this.countIsExact) return null;
+    return this.invitedDroppedClientSide ? this.users.length : this.totalCount;
+  }
+
+  /** Count shown in the toolbar. */
+  private get displayedCount(): string {
+    const n = this.exactUserCount;
+    if (n === null) return `up to ${this.totalCount} users`;
+    return `${n} user${n !== 1 ? 's' : ''}`;
+  }
+
+  /** Count shown in the Users tab label; same source as the toolbar. */
+  private get tabCount(): string {
+    const n = this.exactUserCount;
+    return n === null ? `up to ${this.totalCount}` : `${n}`;
+  }
+
   private get totalPages(): number {
     return Math.max(1, Math.ceil(this.totalCount / PAGE_SIZE));
   }
@@ -1057,6 +1274,18 @@ export class ScionPageAdminUsers extends LitElement {
   private setStatusFilter(filter: StatusFilter): void {
     if (this.statusFilter === filter) return;
     this.statusFilter = filter;
+    // Invited users have no role, so a role filter cannot apply to them.
+    if (filter === 'invited') this.roleFilter = 'all';
+    this.resetPagingAndReload();
+  }
+
+  private setRoleFilter(filter: RoleFilter): void {
+    if (this.roleFilter === filter) return;
+    this.roleFilter = filter;
+    this.resetPagingAndReload();
+  }
+
+  private resetPagingAndReload(): void {
     this.currentPage = 1;
     this.cursorHistory = [];
     this.nextCursor = null;
@@ -1071,22 +1300,15 @@ export class ScionPageAdminUsers extends LitElement {
 
     this.inviteUserInProgress = true;
     try {
-      const response = await apiFetch('/api/v1/admin/users/invite', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, note: this.inviteUserNote }),
-      });
-      if (response.status === 409) {
-        this.showFeedback('danger', 'User already exists.');
-        return;
-      }
-      if (!response.ok) {
-        throw new Error(await extractApiError(response, `HTTP ${response.status}`));
-      }
-      this.showFeedback('success', `Invited ${email}.`);
+      const displayName = this.inviteUserDisplayName.trim();
+      const done = displayName
+        ? await this.provisionUser(email, displayName)
+        : await this.inviteUserByEmail(email);
+      if (!done) return;
       this.showInviteUserDialog = false;
       this.inviteUserEmail = '';
       this.inviteUserNote = '';
+      this.inviteUserDisplayName = '';
       void this.loadUsers(
         this.currentPage > 1 ? this.cursorHistory[this.cursorHistory.length - 1] : undefined
       );
@@ -1095,6 +1317,74 @@ export class ScionPageAdminUsers extends LitElement {
     } finally {
       this.inviteUserInProgress = false;
     }
+  }
+
+  /** Invites through the invite endpoint. Returns true on success. */
+  private async inviteUserByEmail(email: string): Promise<boolean> {
+    const response = await apiFetch('/api/v1/admin/users/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, note: this.inviteUserNote }),
+    });
+    if (response.status === 409) {
+      this.showFeedback('danger', 'User already exists.');
+      return false;
+    }
+    if (!response.ok) {
+      throw new Error(await extractApiError(response, `HTTP ${response.status}`));
+    }
+    this.showFeedback('success', `Invited ${email}.`);
+    return true;
+  }
+
+  /**
+   * Pre-registers the user with a display name through POST /api/v1/users.
+   * Returns true when the user is (or already was) pre-registered with
+   * these details.
+   */
+  private async provisionUser(email: string, displayName: string): Promise<boolean> {
+    const body: { email: string; displayName: string; note?: string } = { email, displayName };
+    if (this.inviteUserNote) body.note = this.inviteUserNote;
+    const response = await apiFetch('/api/v1/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (response.status === 409) {
+      const { details } = await parseApiError(response, '');
+      const reason = typeof details?.reason === 'string' ? details.reason : undefined;
+      if (reason === 'pending_user_exists') {
+        this.showFeedback(
+          'danger',
+          'A pending record for this email exists with different details.'
+        );
+      } else if (reason === 'user_suspended_exists') {
+        this.showFeedback('danger', 'This email belongs to a suspended user.');
+      } else {
+        this.showFeedback('danger', 'User already exists.');
+      }
+      return false;
+    }
+    if (!response.ok) {
+      throw new Error(await extractApiError(response, `HTTP ${response.status}`));
+    }
+    let result: ProvisionUserResponse | null = null;
+    try {
+      result = (await response.json()) as ProvisionUserResponse;
+    } catch {
+      // A success response without a readable body: report the success.
+    }
+    const warnings = (result?.warnings ?? []).map(provisionWarningText);
+    const message =
+      result && !result.created
+        ? `${email} is already pre-registered with these details.`
+        : `Invited ${email}.`;
+    if (warnings.length > 0) {
+      this.showFeedback('warning', `${message} ${warnings.join(' ')}`);
+    } else {
+      this.showFeedback(result && !result.created ? 'primary' : 'success', message);
+    }
+    return true;
   }
 
   // ==================== Bulk Import ====================
@@ -1254,28 +1544,7 @@ export class ScionPageAdminUsers extends LitElement {
         <h1>Users</h1>
       </div>
 
-      ${this.actionFeedback
-        ? html`
-            <sl-alert
-              class="feedback-alert"
-              variant=${this.actionFeedback.variant}
-              open
-              closable
-              duration="5000"
-              @sl-after-hide=${() => {
-                this.actionFeedback = null;
-              }}
-            >
-              <sl-icon
-                slot="icon"
-                name=${this.actionFeedback.variant === 'success'
-                  ? 'check-circle'
-                  : 'exclamation-triangle'}
-              ></sl-icon>
-              ${this.actionFeedback.message}
-            </sl-alert>
-          `
-        : nothing}
+      ${this.actionFeedback ? this.renderFeedbackAlert(this.actionFeedback) : nothing}
 
       <div class="tabs" role="tablist">
         <button
@@ -1287,7 +1556,7 @@ export class ScionPageAdminUsers extends LitElement {
             this.activeTab = 'users';
           }}
         >
-          Users ${!this.loading ? `(${this.totalCount})` : ''}
+          Users ${!this.loading ? `(${this.tabCount})` : ''}
         </button>
         <button
           role="tab"
@@ -1369,8 +1638,33 @@ export class ScionPageAdminUsers extends LitElement {
     `;
   }
 
+  private renderRoleFilter() {
+    const filters: { label: string; value: RoleFilter }[] = [
+      { label: 'All roles', value: 'all' },
+      ...HUB_ROLE_OPTIONS.map((role) => ({ label: HUB_ROLE_LABELS[role], value: role })),
+    ];
+    const disabled = this.statusFilter === 'invited';
+    return html`
+      <sl-select
+        class="role-filter"
+        size="small"
+        value=${this.roleFilter}
+        ?disabled=${disabled}
+        title=${disabled
+          ? 'Invited users are assigned a role at first sign-in'
+          : 'Filter by hub role'}
+        @sl-change=${(e: Event) => {
+          this.setRoleFilter((e.target as HTMLSelectElement).value as RoleFilter);
+        }}
+        style="min-width: 8rem"
+      >
+        ${filters.map((f) => html`<sl-option value=${f.value}>${f.label}</sl-option>`)}
+      </sl-select>
+    `;
+  }
+
   private renderUsers() {
-    if (this.users.length === 0 && this.statusFilter === 'all') {
+    if (this.users.length === 0 && this.statusFilter === 'all' && this.roleFilter === 'all') {
       return html`
         <div class="empty-state">
           <sl-icon name="people"></sl-icon>
@@ -1390,13 +1684,13 @@ export class ScionPageAdminUsers extends LitElement {
       `;
     }
 
-    const hasPagination = this.totalCount > PAGE_SIZE;
+    const hasPagination = this.hasMultiplePages;
 
     return html`
       <div class="users-toolbar">
         <div class="users-toolbar-left">
-          ${this.renderStatusFilter()}
-          <span class="meta-text">${this.totalCount} user${this.totalCount !== 1 ? 's' : ''}</span>
+          ${this.renderStatusFilter()} ${this.renderRoleFilter()}
+          <span class="meta-text user-count">${this.displayedCount}</span>
         </div>
         <div class="users-toolbar-right">
           <sl-button
@@ -1427,8 +1721,13 @@ export class ScionPageAdminUsers extends LitElement {
             <div class="empty-state">
               <sl-icon name="people"></sl-icon>
               <h2>No Users Found</h2>
-              <p>No users match the selected filter.</p>
+              <p>
+                ${hasPagination
+                  ? 'No matching users on this page.'
+                  : 'No users match the selected filter.'}
+              </p>
             </div>
+            ${hasPagination ? this.renderPagination() : ''}
           `
         : html`
             <div class="table-container">
@@ -1466,10 +1765,13 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private renderPagination() {
+    const exact = this.countIsExact;
     return html`
       <div class="pagination">
         <span class="pagination-info">
-          Showing ${this.rangeStart}-${this.rangeEnd} of ${this.totalCount}
+          ${exact
+            ? `Showing ${this.rangeStart}-${this.rangeEnd} of ${this.totalCount}`
+            : `Showing ${this.users.length} on this page`}
         </span>
         <div class="pagination-controls">
           <sl-button
@@ -1481,7 +1783,11 @@ export class ScionPageAdminUsers extends LitElement {
             <sl-icon slot="prefix" name="chevron-left"></sl-icon>
             Previous
           </sl-button>
-          <span class="page-indicator">Page ${this.currentPage} of ${this.totalPages}</span>
+          <span class="page-indicator"
+            >${exact
+              ? `Page ${this.currentPage} of ${this.totalPages}`
+              : `Page ${this.currentPage}`}</span
+          >
           <sl-button
             size="small"
             variant="default"
@@ -1530,7 +1836,13 @@ export class ScionPageAdminUsers extends LitElement {
           </div>
         </td>
         <td>
-          <span class="role-badge ${user.role}">${user.role}</span>
+          ${isInvited
+            ? html`<span
+                class="role-pending"
+                title="The hub default role is applied at first sign-in"
+                >Assigned at sign-in</span
+              >`
+            : html`<span class="role-badge ${user.role}">${user.role}</span>`}
         </td>
         <td>
           <span class="status-badge ${user.status}">${user.status}</span>
@@ -1555,7 +1867,8 @@ export class ScionPageAdminUsers extends LitElement {
     const canDelete = can(caps, 'delete');
 
     if (user.status === 'invited') {
-      // Invited users: only Remove action (requires delete capability)
+      // Invited users: only Remove action (requires delete capability). No
+      // Change role: the role is assigned at first sign-in (PATCH role → 409).
       if (!canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
@@ -1599,7 +1912,7 @@ export class ScionPageAdminUsers extends LitElement {
       `;
     }
 
-    // Active users: View Roles, Promote/Demote, Suspend, Delete
+    // Active users: View Roles, Change role, Suspend, Delete
     // — each action gated by its capability. View Roles requires at least
     // one admin-level capability since the role-bindings endpoint requires
     // admin access (R4-R1: don't show dead controls to regular members).
@@ -1621,23 +1934,16 @@ export class ScionPageAdminUsers extends LitElement {
             View Roles
           </sl-menu-item>
           ${canPromote || canSuspend || canDelete ? html`<sl-divider></sl-divider>` : nothing}
-          ${canPromote && user.role !== 'admin'
-            ? html`<sl-menu-item @click=${() => this.promptChangeRole(user, 'admin')}>
-                <sl-icon slot="prefix" name="shield-check"></sl-icon>
-                Promote to Admin
-              </sl-menu-item>`
-            : nothing}
-          ${canPromote && user.role === 'admin'
-            ? html`<sl-menu-item @click=${() => this.promptChangeRole(user, 'member')}>
-                <sl-icon slot="prefix" name="person"></sl-icon>
-                Demote to Member
-              </sl-menu-item>`
-            : nothing}
+          ${canPromote ? this.renderChangeRoleMenu(user) : nothing}
           ${canSuspend
             ? html`${canPromote ? html`<sl-divider></sl-divider>` : nothing}
                 <sl-menu-item @click=${() => this.promptToggleSuspend(user)}>
                   <sl-icon slot="prefix" name="slash-circle"></sl-icon>
                   Suspend
+                </sl-menu-item>
+                <sl-menu-item @click=${() => this.promptRevokeSession(user)}>
+                  <sl-icon slot="prefix" name="door-open"></sl-icon>
+                  Revoke Sessions
                 </sl-menu-item>`
             : nothing}
           ${canDelete
@@ -1727,6 +2033,16 @@ export class ScionPageAdminUsers extends LitElement {
             required
           ></sl-input>
           <sl-input
+            label="Display name (optional)"
+            placeholder="e.g., Alice Smith"
+            help-text="Replaced at first sign-in by the name from the sign-in provider, if it supplies one."
+            maxlength="128"
+            .value=${this.inviteUserDisplayName}
+            @sl-input=${(e: Event): void => {
+              this.inviteUserDisplayName = (e.target as HTMLInputElement).value;
+            }}
+          ></sl-input>
+          <sl-input
             label="Note (optional)"
             placeholder="e.g., New hire, Q3 contractor"
             .value=${this.inviteUserNote}
@@ -1734,6 +2050,9 @@ export class ScionPageAdminUsers extends LitElement {
               this.inviteUserNote = (e.target as HTMLInputElement).value;
             }}
           ></sl-input>
+          <p class="invite-role-hint">
+            Role is assigned at first sign-in using the hub default (Admin &gt; Server Config).
+          </p>
         </div>
         <sl-button
           slot="footer"

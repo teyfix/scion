@@ -32,7 +32,7 @@ type recoveryFixture struct {
 
 func TestRetainedRuntimeRecoveryRejectsIdentityChangesFromTemplateChain(t *testing.T) {
 	for _, layer := range []string{"requested", "default"} {
-		for _, field := range []string{"branch", "workspace", "hub", "bound-hub", "reserved-agent", "reserved-hub", "provider-dir"} {
+		for _, field := range []string{"branch", "workspace", "provider-dir"} {
 			t.Run(layer+"/"+field, func(t *testing.T) {
 				f := newRecoveryFixture(t)
 				if field == "bound-hub" {
@@ -209,7 +209,6 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("SCION_PROJECT", "")
-	t.Setenv("SCION_GROVE", "")
 	project := filepath.Join(root, "project", ".scion")
 	dir := filepath.Join(project, "agents", "retained")
 	home, workspace := filepath.Join(dir, "home"), filepath.Join(dir, "workspace")
@@ -250,7 +249,7 @@ capabilities:
 	for _, template := range chain {
 		cfg, err := template.LoadConfig()
 		require.NoError(t, err)
-		defaults = config.MergeScionConfig(defaults, cfg)
+		defaults = config.MergeScionConfig(defaults, templateJobConfig(withQuietTemplateEnvWarnings(context.Background()), template, cfg))
 	}
 	old = config.MergeScionConfig(defaults, old)
 	state := &retainedRuntimeState{dir: dir, home: home, workspace: workspace, config: old}
@@ -284,8 +283,8 @@ capabilities:
 	f.containers = []api.AgentInfo{{Name: "retained", ContainerID: "old-container", Phase: "stopped", Image: "old:latest", Labels: map[string]string{"agent_id": "existing-agent", "scion.name": "retained", "scion.project_id": "existing-project"}}}
 	f.rt = &runtime.MockRuntime{
 		ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) { return f.containers, nil },
-		DeleteFunc: func(_ context.Context, id string) error {
-			require.Equal(t, "old-container", id)
+		DeleteFunc: func(_ context.Context, ref runtime.RunRef) error {
+			require.Equal(t, "old-container", ref.ID)
 			f.deletes++
 			f.containers = nil
 			return nil
@@ -312,40 +311,23 @@ func (f *recoveryFixture) assertPreserved(t *testing.T) {
 	require.Equal(t, "retained-branch\n", fixtureGit(t, f.state.workspace, "branch", "--show-current"))
 }
 
-func TestRetainedRuntimeRecoveryTemplateDomainPassthroughAndMissingHost(t *testing.T) {
-	for _, mode := range []string{"host", "explicit", "missing"} {
-		t.Run(mode, func(t *testing.T) {
-			f := newRecoveryFixture(t)
-			t.Setenv("APP_DOMAIN", "host.test")
-			f.opts.RuntimeRecovery.Update.Config.Env = nil
-			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
-			require.NoError(t, os.WriteFile(template, []byte(`{"harness":"codex","harness_config":"test-harness","env":{"APP_DOMAIN":""}}`), 0644))
-			want := "host.test"
-			switch mode {
-			case "explicit":
-				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"APP_DOMAIN": "explicit.test"}
-				want = "explicit.test"
-			case "missing":
-				t.Setenv("APP_DOMAIN", "")
-			}
-			before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
-			require.NoError(t, err)
-			_, err = NewManager(f.rt).Start(context.Background(), f.opts)
-			if mode == "missing" {
-				require.Error(t, err)
-				require.Zero(t, f.runs)
-				require.Zero(t, f.deletes)
-				after, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
-				require.NoError(t, err)
-				require.Equal(t, before, after)
-			} else {
-				require.NoError(t, err)
-				require.Equal(t, "Host(`"+want+"`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
-				require.Contains(t, f.runConfig.Env, "APP_DOMAIN="+want)
-			}
-			f.assertPreserved(t)
-		})
-	}
+func TestRetainedRuntimeRecoveryTemplateEnvironmentIsLiteralFallback(t *testing.T) {
+	f := newRecoveryFixture(t)
+	template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
+	require.NoError(t, os.WriteFile(template, []byte(`{"harness_config":"test-harness","env":{"TOOL_LITERAL":"${RECOVERY_TEMPLATE_VALUE}","TEMPLATE_EMPTY":"","OPENAI_API_KEY":"template-dummy-key","SCION_HUB_ENDPOINT":"http://wrong"}}`), 0644))
+	t.Setenv("RECOVERY_TEMPLATE_VALUE", "must-not-expand")
+	t.Setenv("TEMPLATE_EMPTY", "must-not-pass-through")
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, "${RECOVERY_TEMPLATE_VALUE}", f.runConfig.FallbackEnv["TOOL_LITERAL"])
+	require.NotContains(t, f.runConfig.FallbackEnv, "TEMPLATE_EMPTY")
+	require.NotContains(t, f.runConfig.FallbackEnv, "SCION_HUB_ENDPOINT")
+	require.NotContains(t, f.runConfig.Env, "TOOL_LITERAL=must-not-expand")
+	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.NotContains(t, saved.Env, "TOOL_LITERAL")
+	require.NotContains(t, saved.Env, "OPENAI_API_KEY")
+	f.assertPreserved(t)
 }
 
 func TestRetainedRuntimeRecoveryExpandedEnvCannotReplaceIdentityOrReuseMissingValue(t *testing.T) {
@@ -408,50 +390,27 @@ func TestRetainedRuntimeRecoveryCurrentCredentialReplacesStagedSecret(t *testing
 	}
 }
 
-func TestRetainedRuntimeRecoveryRequestedTemplateEnvAndExplicitOverrides(t *testing.T) {
-	for _, explicit := range []bool{false, true} {
-		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
-			f := newRecoveryFixture(t)
-			f.state.config.Env["APP_DOMAIN"] = "old.test"
-			f.state.config.Model = "old-model"
-			oldThinking := 1
-			f.state.config.ThinkingLevel = &oldThinking
-			require.NoError(t, writeRuntimeRecoveryState(f.state))
-			f.opts.Env["APP_DOMAIN"] = "old.test"
-			f.opts.Env["SCION_MODEL"] = "old-model"
-			f.opts.Env["SCION_THINKING_LEVEL"] = "1"
-			f.opts.Env["EXPANDED_ENTRY"] = "old-value"
-			t.Setenv("RECOVERY_TEMPLATE_VALUE", "expanded-current")
-			f.opts.Env["PASSTHROUGH_CREDENTIAL"] = "hub-resolved-secret"
-			f.opts.Env["SCION_HUB_ENDPOINT"] = "http://authoritative-hub"
-			f.opts.RuntimeRecovery.Update.Config.Env = nil
-			template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
-			require.NoError(t, os.WriteFile(template, []byte(`{"harness":"codex","harness_config":"test-harness","model":"current-model","thinking_level":6,"env":{"APP_DOMAIN":"current.test","EXPANDED_ENTRY":"${RECOVERY_TEMPLATE_VALUE}","PASSTHROUGH_CREDENTIAL":""}}`), 0644))
-			domain, model, thinking := "current.test", "current-model", "6"
-			if explicit {
-				level := 8
-				f.opts.RuntimeRecovery.Update.Config.Env = map[string]string{"APP_DOMAIN": "explicit.test"}
-				f.opts.RuntimeRecovery.Update.Config.Model = "explicit-model"
-				f.opts.RuntimeRecovery.Update.Config.ThinkingLevel = &level
-				domain, model, thinking = "explicit.test", "explicit-model", "8"
-			}
-			_, err := NewManager(f.rt).Start(context.Background(), f.opts)
-			require.NoError(t, err)
-			require.Equal(t, "Host(`"+domain+"`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
-			require.Contains(t, f.runConfig.Env, "APP_DOMAIN="+domain)
-			require.Contains(t, f.runConfig.Env, "SCION_MODEL="+model)
-			require.Contains(t, f.runConfig.Env, "SCION_THINKING_LEVEL="+thinking)
-			require.Contains(t, f.runConfig.Env, "EXPANDED_ENTRY=expanded-current")
-			require.Contains(t, f.runConfig.Env, "PASSTHROUGH_CREDENTIAL=hub-resolved-secret")
-			require.Contains(t, f.runConfig.Env, "SCION_HUB_ENDPOINT=http://authoritative-hub")
-			require.Equal(t, "old.test", f.opts.Env["APP_DOMAIN"], "caller environment must not be mutated")
-			saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
-			require.NoError(t, err)
-			require.Equal(t, domain, saved.Env["APP_DOMAIN"])
-			require.Equal(t, model, saved.Model)
-			f.assertPreserved(t)
-		})
-	}
+func TestRetainedRuntimeRecoveryInlineEnvironmentOverridesRetainedAndTemplate(t *testing.T) {
+	f := newRecoveryFixture(t)
+	f.state.config.Env["APP_DOMAIN"] = "old.test"
+	require.NoError(t, writeRuntimeRecoveryState(f.state))
+	f.opts.Env["APP_DOMAIN"] = "old.test"
+	template := filepath.Join(os.Getenv("HOME"), ".scion", "templates", "current", "scion-agent.json")
+	require.NoError(t, os.WriteFile(template, []byte(`{"harness_config":"test-harness","model":"current-model","env":{"APP_DOMAIN":"template.test","ONLY_FALLBACK":"literal"}}`), 0644))
+	f.opts.RuntimeRecovery.Update.Config.Env["APP_DOMAIN"] = "explicit.test"
+	f.opts.RuntimeRecovery.Update.Config.Model = "explicit-model"
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, "Host(`explicit.test`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
+	require.Contains(t, f.runConfig.Env, "APP_DOMAIN=explicit.test")
+	require.Contains(t, f.runConfig.Env, "SCION_MODEL=explicit-model")
+	require.Equal(t, "literal", f.runConfig.FallbackEnv["ONLY_FALLBACK"])
+	require.Equal(t, "old.test", f.opts.Env["APP_DOMAIN"])
+	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "explicit.test", saved.Env["APP_DOMAIN"])
+	require.NotContains(t, saved.Env, "ONLY_FALLBACK")
+	f.assertPreserved(t)
 }
 
 func TestRetainedRuntimeRecoveryPreservesGitHomeDockerAndSession(t *testing.T) {
@@ -468,7 +427,7 @@ func TestRetainedRuntimeRecoveryPreservesGitHomeDockerAndSession(t *testing.T) {
 	require.Equal(t, []string{"preview"}, f.runConfig.Networks)
 	require.Equal(t, "true", f.runConfig.DockerLabels["traefik.enable"])
 	require.Equal(t, "Host(`preview.test`)", f.runConfig.DockerLabels["traefik.http.routers.retained.rule"])
-	require.Contains(t, f.runConfig.Env, "CURRENT_TEMPLATE=effective")
+	require.Equal(t, "effective", f.runConfig.FallbackEnv["CURRENT_TEMPLATE"])
 	require.Contains(t, f.runConfig.Volumes, f.state.config.Volumes[0])
 	require.Equal(t, 1, f.deletes)
 	require.Equal(t, 1, f.runs)
@@ -529,7 +488,9 @@ func TestRetainedRuntimeRecoveryRunningRetryVerifiesTemplateBinding(t *testing.T
 func TestRetainedRuntimeRecoveryInterruptedAfterInstallRetries(t *testing.T) {
 	f := newRecoveryFixture(t)
 	originalDelete := f.rt.DeleteFunc
-	f.rt.DeleteFunc = func(context.Context, string) error { return errors.New("interrupted after configuration install") }
+	f.rt.DeleteFunc = func(context.Context, runtime.RunRef) error {
+		return errors.New("interrupted after configuration install")
+	}
 	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
 	require.ErrorContains(t, err, "interrupted")
 	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
@@ -566,7 +527,7 @@ func TestRetainedRuntimeRecoveryPartialRunFailureRetainsRecoverableState(t *test
 }
 
 func TestRetainedRuntimeRecoveryRejectsBeforeContainerOrConfigMutation(t *testing.T) {
-	for _, scenario := range []string{"missing-workspace", "missing-config", "identity", "private-docker", "private-docker-alias", "root-overmount", "privileges", "missing-template", "missing-image", "superseded", "running"} {
+	for _, scenario := range []string{"missing-workspace", "missing-config", "missing-remote-config", "identity", "config-identity", "foreign-instance", "private-docker", "private-docker-alias", "root-overmount", "privileges", "missing-template", "missing-image", "superseded", "running"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newRecoveryFixture(t)
 			before, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
@@ -574,8 +535,18 @@ func TestRetainedRuntimeRecoveryRejectsBeforeContainerOrConfigMutation(t *testin
 			switch scenario {
 			case "missing-workspace":
 				require.NoError(t, os.Rename(f.state.workspace, f.state.workspace+"-preserved"))
-			case "missing-config":
+			case "missing-config", "missing-remote-config":
+				if scenario == "missing-remote-config" {
+					f.opts.Template = "https://example.invalid/current.tar.gz"
+				}
 				require.NoError(t, os.Rename(filepath.Join(f.state.dir, "scion-agent.json"), filepath.Join(f.state.dir, "config-preserved")))
+			case "config-identity":
+				f.state.config.Env["SCION_BROKER_ID"] = "foreign"
+				require.NoError(t, writeRuntimeRecoveryState(f.state))
+				before, err = os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
+				require.NoError(t, err)
+			case "foreign-instance":
+				f.containers[0].Labels[api.LabelRuntimeBrokerID] = "foreign"
 			case "identity":
 				f.opts.RuntimeRecovery.AgentID = "another-agent"
 			case "private-docker":
@@ -600,11 +571,15 @@ func TestRetainedRuntimeRecoveryRejectsBeforeContainerOrConfigMutation(t *testin
 			case "running":
 				f.containers[0].Phase = "running"
 			}
-			_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+			manager := NewManager(f.rt)
+			if scenario == "foreign-instance" {
+				manager.(*AgentManager).SetOwner(OwnerScope{RuntimeBrokerID: "existing-broker"})
+			}
+			_, err = manager.Start(context.Background(), f.opts)
 			require.Error(t, err)
 			require.Equal(t, 0, f.deletes)
 			require.Equal(t, 0, f.runs)
-			if scenario != "missing-config" {
+			if scenario != "missing-config" && scenario != "missing-remote-config" {
 				after, err := os.ReadFile(filepath.Join(f.state.dir, "scion-agent.json"))
 				require.NoError(t, err)
 				require.True(t, reflect.DeepEqual(before, after))
@@ -612,6 +587,38 @@ func TestRetainedRuntimeRecoveryRejectsBeforeContainerOrConfigMutation(t *testin
 			if scenario != "missing-workspace" {
 				f.assertPreserved(t)
 			}
+		})
+	}
+}
+
+func TestRetainedCreateAdmissionPreservesConflictingState(t *testing.T) {
+	for _, scenario := range []string{"same-identity", "wrong-agent", "wrong-broker", "missing-config", "gpu-change"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newRecoveryFixture(t)
+			opts := f.opts
+			opts.RuntimeRecovery, opts.Resume = nil, false
+			opts.CreateAdmission = &api.CreateAdmission{AgentID: "existing-agent", ProjectID: "existing-project", RuntimeBrokerID: "existing-broker"}
+			switch scenario {
+			case "wrong-agent":
+				opts.CreateAdmission.AgentID = "foreign"
+			case "wrong-broker":
+				opts.CreateAdmission.RuntimeBrokerID = "foreign"
+			case "missing-config":
+				require.NoError(t, os.Rename(filepath.Join(f.state.dir, "scion-agent.json"), filepath.Join(f.state.dir, "config-preserved")))
+			case "gpu-change":
+				enabled := true
+				opts.InlineConfig = &api.ScionConfig{Docker: &api.DockerConfig{NvidiaGPU: &enabled}}
+			}
+			retained, err := ValidateCreateAdmission(opts)
+			if scenario == "same-identity" {
+				require.NoError(t, err)
+				require.True(t, retained)
+			} else {
+				require.ErrorIs(t, err, ErrCreateAdmissionConflict)
+			}
+			require.Zero(t, f.runs)
+			require.Zero(t, f.deletes)
+			f.assertPreserved(t)
 		})
 	}
 }

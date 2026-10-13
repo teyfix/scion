@@ -47,6 +47,7 @@ env:
 
 jobs:
   prepare:
+    if: github.ref == 'refs/heads/teyfix/onprem'
     runs-on: ubuntu-latest
     outputs:
       commit_sha: ${{ steps.source.outputs.commit_sha }}

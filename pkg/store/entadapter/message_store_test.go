@@ -145,6 +145,31 @@ func TestListMessagesFilters(t *testing.T) {
 	assert.Equal(t, 1, res.TotalCount)
 }
 
+func TestListMessagesExcludeTypeAndSkipCount(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	for i, kind := range []string{"chat", "instruction", "mention"} {
+		msg := newTestMessage(projectID, "agent-1")
+		msg.Type = kind
+		msg.CreatedAt = time.Now().Add(time.Duration(i) * time.Second)
+		require.NoError(t, s.CreateMessage(ctx, msg))
+	}
+	filter := store.MessageFilter{ExcludeType: "mention"}
+	page, err := s.ListMessages(ctx, filter, store.ListOptions{Limit: 1, SkipTotalCount: true})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assert.Equal(t, "instruction", page.Items[0].Type)
+	assert.Zero(t, page.TotalCount)
+	require.NotEmpty(t, page.NextCursor)
+	next, err := s.ListMessages(ctx, filter, store.ListOptions{Limit: 1, Cursor: page.NextCursor})
+	require.NoError(t, err)
+	require.Len(t, next.Items, 1)
+	assert.Equal(t, "chat", next.Items[0].Type)
+	assert.Equal(t, 2, next.TotalCount)
+	assert.Empty(t, next.NextCursor)
+}
+
 func TestPurgeOldMessages(t *testing.T) {
 	s := newTestMessageStore(t)
 	ctx := context.Background()
@@ -175,6 +200,75 @@ func TestPurgeOldMessages(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.GetMessage(ctx, recent.ID)
 	require.NoError(t, err)
+}
+
+func TestPurgeFailedMessages(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+
+	oldFailed := newTestMessage(projectID, "agent-1")
+	oldFailed.DispatchState = store.MessageDispatchFailed
+	oldFailed.CreatedAt = time.Now().Add(-10 * 24 * time.Hour).UTC().Truncate(time.Second)
+	require.NoError(t, s.CreateMessage(ctx, oldFailed))
+
+	recentFailed := newTestMessage(projectID, "agent-1")
+	recentFailed.DispatchState = store.MessageDispatchFailed
+	require.NoError(t, s.CreateMessage(ctx, recentFailed))
+
+	// A dispatched (successfully delivered) message old enough to be purged
+	// by PurgeOldMessages semantics, but must survive PurgeFailedMessages
+	// since it filters strictly on dispatch_state=failed.
+	oldDelivered := newTestMessage(projectID, "agent-1")
+	oldDelivered.DispatchState = store.MessageDispatchDispatched
+	oldDelivered.CreatedAt = time.Now().Add(-10 * 24 * time.Hour).UTC().Truncate(time.Second)
+	require.NoError(t, s.CreateMessage(ctx, oldDelivered))
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	n, err := s.PurgeFailedMessages(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "only the old failed message is purged")
+
+	_, err = s.GetMessage(ctx, oldFailed.ID)
+	assert.ErrorIs(t, err, store.ErrNotFound)
+	_, err = s.GetMessage(ctx, recentFailed.ID)
+	require.NoError(t, err, "recent failed message is within the retention window")
+	_, err = s.GetMessage(ctx, oldDelivered.ID)
+	require.NoError(t, err, "delivered message history is never purged by this sweep")
+}
+
+// TestPurgeFailedMessages_SkipsUserRecipients is a regression test for
+// nc-promote-busy round 2 (R1): only a message addressed to an agent can
+// have genuinely and irrecoverably failed dispatch. A "user:" recipient row
+// reaching dispatch_state "failed" only ever got there because
+// ExpireStuckPendingMessages swept a writer bug that left it "pending"
+// (nc-promote-busy); hard-deleting it here would destroy real chat history
+// the user never saw fail.
+func TestPurgeFailedMessages_SkipsUserRecipients(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+
+	oldFailedUser := newTestMessage(projectID, "user-alice")
+	oldFailedUser.Recipient = "user:alice"
+	oldFailedUser.DispatchState = store.MessageDispatchFailed
+	oldFailedUser.CreatedAt = time.Now().Add(-10 * 24 * time.Hour).UTC().Truncate(time.Second)
+	require.NoError(t, s.CreateMessage(ctx, oldFailedUser))
+
+	oldFailedAgent := newTestMessage(projectID, "agent-1")
+	oldFailedAgent.DispatchState = store.MessageDispatchFailed
+	oldFailedAgent.CreatedAt = time.Now().Add(-10 * 24 * time.Hour).UTC().Truncate(time.Second)
+	require.NoError(t, s.CreateMessage(ctx, oldFailedAgent))
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	n, err := s.PurgeFailedMessages(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "only the agent-recipient failed message is purged")
+
+	_, err = s.GetMessage(ctx, oldFailedUser.ID)
+	require.NoError(t, err, "user-recipient failed row must survive — it is never a real dispatch failure")
+	_, err = s.GetMessage(ctx, oldFailedAgent.ID)
+	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
 // fakePublisher records PublishUserMessage calls to verify the LISTEN/NOTIFY
@@ -310,4 +404,82 @@ func TestCountUnbackfilledMessages_InvalidProjectIDReturnsError(t *testing.T) {
 	count, err := s.CountUnbackfilledMessages(ctx, "not-a-uuid")
 	assert.Error(t, err)
 	assert.Equal(t, 0, count)
+}
+
+// TestMessageProjectProvenanceRoundTrip pins ptone/scion#2282: the
+// server-derived SenderProjectID / RecipientProjectID stamps must survive a
+// CreateMessage -> read round-trip on every read path, and an absent stamp
+// (human sender, legacy row) must read back as nil.
+func TestMessageProjectProvenanceRoundTrip(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	senderProj := uuid.NewString()
+	recipientProj := projectID
+
+	stamped := newTestMessage(projectID, "agent-1")
+	stamped.Sender = "agent:peer"
+	stamped.SenderProjectID = &senderProj
+	stamped.RecipientProjectID = &recipientProj
+	require.NoError(t, s.CreateMessage(ctx, stamped))
+
+	unstamped := newTestMessage(projectID, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, unstamped))
+
+	emptyStr := ""
+	emptyStamp := newTestMessage(projectID, "agent-1")
+	emptyStamp.SenderProjectID = &emptyStr
+	require.NoError(t, s.CreateMessage(ctx, emptyStamp))
+
+	assertStamped := func(t *testing.T, got *store.Message) {
+		t.Helper()
+		require.NotNil(t, got.SenderProjectID, "SenderProjectID must be persisted")
+		require.NotNil(t, got.RecipientProjectID, "RecipientProjectID must be persisted")
+		assert.Equal(t, senderProj, *got.SenderProjectID)
+		assert.Equal(t, recipientProj, *got.RecipientProjectID)
+	}
+
+	t.Run("GetMessage", func(t *testing.T) {
+		got, err := s.GetMessage(ctx, stamped.ID)
+		require.NoError(t, err)
+		assertStamped(t, got)
+
+		got, err = s.GetMessage(ctx, unstamped.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got.SenderProjectID)
+		assert.Nil(t, got.RecipientProjectID)
+
+		got, err = s.GetMessage(ctx, emptyStamp.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got.SenderProjectID, "an empty stamp persists as NULL")
+	})
+
+	t.Run("GetMessagesByIDs", func(t *testing.T) {
+		got, err := s.GetMessagesByIDs(ctx, []string{stamped.ID, unstamped.ID})
+		require.NoError(t, err)
+		require.Contains(t, got, stamped.ID)
+		assertStamped(t, got[stamped.ID])
+		assert.Nil(t, got[unstamped.ID].SenderProjectID)
+	})
+
+	t.Run("ListMessages", func(t *testing.T) {
+		res, err := s.ListMessages(ctx, store.MessageFilter{ProjectID: projectID}, store.ListOptions{Limit: 10})
+		require.NoError(t, err)
+		var found bool
+		for i := range res.Items {
+			if res.Items[i].ID == stamped.ID {
+				found = true
+				assertStamped(t, &res.Items[i])
+			}
+		}
+		assert.True(t, found)
+	})
+}
+
+func TestMessageProjectProvenanceRejectsMalformedID(t *testing.T) {
+	s := newTestMessageStore(t)
+	bad := "not-a-uuid"
+	msg := newTestMessage(uuid.NewString(), "agent-1")
+	msg.RecipientProjectID = &bad
+	assert.ErrorIs(t, s.CreateMessage(context.Background(), msg), store.ErrInvalidInput)
 }

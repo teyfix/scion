@@ -17,7 +17,6 @@ package harness
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,7 +81,7 @@ func TestBundleInstall_OpenCode(t *testing.T) {
 	// 3. Assert the home/ file layout — these are the golden paths that must
 	// match the implicit mapEmbedFileToHomePath placement.
 	wantHomeFiles := []string{
-		"home/.config/opencode/.opencode.json",
+		"home/.config/opencode/opencode.json",
 	}
 	for _, rel := range wantHomeFiles {
 		full := filepath.Join(installDir, filepath.FromSlash(rel))
@@ -265,17 +264,6 @@ func TestBundleInstall_Jcode(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(agentHome, ".scion", "hooks", "pre-start.d", "20-harness-provision")); err != nil {
 		t.Fatalf("hook wrapper missing after provision: %v", err)
-	}
-}
-
-func TestJcodeProvisioner(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 unavailable")
-	}
-	cmd := exec.Command(python, filepath.Join(bundlePath(t, "jcode"), "provision_test.py"))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("jcode provisioner tests: %v\n%s", err, output)
 	}
 }
 

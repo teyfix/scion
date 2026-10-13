@@ -34,6 +34,15 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
+// logQuerier is the subset of LogQueryService used by the hub handlers.
+// Handler tests substitute a fake to record the options they build.
+type logQuerier interface {
+	Query(ctx context.Context, opts LogQueryOptions) (*LogQueryResult, error)
+	Tail(ctx context.Context, opts LogQueryOptions) (<-chan CloudLogEntry, func(), error)
+	GCPProjectID() string
+	Close() error
+}
+
 // LogQueryService queries Google Cloud Logging for structured log entries.
 type LogQueryService struct {
 	client     *logadmin.Client
@@ -63,18 +72,19 @@ type LogSourceLocation struct {
 
 // LogQueryOptions configures a Cloud Logging query.
 type LogQueryOptions struct {
-	AgentID   string
-	ProjectID string
-	BrokerID  string
-	LogID     string // Cloud Logging log ID (e.g. "scion-messages"); empty = default log
-	Tail      int
-	Since     time.Time
-	Until     time.Time
-	Severity  string
-	PageToken string
-	Sources   []string // optional: "hub", "broker", "agent", "messages" — restricts to matching logs/subsystems
-	Search    string   // optional: substring match on jsonPayload.message
-	HubName   string   // optional: filter by hub label to scope logs to this hub instance
+	AgentID       string
+	ProjectID     string
+	BrokerID      string
+	ParticipantID string // DEF-128b: when set, restrict message logs to entries where this user is a participant (sender or recipient)
+	LogID         string // Cloud Logging log ID (e.g. "scion-messages"); empty = default log
+	Tail          int
+	Since         time.Time
+	Until         time.Time
+	Severity      string
+	PageToken     string
+	Sources       []string // optional: "hub", "broker", "agent", "messages" — restricts to matching logs/subsystems
+	Search        string   // optional: substring match on jsonPayload.message
+	HubName       string   // optional: filter by hub label to scope logs to this hub instance
 }
 
 // LogQueryResult contains the result of a log query.
@@ -109,6 +119,9 @@ func NewLogQueryService(ctx context.Context, projectID string) (*LogQueryService
 		projectID:  projectID,
 	}, nil
 }
+
+// GCPProjectID returns the GCP project the service queries.
+func (s *LogQueryService) GCPProjectID() string { return s.projectID }
 
 // Close releases resources held by the LogQueryService.
 func (s *LogQueryService) Close() error {
@@ -158,6 +171,16 @@ func (s *LogQueryService) Query(ctx context.Context, opts LogQueryOptions) (*Log
 	}, nil
 }
 
+// messageRecordFilter restricts message log queries to message records:
+// entries tagged log_kind=event (lifecycle and delivery acknowledgement
+// lines) are left out, as are entries with neither a sender nor a
+// recipient label (older lifecycle lines written before the tag).
+// "NOT x = v" also matches entries without the label; "x:*" tests that
+// the label is present.
+var messageRecordFilter = fmt.Sprintf(
+	`NOT labels.%s = %q AND (labels.%s:* OR labels.%s:*)`,
+	logging.AttrLogKind, logging.LogKindEvent, logging.AttrSender, logging.AttrRecipient)
+
 // BuildLogFilter constructs a Cloud Logging filter string from the options.
 // When projectID is provided and opts.LogID is set, a logName filter is added
 // to restrict results to the specific Cloud Logging log.
@@ -186,6 +209,22 @@ func BuildLogFilter(opts LogQueryOptions, projectID ...string) string {
 	} else if opts.AgentID != "" {
 		parts = append(parts, fmt.Sprintf(`labels.agent_id = %q`, opts.AgentID))
 	}
+	if opts.LogID == logging.MessageLogID {
+		parts = append(parts, messageRecordFilter)
+	}
+	// DEF-128b: participant scoping. When ParticipantID is set, restrict
+	// results to entries where that user is either the sender or the
+	// recipient. This mirrors the hub-store ParticipantID filter
+	// (handlers_messages.go:258-260).
+	//
+	// Unconditional on LogID: an access-control constraint must not be
+	// conditional on a log-routing value set by a different author at a
+	// different layer. If ParticipantID is set, it applies.
+	if opts.ParticipantID != "" {
+		parts = append(parts, fmt.Sprintf(
+			`(labels.recipient_id = %q OR labels.sender_id = %q)`,
+			opts.ParticipantID, opts.ParticipantID))
+	}
 	if opts.ProjectID != "" {
 		parts = append(parts, fmt.Sprintf(`labels.project_id = %q`, opts.ProjectID))
 	}
@@ -193,10 +232,10 @@ func BuildLogFilter(opts LogQueryOptions, projectID ...string) string {
 		parts = append(parts, fmt.Sprintf(`labels.broker_id = %q`, opts.BrokerID))
 	}
 	if !opts.Since.IsZero() {
-		parts = append(parts, fmt.Sprintf(`timestamp >= %q`, opts.Since.Format(time.RFC3339Nano)))
+		parts = append(parts, fmt.Sprintf(`timestamp >= %q`, opts.Since.UTC().Format(time.RFC3339Nano)))
 	}
 	if !opts.Until.IsZero() {
-		parts = append(parts, fmt.Sprintf(`timestamp < %q`, opts.Until.Format(time.RFC3339Nano)))
+		parts = append(parts, fmt.Sprintf(`timestamp < %q`, opts.Until.UTC().Format(time.RFC3339Nano)))
 	}
 	if opts.Severity != "" {
 		parts = append(parts, fmt.Sprintf(`severity >= %s`, strings.ToUpper(opts.Severity)))

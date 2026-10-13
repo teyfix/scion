@@ -24,6 +24,7 @@
  */
 
 import type { AccessDeniedDetail } from '../client/api.js';
+import { ACCESS_DENIED_UNREADABLE_REASON } from '../client/api.js';
 import { showToast } from './toast.js';
 
 /** Human-friendly labels for machine-readable action codes. */
@@ -38,6 +39,18 @@ const ACTION_LABELS: Record<string, string> = {
   execute: 'execute',
   promote: 'promote',
   suspend: 'suspend',
+  assign: 'assign',
+};
+
+/**
+ * Friendly sentences for denial error codes that arrive without structured
+ * detail. The client falls back to the error code as the "action" when a 403
+ * carries no denied_action, and these codes are not actions, so they must
+ * not be shown as one. The server's own message is preferred; the sentence
+ * is used only when that message is missing or generic.
+ */
+const DENIAL_CODE_SENTENCES: Record<string, string> = {
+  identity_assign_denied: "You're not permitted to assign this service account.",
 };
 
 /**
@@ -66,13 +79,24 @@ export function formatAccessDenied(detail: AccessDeniedDetail): {
   // Primary: prefer the backend message when it is not the generic
   // "Insufficient permissions" (which adds no information). Custom
   // messages from authorizeMsg carry real user-facing guidance.
+  // ACCESS_DENIED_UNREADABLE_REASON marks a 403 whose body was never read
+  // (request aborted mid-read), so it carries no server guidance either.
   const isGeneric =
     !detail.reason ||
-    detail.reason === 'Insufficient permissions';
+    detail.reason === 'Insufficient permissions' ||
+    detail.reason === ACCESS_DENIED_UNREADABLE_REASON;
 
-  const primary = isGeneric
-    ? "You don't have permission to perform this action."
-    : detail.reason!;
+  // A denial code in the action slot (no structured detail): show the
+  // server's message, or the code's friendly sentence, and never the code.
+  const codeSentence = detail.action ? DENIAL_CODE_SENTENCES[detail.action] : undefined;
+  if (codeSentence) {
+    return {
+      primary: isGeneric ? codeSentence : detail.reason!,
+      secondary: detail.resource ? `Resource: ${detail.resource}` : undefined,
+    };
+  }
+
+  const primary = isGeneric ? "You don't have permission to perform this action." : detail.reason!;
 
   // Secondary: build from structured detail (denied_action / resource_type).
   const label = actionLabel(detail.action);
@@ -183,14 +207,8 @@ export function showAccessDeniedToast(detail: AccessDeniedDetail): void {
   secondarySpan.style.opacity = '0.8';
   alert.appendChild(secondarySpan);
 
-  alert.addEventListener(
-    'sl-after-hide',
-    () => {
-      alert.remove();
-    },
-    { once: true }
-  );
-
+  // Shoelace's .toast() handles cleanup via its own sl-after-hide listener.
+  // Do NOT register a competing alert.remove() here — see #1733.
   document.body.appendChild(alert);
   void (alert as HTMLElement & { toast(): Promise<void> }).toast();
 }

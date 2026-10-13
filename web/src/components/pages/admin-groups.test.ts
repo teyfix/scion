@@ -29,7 +29,9 @@
  * - Error kind → surface mapping
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'fs';
+import { resolve as resolvePath } from 'path';
 
 import { canGroup } from '../../shared/groups.js';
 import type { Capabilities } from '../../shared/groups.js';
@@ -62,7 +64,9 @@ describe('canGroup — capability gating', () => {
   });
 
   it('checks resource-level actions correctly', () => {
-    const caps: Capabilities = { actions: ['read', 'update', 'delete', 'addMember', 'removeMember'] };
+    const caps: Capabilities = {
+      actions: ['read', 'update', 'delete', 'addMember', 'removeMember'],
+    };
     expect(canGroup(caps, 'read')).toBe(true);
     expect(canGroup(caps, 'update')).toBe(true);
     expect(canGroup(caps, 'delete')).toBe(true);
@@ -144,6 +148,12 @@ describe('buildGroupsQuery — filter to query-param mapping', () => {
 describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
   let originalLocation: Location;
   let replaceStateSpy: ReturnType<typeof vi.fn>;
+  let ScionPageAdminGroups: (typeof import('./admin-groups.js'))['ScionPageAdminGroups'];
+
+  beforeAll(async () => {
+    const mod = await import('./admin-groups.js');
+    ScionPageAdminGroups = mod.ScionPageAdminGroups;
+  }, 30_000);
 
   beforeEach(() => {
     originalLocation = window.location;
@@ -155,9 +165,7 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
     vi.restoreAllMocks();
   });
 
-  it('reads filters from URL query params', async () => {
-    // Import dynamically to work with happy-dom
-    const { ScionPageAdminGroups } = await import('./admin-groups.js');
+  it('reads filters from URL query params', () => {
     const el = new ScionPageAdminGroups();
 
     // Simulate URL params
@@ -188,8 +196,7 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
     });
   });
 
-  it('syncs filters to URL', async () => {
-    const { ScionPageAdminGroups } = await import('./admin-groups.js');
+  it('syncs filters to URL', () => {
     const el = new ScionPageAdminGroups();
 
     Object.defineProperty(window, 'location', {
@@ -197,6 +204,7 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
         ...originalLocation,
         search: '',
         pathname: '/admin/groups',
+        hash: '',
       },
       writable: true,
     });
@@ -211,11 +219,9 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
 
     el.syncFiltersToURL();
 
-    expect(replaceStateSpy).toHaveBeenCalledWith(
-      {},
-      '',
-      expect.stringContaining('q=hello')
-    );
+    // replaceSearch() keeps the current history state; only the URL matters.
+    expect(replaceStateSpy).toHaveBeenCalledTimes(1);
+    expect(replaceStateSpy.mock.calls[0][2]).toEqual(expect.stringContaining('q=hello'));
     const urlArg = replaceStateSpy.mock.calls[0][2] as string;
     expect(urlArg).toContain('groupType=project_agents');
     expect(urlArg).toContain('owner=me');
@@ -228,8 +234,7 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
     });
   });
 
-  it('omits default/empty values from URL', async () => {
-    const { ScionPageAdminGroups } = await import('./admin-groups.js');
+  it('omits default/empty values from URL', () => {
     const el = new ScionPageAdminGroups();
 
     Object.defineProperty(window, 'location', {
@@ -237,6 +242,7 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
         ...originalLocation,
         search: '',
         pathname: '/admin/groups',
+        hash: '',
       },
       writable: true,
     });
@@ -251,7 +257,8 @@ describe('URL round-trip (readFiltersFromURL / syncFiltersToURL)', () => {
 
     el.syncFiltersToURL();
 
-    expect(replaceStateSpy).toHaveBeenCalledWith({}, '', '/admin/groups');
+    expect(replaceStateSpy).toHaveBeenCalledTimes(1);
+    expect(replaceStateSpy.mock.calls[0][2]).toBe('/admin/groups');
 
     Object.defineProperty(window, 'location', {
       value: originalLocation,
@@ -657,11 +664,9 @@ describe('Tab switching', () => {
 /* ========================================================================== */
 
 describe('Accessibility (G6 sweep)', () => {
-  const { readFileSync } = require('fs');
-  const { resolve } = require('path');
-  const LIST_SOURCE = readFileSync(resolve(__dirname, './admin-groups.ts'), 'utf-8');
+  const LIST_SOURCE = readFileSync(resolvePath(__dirname, './admin-groups.ts'), 'utf-8');
   const FORM_SOURCE = readFileSync(
-    resolve(__dirname, '../shared/group-form-dialog.ts'),
+    resolvePath(__dirname, '../shared/group-form-dialog.ts'),
     'utf-8'
   );
 

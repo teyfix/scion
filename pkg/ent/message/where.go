@@ -145,9 +145,14 @@ func ConversationID(v uuid.UUID) predicate.Message {
 	return predicate.Message(sql.FieldEQ(FieldConversationID, v))
 }
 
-// Visibility applies equality check predicate on the "visibility" field. It's identical to VisibilityEQ.
-func Visibility(v string) predicate.Message {
-	return predicate.Message(sql.FieldEQ(FieldVisibility, v))
+// SenderProjectID applies equality check predicate on the "sender_project_id" field. It's identical to SenderProjectIDEQ.
+func SenderProjectID(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldSenderProjectID, v))
+}
+
+// RecipientProjectID applies equality check predicate on the "recipient_project_id" field. It's identical to RecipientProjectIDEQ.
+func RecipientProjectID(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldRecipientProjectID, v))
 }
 
 // Created applies equality check predicate on the "created" field. It's identical to CreatedEQ.
@@ -1175,79 +1180,104 @@ func ConversationIDNotNil() predicate.Message {
 	return predicate.Message(sql.FieldNotNull(FieldConversationID))
 }
 
-// VisibilityEQ applies the EQ predicate on the "visibility" field.
-func VisibilityEQ(v string) predicate.Message {
-	return predicate.Message(sql.FieldEQ(FieldVisibility, v))
+// SenderProjectIDEQ applies the EQ predicate on the "sender_project_id" field.
+func SenderProjectIDEQ(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldSenderProjectID, v))
 }
 
-// VisibilityNEQ applies the NEQ predicate on the "visibility" field.
-func VisibilityNEQ(v string) predicate.Message {
-	return predicate.Message(sql.FieldNEQ(FieldVisibility, v))
+// SenderProjectIDNEQ applies the NEQ predicate on the "sender_project_id" field.
+func SenderProjectIDNEQ(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldSenderProjectID, v))
 }
 
-// VisibilityIn applies the In predicate on the "visibility" field.
-func VisibilityIn(vs ...string) predicate.Message {
-	return predicate.Message(sql.FieldIn(FieldVisibility, vs...))
+// SenderProjectIDIn applies the In predicate on the "sender_project_id" field.
+func SenderProjectIDIn(vs ...uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldSenderProjectID, vs...))
 }
 
-// VisibilityNotIn applies the NotIn predicate on the "visibility" field.
-func VisibilityNotIn(vs ...string) predicate.Message {
-	return predicate.Message(sql.FieldNotIn(FieldVisibility, vs...))
+// SenderProjectIDNotIn applies the NotIn predicate on the "sender_project_id" field.
+func SenderProjectIDNotIn(vs ...uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldSenderProjectID, vs...))
 }
 
-// VisibilityGT applies the GT predicate on the "visibility" field.
-func VisibilityGT(v string) predicate.Message {
-	return predicate.Message(sql.FieldGT(FieldVisibility, v))
+// SenderProjectIDGT applies the GT predicate on the "sender_project_id" field.
+func SenderProjectIDGT(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldSenderProjectID, v))
 }
 
-// VisibilityGTE applies the GTE predicate on the "visibility" field.
-func VisibilityGTE(v string) predicate.Message {
-	return predicate.Message(sql.FieldGTE(FieldVisibility, v))
+// SenderProjectIDGTE applies the GTE predicate on the "sender_project_id" field.
+func SenderProjectIDGTE(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldSenderProjectID, v))
 }
 
-// VisibilityLT applies the LT predicate on the "visibility" field.
-func VisibilityLT(v string) predicate.Message {
-	return predicate.Message(sql.FieldLT(FieldVisibility, v))
+// SenderProjectIDLT applies the LT predicate on the "sender_project_id" field.
+func SenderProjectIDLT(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldSenderProjectID, v))
 }
 
-// VisibilityLTE applies the LTE predicate on the "visibility" field.
-func VisibilityLTE(v string) predicate.Message {
-	return predicate.Message(sql.FieldLTE(FieldVisibility, v))
+// SenderProjectIDLTE applies the LTE predicate on the "sender_project_id" field.
+func SenderProjectIDLTE(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldSenderProjectID, v))
 }
 
-// VisibilityContains applies the Contains predicate on the "visibility" field.
-func VisibilityContains(v string) predicate.Message {
-	return predicate.Message(sql.FieldContains(FieldVisibility, v))
+// SenderProjectIDIsNil applies the IsNil predicate on the "sender_project_id" field.
+func SenderProjectIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldSenderProjectID))
 }
 
-// VisibilityHasPrefix applies the HasPrefix predicate on the "visibility" field.
-func VisibilityHasPrefix(v string) predicate.Message {
-	return predicate.Message(sql.FieldHasPrefix(FieldVisibility, v))
+// SenderProjectIDNotNil applies the NotNil predicate on the "sender_project_id" field.
+func SenderProjectIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldSenderProjectID))
 }
 
-// VisibilityHasSuffix applies the HasSuffix predicate on the "visibility" field.
-func VisibilityHasSuffix(v string) predicate.Message {
-	return predicate.Message(sql.FieldHasSuffix(FieldVisibility, v))
+// RecipientProjectIDEQ applies the EQ predicate on the "recipient_project_id" field.
+func RecipientProjectIDEQ(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldEQ(FieldRecipientProjectID, v))
 }
 
-// VisibilityIsNil applies the IsNil predicate on the "visibility" field.
-func VisibilityIsNil() predicate.Message {
-	return predicate.Message(sql.FieldIsNull(FieldVisibility))
+// RecipientProjectIDNEQ applies the NEQ predicate on the "recipient_project_id" field.
+func RecipientProjectIDNEQ(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldNEQ(FieldRecipientProjectID, v))
 }
 
-// VisibilityNotNil applies the NotNil predicate on the "visibility" field.
-func VisibilityNotNil() predicate.Message {
-	return predicate.Message(sql.FieldNotNull(FieldVisibility))
+// RecipientProjectIDIn applies the In predicate on the "recipient_project_id" field.
+func RecipientProjectIDIn(vs ...uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldIn(FieldRecipientProjectID, vs...))
 }
 
-// VisibilityEqualFold applies the EqualFold predicate on the "visibility" field.
-func VisibilityEqualFold(v string) predicate.Message {
-	return predicate.Message(sql.FieldEqualFold(FieldVisibility, v))
+// RecipientProjectIDNotIn applies the NotIn predicate on the "recipient_project_id" field.
+func RecipientProjectIDNotIn(vs ...uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldNotIn(FieldRecipientProjectID, vs...))
 }
 
-// VisibilityContainsFold applies the ContainsFold predicate on the "visibility" field.
-func VisibilityContainsFold(v string) predicate.Message {
-	return predicate.Message(sql.FieldContainsFold(FieldVisibility, v))
+// RecipientProjectIDGT applies the GT predicate on the "recipient_project_id" field.
+func RecipientProjectIDGT(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldGT(FieldRecipientProjectID, v))
+}
+
+// RecipientProjectIDGTE applies the GTE predicate on the "recipient_project_id" field.
+func RecipientProjectIDGTE(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldGTE(FieldRecipientProjectID, v))
+}
+
+// RecipientProjectIDLT applies the LT predicate on the "recipient_project_id" field.
+func RecipientProjectIDLT(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldLT(FieldRecipientProjectID, v))
+}
+
+// RecipientProjectIDLTE applies the LTE predicate on the "recipient_project_id" field.
+func RecipientProjectIDLTE(v uuid.UUID) predicate.Message {
+	return predicate.Message(sql.FieldLTE(FieldRecipientProjectID, v))
+}
+
+// RecipientProjectIDIsNil applies the IsNil predicate on the "recipient_project_id" field.
+func RecipientProjectIDIsNil() predicate.Message {
+	return predicate.Message(sql.FieldIsNull(FieldRecipientProjectID))
+}
+
+// RecipientProjectIDNotNil applies the NotNil predicate on the "recipient_project_id" field.
+func RecipientProjectIDNotNil() predicate.Message {
+	return predicate.Message(sql.FieldNotNull(FieldRecipientProjectID))
 }
 
 // CreatedEQ applies the EQ predicate on the "created" field.

@@ -4,14 +4,40 @@ title: Release Notes
 
 Scion release notes are published weekly.
 
-## Latest: Week of August 31 -- September 6, 2026
+## Latest: Week of October 5 -- 11, 2026
 
-This week completed the authorization foundation refactor, replacing the legacy dual Policy/RoleBinding grant model with a unified, positive-authority RoleBinding system and shipping end-to-end access boundaries with a full admin UI. The Cloud Run sandbox received significant hardening for the single-node tier, including a gVisor capability discovery that forced a UID strategy change. Several critical credential-management fixes landed — notably a P0 GITHUB_TOKEN injection regression and a GCP Secret Manager mapping error that caused approximately 15 hours of Discord downtime.
+Conduit, still behind its experiment flag, now carries agent terminals, Runtime Broker traffic and user tunnels, including SSH through `scion tunnel`. Agent create, start, stop and delete hold up under races: a create or start that loses to a delete no longer revives the agent, operations are scoped to the run they target, and starts fail closed when credentials or settings cannot be resolved. Access follows membership: removed members' agents are suspended, sharing a Runtime Broker needs its owner's consent, and schedules run under recorded authority. `scion reincarnate` can move agents between Runtime Brokers and change their settings, and the health dashboard was rebuilt around a single attention policy.
 
-[Read the full release notes for this week ->](/scion/release-notes/2026-08-31/)
+[Read the full release notes for this week ->](/scion/release-notes/2026-10-05/)
+
+## `scion project list` lists projects across hubs
+
+`scion project list` (and `scion projects list`) now lists the projects on all your registered hubs, each with its hub, merged with the project directories on this machine. Use `--hub <hub>` to show one hub and `--refresh` to fetch each logged-in hub's project list. The earlier output, the project directories on this machine with their type, agent count, status and workspace, moved to `scion project list --local`, which keeps that format byte for byte, JSON included. **Scripts that parse `scion project list` should switch to `scion project list --local`.**
+
+## Timezone handling changes
+
+During the week of September 28 ([release notes](/scion/release-notes/2026-09-28/)), timezone handling changed: the Hub sends every timestamp in UTC with `Z`, the web dashboard has a per-user display timezone and a 24-hour clock, and cron schedules are UTC only. The runtime-profile `timezone` setting introduced the week before ([release notes](/scion/release-notes/2026-09-21/)) has been removed: an agent's `TZ` now comes from its pin, `TZ` environment variables on the Hub, or the Hub default timezone. See [Times and Timezones](/scion/reference/times-and-timezones/) for the full behaviour and the operator steps after upgrading.
+
+## Deleted built-in harness configs and templates stay deleted
+
+A deleted built-in harness config (for example `claude`) or the built-in `default` template no longer comes back when the Hub restarts or is upgraded ([ptone/scion#3544](https://github.com/ptone/scion/issues/3544)). This also applies to harness configs left unselected in the setup wizard. The Hub records each built-in it has seeded in the `builtin_resources_seeded` Hub setting, and startup only creates built-ins that are not in that record. Built-ins that are new in a release are still added, and built-ins you keep still receive content updates.
+
+To bring a deleted built-in harness config back, re-import it as a global harness config from its canonical URL, `https://github.com/GoogleCloudPlatform/scion/harnesses/<name>` (for example `.../harnesses/claude`). Use the import box on the **Harness Configs** tab of the Hub's **Settings** page, or `POST /api/v1/resources/import`. On a hosted Hub, a copy imported from any other URL (such as a `/tree/<ref>/` URL), or a re-imported `default` template, is usable but user-managed: it does not receive the content bundled with later releases. Workstation Hubs update it either way. See [Recovering a deleted built-in](/scion/reference/harness-settings/#recovering-a-deleted-built-in).
+
+Upgrade note: on the first start after upgrading, the Hub has no record yet, so built-ins you deleted since the last restart before the upgrade reappear once. Delete them again and they stay deleted.
+
+## Migration guides
+
+- [Migrating from raw message delivery](/scion/reference/raw-message-removal/): raw keystroke delivery through messages is removed. `scion message --raw` fails before sending anything, and any message request that still carries `raw` is refused with `422 raw_input_removed`. Use `scion keys` or `POST .../keys` instead.
+- [Migrating from grove names](/scion/reference/grove-removal/): the grove→project rename.
 
 ## Previous Weeks
 
+- [Week of September 28 -- October 4, 2026](/scion/release-notes/2026-09-28/)
+- [Week of September 21 -- 27, 2026](/scion/release-notes/2026-09-21/)
+- [Week of September 14 -- 20, 2026](/scion/release-notes/2026-09-14/)
+- [Week of September 7 -- 13, 2026](/scion/release-notes/2026-09-07/)
+- [Week of August 31 -- September 6, 2026](/scion/release-notes/2026-08-31/)
 - [Week of August 24 -- 30, 2026](/scion/release-notes/2026-08-24/)
 - [Week of August 17 -- 23, 2026](/scion/release-notes/2026-08-17/)
 - [Week of August 10 -- 16, 2026](/scion/release-notes/2026-08-10/)

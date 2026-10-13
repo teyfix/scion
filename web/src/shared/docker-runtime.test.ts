@@ -52,6 +52,13 @@ describe('buildDockerRuntimeConfig', () => {
     ).toEqual({ privileged: false, devices: ['/dev/dri'] });
   });
 
+  it('preserves omitted and explicit GPU values', () => {
+    expect(buildDockerRuntimeConfig(undefined, [], [])).toBeUndefined();
+    expect(buildDockerRuntimeConfig({}, ['backend'], [])).toEqual({ networks: ['backend'] });
+    expect(buildDockerRuntimeConfig({ nvidia_gpu: false }, [], [])).toEqual({ nvidia_gpu: false });
+    expect(buildDockerRuntimeConfig({ nvidia_gpu: true }, [], [])).toEqual({ nvidia_gpu: true });
+  });
+
   it('returns undefined when no Docker override remains', () => {
     expect(buildDockerRuntimeConfig(undefined, [' '], [{ key: '', value: '' }])).toBeUndefined();
   });

@@ -19,32 +19,35 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
+	brokerv1 "github.com/GoogleCloudPlatform/scion/proto/broker/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 func TestStructuredMessageRoundTrip(t *testing.T) {
 	original := &messages.StructuredMessage{
-		Version:      1,
-		Timestamp:    "2026-07-04T12:00:00Z",
-		Sender:       "user:alice",
-		SenderID:     "uid-001",
-		Recipient:    "agent:coder",
-		RecipientID:  "aid-002",
-		Recipients:   "agent:coder,agent:reviewer",
-		Msg:          "hello world",
-		Type:         "instruction",
-		Plain:        true,
-		Raw:          false,
-		Urgent:       true,
-		Broadcasted:  false,
-		ObserverOnly: true,
-		Status:       "active",
-		Attachments:  []string{"file1.txt", "file2.png"},
-		Metadata:     map[string]string{"key1": "val1", "key2": "val2"},
-		Channel:      "discord",
-		ThreadID:     "thread-123",
-		Visibility:   "normal",
+		Version:        1,
+		Timestamp:      "2026-07-04T12:00:00Z",
+		Sender:         "user:alice",
+		SenderID:       "uid-001",
+		Recipient:      "agent:coder",
+		RecipientID:    "aid-002",
+		Recipients:     "agent:coder,agent:reviewer",
+		Msg:            "hello world",
+		Type:           "instruction",
+		Plain:          true,
+		Urgent:         true,
+		Broadcasted:    false,
+		ObserverOnly:   true,
+		Status:         "active",
+		Attachments:    []string{"file1.txt", "file2.png"},
+		Metadata:       map[string]string{"key1": "val1", "key2": "val2"},
+		Channel:        "discord",
+		ThreadID:       "thread-123",
+		ConversationID: "conversation-456",
+		DeliveryText:   "rendered delivery text",
 	}
 
 	pb := StructuredMessageToProto(original)
@@ -63,7 +66,6 @@ func TestStructuredMessageRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Msg, roundTripped.Msg)
 	assert.Equal(t, original.Type, roundTripped.Type)
 	assert.Equal(t, original.Plain, roundTripped.Plain)
-	assert.Equal(t, original.Raw, roundTripped.Raw)
 	assert.Equal(t, original.Urgent, roundTripped.Urgent)
 	assert.Equal(t, original.Broadcasted, roundTripped.Broadcasted)
 	assert.Equal(t, original.ObserverOnly, roundTripped.ObserverOnly)
@@ -72,7 +74,8 @@ func TestStructuredMessageRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Metadata, roundTripped.Metadata)
 	assert.Equal(t, original.Channel, roundTripped.Channel)
 	assert.Equal(t, original.ThreadID, roundTripped.ThreadID)
-	assert.Equal(t, original.Visibility, roundTripped.Visibility)
+	assert.Equal(t, original.ConversationID, roundTripped.ConversationID)
+	assert.Equal(t, original.DeliveryText, roundTripped.DeliveryText)
 }
 
 func TestStructuredMessageNilHandling(t *testing.T) {
@@ -95,6 +98,16 @@ func TestStructuredMessageEmptyFields(t *testing.T) {
 	assert.Equal(t, original.Msg, roundTripped.Msg)
 	assert.Nil(t, roundTripped.Attachments)
 	assert.Nil(t, roundTripped.Metadata)
+}
+
+func TestStructuredMessageProtoSchema(t *testing.T) {
+	descriptor := (&brokerv1.StructuredMessage{}).ProtoReflect().Descriptor()
+
+	assert.Equal(t, protoreflect.FieldNumber(21), descriptor.Fields().ByName("conversation_id").Number())
+	assert.Equal(t, protoreflect.FieldNumber(22), descriptor.Fields().ByName("delivery_text").Number())
+	assert.Nil(t, descriptor.Fields().ByName("visibility"))
+	assert.True(t, descriptor.ReservedRanges().Has(20))
+	assert.True(t, descriptor.ReservedNames().Has("visibility"))
 }
 
 func TestHealthStatusRoundTrip(t *testing.T) {
@@ -148,4 +161,27 @@ func TestPluginInfoNilHandling(t *testing.T) {
 	assert.Equal(t, "", pb.Name)
 
 	assert.Nil(t, ProtoToPluginInfo(nil))
+}
+
+// TestStructuredMessageRawFieldReserved pins that the retired raw field
+// (number 11) stays reserved by number and name so it cannot be reused with
+// a different meaning, and that a message from an older Hub publishing to
+// this plugin that still sets it decodes as an ordinary message. This gRPC
+// path carries messages Hub to plugin only; plugin inbound is HTTP
+// (/api/v1/broker/inbound), where the field is rejected.
+func TestStructuredMessageRawFieldReserved(t *testing.T) {
+	md := (&brokerv1.StructuredMessage{}).ProtoReflect().Descriptor()
+	assert.Nil(t, md.Fields().ByNumber(11), "field 11 must not be redefined")
+	assert.Nil(t, md.Fields().ByName("raw"), "field raw must not be redefined")
+	assert.True(t, md.ReservedRanges().Has(11), "field number 11 must stay reserved")
+	assert.True(t, md.ReservedNames().Has("raw"), "field name raw must stay reserved")
+
+	// Wire bytes for {msg: "hi" (field 8), raw: true (field 11)} as an
+	// older Hub publishing to this plugin would have sent them.
+	wire := []byte{0x42, 0x02, 'h', 'i', 0x58, 0x01}
+	var pb brokerv1.StructuredMessage
+	require.NoError(t, proto.Unmarshal(wire, &pb))
+	msg := ProtoToStructuredMessage(&pb)
+	assert.Equal(t, "hi", msg.Msg)
+	assert.False(t, msg.Plain)
 }

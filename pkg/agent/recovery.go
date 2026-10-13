@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +16,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -25,19 +26,23 @@ type retainedRuntimeState struct {
 	dir, home, workspace string
 	config               *api.ScionConfig
 	requested            *api.ScionConfig
+	requesterDocker      *api.DockerConfig
 }
 
 // loadRuntimeRecovery reads retained state without GetAgent's fresh provisioning
 // and repair paths. Missing state is an error, never permission to reconstruct it.
-func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []api.AgentInfo) (*retainedRuntimeState, error) {
+func loadRuntimeRecovery(ctx context.Context, opts api.StartOptions, projectDir string, containers []api.AgentInfo, owner *OwnerScope) (*retainedRuntimeState, error) {
 	recovery := opts.RuntimeRecovery
 	if err := recovery.Update.Validate(); err != nil {
 		return nil, err
 	}
+	if recovery.AgentID == "" || recovery.ProjectID == "" || recovery.RuntimeBrokerID == "" || recovery.AdmissionVersion != *recovery.Update.StateVersion+1 {
+		return nil, fmt.Errorf("runtime recovery admission or identity is invalid")
+	}
 	if opts.GitClone != nil || opts.Branch != "" || opts.Workspace != "" {
 		return nil, fmt.Errorf("retained recovery cannot clone or change workspace/branch")
 	}
-	state, err := readRetainedRuntimeState(opts, projectDir, containers)
+	state, err := readRetainedRuntimeState(opts, projectDir, containers, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +70,7 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	} else if model := effective.Env["SCION_MODEL"]; model != "" {
 		// Retain the selected environment model when no new scalar replaces
 		// it, including when old scalar and environment defaults differed.
-		entries, _, _ := buildAgentEnv(&api.ScionConfig{Env: map[string]string{"SCION_MODEL": model}}, nil)
+		entries, _, _, _ := buildAgentEnv(&api.ScionConfig{Env: map[string]string{"SCION_MODEL": model}}, nil, nil, false)
 		if len(entries) != 1 {
 			return nil, fmt.Errorf("retained model environment has an unresolved value")
 		}
@@ -73,6 +78,17 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	}
 	if requested.ThinkingLevel != nil && requested.Env["SCION_THINKING_LEVEL"] == "" {
 		delete(effective.Env, "SCION_THINKING_LEVEL")
+	} else if thinking := effective.Env["SCION_THINKING_LEVEL"]; thinking != "" {
+		entries, _, _, _ := buildAgentEnv(&api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": thinking}}, nil, nil, false)
+		if len(entries) != 1 {
+			return nil, fmt.Errorf("retained thinking environment has an unresolved value")
+		}
+		_, value, _ := strings.Cut(entries[0], "=")
+		level, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid requested thinking level: %w", err)
+		}
+		effective.ThinkingLevel = &level
 	}
 	if err := validateRetainedRuntimeConfig(old, effective); err != nil {
 		return nil, err
@@ -84,6 +100,7 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	effective.Env = config.MergeScionConfig(&api.ScionConfig{Env: effective.Env}, &api.ScionConfig{Env: map[string]string{
 		"SCION_AGENT_ID": recovery.AgentID, "SCION_PROJECT_ID": recovery.ProjectID, "SCION_BROKER_ID": recovery.RuntimeBrokerID,
 	}}).Env
+	resolveModelAliasForExistingAgent(ctx, effective, projectDir)
 	effective.RuntimeUpdateVersion = recovery.AdmissionVersion
 	info.ID, info.ProjectID, info.RuntimeBrokerID = recovery.AgentID, recovery.ProjectID, recovery.RuntimeBrokerID
 	info.Template = recovery.Update.Template
@@ -91,6 +108,9 @@ func loadRuntimeRecovery(opts api.StartOptions, projectDir string, containers []
 	effective.Info = info
 	state.config = effective
 	state.requested = requested
+	if recovery.Update.Config != nil {
+		state.requesterDocker = config.MergeDockerConfig(state.requesterDocker, recovery.Update.Config.Docker)
+	}
 	return state, nil
 }
 
@@ -120,7 +140,7 @@ func recoveryDispatchEnv(env map[string]string, requested *api.ScionConfig) (map
 	}
 	// Auth gathering runs before container env construction. Use that same
 	// expansion primitive now so staging and creation consume the same value.
-	entries, _, _ := buildAgentEnv(current, nil)
+	entries, _, _, _ := buildAgentEnv(current, nil, nil, false)
 	modelEnv, thinkingEnv := false, false
 	for _, entry := range entries {
 		key, value, _ := strings.Cut(entry, "=")
@@ -140,15 +160,21 @@ func recoveryDispatchEnv(env map[string]string, requested *api.ScionConfig) (map
 	}
 	return result, nil
 }
-func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containers []api.AgentInfo) (*retainedRuntimeState, error) {
+func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containers []api.AgentInfo, owner *OwnerScope) (*retainedRuntimeState, error) {
 	recovery := opts.RuntimeRecovery
-	dir := config.ResolveAgentDir(projectDir, opts.Name)
+	dir, _, err := AgentStateDir(projectDir, opts.Name, opts.SharedWorkspace, opts.HubProjectID, opts.BrokerMode || opts.HubProjectID != "")
+	if err != nil {
+		return nil, err
+	}
 	home := config.GetAgentHomePath(projectDir, opts.Name)
 	for _, path := range []string{dir, home} {
 		info, err := os.Stat(path)
 		if err != nil || !info.IsDir() {
 			return nil, fmt.Errorf("retained directory is missing or invalid: %s", path)
 		}
+	}
+	if config.GetScionAgentConfigPath(dir) == "" {
+		return nil, fmt.Errorf("retained configuration is missing")
 	}
 	old, err := (&config.Template{Path: dir}).LoadConfig()
 	if err != nil {
@@ -168,6 +194,18 @@ func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containe
 	if err := verifyRetainedRuntimeIdentity(opts, old, &info, containers); err != nil {
 		return nil, err
 	}
+	old.Info = &info
+	requesterDocker := config.CloneDockerConfig(old.Docker)
+	// An older snapshot can belong to an interrupted full-config install;
+	// its requester provenance remains the base of this admitted retry.
+	if own, recorded, err := requesterDockerFromSnapshot(dir, old, true); err != nil {
+		return nil, err
+	} else if recorded {
+		requesterDocker = own
+	}
+	if err := restoreRuntimeEnvironmentSnapshot(dir, opts, old, &info, owner); err != nil {
+		return nil, err
+	}
 	workspace := filepath.Join(dir, "workspace")
 	if opts.SharedWorkspace || old.ExplicitWorkspace {
 		workspace = extractWorkspaceFromVolumes(old.Volumes)
@@ -179,7 +217,7 @@ func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containe
 		return nil, fmt.Errorf("retained workspace is missing: %s", workspace)
 	}
 	old.Info = &info
-	return &retainedRuntimeState{dir: dir, home: home, workspace: workspace, config: old}, nil
+	return &retainedRuntimeState{dir: dir, home: home, workspace: workspace, config: old, requesterDocker: requesterDocker}, nil
 }
 
 func verifyRetainedRuntimeIdentity(opts api.StartOptions, old *api.ScionConfig, info *api.AgentInfo, containers []api.AgentInfo) error {
@@ -187,18 +225,23 @@ func verifyRetainedRuntimeIdentity(opts api.StartOptions, old *api.ScionConfig, 
 	if api.Slugify(info.Name) != api.Slugify(opts.Name) || (info.RuntimeBrokerID != "" && info.RuntimeBrokerID != recovery.RuntimeBrokerID) {
 		return fmt.Errorf("retained agent name or broker does not match")
 	}
+	for key, expected := range map[string]string{"SCION_AGENT_ID": recovery.AgentID, "SCION_PROJECT_ID": recovery.ProjectID, "SCION_BROKER_ID": recovery.RuntimeBrokerID} {
+		if value, present := old.Env[key]; present && value != expected {
+			return fmt.Errorf("retained configuration identity does not match: %s", key)
+		}
+	}
 	agentID, projectID := info.ID, info.ProjectID
 	if agentID == "" {
 		agentID = old.Env["SCION_AGENT_ID"]
 	}
 	if projectID == "" {
-		projectID = projectcompat.ProjectIDFromEnv(old.Env)
+		projectID = old.Env["SCION_PROJECT_ID"]
 	}
 	for _, c := range containers {
 		if api.Slugify(c.Name) != api.Slugify(opts.Name) {
 			continue
 		}
-		if c.Labels["agent_id"] == recovery.AgentID && projectcompat.ProjectIDFromLabels(c.Labels) == recovery.ProjectID {
+		if c.Labels["agent_id"] == recovery.AgentID && projectkeys.ProjectIDFromLabels(c.Labels) == recovery.ProjectID {
 			if agentID == "" {
 				agentID = recovery.AgentID
 			}
@@ -225,7 +268,7 @@ func requestedRuntimeConfig(opts api.StartOptions) (*api.ScionConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read requested recovery template: %w", err)
 		}
-		requested = config.MergeScionConfig(requested, cfg)
+		requested = config.MergeScionConfig(requested, templateJobConfig(withQuietTemplateEnvWarnings(context.Background()), template, cfg))
 	}
 	requested = config.MergeScionConfig(requested, recovery.Update.Config)
 	requested.Image = recovery.Update.Image
@@ -235,7 +278,19 @@ func requestedRuntimeConfig(opts api.StartOptions) (*api.ScionConfig, error) {
 func resolveRecoveryLabels(opts api.StartOptions, projectDir string, old, requested *api.ScionConfig) error {
 	recovery := opts.RuntimeRecovery
 	// Expand layers before merging so a retry overrides an expanded key.
-	labelEnv := config.MergeScionConfig(&api.ScionConfig{Env: old.Env}, &api.ScionConfig{Env: requested.Env}).Env
+	labelEnv := config.MergeScionConfig(&api.ScionConfig{Env: old.Env}, &api.ScionConfig{Env: opts.Env}).Env
+	labelEnv = config.MergeScionConfig(&api.ScionConfig{Env: labelEnv}, &api.ScionConfig{Env: requested.Env}).Env
+	if opts.BrokerMode {
+		for key, value := range labelEnv {
+			if value == "" {
+				if current := opts.Env[key]; current != "" {
+					labelEnv[key] = current
+				} else {
+					delete(labelEnv, key)
+				}
+			}
+		}
+	}
 	vars := BuildScopedLabelVars(opts.Name, recovery.AgentID, config.GetProjectName(projectDir), recovery.ProjectID, labelEnv)
 	for _, layer := range []*api.ScionConfig{old, requested} {
 		if layer.Docker == nil {
@@ -453,6 +508,15 @@ func runtimeConfigHash(cfg *api.ScionConfig) (string, error) {
 	copy := *cfg
 	// Admission changes on retry; effective configuration identity does not.
 	copy.RuntimeUpdateVersion = 0
+	copy.Info = nil
+	// Model and thinking level are normalized runtime selections above. Their
+	// old env expressions are a duplicate input, not a different runtime config.
+	copy.Env = make(map[string]string, len(cfg.Env))
+	for key, value := range cfg.Env {
+		copy.Env[key] = value
+	}
+	delete(copy.Env, "SCION_MODEL")
+	delete(copy.Env, "SCION_THINKING_LEVEL")
 	data, err := json.Marshal(&copy)
 	if err != nil {
 		return "", err

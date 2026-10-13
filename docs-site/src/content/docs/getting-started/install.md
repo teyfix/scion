@@ -93,7 +93,7 @@ Scion requires a container runtime to manage agents. You can use Docker, Podman,
 ### 3. Git
 Scion uses `git worktree` to manage agent workspaces.
 - Ensure `git` is installed and available in your PATH.
-- Because Scion uses a new feature for relative path worktrees, ensure that `git --version` >= 2.47.0.
+- Because Scion uses a new feature for relative path worktrees, ensure that `git --version` >= 2.48.0.
 
 For Ubuntu you can install the latest version with
 
@@ -103,7 +103,7 @@ add-apt-repository ppa:git-core/ppa
 apt update; apt install git
 ```
 
-For Debian you may need to build from source, see the [git site](https://git-scm.com/install/source), or see the Dockerfile in this repo for the base image.
+On Debian, note that Debian 13 (trixie)'s own `apt` git is **2.47.3** — below the 2.48 floor. Check `git --version`; if it's too old, build from source (see the [git site](https://git-scm.com/install/source)) or install a newer package from a source like [git-scm.com's Linux downloads](https://git-scm.com/download/linux).
 
 ---
 
@@ -196,15 +196,15 @@ Scion also supports Vertex AI (via Application Default Credentials) and OAuth to
 
 ### 4. Select Runtime
 Scion automatically selects the appropriate runtime based on your operating system:
-- **macOS**: Defaults to `container` (Apple Virtualization Framework).
+- **macOS**: Uses the first runtime it finds, in this order: `podman`, `docker`, then `container` (Apple Virtualization Framework).
 - **Linux/Windows**: Defaults to `docker` (or `podman` if Docker is missing).
 
-If you wish to change this (e.g., to use Podman on macOS), you can manually edit `.scion/settings.yaml`:
+If you wish to change this (e.g., to use Apple `container` on macOS when Podman or Docker is also installed), you can manually edit `.scion/settings.yaml`:
 
 ```yaml
 profiles:
   local:
-    runtime: podman
+    runtime: container
 ```
 
 Scion accepts settings in either YAML or JSON. `scion init` writes `settings.yaml`, and YAML is preferred when multiple files are present (the loader looks for `settings.yaml`, then `settings.yml`, then `settings.json`). If you prefer JSON, name the file `.scion/settings.json` and use valid JSON syntax:

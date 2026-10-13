@@ -100,6 +100,9 @@ const (
 	InviteAuditUserActivated    InviteAuditEventType = "user_activated"
 	InviteAuditUserInvited      InviteAuditEventType = "user_invited"
 	InviteAuditUserInvitedBulk  InviteAuditEventType = "user_invited_bulk"
+	// InviteAuditUserProvisioned records a pending user created through
+	// POST /api/v1/users (post-commit, best-effort).
+	InviteAuditUserProvisioned InviteAuditEventType = "user_provisioned"
 )
 
 // InviteAuditEvent represents an auditable event for the invite/allow-list system.
@@ -181,12 +184,66 @@ type LifecycleHookExecutionEvent struct {
 
 // AgentSecretReadEvent represents an auditable agent secret read event.
 type AgentSecretReadEvent struct {
-	AgentID    string    `json:"agentId"`
-	ProjectID  string    `json:"projectId"`
-	SecretKey  string    `json:"secretKey"`
-	Success    bool      `json:"success"`
-	FailReason string    `json:"failReason,omitempty"`
-	Timestamp  time.Time `json:"timestamp"`
+	AgentID   string `json:"agentId"`
+	ProjectID string `json:"projectId"`
+	// Scope and ScopeID record the secret's scope and scope ID separately.
+	// Earlier callers folded the scope ID into ProjectID; the material
+	// selection compat path (logAgentSecretReadCompat) is the corrected
+	// shape.
+	Scope     string `json:"scope,omitempty"`
+	ScopeID   string `json:"scopeId,omitempty"`
+	SecretKey string `json:"secretKey"`
+	Success   bool   `json:"success"`
+	// Derived is true when this event has a partner MaterialSelectionEvent
+	// with the same CorrelationID.
+	Derived       bool      `json:"derived,omitempty"`
+	CorrelationID string    `json:"correlationId,omitempty"`
+	FailReason    string    `json:"failReason,omitempty"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
+// GCSLinkFetchReason enumerates why a gs:// link fetch was allowed or denied.
+// Exactly one is recorded per request, alongside Decision.
+type GCSLinkFetchReason string
+
+const (
+	GCSLinkReasonFeatureOff         GCSLinkFetchReason = "feature_off"
+	GCSLinkReasonNotUser            GCSLinkFetchReason = "not_user"
+	GCSLinkReasonBadRequest         GCSLinkFetchReason = "bad_request"
+	GCSLinkReasonRateLimited        GCSLinkFetchReason = "rate_limited"
+	GCSLinkReasonMessageNotFound    GCSLinkFetchReason = "message_not_found"
+	GCSLinkReasonMessageNotReadable GCSLinkFetchReason = "message_not_readable"
+	GCSLinkReasonURINotInBody       GCSLinkFetchReason = "uri_not_in_body"
+	GCSLinkReasonSenderNotAgent     GCSLinkFetchReason = "sender_not_agent"
+	GCSLinkReasonNoSA               GCSLinkFetchReason = "no_sa"
+	GCSLinkReasonSANotAdmissible    GCSLinkFetchReason = "sa_not_admissible"
+	GCSLinkReasonSALookupFailed     GCSLinkFetchReason = "sa_lookup_failed"
+	GCSLinkReasonMintFailed         GCSLinkFetchReason = "mint_failed"
+	GCSLinkReasonGCSNotFound        GCSLinkFetchReason = "gcs_not_found"
+	GCSLinkReasonGCSDenied          GCSLinkFetchReason = "gcs_denied"
+	GCSLinkReasonTooLarge           GCSLinkFetchReason = "too_large"
+	GCSLinkReasonUpstreamError      GCSLinkFetchReason = "upstream_error"
+	GCSLinkReasonOK                 GCSLinkFetchReason = "ok"
+)
+
+// GCSLinkFetchEvent is the single auditable event emitted for every
+// GET /api/v1/gcs/object request, allow or deny. Fields not resolved by the time the request was
+// denied (e.g. SAEmail before step 9) are left at their zero value.
+type GCSLinkFetchEvent struct {
+	ViewerUserID   string             `json:"viewerUserId"`
+	MessageID      string             `json:"messageId"`
+	ConversationID string             `json:"conversationId,omitempty"`
+	SenderAgentID  string             `json:"senderAgentId,omitempty"`
+	SAEmail        string             `json:"saEmail,omitempty"`
+	Bucket         string             `json:"bucket,omitempty"`
+	Object         string             `json:"object,omitempty"`
+	Decision       string             `json:"decision"` // "allow" or "deny"
+	Reason         GCSLinkFetchReason `json:"reason"`
+	Status         int                `json:"status"`
+	Bytes          int64              `json:"bytes,omitempty"`
+	Generation     int64              `json:"generation,omitempty"`
+	DurationMS     int64              `json:"durationMs"`
+	Timestamp      time.Time          `json:"timestamp"`
 }
 
 // AuditLogger defines the interface for logging audit events.
@@ -195,6 +252,8 @@ type AuditLogger interface {
 	LogBrokerAuthEvent(ctx context.Context, event *BrokerAuthEvent) error
 	// LogGCPTokenEvent logs a GCP token generation event.
 	LogGCPTokenEvent(ctx context.Context, event *GCPTokenEvent) error
+	// LogGCSLinkFetchEvent logs a gs:// link fetch decision (allow or deny).
+	LogGCSLinkFetchEvent(ctx context.Context, event *GCSLinkFetchEvent) error
 	// LogInviteAuditEvent logs an invite/allow-list audit event.
 	LogInviteAuditEvent(ctx context.Context, event *InviteAuditEvent) error
 	// LogLifecycleHookEvent logs a lifecycle-hook admin event.
@@ -241,6 +300,23 @@ func (l *LogAuditLogger) logger() *slog.Logger {
 		return l.log
 	}
 	return slog.Default()
+}
+
+// credentialLogAttr returns the "credential" attribute for a hub.audit event
+// log line, when descriptive credential metadata (token name, boundary,
+// issuer-supplied purpose/labels) is available on ctx. ok is false when
+// there is nothing to add — no such metadata on ctx, e.g. a non-token
+// credential or no request context at all — so callers append nothing
+// rather than an empty group.
+//
+// This is a rendering helper only: it never changes an event's outcome or
+// fields, and it does not touch any authentication middleware.
+func credentialLogAttr(ctx context.Context) (slog.Attr, bool) {
+	decoration, ok := CredentialDecorationFromContext(ctx)
+	if !ok {
+		return slog.Attr{}, false
+	}
+	return slog.Any("credential", decoration), true
 }
 
 // LogBrokerAuthEvent logs a broker authentication event to the standard logger.
@@ -309,17 +385,21 @@ func (l *LogAuditLogger) LogBrokerAuthEvent(ctx context.Context, event *BrokerAu
 	}
 
 	// Details is emitted unconditionally, NOT debug-gated as it was before
-	// 500efd1a. That gating was a defect the no-op hid: the only in-tree
-	// producers are LogLinkEvent and LogUnlinkEvent, and the only key they set
-	// is projectId. Debug-gating it means a link record says "broker B was
-	// linked" without saying to what — an event stripped of the one field that
-	// makes it mean anything.
+	// 500efd1a. That gating was a defect the no-op hid: LogLinkEvent and
+	// LogUnlinkEvent set projectId, and debug-gating it means a link record
+	// says "broker B was linked" without saying to what — an event stripped
+	// of the one field that makes it mean anything. Registration, rotation,
+	// link and unlink events also carry the credential attribution from
+	// brokerAuditCredentialDetails.
 	//
 	// Security: Details is free-form and this method does not vet it. Callers
 	// must not put secret material in it — the same rule that governs
 	// LifecycleHookExecutionEvent.
 	for k, v := range event.Details {
 		attrs = append(attrs, slog.String(k, v))
+	}
+	if credAttr, ok := credentialLogAttr(ctx); ok {
+		attrs = append(attrs, credAttr)
 	}
 
 	l.logger().LogAttrs(ctx, level, "Broker auth audit event", attrs...)
@@ -360,6 +440,9 @@ func (l *LogAuditLogger) LogInviteAuditEvent(ctx context.Context, event *InviteA
 	for k, v := range event.Details {
 		attrs = append(attrs, slog.String(k, v))
 	}
+	if credAttr, ok := credentialLogAttr(ctx); ok {
+		attrs = append(attrs, credAttr)
+	}
 
 	l.logger().LogAttrs(ctx, level, "authz: "+string(event.EventType), attrs...)
 
@@ -397,6 +480,36 @@ func (l *LogAuditLogger) LogGCPTokenEvent(ctx context.Context, event *GCPTokenEv
 	return nil
 }
 
+// LogGCSLinkFetchEvent logs a gs:// link fetch decision to the standard
+// logger. A deny is logged at INFO (these are expected, routine denials —
+// wrong viewer, expired SA, and so on — not warnings), and an allow at DEBUG.
+func (l *LogAuditLogger) LogGCSLinkFetchEvent(ctx context.Context, event *GCSLinkFetchEvent) error {
+	level := slog.LevelDebug
+	if event.Decision != "allow" {
+		level = slog.LevelInfo
+	}
+
+	attrs := []slog.Attr{
+		slog.String("decision", event.Decision),
+		slog.String("reason", string(event.Reason)),
+		slog.Int("status", event.Status),
+		slog.String("viewer_user_id", event.ViewerUserID),
+		slog.String("message_id", event.MessageID),
+		slog.String("conversation_id", event.ConversationID),
+		slog.String("sender_agent_id", event.SenderAgentID),
+		slog.String("sa_email", event.SAEmail),
+		slog.String("bucket", event.Bucket),
+		slog.String("object", event.Object),
+		slog.Int64("bytes", event.Bytes),
+		slog.Int64("generation", event.Generation),
+		slog.Int64("duration_ms", event.DurationMS),
+	}
+
+	l.logger().LogAttrs(ctx, level, "gcs link fetch audit event", attrs...)
+
+	return nil
+}
+
 // LogLifecycleHookEvent logs a lifecycle-hook admin event to the standard logger.
 func (l *LogAuditLogger) LogLifecycleHookEvent(ctx context.Context, event *LifecycleHookEvent) error {
 	level := slog.LevelInfo
@@ -413,6 +526,9 @@ func (l *LogAuditLogger) LogLifecycleHookEvent(ctx context.Context, event *Lifec
 	}
 	if event.FailReason != "" {
 		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
+	}
+	if credAttr, ok := credentialLogAttr(ctx); ok {
+		attrs = append(attrs, credAttr)
 	}
 
 	l.logger().LogAttrs(ctx, level, "lifecycle hook audit event", attrs...)
@@ -465,8 +581,23 @@ func (l *LogAuditLogger) LogAgentSecretReadEvent(ctx context.Context, event *Age
 		slog.String("secret_key", event.SecretKey),
 		slog.Bool("success", event.Success),
 	}
+	if event.Scope != "" {
+		attrs = append(attrs, slog.String("scope", event.Scope))
+	}
+	if event.ScopeID != "" {
+		attrs = append(attrs, slog.String("scope_id", event.ScopeID))
+	}
+	if event.Derived {
+		attrs = append(attrs, slog.Bool("derived", event.Derived))
+	}
+	if event.CorrelationID != "" {
+		attrs = append(attrs, slog.String("correlation_id", event.CorrelationID))
+	}
 	if event.FailReason != "" {
 		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
+	}
+	if credAttr, ok := credentialLogAttr(ctx); ok {
+		attrs = append(attrs, credAttr)
 	}
 
 	l.logger().LogAttrs(ctx, level, "agent secret read event", attrs...)
@@ -538,24 +669,6 @@ func (l *LogAuditLogger) RecordSAAssignment(ctx context.Context, event *store.SA
 	return nil
 }
 
-// LogAgentSecretRead logs an agent secret read event through the AuditLogger interface.
-func LogAgentSecretRead(ctx context.Context, logger AuditLogger, agentID, projectID, secretKey string, success bool, failReason string) {
-	if logger == nil {
-		return
-	}
-
-	event := &AgentSecretReadEvent{
-		AgentID:    agentID,
-		ProjectID:  projectID,
-		SecretKey:  secretKey,
-		Success:    success,
-		FailReason: failReason,
-		Timestamp:  time.Now(),
-	}
-
-	_ = logger.LogAgentSecretReadEvent(ctx, event)
-}
-
 // AuditableBrokerAuthMiddleware creates middleware that logs authentication events.
 // This wraps BrokerAuthMiddleware with audit logging.
 func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) func(http.Handler) http.Handler {
@@ -597,9 +710,12 @@ func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) f
 				return
 			}
 
-			// Set broker-specific identity context and resolve on-behalf-of
-			ctx := contextWithBrokerIdentity(r.Context(), identity)
-			ctx, userIdent, ok := svc.applyOnBehalfOf(ctx, w, r, identity)
+			// Install the authenticated broker/on-behalf-of context through
+			// the same shared helper BrokerAuthMiddleware uses, so both
+			// variants install an identical broker identity, effective user
+			// (when OBO resolves), OBO marker, and broker credential for the
+			// same request.
+			ctx, userIdent, ok := svc.applyOnBehalfOf(r.Context(), w, r, identity)
 			if !ok {
 				return
 			}
@@ -619,7 +735,7 @@ func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) f
 				_ = logger.LogBrokerAuthEvent(ctx, event)
 			}
 
-			next.ServeHTTP(w, r.WithContext(ctx))
+			serveAfterAuth(w, next, r.WithContext(ctx))
 		})
 	}
 }
@@ -646,8 +762,63 @@ func getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// LogRegistrationEvent logs a broker registration event.
-func LogRegistrationEvent(ctx context.Context, logger AuditLogger, brokerID, brokerName, actorID, ipAddress string) {
+// brokerAuditCredentialDetails returns the credential attribution recorded
+// on broker registration, rotation, link and unlink audit events, next to
+// the acting principal:
+//   - credential_kind: the request credential kind (interactive, dev, uat,
+//     broker, ...);
+//   - credential_id: the credential's identifier when it has one (a user
+//     access token ID or a broker ID), never a token, secret or hash;
+//   - credential_boundary_kind: the boundary kind (project or hub) of a
+//     user access token.
+//
+// Keys with no value are omitted. The returned map is freshly allocated, so
+// callers may add event-specific keys to it.
+func brokerAuditCredentialDetails(ctx context.Context) map[string]string {
+	details := map[string]string{}
+	actor := auditActorFromContext(ctx)
+	if actor.CredentialKind != "" {
+		details["credential_kind"] = actor.CredentialKind
+	}
+	if actor.CredentialID != "" {
+		details["credential_id"] = actor.CredentialID
+	}
+	if actor.CredentialKind == string(CredentialKindUAT) {
+		boundary := actor.CredentialBoundaryKind
+		if boundary == "" {
+			if b := GetCredentialContextFromContext(ctx).Boundary; b != nil {
+				boundary = string(b.Kind)
+			}
+		}
+		if boundary != "" {
+			details["credential_boundary_kind"] = boundary
+		}
+	}
+	return details
+}
+
+// mergeBrokerAuditDetails returns a new map holding details plus the given
+// event-specific key/value pairs; the pairs win on a key collision.
+func mergeBrokerAuditDetails(details map[string]string, kv ...string) map[string]string {
+	out := make(map[string]string, len(details)+len(kv)/2)
+	for k, v := range details {
+		out[k] = v
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		out[kv[i]] = kv[i+1]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// LogRegistrationEvent logs a broker registration or re-registration event.
+// details carries the credential attribution, the operation and the issued
+// join token's details (brokerAuditCredentialDetails, "operation" and
+// joinTokenAuditDetails); it must not hold secret material, the join token
+// or its hash.
+func LogRegistrationEvent(ctx context.Context, logger AuditLogger, brokerID, brokerName, actorID, ipAddress string, details map[string]string) {
 	if logger == nil {
 		return
 	}
@@ -661,6 +832,7 @@ func LogRegistrationEvent(ctx context.Context, logger AuditLogger, brokerID, bro
 		ActorID:    actorID,
 		ActorType:  "user",
 		Timestamp:  time.Now(),
+		Details:    mergeBrokerAuditDetails(details),
 	}
 
 	_ = logger.LogBrokerAuthEvent(ctx, event)
@@ -684,8 +856,10 @@ func LogJoinEvent(ctx context.Context, logger AuditLogger, brokerID, ipAddress s
 	_ = logger.LogBrokerAuthEvent(ctx, event)
 }
 
-// LogRotateEvent logs a secret rotation event.
-func LogRotateEvent(ctx context.Context, logger AuditLogger, brokerID, actorID, actorType, ipAddress string) {
+// LogRotateEvent logs a secret rotation event. details carries the
+// credential attribution (brokerAuditCredentialDetails); it must not hold
+// secret material.
+func LogRotateEvent(ctx context.Context, logger AuditLogger, brokerID, actorID, actorType, ipAddress string, details map[string]string) {
 	if logger == nil {
 		return
 	}
@@ -698,6 +872,7 @@ func LogRotateEvent(ctx context.Context, logger AuditLogger, brokerID, actorID, 
 		ActorID:   actorID,
 		ActorType: actorType,
 		Timestamp: time.Now(),
+		Details:   mergeBrokerAuditDetails(details),
 	}
 
 	_ = logger.LogBrokerAuthEvent(ctx, event)
@@ -724,7 +899,9 @@ func LogDeregisterEvent(ctx context.Context, logger AuditLogger, brokerID, broke
 }
 
 // LogLinkEvent logs a project link event (broker linked to project).
-func LogLinkEvent(ctx context.Context, logger AuditLogger, brokerID, brokerName, projectID, actorID, ipAddress string) {
+// details carries the credential attribution (brokerAuditCredentialDetails);
+// it must not hold secret material. projectId is always set from projectID.
+func LogLinkEvent(ctx context.Context, logger AuditLogger, brokerID, brokerName, projectID, actorID, ipAddress string, details map[string]string) {
 	if logger == nil {
 		return
 	}
@@ -738,16 +915,16 @@ func LogLinkEvent(ctx context.Context, logger AuditLogger, brokerID, brokerName,
 		ActorID:    actorID,
 		ActorType:  "user",
 		Timestamp:  time.Now(),
-		Details: map[string]string{
-			"projectId": projectID,
-		},
+		Details:    mergeBrokerAuditDetails(details, "projectId", projectID),
 	}
 
 	_ = logger.LogBrokerAuthEvent(ctx, event)
 }
 
 // LogUnlinkEvent logs a project unlink event (broker unlinked from project).
-func LogUnlinkEvent(ctx context.Context, logger AuditLogger, brokerID, projectID, actorID, ipAddress string) {
+// details carries the credential attribution (brokerAuditCredentialDetails);
+// it must not hold secret material. projectId is always set from projectID.
+func LogUnlinkEvent(ctx context.Context, logger AuditLogger, brokerID, projectID, actorID, ipAddress string, details map[string]string) {
 	if logger == nil {
 		return
 	}
@@ -760,9 +937,7 @@ func LogUnlinkEvent(ctx context.Context, logger AuditLogger, brokerID, projectID
 		ActorID:   actorID,
 		ActorType: "user",
 		Timestamp: time.Now(),
-		Details: map[string]string{
-			"projectId": projectID,
-		},
+		Details:   mergeBrokerAuditDetails(details, "projectId", projectID),
 	}
 
 	_ = logger.LogBrokerAuthEvent(ctx, event)

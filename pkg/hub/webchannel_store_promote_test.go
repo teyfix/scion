@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !no_sqlite
+
 package hub
 
 import (
@@ -20,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,11 +29,10 @@ import (
 // includes a messages table (Ent-managed in production, manually created here).
 func newPromoteTestStore(t *testing.T) (WebChatStore, *sql.DB) {
 	t.Helper()
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
+	db := openTestMemorySQLite(t, "sqlite")
 
 	// Create the Ent messages table manually — in production it's managed by Ent.
-	_, err = db.Exec(`
+	_, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL DEFAULT '',
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS messages (
     recipient_id TEXT NOT NULL DEFAULT '',
     channel TEXT,
     thread_id TEXT,
+    conversation_id TEXT NOT NULL DEFAULT '',
     msg TEXT NOT NULL DEFAULT '',
     type TEXT NOT NULL DEFAULT 'chat',
     dispatch_state TEXT NOT NULL DEFAULT 'dispatched',
@@ -50,7 +51,7 @@ CREATE TABLE IF NOT EXISTS messages (
 `)
 	require.NoError(t, err)
 
-	store := NewWebChatStore(db, "sqlite3")
+	store := NewWebChatStore(db, "sqlite")
 	require.NoError(t, store.Init())
 
 	return store, db
@@ -111,7 +112,7 @@ func TestPromoteDM_HappyPath(t *testing.T) {
 		LastActivityAt: now,
 	}
 
-	result, err := store.PromoteDM(ctx, topic, dmKey)
+	result, err := store.PromoteDM(ctx, topic, PromoteKeys{DMKey: dmKey})
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, "topic-promote-1", result.ID)
@@ -186,7 +187,7 @@ func TestPromoteDM_Atomicity(t *testing.T) {
 		LastActivityAt: now,
 	}
 
-	_, err := store.PromoteDM(ctx, topic, dmKey)
+	_, err := store.PromoteDM(ctx, topic, PromoteKeys{DMKey: dmKey})
 	require.Error(t, err, "should fail due to name conflict")
 
 	// Verify: messages are NOT re-keyed (rollback worked)
@@ -230,7 +231,7 @@ func TestPromoteDM_Idempotency(t *testing.T) {
 	}
 
 	// First promotion should succeed.
-	result, err := store.PromoteDM(ctx, topic, dmKey)
+	result, err := store.PromoteDM(ctx, topic, PromoteKeys{DMKey: dmKey})
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, 3, result.MessageCount)
@@ -246,7 +247,7 @@ func TestPromoteDM_Idempotency(t *testing.T) {
 		CreatedAt:      now,
 		LastActivityAt: now,
 	}
-	result2, err := store.PromoteDM(ctx, topic2, dmKey)
+	result2, err := store.PromoteDM(ctx, topic2, PromoteKeys{DMKey: dmKey})
 	require.NoError(t, err)
 	require.NotNil(t, result2)
 	require.Equal(t, 0, result2.MessageCount, "second promotion should re-key 0 messages")
@@ -386,36 +387,4 @@ func TestPromoteDM_ThreadIDIndex(t *testing.T) {
 	err = db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_thread_id'").Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 1, count, "idx_messages_thread_id index should exist")
-}
-
-// TestTitleCase verifies the titleCase helper function.
-func TestTitleCase(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"code-reviewer", "Code Reviewer"},
-		{"my_agent", "My Agent"},
-		{"simple", "Simple"},
-		{"multi-word-agent", "Multi Word Agent"},
-		{"already Title", "Already Title"},
-	}
-	for _, tc := range tests {
-		got := titleCase(tc.input)
-		require.Equal(t, tc.expected, got, "titleCase(%q)", tc.input)
-	}
-}
-
-// TestDMPromotedEvent verifies the DMPromotedEvent struct serialization.
-func TestDMPromotedEvent(t *testing.T) {
-	evt := DMPromotedEvent{
-		OldConversationKey: "dm:agent:a1:user:u1",
-		NewTopic: WebChatTopic{
-			ID:        "topic-1",
-			ProjectID: "proj-1",
-			Name:      "Test Thread",
-		},
-	}
-	require.Equal(t, "dm:agent:a1:user:u1", evt.OldConversationKey)
-	require.Equal(t, "topic-1", evt.NewTopic.ID)
 }

@@ -33,10 +33,12 @@ import (
 // handing callers the live pointer would let a downstream merge mutate the
 // server's config out from under the lock.
 //
-// In file mode this always returns the zero value: BuildLayer1SnapshotFromFile
-// deliberately leaves the agent-defaults fields empty (design §3.2.4), so
-// callers that gate on "non-empty" never fire in file mode. That is what keeps
-// file-mode dispatch byte-identical to the pre-change behaviour.
+// In file mode, BuildLayer1SnapshotFromFile populates only
+// DefaultHarnessConfig, DefaultTimezone and the two GCP identity fields (read
+// from their own top-level settings.yaml keys); every other agent-defaults
+// field stays at its zero value, so callers that gate on "non-empty" for
+// those never fire in file mode. That is what keeps file-mode dispatch of
+// the other fields byte-identical to the pre-change behaviour.
 func (s *Server) hubAgentDefaults() opsettings.AgentDefaultsSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -50,6 +52,15 @@ func (s *Server) hubAgentDefaults() opsettings.AgentDefaultsSettings {
 		d.DefaultThinkingLevel = &v
 	}
 	return d
+}
+
+// autoExposePortsDefault returns a copy of the hub's auto-expose-ports
+// default under s.mu, or nil when unset. The settings propagation goroutine
+// rewrites the pointer while the hub runs (ApplySnapshot).
+func (s *Server) autoExposePortsDefault() *bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return copyBoolPtr(s.config.AutoExposePortsDefault)
 }
 
 // agentDefaultsEqual reports whether two agent_defaults sections carry the same
@@ -67,7 +78,10 @@ func agentDefaultsEqual(a, b opsettings.AgentDefaultsSettings) bool {
 		a.DefaultModel != b.DefaultModel ||
 		a.DefaultMaxAgentRole != b.DefaultMaxAgentRole ||
 		a.DefaultAgentRole != b.DefaultAgentRole ||
-		a.DefaultRuntimeBroker != b.DefaultRuntimeBroker {
+		a.DefaultRuntimeBroker != b.DefaultRuntimeBroker ||
+		a.DefaultTimezone != b.DefaultTimezone ||
+		a.DefaultGCPIdentityMode != b.DefaultGCPIdentityMode ||
+		a.DefaultGCPIdentityServiceAccountID != b.DefaultGCPIdentityServiceAccountID {
 		return false
 	}
 	if !intPtrEqual(a.DefaultThinkingLevel, b.DefaultThinkingLevel) {

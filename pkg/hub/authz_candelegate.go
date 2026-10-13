@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -28,7 +29,8 @@ import (
 //
 //   - Role binding creation (admin): wired in handlers_roles.go:createRoleBinding.
 //   - Project membership: wired in handlers_project_members.go (add/update/delete).
-//   - Group membership: wired in handlers_groups.go:addGroupMember.
+//   - Group membership: wired in handlers_groups.go:authorizeGroupMemberGrant
+//     (addGroupMember, and createGroup when a parent group is given).
 //   - Agent delegation: wired in handlers_agents_core.go:createAgentInProject.
 //   - Scheduled dispatch: wired in server.go:authorizeScheduledAgentCreate.
 //   - Policy routes: removed in CO1 cutover.
@@ -68,6 +70,14 @@ type GrantDescriptor struct {
 	// Scope of the grant.
 	ScopeType string // "system", "project"
 	ScopeID   string
+
+	// GranteeType and GranteeID name the principal that receives the
+	// grant, when the caller knows it ("user", "group" or "agent"; the ID
+	// may be a user's email on the membership paths). CanDelegate refuses
+	// any grant to an admin-kind test identity (test_hub_admin,
+	// test_super_admin): its authority is fixed at issuance.
+	GranteeType string
+	GranteeID   string
 }
 
 // CanDelegate checks whether the actor has sufficient authority to create
@@ -82,9 +92,36 @@ func (a *AuthzService) CanDelegate(ctx context.Context, actor Identity, grant Gr
 		return Decision{Allowed: false, Reason: "missing actor"}
 	}
 
+	// A delivery credential cannot delegate any permission. The check keys
+	// on the concrete type and comes before every allow path below,
+	// including the AgentRoleNone allow for an agent delegation with no
+	// scopes.
+	if _, ok := actor.(*hubDeliveryIdentity); ok {
+		return Decision{Allowed: false, Reason: "delivery credential cannot delegate"}
+	}
+	// An agent delegated credential delegates nothing onward: no v1
+	// operation passes delegated authority on (.design/agent-delegation.md
+	// §12.3).
+	if _, ok := actor.(*DelegatedAgentIdentity); ok {
+		return Decision{Allowed: false, Reason: "delegated credential cannot delegate"}
+	}
+	// A visitor (a federated account) manages no resource, so it
+	// delegates nothing.
+	if isVisitorIdentity(actor) {
+		return Decision{Allowed: false, Reason: "visitor cannot delegate"}
+	}
+
+	// An admin-kind test identity holds exactly its issuance binding: no
+	// actor, not even a super-admin, adds authority to it afterwards. The
+	// check runs before the super-admin shortcut below, and reads the
+	// grantee's kind through kindForPrincipal; a read error denies.
+	if denied := a.refuseTestAdminGrantee(ctx, grant); denied != nil {
+		return *denied
+	}
+
 	// Scoped credentials (UAT) can only delegate within their credential scope.
 	if scoped, ok := actor.(*ScopedUserIdentity); ok {
-		if denied := a.enforceUATDelegation(scoped, grant); denied != nil {
+		if denied := a.enforceUATDelegation(ctx, scoped, grant); denied != nil {
 			return *denied
 		}
 	}
@@ -114,26 +151,177 @@ func (a *AuthzService) CanDelegate(ctx context.Context, actor Identity, grant Gr
 	}
 }
 
-// enforceUATDelegation checks that a scoped UAT credential only delegates
-// within its credential scope.
-func (a *AuthzService) enforceUATDelegation(scoped *ScopedUserIdentity, grant GrantDescriptor) *Decision {
-	// UAT is project-scoped: delegation must target the same project.
-	if grant.ScopeType == store.RoleScopeProject && grant.ScopeID != "" {
-		if scoped.ScopedProjectID() != grant.ScopeID {
-			return &Decision{
-				Allowed: false,
-				Reason:  "scoped credential cannot delegate outside its project",
-			}
-		}
-	}
-	// System-scoped grants are never allowed via UAT.
-	if grant.ScopeType == store.RoleScopeSystem {
-		return &Decision{
-			Allowed: false,
-			Reason:  "scoped credential cannot create system-scoped grants",
-		}
+// refuseTestAdminGrantee denies a grant whose grantee is an admin-kind
+// test identity: a user ID whose stored kind is an admin kind
+// (kindForPrincipal), or a user email in an admin kind's reserved domain.
+// A kind read error or unrecognized kind denies. Other grantees, and a
+// grant that names none, pass.
+func (a *AuthzService) refuseTestAdminGrantee(ctx context.Context, grant GrantDescriptor) *Decision {
+	if reason := testAdminGranteeRefusal(ctx, a.store, a.kindCache(), grant.GranteeType, grant.GranteeID); reason != "" {
+		return &Decision{Allowed: false, Reason: reason}
 	}
 	return nil
+}
+
+// Reasons of testAdminGranteeRefusal.
+const (
+	testAdminGranteeReasonRefused    = "an admin-kind test identity cannot receive grants"
+	testAdminGranteeReasonUnverified = "cannot verify the grantee's kind"
+	federatedGranteeReasonRefused    = "a federated account cannot receive grants through this path"
+)
+
+// testAdminGranteeRefusal is the one admin-kind grantee check behind
+// CanDelegate (refuseTestAdminGrantee) and the project member PUT
+// (refuseTestAdminMemberGrantee). It returns a non-empty reason when the
+// grantee is an admin-kind test identity: a user email in an admin kind's
+// reserved domain, or a user ID whose stored kind
+// (kindForPrincipalVia through users, with cache when non-nil) is an admin
+// kind. It refuses a federated account the same way: a user ID whose
+// stored kind is federated, or an address of the federated synthetic shape
+// (the visitor grant path, not this one, gives such an account access). It
+// fails closed: a kind read error or an unrecognized kind refuses.
+// Non-user grantees and an empty ID pass.
+func testAdminGranteeRefusal(ctx context.Context, users store.UserStore, cache *testFixtureClampCache, principalType, principalID string) string {
+	if principalType != store.RoleBindingPrincipalUser || principalID == "" {
+		return ""
+	}
+	if store.IsTestAdminKind(store.TestIdentityEmailKind(principalID)) {
+		return testAdminGranteeReasonRefused
+	}
+	if store.IsFederatedSyntheticEmail(principalID) {
+		return federatedGranteeReasonRefused
+	}
+	if users == nil {
+		return testAdminGranteeReasonUnverified
+	}
+	k, err := kindForPrincipalVia(ctx, users, cache, principalID)
+	if err != nil {
+		return testAdminGranteeReasonUnverified
+	}
+	if k.isTestAdmin() {
+		return testAdminGranteeReasonRefused
+	}
+	if k.isFederated() {
+		return federatedGranteeReasonRefused
+	}
+	return ""
+}
+
+// kindForPrincipal reads a user principal's stored kind through the
+// service's store and clamp cache (kindForPrincipalVia).
+func (a *AuthzService) kindForPrincipal(ctx context.Context, userID string) (principalKind, error) {
+	if a.store == nil {
+		return principalKind{}, errors.New("kind lookup: no store")
+	}
+	return kindForPrincipalVia(ctx, a.store, a.kindCache(), userID)
+}
+
+// kindCache returns the clamp's per-user kind cache of the service's store,
+// or nil (uncached reads) when the store is not the clamped store.
+func (a *AuthzService) kindCache() *testFixtureClampCache {
+	if a == nil {
+		return nil
+	}
+	if c, ok := a.store.(*testFixtureGrantClamp); ok {
+		return c.cache
+	}
+	return nil
+}
+
+// enforceUATDelegation checks that a scoped UAT credential only delegates
+// within its token boundary. It is the boundary half of CanDelegate for a
+// UAT; the permission half is the ceiling intersection in
+// actorHoldsAllPermissions, which every type-specific check applies.
+//
+//   - A grant with no scope type (group membership) is not confined here.
+//     canDelegateGroupMembership denies system-scoped group authority to
+//     every scoped credential.
+//   - A system-scoped grant is denied for every UAT, of either boundary
+//     kind.
+//   - A grant with any other non-project scope type is denied.
+//   - A project-scoped grant must name its project, and the token boundary
+//     must allow that project (BoundaryAllows): a project boundary allows
+//     only its own project, a hub boundary allows any project.
+//   - An agent delegation must name the same project in ProjectID and
+//     ScopeID, for every boundary kind, because the authority check runs
+//     on ProjectID and the boundary check runs on ScopeID.
+//   - Under a hub boundary the holder must also currently have access to
+//     that project (ProjectTargetAdmission), for the permission of the
+//     operation that creates the grant, on that project. The boundary
+//     alone never admits a project.
+func (a *AuthzService) enforceUATDelegation(ctx context.Context, scoped *ScopedUserIdentity, grant GrantDescriptor) *Decision {
+	deny := func(reason string) *Decision {
+		return &Decision{Allowed: false, Reason: reason}
+	}
+	if scoped == nil {
+		return deny("scoped credential is missing")
+	}
+
+	switch grant.ScopeType {
+	case "":
+		return nil
+	case store.RoleScopeSystem:
+		return deny("scoped credential cannot create system-scoped grants")
+	case store.RoleScopeProject:
+	default:
+		return deny("scoped credential cannot delegate a grant with an unknown scope type")
+	}
+
+	if grant.ScopeID == "" {
+		return deny("scoped credential cannot delegate a project grant that names no project")
+	}
+	if grant.Type == GrantTypeAgentDelegation && grant.ProjectID != grant.ScopeID {
+		return deny("scoped credential cannot delegate an agent grant that names two projects")
+	}
+	boundary := scoped.Boundary()
+	if !BoundaryAllows(boundary, TargetScope{Kind: TargetScopeProject, ProjectID: grant.ScopeID}) {
+		return deny("scoped credential cannot delegate outside its project")
+	}
+	if boundary.Kind != BoundaryKindHub {
+		return nil
+	}
+
+	permissionID, target, ok := uatDelegationAdmissionTarget(grant)
+	if !ok {
+		return deny("scoped credential cannot delegate this grant type into a project")
+	}
+	admission, err := a.ProjectTargetAdmission(ctx, principalContextForIdentity(scoped), grant.ScopeID, permissionID, target, nil)
+	if err != nil || !admission.Admitted {
+		return deny("scoped credential requires current access to the grant's project")
+	}
+	return nil
+}
+
+// uatDelegationAdmissionTarget names the permission and the project target
+// on which a hub-boundary UAT's project access is checked before it may
+// create grant. The permission is the one the operation creating the grant
+// enforces:
+//
+//   - an agent delegation is created by agent creation, which enforces
+//     agent.create on an agent in the project;
+//   - a project membership, or a project role binding for a built-in
+//     project role, is created by the project membership routes, which
+//     enforce project.manage on the project;
+//   - a project role binding for a custom role is admitted on
+//     project.manage on the project as its project-level access check. Its
+//     route additionally enforces role_binding.create at hub level.
+//
+// Any other grant type has no project admission target, and ok is false.
+// An agent delegation whose ProjectID differs from its ScopeID names two
+// projects, and ok is false; enforceUATDelegation denies that case before
+// it gets here.
+func uatDelegationAdmissionTarget(grant GrantDescriptor) (permissionID string, target Resource, ok bool) {
+	switch grant.Type {
+	case GrantTypeAgentDelegation:
+		if grant.ProjectID != grant.ScopeID {
+			return "", Resource{}, false
+		}
+		return "agent.create", Resource{Type: "agent", ParentType: "project", ParentID: grant.ScopeID}, true
+	case GrantTypeRoleBinding, GrantTypeProjectMembership:
+		return "project.manage", Resource{Type: "project", ID: grant.ScopeID}, true
+	default:
+		return "", Resource{}, false
+	}
 }
 
 // canDelegateRoleBinding checks whether the actor holds all permissions that
@@ -302,8 +490,8 @@ func (a *AuthzService) canDelegateAgent(ctx context.Context, actor Identity, gra
 	}
 
 	// For user callers: verify the user has agent-create authority in the
-	// target project. The role ceiling logic (ResolveEffectiveRole, minRole)
-	// already caps the effective role to the project max and caller ceiling.
+	// target project. Agent creation already caps the effective role to the
+	// project maximum (and, for agent callers, the parent agent's role).
 	// CanDelegate adds the check that the user has at least the base
 	// create-agent permission. For role-level escalation prevention between
 	// users, the system relies on the role ceiling logic rather than
@@ -337,13 +525,30 @@ func (a *AuthzService) canDelegateAgent(ctx context.Context, actor Identity, gra
 
 // canAgentDelegateToAgent checks that an agent creating a sub-agent holds
 // at least the scopes being delegated.
+//
+// Compares against effectiveAgentScopes(agentActor), not agentActor.Scopes()
+// directly, so a verified legacy token (isLegacyPreSplitAgentJWT,
+// ptone/scion#2339) is judged by the same effective scopes the synthetic
+// grant and the credential-scope restriction use, rather than its literal,
+// pre-split scope list.
 func (a *AuthzService) canAgentDelegateToAgent(agentActor AgentIdentity, grant GrantDescriptor) Decision {
 	// Resolve the requested role to scopes.
+	// A role's ceilingOptionalRoleScopes are not required of the actor: the
+	// child's ceiling is derived from the parent's ceiling-filtered role
+	// coverage (agentSourceEffectCeiling), so the mint filter leaves such a
+	// scope out of the child's tokens whenever the parent's chain does not
+	// allow it. Scopes requested explicitly (grant.AgentScopes) are always
+	// required.
 	requestedRole := AgentRole(grant.AgentRole)
-	requestedScopes := ScopesForRole(requestedRole)
+	var requestedScopes []AgentTokenScope
+	for _, s := range ScopesForRole(requestedRole) {
+		if !ceilingOptionalRoleScopes[s] {
+			requestedScopes = append(requestedScopes, s)
+		}
+	}
 	requestedScopes = append(requestedScopes, grant.AgentScopes...)
 
-	actorScopes := agentActor.Scopes()
+	actorScopes := effectiveAgentScopes(agentActor)
 	actorScopeSet := make(map[AgentTokenScope]bool, len(actorScopes))
 	for _, s := range actorScopes {
 		actorScopeSet[s] = true
@@ -439,16 +644,27 @@ func (a *AuthzService) intersectCredentialCaveats(actor Identity, perms []string
 	var restriction *Restriction
 
 	switch v := actor.(type) {
+	case *DelegatedAgentIdentity:
+		// Nothing is delegable onward from an agent delegated credential.
+		return []string{}
 	case *ScopedUserIdentity:
 		if v != nil {
-			scopes := v.ScopedScopes()
-			if len(scopes) > 0 {
-				r := uatScopeRestriction(scopes)
-				restriction = &r
-			}
+			// Always apply the ceiling restriction, even when it has no
+			// permission IDs at all: an empty or malformed ceiling denies
+			// delegation of every permission rather than lifting the
+			// restriction. CanDelegate applies the same ceiling as Decide;
+			// no scope implies another.
+			r := ceilingRestriction(v.Ceiling())
+			restriction = &r
 		}
 	case AgentIdentity:
-		r := agentScopeRestriction(v)
+		// Zero Resource: CanDelegate reasons about a target-agnostic
+		// permission set, never one resource instance, so the
+		// gcp_service_account.use per-SA match (agentScopeRestriction's one
+		// resource-aware exception) can never engage here, so
+		// gcp_service_account.use is always filtered out of an agent's
+		// delegable set.
+		r := agentScopeRestriction(v, Resource{})
 		restriction = &r
 	}
 

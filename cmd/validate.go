@@ -34,19 +34,33 @@ all templates visible to the current user.
 Examples:
   scion template validate default
   scion template validate --all`,
-	Args: cobra.MaximumNArgs(1),
+	Args: nameOrAllArgs("template"),
 	RunE: runTemplateValidate,
+}
+
+// nameOrAllArgs is the Args validator for commands that take either one
+// <noun> name argument or an --all flag, but not both. It runs in cobra's
+// argument-validation phase, before root's PersistentPreRunE, so these
+// errors are still reported as usage errors with the usage block
+// (ptone/scion#2859).
+func nameOrAllArgs(noun string) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+			return err
+		}
+		all, _ := cmd.Flags().GetBool("all")
+		if !all && len(args) == 0 {
+			return fmt.Errorf("requires a %s name argument or --all flag", noun)
+		}
+		if all && len(args) > 0 {
+			return fmt.Errorf("cannot specify both a %s name and --all", noun)
+		}
+		return nil
+	}
 }
 
 func runTemplateValidate(cmd *cobra.Command, args []string) error {
 	validateAll, _ := cmd.Flags().GetBool("all")
-
-	if !validateAll && len(args) == 0 {
-		return fmt.Errorf("requires a template name argument or --all flag")
-	}
-	if validateAll && len(args) > 0 {
-		return fmt.Errorf("cannot specify both a template name and --all")
-	}
 
 	hubCtx, err := CheckHubAvailability(projectPath)
 	if err != nil {
@@ -104,36 +118,11 @@ func validateAllTemplates(ctx context.Context, hubCtx *HubContext) error {
 		return fmt.Errorf("failed to list templates: %w", err)
 	}
 
-	if len(resp.Templates) == 0 {
-		fmt.Println("No templates found.")
-		return nil
+	targets := make([]validationTarget, len(resp.Templates))
+	for i, template := range resp.Templates {
+		targets[i] = validationTarget{id: template.ID, name: template.Name}
 	}
-
-	var passed, failed int
-	for _, t := range resp.Templates {
-		report, err := hubCtx.Client.Templates().Validate(ctx, t.ID)
-		if err != nil {
-			fmt.Printf("FAIL  %s  (error: %v)\n", t.Name, err)
-			failed++
-			continue
-		}
-		if len(report.Issues) == 0 {
-			fmt.Printf("PASS  %s\n", t.Name)
-			passed++
-		} else {
-			fmt.Printf("FAIL  %s\n", t.Name)
-			for _, issue := range report.Issues {
-				fmt.Printf("  - [%s] %s\n", issue.Kind, issue.Message)
-			}
-			failed++
-		}
-	}
-
-	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
-	if failed > 0 {
-		return fmt.Errorf("%d template(s) failed validation", failed)
-	}
-	return nil
+	return validateAllResources(ctx, "template", targets, hubCtx.Client.Templates().Validate)
 }
 
 var harnessConfigValidateCmd = &cobra.Command{
@@ -147,19 +136,12 @@ all harness-configs visible to the current user.
 Examples:
   scion harness-config validate claude
   scion harness-config validate --all`,
-	Args: cobra.MaximumNArgs(1),
+	Args: nameOrAllArgs("harness-config"),
 	RunE: runHarnessConfigValidate,
 }
 
 func runHarnessConfigValidate(cmd *cobra.Command, args []string) error {
 	validateAll, _ := cmd.Flags().GetBool("all")
-
-	if !validateAll && len(args) == 0 {
-		return fmt.Errorf("requires a harness-config name argument or --all flag")
-	}
-	if validateAll && len(args) > 0 {
-		return fmt.Errorf("cannot specify both a harness-config name and --all")
-	}
 
 	hubCtx, err := CheckHubAvailability(projectPath)
 	if err != nil {
@@ -217,24 +199,42 @@ func validateAllHarnessConfigs(ctx context.Context, hubCtx *HubContext) error {
 		return fmt.Errorf("failed to list harness-configs: %w", err)
 	}
 
-	if len(resp.HarnessConfigs) == 0 {
-		fmt.Println("No harness-configs found.")
+	targets := make([]validationTarget, len(resp.HarnessConfigs))
+	for i, harnessConfig := range resp.HarnessConfigs {
+		targets[i] = validationTarget{id: harnessConfig.ID, name: harnessConfig.Name}
+	}
+	return validateAllResources(ctx, "harness-config", targets, hubCtx.Client.HarnessConfigs().Validate)
+}
+
+type validationTarget struct {
+	id   string
+	name string
+}
+
+func validateAllResources(
+	ctx context.Context,
+	resourceKind string,
+	targets []validationTarget,
+	validate func(context.Context, string) (*hubclient.ValidationReport, error),
+) error {
+	if len(targets) == 0 {
+		fmt.Printf("No %ss found.\n", resourceKind)
 		return nil
 	}
 
 	var passed, failed int
-	for _, hc := range resp.HarnessConfigs {
-		report, err := hubCtx.Client.HarnessConfigs().Validate(ctx, hc.ID)
+	for _, target := range targets {
+		report, err := validate(ctx, target.id)
 		if err != nil {
-			fmt.Printf("FAIL  %s  (error: %v)\n", hc.Name, err)
+			fmt.Printf("FAIL  %s  (error: %v)\n", target.name, err)
 			failed++
 			continue
 		}
 		if len(report.Issues) == 0 {
-			fmt.Printf("PASS  %s\n", hc.Name)
+			fmt.Printf("PASS  %s\n", target.name)
 			passed++
 		} else {
-			fmt.Printf("FAIL  %s\n", hc.Name)
+			fmt.Printf("FAIL  %s\n", target.name)
 			for _, issue := range report.Issues {
 				fmt.Printf("  - [%s] %s\n", issue.Kind, issue.Message)
 			}
@@ -244,7 +244,7 @@ func validateAllHarnessConfigs(ctx context.Context, hubCtx *HubContext) error {
 
 	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
 	if failed > 0 {
-		return fmt.Errorf("%d harness-config(s) failed validation", failed)
+		return fmt.Errorf("%d %s(s) failed validation", failed, resourceKind)
 	}
 	return nil
 }
@@ -289,7 +289,7 @@ func init() {
 	templateValidateAlias := &cobra.Command{
 		Use:   "validate [name]",
 		Short: "Validate storage consistency for a template",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  nameOrAllArgs("template"),
 		RunE:  runTemplateValidate,
 	}
 	templateValidateAlias.Flags().Bool("all", false, "Validate all templates")

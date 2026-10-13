@@ -18,7 +18,7 @@ import (
 	"github.com/slack-go/slack/socketmode"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 )
 
 var botMentionRe = regexp.MustCompile(`<@[A-Z0-9]+>\s*`)
@@ -35,10 +35,13 @@ type eventServer struct {
 	botUserID     string
 	onBotUserID   func(string)
 
-	store          Store
-	hubClient      HubClient
-	registration   *RegistrationHandler
-	deliverInbound func(topic string, msg *messages.StructuredMessage) *hubError
+	store                Store
+	hubClient            HubClient
+	registration         *RegistrationHandler
+	deliverInbound       func(topic string, msg *messages.StructuredMessage) *hubError
+	deliverRoutedInbound func(projectID, defaultAgent string, msg *messages.StructuredMessage) (*routedInboundResult, *hubError)
+	routedInboundEnabled bool
+	preflightTimeout     time.Duration // default 10s; settable for testing
 }
 
 // startHTTP begins listening for Slack events via HTTP webhooks.
@@ -333,7 +336,7 @@ func (s *eventServer) handleInteractionCallback(callback slackapi.InteractionCal
 		}
 		action := callback.ActionCallback.BlockActions[0]
 		s.log.Debug("block action received", "action_id", action.ActionID)
-		HandleBlockAction(ctx, s.client, s.store, s.deliverInbound, callback, action, s.log)
+		HandleBlockAction(ctx, s.client, s.store, s.hubClient, s.deliverInbound, callback, action, s.log)
 
 	case slackapi.InteractionTypeViewSubmission:
 		s.log.Debug("view submission received", "callback_id", callback.View.CallbackID)
@@ -348,7 +351,11 @@ func (s *eventServer) deliverUserMessage(channelID, threadID, userID, text strin
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	preflightTimeout := s.preflightTimeout
+	if preflightTimeout == 0 {
+		preflightTimeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), preflightTimeout)
 	defer cancel()
 
 	link, err := s.store.GetChannelLink(ctx, channelID)
@@ -371,29 +378,110 @@ func (s *eventServer) deliverUserMessage(channelID, threadID, userID, text strin
 		return
 	}
 
-	sender := "user:" + mapping.ScionEmail
+	// Messages are sent as the linked user; a link without a Scion email
+	// must be redone before the user can message agents.
 	if mapping.ScionEmail == "" {
-		sender = "slack:" + mapping.SlackUsername
+		s.log.Warn("Message blocked: user has no linked Scion email",
+			"slack_user_id", userID, "slack_username", mapping.SlackUsername)
+		_, _ = s.client.PostEphemeral(channelID, userID, slackapi.MsgOptionText(missingEmailLinkText, false))
+		return
 	}
+	sender := "user:" + mapping.ScionEmail
 
 	agentSlug := link.DefaultAgent
+	if agentSlug == "" && !s.routedInboundEnabled {
+		// Legacy path requires a default agent; routed path can derive from mentions.
+		return
+	}
+
+	// --- Routed inbound path ---
+	// When routed_inbound_enabled is true, use the centralized hub endpoint
+	// that handles mention extraction and multi-agent routing. The adapter
+	// supplies the project ID, default agent slug, and the message; the hub
+	// resolves routing. Slash-command paths remain legacy.
+	if s.routedInboundEnabled && s.deliverRoutedInbound != nil {
+		msg := &messages.StructuredMessage{
+			Version:   messages.Version,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Channel:   "slack",
+			ThreadID:  threadID,
+			Sender:    sender,
+			SenderID:  userID,
+			Msg:       text,
+			Type:      messages.TypeInstruction,
+			Metadata: map[string]string{
+				"slack_channel_id": channelID,
+				"slack_thread_ts":  threadID,
+			},
+		}
+		result, he := s.deliverRoutedInbound(link.ProjectID, agentSlug, msg)
+		if he != nil {
+			s.client.PostEphemeral(channelID, userID,
+				slackapi.MsgOptionText(he.userFacingMessage(mapping.ScionEmail), false))
+			return
+		}
+
+		// Save conversation context ONLY when the hub explicitly confirms
+		// delivered=true with a nonempty primary_agent. No fallback to the
+		// configured default — a nil result, delivered=false, empty primary,
+		// malformed/empty 200, or decode error means the routing outcome is
+		// uncertain and must not be persisted. The adapter does not retry
+		// and does not fall back to legacy.
+		if result != nil && result.Delivered && result.PrimaryAgent != "" {
+			// Fresh context for the store call: the parent ctx (10s preflight)
+			// will have expired during the hub's 6-minute fan-out window.
+			// deliverRoutedInbound uses its own http.Client timeout and does
+			// not propagate ctx, so we must not reuse ctx for post-response work.
+			storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer storeCancel()
+			cc := &ConversationContext{
+				SlackUserID:   userID,
+				ProjectID:     link.ProjectID,
+				AgentSlug:     result.PrimaryAgent,
+				LastChannelID: channelID,
+				LastThreadTS:  threadID,
+				LastMessageAt: time.Now(),
+			}
+			if err := s.store.SetConversationContext(storeCtx, cc); err != nil {
+				s.log.Warn("Failed to save conversation context", "error", err)
+			}
+		} else if result == nil || !result.Delivered {
+			// Uncertain result: no error from transport, but the hub response
+			// was nil, malformed, or did not confirm delivery. Surface feedback
+			// so the user knows the outcome is uncertain.
+			s.log.Warn("Routed delivery returned uncertain result",
+				"result_nil", result == nil,
+				"project_id", link.ProjectID,
+				"default_agent", agentSlug)
+			_, _ = s.client.PostEphemeral(channelID, userID,
+				slackapi.MsgOptionText("Message delivery could not be confirmed — the service may be temporarily unavailable.", false))
+		}
+		return
+	}
+
+	// --- Legacy inbound path ---
+	// Save conversation context with the configured default before delivery.
+	// Legacy behavior: always saves with the configured default slug.
+	if agentSlug != "" {
+		cc := &ConversationContext{
+			SlackUserID:   userID,
+			ProjectID:     link.ProjectID,
+			AgentSlug:     agentSlug,
+			LastChannelID: channelID,
+			LastThreadTS:  threadID,
+			LastMessageAt: time.Now(),
+		}
+		if err := s.store.SetConversationContext(ctx, cc); err != nil {
+			s.log.Warn("Failed to save conversation context", "error", err)
+		}
+	}
+
+	// --- Legacy inbound path ---
 	if agentSlug == "" {
 		return
 	}
 
-	cc := &ConversationContext{
-		SlackUserID:   userID,
-		ProjectID:     link.ProjectID,
-		AgentSlug:     agentSlug,
-		LastChannelID: channelID,
-		LastThreadTS:  threadID,
-		LastMessageAt: time.Now(),
-	}
-	if err := s.store.SetConversationContext(ctx, cc); err != nil {
-		s.log.Warn("Failed to save conversation context", "error", err)
-	}
-
-	topic := projectcompat.AgentTopic(link.ProjectID, agentSlug)
+	topic := projectkeys.AgentTopic(link.ProjectID, agentSlug)
 	recipient := "agent:" + agentSlug
 
 	msg := &messages.StructuredMessage{
@@ -415,7 +503,7 @@ func (s *eventServer) deliverUserMessage(channelID, threadID, userID, text strin
 
 	if he := s.deliverInbound(topic, msg); he != nil {
 		s.client.PostEphemeral(channelID, userID,
-			slackapi.MsgOptionText(he.userFacingMessage(), false))
+			slackapi.MsgOptionText(he.userFacingMessage(mapping.ScionEmail), false))
 	}
 }
 

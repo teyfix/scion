@@ -53,6 +53,12 @@ These platform skills are managed by Scion and do not need to be manually includ
 | `max_duration` | string | Maximum runtime duration (e.g., `"2h"`, `"30m"`). Exceeding this triggers a `LIMITS_EXCEEDED` state and termination. |
 | `resources` | object | Container resource requests/limits (see below). |
 
+### Workspace Clone
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `clone_depth` | string or int | Git clone depth for a clone-per-agent workspace: `full` for a full (non-shallow) clone, or an integer N from 1 to 999999999 for a clone of depth N. Overrides the profile's `clone_depth`. Unset (absent, null or empty) keeps the profile's value, else the default shallow clone of depth 1. Applies only when the workspace is cloned (a new agent, or a recreated workspace); restarting an agent whose workspace is already a shallow clone keeps it shallow. See [Profiles](/scion/reference/orchestrator-settings/#profiles-profiles). |
+
 ### Resource Specification
 
 ```yaml
@@ -152,7 +158,13 @@ kubernetes:
   namespace: "custom-ns"
   serviceAccountName: "workload-identity-sa"
   runtimeClassName: "gvisor"
+  priorityClassName: "scion-agent-priority"
+  safeToEvict: false
 ```
+
+`priorityClassName` must name a `PriorityClass` that already exists on the cluster — Scion does not create one — and overrides any `runtimes.<name>.priority_class_name` default set in `settings.yaml`. See [Running Scion on Kubernetes](/scion/hosted/ha/kubernetes/#pod-priority-and-preemption) for why to set it.
+
+`safeToEvict: false` adds the `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` annotation to the pod. It overrides `safe_to_evict` on the profile and the runtime entry, and an explicit `true` turns the annotation off. See [Safe-to-Evict](/scion/hosted/ha/kubernetes/#safe-to-evict).
 
 ## Resolution Logic
 
@@ -199,7 +211,7 @@ Environment variables are governed by a **separate** precedence system that rank
 the same-named sources differently. A rule taken from one and applied to the other
 gives answers backwards.
 
-See **[Settings Precedence](/reference/settings-precedence/)** for both systems in
+See **[Settings Precedence](/scion/reference/settings-precedence/)** for both systems in
 full, the `SCION_*` variables Scion injects, and the known gaps.
 :::
 

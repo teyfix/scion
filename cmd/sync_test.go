@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ import (
 
 func TestResolveAgentID_AgentFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/projects/grove-1/agents" && r.Method == http.MethodGet {
+		if r.URL.Path == "/api/v1/projects/project-1/agents" && r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"agents": []map[string]interface{}{
@@ -49,7 +50,7 @@ func TestResolveAgentID_AgentFound(t *testing.T) {
 		t.Fatalf("failed to create client: %v", err)
 	}
 
-	agentID, err := resolveAgentID(context.Background(), client, "grove-1", "my-agent")
+	agentID, err := resolveAgentID(context.Background(), client, "project-1", "my-agent")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestResolveAgentID_AgentFound(t *testing.T) {
 
 func TestResolveAgentID_AgentNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/projects/grove-1/agents" && r.Method == http.MethodGet {
+		if r.URL.Path == "/api/v1/projects/project-1/agents" && r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"agents": []map[string]interface{}{
@@ -78,7 +79,7 @@ func TestResolveAgentID_AgentNotFound(t *testing.T) {
 		t.Fatalf("failed to create client: %v", err)
 	}
 
-	_, err = resolveAgentID(context.Background(), client, "grove-1", "nonexistent-agent")
+	_, err = resolveAgentID(context.Background(), client, "project-1", "nonexistent-agent")
 	if err == nil {
 		t.Fatal("expected error for non-existent agent")
 	}
@@ -89,7 +90,7 @@ func TestResolveAgentID_AgentNotFound(t *testing.T) {
 
 func TestResolveAgentID_AgentNotRunning(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/projects/grove-1/agents" && r.Method == http.MethodGet {
+		if r.URL.Path == "/api/v1/projects/project-1/agents" && r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"agents": []map[string]interface{}{
@@ -107,7 +108,7 @@ func TestResolveAgentID_AgentNotRunning(t *testing.T) {
 		t.Fatalf("failed to create client: %v", err)
 	}
 
-	_, err = resolveAgentID(context.Background(), client, "grove-1", "my-agent")
+	_, err = resolveAgentID(context.Background(), client, "project-1", "my-agent")
 	if err == nil {
 		t.Fatal("expected error for stopped agent")
 	}
@@ -257,5 +258,58 @@ func TestSyncToFinalizeResponse_ResponseParsing(t *testing.T) {
 	}
 	if resp.BytesTransferred != 102400 {
 		t.Errorf("bytes transferred = %d, want 102400", resp.BytesTransferred)
+	}
+}
+
+// TestSyncToViaHub_AppliesExcludeFlag checks that `scion sync to --exclude`
+// patterns reach the workspace collect and are applied together with the
+// default excludes: the SyncTo request lists neither the user-excluded files
+// nor .git or the workspace-root .scion entry.
+func TestSyncToViaHub_AppliesExcludeFlag(t *testing.T) {
+	ws := t.TempDir()
+	writeWorkspaceTree(t, ws,
+		"main.go",
+		"docs/readme.md",
+		"logs/app.log",
+		"build/out.bin",
+		".git/config",
+		".scion/settings.yaml",
+	)
+
+	var gotPaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/agents/agent-1/workspace/sync-to" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Files []transfer.FileInfo `json:"files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		gotPaths = collectedPaths(req.Files)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hubclient.SyncToResponse{})
+	}))
+	defer server.Close()
+
+	client, err := hubclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	savedExclude, savedDryRun := syncExclude, syncDryRun
+	t.Cleanup(func() { syncExclude, syncDryRun = savedExclude, savedDryRun })
+	syncExclude = []string{"*.log", "build/**"}
+	syncDryRun = true // stop after the SyncTo request
+
+	if err := syncToViaHub(&HubContext{Client: client, Endpoint: server.URL}, "agent-1", "agent-1", ws); err != nil {
+		t.Fatalf("syncToViaHub: %v", err)
+	}
+	want := []string{"docs/readme.md", "main.go"}
+	if !slices.Equal(gotPaths, want) {
+		t.Errorf("SyncTo request files = %v, want %v", gotPaths, want)
 	}
 }

@@ -72,16 +72,6 @@ func (m *TemplateMatch) IsHub() bool {
 	return m.Location == LocationHubProject || m.Location == LocationHubGlobal
 }
 
-// IsGlobal returns true if this template is in global scope.
-func (m *TemplateMatch) IsGlobal() bool {
-	return m.Location == LocationLocalGlobal || m.Location == LocationHubGlobal
-}
-
-// IsProjectScoped returns true if this template is in project scope.
-func (m *TemplateMatch) IsProjectScoped() bool {
-	return m.Location == LocationLocalProject || m.Location == LocationHubProject
-}
-
 // ResolveOpts controls how template resolution behaves.
 type ResolveOpts struct {
 	LocalOnly   bool // --local flag: only search local filesystem
@@ -133,7 +123,7 @@ func findLocalTemplates(name string, opts *ResolveOpts) ([]TemplateMatch, error)
 
 	// Get templates directory paths
 	globalDir, globalErr := config.GetGlobalTemplatesDir()
-	projectDir, projectErr := config.GetProjectTemplatesDir()
+	_, projectErr := config.GetProjectTemplatesDir()
 
 	// Search project (project) templates unless GlobalOnly is set
 	if !opts.GlobalOnly && projectErr == nil {
@@ -169,10 +159,6 @@ func findLocalTemplates(name string, opts *ResolveOpts) ([]TemplateMatch, error)
 			}
 		}
 	}
-
-	// Suppress unused variable warnings
-	_ = globalDir
-	_ = projectDir
 
 	return matches, nil
 }
@@ -253,15 +239,15 @@ func PromptTemplateChoice(matches []TemplateMatch, action string) (*TemplateMatc
 		return nil, fmt.Errorf("multiple templates found but running non-interactively; use --local, --hub, --project, or --global flags to specify")
 	}
 
-	fmt.Printf("\nTemplate '%s' found in multiple locations:\n", matches[0].Name)
+	fmt.Fprintf(os.Stderr, "\nTemplate '%s' found in multiple locations:\n", matches[0].Name)
 	for i, m := range matches {
-		fmt.Printf("  [%d] %s\n", i+1, m.DisplayLocation())
+		fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, m.DisplayLocation())
 	}
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Printf("Select a template to %s (or 'c' to cancel): ", action)
+		fmt.Fprintf(os.Stderr, "Select a template to %s (or 'c' to cancel): ", action)
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("failed to read input: %w", err)
@@ -274,7 +260,7 @@ func PromptTemplateChoice(matches []TemplateMatch, action string) (*TemplateMatc
 
 		choice, err := strconv.Atoi(input)
 		if err != nil || choice < 1 || choice > len(matches) {
-			fmt.Printf("Invalid choice. Please enter 1-%d.\n", len(matches))
+			fmt.Fprintf(os.Stderr, "Invalid choice. Please enter 1-%d.\n", len(matches))
 			continue
 		}
 
@@ -298,16 +284,16 @@ func PromptTemplateChoiceWithAll(matches []TemplateMatch, action string) ([]Temp
 		return nil, fmt.Errorf("multiple templates found but running non-interactively; use --local, --hub, --project, or --global flags to specify")
 	}
 
-	fmt.Printf("\nTemplate '%s' found in multiple locations:\n", matches[0].Name)
+	fmt.Fprintf(os.Stderr, "\nTemplate '%s' found in multiple locations:\n", matches[0].Name)
 	for i, m := range matches {
-		fmt.Printf("  [%d] %s\n", i+1, m.DisplayLocation())
+		fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, m.DisplayLocation())
 	}
-	fmt.Printf("  [a] All of the above\n")
-	fmt.Println()
+	fmt.Fprintf(os.Stderr, "  [a] All of the above\n")
+	fmt.Fprintln(os.Stderr)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Printf("Select template(s) to %s (or 'c' to cancel): ", action)
+		fmt.Fprintf(os.Stderr, "Select template(s) to %s (or 'c' to cancel): ", action)
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("failed to read input: %w", err)
@@ -324,7 +310,7 @@ func PromptTemplateChoiceWithAll(matches []TemplateMatch, action string) ([]Temp
 
 		choice, err := strconv.Atoi(input)
 		if err != nil || choice < 1 || choice > len(matches) {
-			fmt.Printf("Invalid choice. Please enter 1-%d or 'a' for all.\n", len(matches))
+			fmt.Fprintf(os.Stderr, "Invalid choice. Please enter 1-%d or 'a' for all.\n", len(matches))
 			continue
 		}
 
@@ -398,38 +384,4 @@ func ResolveTemplateForDelete(ctx context.Context, name string, hubCtx *HubConte
 	}
 
 	return PromptTemplateChoiceWithAll(matches, "delete")
-}
-
-// FilterMatchesBySource filters matches to only local or only hub sources.
-func FilterMatchesBySource(matches []TemplateMatch, localOnly, hubOnly bool) []TemplateMatch {
-	if !localOnly && !hubOnly {
-		return matches
-	}
-
-	var filtered []TemplateMatch
-	for _, m := range matches {
-		if localOnly && m.IsLocal() {
-			filtered = append(filtered, m)
-		} else if hubOnly && m.IsHub() {
-			filtered = append(filtered, m)
-		}
-	}
-	return filtered
-}
-
-// FilterMatchesByScope filters matches to only project or only global scope.
-func FilterMatchesByScope(matches []TemplateMatch, projectOnly, globalOnly bool) []TemplateMatch {
-	if !projectOnly && !globalOnly {
-		return matches
-	}
-
-	var filtered []TemplateMatch
-	for _, m := range matches {
-		if projectOnly && m.IsProjectScoped() {
-			filtered = append(filtered, m)
-		} else if globalOnly && m.IsGlobal() {
-			filtered = append(filtered, m)
-		}
-	}
-	return filtered
 }

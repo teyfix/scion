@@ -6,14 +6,18 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/telemetry"
+	"github.com/GoogleCloudPlatform/scion/pkg/telemetrycontract"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -54,7 +58,6 @@ type inProgressSpan struct {
 type TelemetryHandler struct {
 	tracer       trace.Tracer
 	logger       *slog.Logger
-	redactor     *telemetry.Redactor
 	metricsDebug bool
 	spanStore    sync.Map // map[string]*inProgressSpan - keyed by spanKey
 
@@ -62,14 +65,17 @@ type TelemetryHandler struct {
 	aggregator *telemetry.Aggregator
 
 	// OnSessionEnd is called with the finalized session summary when a
-	// session-end event is processed. Set by the daemon to wire up Hub
-	// reporting without creating a circular dependency.
+	// session-end event is processed. Set by the hook command to wire up
+	// Hub reporting without creating a circular dependency.
 	OnSessionEnd func(summary telemetry.SessionSummary)
 
+	// SessionState, if set, persists the aggregator's state between hook
+	// invocations. Each `sciontool hook` run is a new process with a new
+	// handler, so without it a session's counts are lost between events.
+	SessionState SessionStateStore
+
 	// Metric instruments
-	tokensInput  metric.Int64Counter
-	tokensOutput metric.Int64Counter
-	tokensCached metric.Int64Counter
+	usageTokens  metric.Int64Counter // scion.usage.tokens{token_type} (design §3.5; replaces scion.hook.tokens.*)
 	toolCalls    metric.Int64Counter
 	toolDuration metric.Float64Histogram
 	sessionCount metric.Int64Counter
@@ -81,17 +87,28 @@ type TelemetryHandler struct {
 // If tp is nil, a noop tracer will be used.
 // If lp is non-nil, correlated log records will be emitted alongside spans.
 // If mp is non-nil, OTel metric instruments will be created for recording counters and histograms.
-func NewTelemetryHandler(tp trace.TracerProvider, lp otellog.LoggerProvider, redactor *telemetry.Redactor, mp ...metric.MeterProvider) *TelemetryHandler {
+func NewTelemetryHandler(tp trace.TracerProvider, lp otellog.LoggerProvider, _ *telemetry.Redactor, mp ...metric.MeterProvider) *TelemetryHandler {
+	return newTelemetryHandler(tp, lp, hookMetricScope, mp...)
+}
+
+// NewLifecycleTelemetryHandler gives init lifecycle metrics their own source
+// identity. Hook subprocesses keep the original instrumentation scope.
+func NewLifecycleTelemetryHandler(tp trace.TracerProvider, lp otellog.LoggerProvider, _ *telemetry.Redactor, mp ...metric.MeterProvider) *TelemetryHandler {
+	return newTelemetryHandler(tp, lp, telemetry.LifecycleMetricScope, mp...)
+}
+
+const hookMetricScope = "github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/handlers"
+
+func newTelemetryHandler(tp trace.TracerProvider, lp otellog.LoggerProvider, metricScope string, mp ...metric.MeterProvider) *TelemetryHandler {
 	var tracer trace.Tracer
 	if tp != nil {
-		tracer = tp.Tracer("github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/handlers")
+		tracer = tp.Tracer(hookMetricScope)
 	} else {
 		tracer = noop.NewTracerProvider().Tracer("noop")
 	}
 
 	h := &TelemetryHandler{
 		tracer:       tracer,
-		redactor:     redactor,
 		metricsDebug: telemetry.MetricsDebugEnabled(),
 		aggregator:   telemetry.NewAggregator(),
 	}
@@ -104,40 +121,24 @@ func NewTelemetryHandler(tp trace.TracerProvider, lp otellog.LoggerProvider, red
 
 	// Initialize metric instruments if a MeterProvider is given
 	if len(mp) > 0 && mp[0] != nil {
-		h.initMetrics(mp[0])
+		h.initMetrics(mp[0], metricScope)
 	}
 
 	return h
 }
 
 // initMetrics creates OTel metric instruments on the handler.
-func (h *TelemetryHandler) initMetrics(mp metric.MeterProvider) {
-	meter := mp.Meter("github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/handlers")
+func (h *TelemetryHandler) initMetrics(mp metric.MeterProvider, scope string) {
+	meter := mp.Meter(scope)
 
 	var err error
 
-	h.tokensInput, err = meter.Int64Counter("gen_ai.tokens.input",
+	h.usageTokens, err = meter.Int64Counter(telemetrycontract.MetricUsageTokens,
 		metric.WithUnit("{token}"),
-		metric.WithDescription("Number of input tokens consumed"),
+		metric.WithDescription("Tokens attributed to model requests, by token_type"),
 	)
 	if err != nil {
-		log.Error("Failed to create gen_ai.tokens.input counter: %v", err)
-	}
-
-	h.tokensOutput, err = meter.Int64Counter("gen_ai.tokens.output",
-		metric.WithUnit("{token}"),
-		metric.WithDescription("Number of output tokens generated"),
-	)
-	if err != nil {
-		log.Error("Failed to create gen_ai.tokens.output counter: %v", err)
-	}
-
-	h.tokensCached, err = meter.Int64Counter("gen_ai.tokens.cached",
-		metric.WithUnit("{token}"),
-		metric.WithDescription("Number of tokens served from cache"),
-	)
-	if err != nil {
-		log.Error("Failed to create gen_ai.tokens.cached counter: %v", err)
+		log.Error("Failed to create %s counter: %v", telemetrycontract.MetricUsageTokens, err)
 	}
 
 	h.toolCalls, err = meter.Int64Counter("agent.tool.calls",
@@ -164,12 +165,12 @@ func (h *TelemetryHandler) initMetrics(mp metric.MeterProvider) {
 		log.Error("Failed to create agent.session.count counter: %v", err)
 	}
 
-	h.apiCalls, err = meter.Int64Counter("gen_ai.api.calls",
+	h.apiCalls, err = meter.Int64Counter(telemetrycontract.MetricAPICalls,
 		metric.WithUnit("{call}"),
 		metric.WithDescription("Number of LLM API calls"),
 	)
 	if err != nil {
-		log.Error("Failed to create gen_ai.api.calls counter: %v", err)
+		log.Error("Failed to create %s counter: %v", telemetrycontract.MetricAPICalls, err)
 	}
 
 	h.apiDuration, err = meter.Float64Histogram("gen_ai.api.duration",
@@ -193,8 +194,8 @@ func (h *TelemetryHandler) Handle(event *hooks.Event) error {
 
 	if h.metricsDebug && isMetricRelevantEvent(event.Name) {
 		log.TaggedInfo("metrics",
-			"normalized hook event=%s raw=%s dialect=%s input_tokens=%d output_tokens=%d cached_tokens=%d success=%t error=%q",
-			event.Name, event.RawName, event.Dialect, event.Data.InputTokens, event.Data.OutputTokens, event.Data.CachedTokens, event.Data.Success, event.Data.Error)
+			"normalized hook event=%s dialect=%s input_tokens=%d output_tokens=%d cached_tokens=%d success=%t has_error=%t",
+			event.Name, event.Dialect, event.Data.InputTokens, event.Data.OutputTokens, event.Data.CachedTokens, event.Data.Success, event.Data.Error != "")
 	}
 
 	spanName, ok := SpanMapping[event.Name]
@@ -320,7 +321,7 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 	}
 
 	attrs := []slog.Attr{
-		slog.String("event.name", event.Name),
+		slog.String("event.name", spanName),
 	}
 
 	if event.RawName != "" {
@@ -330,38 +331,22 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 		attrs = append(attrs, slog.String("event.dialect", event.Dialect))
 	}
 	if event.Data.SessionID != "" {
-		val := event.Data.SessionID
-		if h.redactor != nil && h.redactor.ShouldHash("session_id") {
-			val = telemetry.HashValue(val)
-		}
-		attrs = append(attrs, slog.String("session_id", val))
+		attrs = append(attrs, slog.String("session_id", event.Data.SessionID))
 	}
 	if event.Data.ToolName != "" {
 		attrs = append(attrs, slog.String("tool_name", event.Data.ToolName))
 	}
 	if event.Data.ToolInput != "" {
-		val := event.Data.ToolInput
-		if h.redactor != nil && h.redactor.ShouldRedact("tool_input") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, slog.String("tool_input", val))
+		attrs = append(attrs, slog.String("tool_input", event.Data.ToolInput))
 	}
 	if event.Data.ToolOutput != "" {
-		val := event.Data.ToolOutput
-		if h.redactor != nil && h.redactor.ShouldRedact("tool_output") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, slog.String("tool_output", val))
+		attrs = append(attrs, slog.String("tool_output", event.Data.ToolOutput))
 	}
 	if event.Data.FilePath != "" {
 		attrs = append(attrs, slog.String("file_path", event.Data.FilePath))
 	}
 	if event.Data.Prompt != "" {
-		val := event.Data.Prompt
-		if h.redactor != nil && h.redactor.ShouldRedact("prompt") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, slog.String("prompt", val))
+		attrs = append(attrs, slog.String("prompt", event.Data.Prompt))
 	}
 	if event.Data.Source != "" {
 		attrs = append(attrs, slog.String("source", event.Data.Source))
@@ -371,6 +356,9 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 	}
 	if event.Data.Message != "" {
 		attrs = append(attrs, slog.String("message", event.Data.Message))
+	}
+	if model := payloadModel(event); model != "" {
+		attrs = append(attrs, slog.String(telemetrycontract.ModelLabel, model))
 	}
 	if event.Data.Success {
 		attrs = append(attrs, slog.Bool("success", true))
@@ -393,8 +381,12 @@ func (h *TelemetryHandler) emitLogRecord(ctx context.Context, event *hooks.Event
 
 // eventToAttributes converts event data to span attributes.
 func (h *TelemetryHandler) eventToAttributes(event *hooks.Event) []attribute.KeyValue {
+	eventName := SpanMapping[event.Name]
+	if eventName == "" {
+		eventName = event.Name
+	}
 	attrs := []attribute.KeyValue{
-		attribute.String("event.name", event.Name),
+		attribute.String("event.name", eventName),
 	}
 
 	if event.RawName != "" {
@@ -406,11 +398,7 @@ func (h *TelemetryHandler) eventToAttributes(event *hooks.Event) []attribute.Key
 
 	// Add data fields with redaction
 	if event.Data.SessionID != "" {
-		val := event.Data.SessionID
-		if h.redactor != nil && h.redactor.ShouldHash("session_id") {
-			val = telemetry.HashValue(val)
-		}
-		attrs = append(attrs, attribute.String("session_id", val))
+		attrs = append(attrs, attribute.String("session_id", event.Data.SessionID))
 	}
 
 	if event.Data.ToolName != "" {
@@ -418,19 +406,11 @@ func (h *TelemetryHandler) eventToAttributes(event *hooks.Event) []attribute.Key
 	}
 
 	if event.Data.ToolInput != "" {
-		val := event.Data.ToolInput
-		if h.redactor != nil && h.redactor.ShouldRedact("tool_input") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, attribute.String("tool_input", val))
+		attrs = append(attrs, attribute.String("tool_input", event.Data.ToolInput))
 	}
 
 	if event.Data.ToolOutput != "" {
-		val := event.Data.ToolOutput
-		if h.redactor != nil && h.redactor.ShouldRedact("tool_output") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, attribute.String("tool_output", val))
+		attrs = append(attrs, attribute.String("tool_output", event.Data.ToolOutput))
 	}
 
 	if event.Data.FilePath != "" {
@@ -438,11 +418,7 @@ func (h *TelemetryHandler) eventToAttributes(event *hooks.Event) []attribute.Key
 	}
 
 	if event.Data.Prompt != "" {
-		val := event.Data.Prompt
-		if h.redactor != nil && h.redactor.ShouldRedact("prompt") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, attribute.String("prompt", val))
+		attrs = append(attrs, attribute.String("prompt", event.Data.Prompt))
 	}
 
 	if event.Data.Source != "" {
@@ -455,6 +431,10 @@ func (h *TelemetryHandler) eventToAttributes(event *hooks.Event) []attribute.Key
 
 	if event.Data.Message != "" {
 		attrs = append(attrs, attribute.String("message", event.Data.Message))
+	}
+
+	if model := payloadModel(event); model != "" {
+		attrs = append(attrs, attribute.String(telemetrycontract.ModelLabel, model))
 	}
 
 	return attrs
@@ -476,11 +456,7 @@ func (h *TelemetryHandler) eventToEndAttributes(event *hooks.Event, startTime ti
 
 	// Add tool output for end events
 	if event.Data.ToolOutput != "" {
-		val := event.Data.ToolOutput
-		if h.redactor != nil && h.redactor.ShouldRedact("tool_output") {
-			val = "[REDACTED]"
-		}
-		attrs = append(attrs, attribute.String("tool_output", val))
+		attrs = append(attrs, attribute.String("tool_output", event.Data.ToolOutput))
 	}
 
 	// Add token usage attributes
@@ -504,16 +480,61 @@ func (h *TelemetryHandler) metricAttrs() []attribute.KeyValue {
 		attrs = append(attrs, attribute.String("agent_id", v))
 	}
 	if v := os.Getenv("SCION_HARNESS"); v != "" {
-		attrs = append(attrs, attribute.String("harness", v))
+		attrs = append(attrs, attribute.String(telemetrycontract.HarnessLabel, v))
 	}
-	if v := os.Getenv("SCION_GROVE_ID"); v != "" {
-		attrs = append(attrs, attribute.String("grove_id", v))
-		attrs = append(attrs, attribute.String("project_id", v))
-	} else if v := os.Getenv("SCION_PROJECT_ID"); v != "" {
-		attrs = append(attrs, attribute.String("grove_id", v))
-		attrs = append(attrs, attribute.String("project_id", v))
+	projectID := projectkeys.ProjectIDFromEnv(os.Getenv)
+	if projectID != "" {
+		attrs = append(attrs, attribute.String("project_id", projectID))
 	}
 	return attrs
+}
+
+// usageHookRecordingEnabled reports whether this process should record
+// hook-sourced usage (gen_ai.api.calls and scion.usage.tokens). Per design
+// D4/D10 and §3.5 "Single source":
+//   - SCION_USAGE_SOURCE=hooks: this harness has opted in behind a
+//     fixture-backed PR, so hook usage is recorded;
+//   - SCION_USAGE_SOURCE=native: the native UsageDeriver owns usage instead,
+//     so hook usage is skipped;
+//   - unset (the vetting-gate default, D10): usage is skipped until a
+//     harness's provision.py explicitly declares a source.
+//
+// Tool, session, turn and every other hook metric, span and log is
+// unaffected by this gate (D4, narrow).
+func usageHookRecordingEnabled() bool {
+	v := os.Getenv("SCION_USAGE_SOURCE")
+	if v == "hooks" {
+		return true
+	}
+	// "native" is the expected value that intentionally suppresses hook usage
+	// (the deriver owns it); anything else non-empty is likely a provision.py
+	// typo (e.g. "HOOKS" or a trailing space) rather than a deliberate choice.
+	// The safe D10 default (no usage) still applies either way; this only
+	// makes an unrecognized value visible for debugging.
+	if v != "" && v != telemetry.UsageSourceNative {
+		log.Debug("SCION_USAGE_SOURCE=%q is not a recognized usage source (want \"hooks\" or \"native\"); hook usage stays suppressed", v)
+	}
+	return false
+}
+
+// hookModelLabel resolves the model label for a hook-sourced usage point
+// (design §3.2): the event payload's own model when the dialect mapped one,
+// then SCION_MODEL, then "unknown", truncated to 128 bytes. The native
+// UsageDeriver resolves through the same telemetrycontract helper.
+func hookModelLabel(event *hooks.Event) string {
+	return telemetrycontract.ResolveModelLabel(event.Data.Model, os.Getenv("SCION_MODEL"))
+}
+
+// payloadModel returns the event payload's own model (bounded like the
+// metric label), or "" when the payload carried none. Hook spans and logs
+// carry a model attribute only in that case: unlike the usage metrics, they
+// describe the event itself, so they never fall back to SCION_MODEL or
+// "unknown".
+func payloadModel(event *hooks.Event) string {
+	if strings.TrimSpace(event.Data.Model) == "" {
+		return ""
+	}
+	return telemetrycontract.ResolveModelLabel(event.Data.Model, "")
 }
 
 // recordEndMetrics records metrics when a paired end event completes.
@@ -543,28 +564,26 @@ func (h *TelemetryHandler) recordEndMetrics(event *hooks.Event, startEventType s
 		}
 
 	case hooks.EventModelStart:
-		if h.apiCalls != nil {
-			status := "success"
+		usageEnabled := usageHookRecordingEnabled()
+		if h.apiCalls != nil && usageEnabled {
+			status := telemetrycontract.StatusSuccess
 			if event.Data.Error != "" {
-				status = "error"
+				status = telemetrycontract.StatusError
 			}
-			attrs := baseAttrs
-			if model := os.Getenv("SCION_MODEL"); model != "" {
-				attrs = append(attrs, attribute.String("model", model))
-			}
-			attrs = append(attrs, attribute.String("status", status))
+			attrs := append(baseAttrs, attribute.String(telemetrycontract.ModelLabel, hookModelLabel(event)))
+			attrs = append(attrs, attribute.String(telemetrycontract.StatusLabel, status))
 			h.apiCalls.Add(ctx, 1, metric.WithAttributes(attrs...))
 		}
 		if h.apiDuration != nil {
-			attrs := baseAttrs
-			if model := os.Getenv("SCION_MODEL"); model != "" {
-				attrs = append(attrs, attribute.String("model", model))
-			}
+			attrs := append(baseAttrs, attribute.String(telemetrycontract.ModelLabel, hookModelLabel(event)))
 			h.apiDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
 		}
 
-		// Record token usage from model-end events
-		h.recordTokenMetrics(ctx, event, baseAttrs)
+		// Record token usage from model-end events, subject to the same
+		// usage-source gate as gen_ai.api.calls above (design §3.5).
+		if usageEnabled {
+			h.recordTokenMetrics(ctx, event)
+		}
 	}
 }
 
@@ -591,58 +610,98 @@ func (h *TelemetryHandler) recordUnpairedEndMetrics(event *hooks.Event, startEve
 		}
 
 	case hooks.EventModelStart:
-		if h.apiCalls != nil {
-			status := "success"
+		usageEnabled := usageHookRecordingEnabled()
+		if h.apiCalls != nil && usageEnabled {
+			status := telemetrycontract.StatusSuccess
 			if event.Data.Error != "" {
-				status = "error"
+				status = telemetrycontract.StatusError
 			}
-			attrs := baseAttrs
-			if model := os.Getenv("SCION_MODEL"); model != "" {
-				attrs = append(attrs, attribute.String("model", model))
-			}
-			attrs = append(attrs, attribute.String("status", status))
+			attrs := append(baseAttrs, attribute.String(telemetrycontract.ModelLabel, hookModelLabel(event)))
+			attrs = append(attrs, attribute.String(telemetrycontract.StatusLabel, status))
 			h.apiCalls.Add(ctx, 1, metric.WithAttributes(attrs...))
 		}
 
-		// Record token usage from model-end events
-		h.recordTokenMetrics(ctx, event, baseAttrs)
+		// Record token usage from model-end events, subject to the same
+		// usage-source gate as gen_ai.api.calls above (design §3.5).
+		if usageEnabled {
+			h.recordTokenMetrics(ctx, event)
+		}
 	}
 }
 
-// recordTokenMetrics records token usage counters from an event's token fields.
-func (h *TelemetryHandler) recordTokenMetrics(ctx context.Context, event *hooks.Event, baseAttrs []attribute.KeyValue) {
-	attrs := baseAttrs
-	if model := os.Getenv("SCION_MODEL"); model != "" {
-		attrs = append(attrs, attribute.String("model", model))
+// toOTelAttrs converts contract label pairs into OTel attributes,
+// preallocated to the input length.
+func toOTelAttrs(kvs []telemetrycontract.LabelKV) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, len(kvs))
+	for i, kv := range kvs {
+		attrs[i] = attribute.String(kv.Key, kv.Value)
 	}
+	return attrs
+}
+
+// recordTokenMetrics records token usage counters from an event's token
+// fields. Unlike gen_ai.api.calls (which keeps agent_id/project_id for
+// descriptor compatibility, design §3.2), scion.usage.tokens's producer
+// label set is exactly harness, model and token_type -- nothing else. The
+// GCP allowlist for this one metric is cloudUsageTokenFields, narrower than
+// the general hook-counter allowlist cloudPointFields
+// (gcp_metric_identity.go): a point carrying any other key, such as
+// agent_id or project_id, gets the whole OTLP request rejected. This builds
+// its attribute set from telemetrycontract.UsageTokenPointAttrs instead of
+// taking baseAttrs from the caller -- the same helper the admission
+// regression test in pkg/sciontool/telemetry uses, so the two can't drift
+// apart.
+func (h *TelemetryHandler) recordTokenMetrics(ctx context.Context, event *hooks.Event) {
+	if h.usageTokens == nil {
+		return
+	}
+
+	attrs := toOTelAttrs(telemetrycontract.UsageTokenPointAttrs(os.Getenv("SCION_HARNESS"), hookModelLabel(event)))
 
 	recorded := false
+	record := func(tokenType string, n int64) {
+		if n <= 0 {
+			return
+		}
+		// Built fresh on every call: appending onto a shared prefix's spare
+		// capacity would be safe only as long as metric.WithAttributes
+		// copies synchronously before the next call -- an easy invariant to
+		// break later, so this avoids depending on it.
+		pointAttrs := make([]attribute.KeyValue, len(attrs), len(attrs)+1)
+		copy(pointAttrs, attrs)
+		pointAttrs = append(pointAttrs, attribute.String(telemetrycontract.TokenTypeLabel, tokenType))
+		h.usageTokens.Add(ctx, n, metric.WithAttributes(pointAttrs...))
+		recorded = true
+	}
 
-	if h.tokensInput != nil && event.Data.InputTokens > 0 {
-		h.tokensInput.Add(ctx, event.Data.InputTokens, metric.WithAttributes(attrs...))
-		recorded = true
-	}
-	if h.tokensOutput != nil && event.Data.OutputTokens > 0 {
-		h.tokensOutput.Add(ctx, event.Data.OutputTokens, metric.WithAttributes(attrs...))
-		recorded = true
-	}
-	if h.tokensCached != nil && event.Data.CachedTokens > 0 {
-		h.tokensCached.Add(ctx, event.Data.CachedTokens, metric.WithAttributes(attrs...))
-		recorded = true
-	}
+	// scion.hook.tokens.{input,output,cached} is replaced by a single
+	// scion.usage.tokens counter with a token_type attribute (design §3.5).
+	// "cached" maps to the canonical "cache_read" (design §3.2/§3.5).
+	record(telemetrycontract.TokenTypeInput, event.Data.InputTokens)
+	record(telemetrycontract.TokenTypeOutput, event.Data.OutputTokens)
+	record(telemetrycontract.TokenTypeCacheRead, event.Data.CachedTokens)
+	record(telemetrycontract.TokenTypeCacheWrite, event.Data.CacheWriteTokens)
+	// Reasoning is informational only: design §3.2 defines canonical
+	// "output" as generated tokens *including* reasoning, and a source that
+	// reports ReasoningTokens separately already includes it in
+	// event.Data.OutputTokens too. So this is recorded as its own
+	// token_type for visibility, but never added into TokenTypeOutput
+	// above, which would double count it against the total.
+	record(telemetrycontract.TokenTypeReasoning, event.Data.ReasoningTokens)
 
 	if h.metricsDebug {
 		if recorded {
 			log.TaggedInfo("metrics",
-				"recorded token metrics for event=%s input=%d output=%d cached=%d",
-				event.Name, event.Data.InputTokens, event.Data.OutputTokens, event.Data.CachedTokens)
+				"recorded token metrics for event=%s input=%d output=%d cached=%d cache_write=%d reasoning=%d",
+				event.Name, event.Data.InputTokens, event.Data.OutputTokens, event.Data.CachedTokens, event.Data.CacheWriteTokens, event.Data.ReasoningTokens)
 		} else if event.Name == hooks.EventModelEnd || event.Name == hooks.EventSessionEnd {
 			log.TaggedInfo("metrics", "no token metrics recorded for event=%s (no token fields present)", event.Name)
 		}
 	}
 }
 
-// recordSessionMetrics records session counters and any cumulative token usage on session end.
+// recordSessionMetrics records session completion. Session-end token totals
+// overlap model-end increments, so they are omitted from normalized counters.
 func (h *TelemetryHandler) recordSessionMetrics(event *hooks.Event) {
 	ctx := context.Background()
 	baseAttrs := h.metricAttrs()
@@ -656,8 +715,6 @@ func (h *TelemetryHandler) recordSessionMetrics(event *hooks.Event) {
 		h.sessionCount.Add(ctx, 1, metric.WithAttributes(sessionAttrs...))
 	}
 
-	// Record cumulative token usage if reported on session-end
-	h.recordTokenMetrics(ctx, event, baseAttrs)
 }
 
 // Flush ends any in-progress spans. Called during shutdown.
@@ -672,43 +729,170 @@ func (h *TelemetryHandler) Flush() {
 	})
 }
 
-// updateAggregator feeds event data into the in-memory aggregator that
-// accumulates session-level metrics for Hub reporting.
+// updateAggregator feeds event data into the aggregator that accumulates
+// session-level metrics for Hub reporting, and calls OnSessionEnd when a
+// session ends.
+//
+// With SessionState set, the aggregator's state is loaded before the event
+// is applied and saved after it, under the store's lock, so that the
+// per-invocation hook processes share one session's counts. OnSessionEnd is
+// called after the lock is released.
 func (h *TelemetryHandler) updateAggregator(event *hooks.Event) {
 	if h.aggregator == nil {
 		return
 	}
 
-	switch event.Name {
-	case hooks.EventSessionStart:
-		h.aggregator.StartSession(event.Data.SessionID)
+	update, ok := aggregatorUpdates[event.Name]
+	if !ok {
+		return
+	}
 
-	case hooks.EventToolEnd:
-		h.aggregator.RecordToolEnd(event.Data.ToolName, event.Data.Error)
+	var summary telemetry.SessionSummary
+	var ended bool
+	apply := func() (telemetry.SessionSummary, bool) {
+		summary, ended = update(h.aggregator, event)
+		return summary, ended
+	}
+	held := false
+	if h.SessionState != nil {
+		if err := h.SessionState.Update(h.aggregator, event, apply); errors.Is(err, ErrSessionReportHeld) {
+			// The init daemon or a later hook process sends the report
+			// once late native usage has been added to it.
+			held = true
+			log.Info("Session metrics for session %s held for late native usage", summary.SessionID)
+		} else if err != nil {
+			log.Error("Session metrics state: %v", err)
+			if ended && errors.Is(err, ErrSessionStateUnavailable) {
+				// The summary was built without the session's persisted
+				// counts; reporting it would send a near-empty summary.
+				log.Error("Session metrics for session %s not reported: state unavailable", event.Data.SessionID)
+				return
+			}
+		}
+	} else {
+		apply()
+	}
 
-	case hooks.EventModelEnd:
-		h.aggregator.RecordModelEnd(
-			event.Data.InputTokens,
-			event.Data.OutputTokens,
-			event.Data.CachedTokens,
-			event.Data.ReasoningTokens,
-		)
+	pending, _ := h.SessionState.(PendingReportStore)
+	if ended && !held {
+		if h.OnSessionEnd != nil {
+			h.OnSessionEnd(summary)
+		}
+		if pending != nil {
+			// The send was attempted (or there is no Hub to send to):
+			// the pending report Update kept is done.
+			if err := pending.CompleteReport(summary); err != nil {
+				log.Error("Session metrics: cannot clear the pending report for session %s: %v", summary.SessionID, err)
+			}
+		}
+	}
+	if pending != nil && h.OnSessionEnd != nil {
+		h.sendAbandonedReports(pending)
+	}
+}
 
-	case hooks.EventAgentEnd:
-		h.aggregator.RecordTurn()
+// PendingReportStore is implemented by a SessionStateStore that keeps a
+// finalized summary until its send is confirmed (FileSessionState). See
+// session_state_pending.go.
+type PendingReportStore interface {
+	// ClaimAbandonedReports claims the pending reports whose sender died
+	// before confirming them.
+	ClaimAbandonedReports() ([]telemetry.SessionSummary, error)
+	// CompleteReport confirms that the send of a report claimed by this
+	// process was attempted.
+	// The report is identified by the summary's session ID and start
+	// time (one segment of the session).
+	CompleteReport(summary telemetry.SessionSummary) error
+}
 
-	case hooks.EventSessionEnd:
-		summary := h.aggregator.Finalize(
+// sendAbandonedReports sends, through OnSessionEnd, the session reports
+// whose sender (an earlier hook process, or the init daemon) died before
+// confirming them, and confirms each attempt.
+func (h *TelemetryHandler) sendAbandonedReports(pending PendingReportStore) {
+	claimed, err := pending.ClaimAbandonedReports()
+	if err != nil {
+		log.Error("Session metrics: cannot check for unsent reports: %v", err)
+		return
+	}
+	for _, s := range claimed {
+		log.Info("Session metrics: sending the unsent report for session %s", s.SessionID)
+		h.OnSessionEnd(s)
+		if err := pending.CompleteReport(s); err != nil {
+			log.Error("Session metrics: cannot clear the pending report for session %s: %v", s.SessionID, err)
+		}
+	}
+}
+
+// aggregatorUpdate applies one event to the aggregator. For session-end it
+// returns the finalized summary and true.
+type aggregatorUpdate func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool)
+
+// observed wraps an update for an event that feeds the summary. Such events
+// also carry the session ID; observing it first means a missed session-start
+// does not leave the summary without an ID or start time (the session-end
+// event itself usually has the ID). Session-start, lifecycle and other
+// events are not observed, so they cannot open a session ahead of the real
+// session-start.
+//
+// ObserveSession and the Record*/Finalize call that follows take the
+// aggregator's lock separately. That is safe only because events reach a
+// handler one at a time: HarnessProcessor.dispatchEvent and
+// LifecycleManager.runHooks both dispatch serially. Across hook processes,
+// SessionState's file lock covers the whole load, update and save.
+func observed(update aggregatorUpdate) aggregatorUpdate {
+	return func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool) {
+		a.ObserveSession(event.Data.SessionID)
+		return update(a, event)
+	}
+}
+
+// noSummary is the result of an update that does not end the session.
+func noSummary() (telemetry.SessionSummary, bool) { return telemetry.SessionSummary{}, false }
+
+// aggregatorUpdates is the single list of events that change the
+// aggregator, and how each does. updateAggregator persists state only for
+// events in it.
+var aggregatorUpdates = map[string]aggregatorUpdate{
+	hooks.EventSessionStart: func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool) {
+		a.StartSession(event.Data.SessionID)
+		return noSummary()
+	},
+	hooks.EventToolEnd: observed(func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool) {
+		a.RecordToolEnd(event.Data.ToolName, event.Data.Error)
+		return noSummary()
+	}),
+	// With SCION_USAGE_SOURCE=native, usage reaches the session from the
+	// native usage deriver instead (telemetry.HookUsageFeedsSessionMetrics),
+	// so model-end events then count neither the call nor its tokens.
+	hooks.EventModelEnd: observed(func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool) {
+		if telemetry.HookUsageFeedsSessionMetrics() {
+			a.RecordModelEnd(
+				event.Data.InputTokens,
+				event.Data.OutputTokens,
+				event.Data.CachedTokens,
+				event.Data.ReasoningTokens,
+			)
+		}
+		return noSummary()
+	}),
+	hooks.EventAgentEnd: observed(func(a *telemetry.Aggregator, _ *hooks.Event) (telemetry.SessionSummary, bool) {
+		a.RecordTurn()
+		return noSummary()
+	}),
+	// Session-end token totals override the accumulated tokens, so with
+	// native usage they are not passed: the natively derived tokens stand.
+	hooks.EventSessionEnd: observed(func(a *telemetry.Aggregator, event *hooks.Event) (telemetry.SessionSummary, bool) {
+		if !telemetry.HookUsageFeedsSessionMetrics() {
+			return a.Finalize(0, 0, 0, 0, event.Data.Error), true
+		}
+		return a.Finalize(
 			event.Data.InputTokens,
 			event.Data.OutputTokens,
 			event.Data.CachedTokens,
 			event.Data.ReasoningTokens,
 			event.Data.Error,
-		)
-		if h.OnSessionEnd != nil {
-			h.OnSessionEnd(summary)
-		}
-	}
+		), true
+	}),
 }
 
 func isMetricRelevantEvent(name string) bool {

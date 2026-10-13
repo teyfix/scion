@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
@@ -48,6 +49,20 @@ func (m *hubDefaultsCapturingManager) Provision(ctx context.Context, opts api.St
 	return &api.ScionConfig{Harness: "claude", HarnessConfig: "claude"}, nil
 }
 
+func (m *hubDefaultsCapturingManager) Preflight(ctx context.Context, opts api.StartOptions) error {
+	return nil
+}
+
+func (m *hubDefaultsCapturingManager) CleanupLaunch(ctx context.Context, handles []agent.ResourceHandle) error {
+	return nil
+}
+
+func (m *hubDefaultsCapturingManager) Reprovision(ctx context.Context, opts api.StartOptions) (*api.ScionConfig, error) {
+	m.provisionCalled = true
+	m.seenOnContext = api.HubAgentDefaultsFromContext(ctx)
+	return &api.ScionConfig{Harness: "claude", HarnessConfig: "claude"}, nil
+}
+
 func newHubDefaultsWiringServer() (*Server, *hubDefaultsCapturingManager) {
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
@@ -55,7 +70,7 @@ func newHubDefaultsWiringServer() (*Server, *hubDefaultsCapturingManager) {
 	cfg.ForceRuntime = "mock"
 
 	mgr := &hubDefaultsCapturingManager{}
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr
 }

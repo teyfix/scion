@@ -330,9 +330,7 @@ export class ScionRoleBindingAssignmentForm extends LitElement {
         <div class="form-group">
           <label>Principal</label>
           <div class="locked-principal">
-            <sl-icon
-              name=${this.lockedPrincipalType === 'user' ? 'person' : 'cpu'}
-            ></sl-icon>
+            <sl-icon name=${this.lockedPrincipalType === 'user' ? 'person' : 'cpu'}></sl-icon>
             <span>${this.lockedPrincipalType}: ${this.lockedPrincipalId}</span>
             <sl-icon name="lock" style="margin-left: auto;"></sl-icon>
           </div>
@@ -367,7 +365,7 @@ export class ScionRoleBindingAssignmentForm extends LitElement {
       </div>
       <div class="form-group">
         <scion-principal-picker
-          .principalType=${this._principalType as 'user' | 'agent' | 'group'}
+          .principalType=${this._principalType}
           ?disabled=${this.disabled}
           @principal-change=${(e: CustomEvent<PrincipalChangeDetail>) => {
             this._principalId = e.detail.principalId;
@@ -417,8 +415,8 @@ export class ScionRoleBindingAssignmentForm extends LitElement {
       ${(this.lockedPrincipalType || this._principalType) === 'agent' && !this.agentDisabled
         ? html`<p class="agent-scope-note">
             <sl-icon name="info-circle"></sl-icon>
-            Agents are project-bound. This binding is effective only within the
-            specified project scope.
+            Agents are project-bound. This binding is effective only within the specified project
+            scope.
           </p>`
         : nothing}
     `;
@@ -441,9 +439,7 @@ export class ScionRoleBindingAssignmentForm extends LitElement {
           }}
         >
           ${this._filteredRoles.length === 0
-            ? html`<sl-option value="" disabled
-                >No roles available for this scope</sl-option
-              >`
+            ? html`<sl-option value="" disabled>No roles available for this scope</sl-option>`
             : this._filteredRoles.map(
                 (role) => html`
                   <sl-option value=${role.id}>

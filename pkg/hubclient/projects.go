@@ -16,7 +16,6 @@ package hubclient
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"time"
@@ -67,6 +66,14 @@ type ProjectService interface {
 
 	// UpdateSettings updates project settings.
 	UpdateSettings(ctx context.Context, projectID string, settings *ProjectSettings) (*ProjectSettings, error)
+
+	// GetResolvedSettings retrieves the per-setting report of project
+	// annotations and hub defaults (GET /settings/resolved).
+	GetResolvedSettings(ctx context.Context, projectID string) (*ResolvedProjectSettings, error)
+
+	// UpdateGCPIdentityDefaults writes only the default GCP identity fields
+	// of the project settings; every other setting keeps its stored value.
+	UpdateGCPIdentityDefaults(ctx context.Context, projectID string, update *ProjectGCPIdentityDefaultsUpdate) (*ProjectSettings, error)
 
 	// RefreshCache triggers a cache refresh for a linked project.
 	// The hub pulls the workspace from a connected provider broker.
@@ -123,27 +130,12 @@ type BrokerInfo struct {
 
 // RegisterProjectResponse is the response from registering a project.
 type RegisterProjectResponse struct {
-	Project       *Project       `json:"project"`
-	LegacyProject *Project       `json:"grove,omitempty"`       // Legacy alias for compatibility
-	Broker        *RuntimeBroker `json:"broker,omitempty"`      // Populated if brokerId or broker provided
-	Created       bool           `json:"created"`               // True if project was newly created
-	Matches       []ProjectMatch `json:"matches,omitempty"`     // Populated when multiple projects share the same git remote
-	BrokerToken   string         `json:"brokerToken,omitempty"` // DEPRECATED: use two-phase registration
-	SecretKey     string         `json:"secretKey,omitempty"`   // DEPRECATED: secrets only from /brokers/join
-}
-
-// UnmarshalJSON implements custom unmarshaling to support legacy grove field.
-func (r *RegisterProjectResponse) UnmarshalJSON(data []byte) error {
-	type alias RegisterProjectResponse
-	var aux alias
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	*r = RegisterProjectResponse(aux)
-	if r.Project == nil && r.LegacyProject != nil {
-		r.Project = r.LegacyProject
-	}
-	return nil
+	Project     *Project       `json:"project"`
+	Broker      *RuntimeBroker `json:"broker,omitempty"`      // Populated if brokerId or broker provided
+	Created     bool           `json:"created"`               // True if project was newly created
+	Matches     []ProjectMatch `json:"matches,omitempty"`     // Populated when multiple projects share the same git remote
+	BrokerToken string         `json:"brokerToken,omitempty"` // DEPRECATED: use two-phase registration
+	SecretKey   string         `json:"secretKey,omitempty"`   // DEPRECATED: secrets only from /brokers/join
 }
 
 // ProjectMatch holds summary information about a project for disambiguation.
@@ -155,11 +147,16 @@ type ProjectMatch struct {
 
 // CreateProjectRequest is the request for creating a project without a broker.
 type CreateProjectRequest struct {
-	ID        string            `json:"id,omitempty"`
-	Slug      string            `json:"slug,omitempty"`
-	Name      string            `json:"name"`
-	GitRemote string            `json:"gitRemote,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Slug      string `json:"slug,omitempty"`
+	Name      string `json:"name"`
+	GitRemote string `json:"gitRemote,omitempty"`
+	// WorkspaceMode is the create-only workspace sharing mode: "shared",
+	// "per-agent" or "worktree-per-agent" (git only). On a project without a
+	// git remote, "per-agent" gives each agent an empty private directory.
+	// The hub validates the value; empty means the server default.
+	WorkspaceMode string            `json:"workspaceMode,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
 }
 
 // UpdateProjectRequest is the request for updating a project.
@@ -235,24 +232,18 @@ func (s *projectService) List(ctx context.Context, opts *ListProjectsOptions) (*
 	}
 
 	type listResponse struct {
-		Projects       []Project `json:"projects"`
-		LegacyProjects []Project `json:"groves,omitempty"`
-		NextCursor     string    `json:"nextCursor,omitempty"`
-		TotalCount     int       `json:"totalCount,omitempty"`
+		Projects   []Project `json:"projects"`
+		NextCursor string    `json:"nextCursor,omitempty"`
+		TotalCount int       `json:"totalCount,omitempty"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
 
-	projects := result.Projects
-	if len(projects) == 0 && len(result.LegacyProjects) > 0 {
-		projects = result.LegacyProjects
-	}
-
 	return &ListProjectsResponse{
-		Projects: projects,
+		Projects: result.Projects,
 		Page: apiclient.PageResult{
 			NextCursor: result.NextCursor,
 			TotalCount: result.TotalCount,
@@ -266,7 +257,7 @@ func (s *projectService) Get(ctx context.Context, projectID string) (*Project, e
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
 // Register registers a project (upsert based on git remote).
@@ -275,7 +266,7 @@ func (s *projectService) Register(ctx context.Context, req *RegisterProjectReque
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[RegisterProjectResponse](resp)
+	return apiclient.DecodeRequired[RegisterProjectResponse](resp)
 }
 
 // Create creates a project without a contributing broker.
@@ -284,7 +275,7 @@ func (s *projectService) Create(ctx context.Context, req *CreateProjectRequest) 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
 // Update updates project metadata.
@@ -293,7 +284,7 @@ func (s *projectService) Update(ctx context.Context, projectID string, req *Upda
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
 // Delete removes a project and all its agents.
@@ -319,6 +310,21 @@ func (s *projectService) ListAgents(ctx context.Context, projectID string, opts 
 		for k, v := range opts.Labels {
 			query.Add("label", fmt.Sprintf("%s=%s", k, v))
 		}
+		if opts.OwnerID != "" {
+			query.Set("ownerId", opts.OwnerID)
+		}
+		if opts.AncestorID != "" {
+			query.Set("ancestorId", opts.AncestorID)
+		}
+		if opts.HarnessConfig != "" {
+			query.Set("harnessConfig", opts.HarnessConfig)
+		}
+		for _, id := range opts.IDs {
+			query.Add("id", id)
+		}
+		if opts.LineageRootID != "" {
+			query.Set("lineageRootId", opts.LineageRootID)
+		}
 		opts.Page.ToQuery(query)
 	}
 
@@ -333,7 +339,7 @@ func (s *projectService) ListAgents(ctx context.Context, projectID string, opts 
 		TotalCount int     `json:"totalCount,omitempty"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +359,7 @@ func (s *projectService) ListProviders(ctx context.Context, projectID string) (*
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListProvidersResponse](resp)
+	return apiclient.DecodeRequired[ListProvidersResponse](resp)
 }
 
 // AddProvider adds a broker as a provider to a project.
@@ -362,7 +368,7 @@ func (s *projectService) AddProvider(ctx context.Context, projectID string, req 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[AddProviderResponse](resp)
+	return apiclient.DecodeRequired[AddProviderResponse](resp)
 }
 
 // RemoveProvider removes a broker from a project.
@@ -380,16 +386,48 @@ func (s *projectService) GetSettings(ctx context.Context, projectID string) (*Pr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectSettings](resp)
+	return apiclient.DecodeRequired[ProjectSettings](resp)
 }
 
-// UpdateSettings updates project settings.
+// UpdateSettings updates project settings. The server merges the PUT
+// field by field: a field left out of the body, or sent as null, keeps its
+// stored value, and a field's empty value clears it. ProjectSettings drops
+// zero values (omitempty), so through this type only ActiveProfile
+// (pointer to ""), DefaultResources (pointer to an empty spec, sent as {})
+// and DefaultGCPIdentityServiceAccountIDByProfile (empty map, sent as {})
+// can be cleared; other fields cannot be cleared, and the tri-state fields
+// cannot be reset to inherit.
 func (s *projectService) UpdateSettings(ctx context.Context, projectID string, settings *ProjectSettings) (*ProjectSettings, error) {
 	resp, err := s.c.put(ctx, "/api/v1/projects/"+projectID+"/settings", settings, nil)
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectSettings](resp)
+	return apiclient.DecodeRequired[ProjectSettings](resp)
+}
+
+// GetResolvedSettings retrieves the per-setting report of project
+// annotations and hub defaults. It reports which layers carry a value; it
+// does not say which one wins.
+func (s *projectService) GetResolvedSettings(ctx context.Context, projectID string) (*ResolvedProjectSettings, error) {
+	resp, err := s.c.get(ctx, "/api/v1/projects/"+projectID+"/settings/resolved", nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ResolvedProjectSettings](resp)
+}
+
+// UpdateGCPIdentityDefaults sends a settings PUT whose body carries only the
+// fields set in update. The server merges the PUT field by field, so every
+// field the body leaves out, identity or not, keeps its stored value.
+func (s *projectService) UpdateGCPIdentityDefaults(ctx context.Context, projectID string, update *ProjectGCPIdentityDefaultsUpdate) (*ProjectSettings, error) {
+	if update == nil {
+		update = &ProjectGCPIdentityDefaultsUpdate{}
+	}
+	resp, err := s.c.put(ctx, "/api/v1/projects/"+projectID+"/settings", update, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ProjectSettings](resp)
 }
 
 // GetAgent returns an agent by ID or slug within a project.
@@ -398,24 +436,12 @@ func (s *projectService) GetAgent(ctx context.Context, projectID, agentID string
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // DeleteAgent removes an agent by ID or slug within a project.
 func (s *projectService) DeleteAgent(ctx context.Context, projectID, agentID string, opts *DeleteAgentOptions) error {
-	path := "/api/v1/projects/" + projectID + "/agents/" + agentID
-	if opts != nil {
-		query := url.Values{}
-		if opts.DeleteFiles {
-			query.Set("deleteFiles", "true")
-		}
-		if opts.RemoveBranch {
-			query.Set("removeBranch", "true")
-		}
-		if len(query) > 0 {
-			path += "?" + query.Encode()
-		}
-	}
+	path := withDeleteAgentQuery("/api/v1/projects/"+projectID+"/agents/"+agentID, opts)
 
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {
@@ -433,36 +459,6 @@ type ProjectCacheRefreshResponse struct {
 	CachedAt   time.Time `json:"cachedAt"`
 }
 
-// MarshalJSON implements custom marshaling to support legacy groveId field.
-func (r ProjectCacheRefreshResponse) MarshalJSON() ([]byte, error) {
-	type Alias ProjectCacheRefreshResponse
-	return json.Marshal(&struct {
-		Alias
-		GroveID string `json:"groveId"`
-	}{
-		Alias:   Alias(r),
-		GroveID: r.ProjectID,
-	})
-}
-
-// UnmarshalJSON implements custom unmarshaling to support legacy groveId field.
-func (r *ProjectCacheRefreshResponse) UnmarshalJSON(data []byte) error {
-	type Alias ProjectCacheRefreshResponse
-	aux := &struct {
-		GroveID string `json:"groveId"`
-		*Alias
-	}{
-		Alias: (*Alias)(r),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	if r.ProjectID == "" && aux.GroveID != "" {
-		r.ProjectID = aux.GroveID
-	}
-	return nil
-}
-
 // ProjectCacheStatusResponse is the response for project cache status.
 type ProjectCacheStatusResponse struct {
 	ProjectID   string     `json:"projectId"`
@@ -473,43 +469,13 @@ type ProjectCacheStatusResponse struct {
 	LastRefresh *time.Time `json:"lastRefresh,omitempty"`
 }
 
-// MarshalJSON implements custom marshaling to support legacy groveId field.
-func (r ProjectCacheStatusResponse) MarshalJSON() ([]byte, error) {
-	type Alias ProjectCacheStatusResponse
-	return json.Marshal(&struct {
-		Alias
-		GroveID string `json:"groveId"`
-	}{
-		Alias:   Alias(r),
-		GroveID: r.ProjectID,
-	})
-}
-
-// UnmarshalJSON implements custom unmarshaling to support legacy groveId field.
-func (r *ProjectCacheStatusResponse) UnmarshalJSON(data []byte) error {
-	type Alias ProjectCacheStatusResponse
-	aux := &struct {
-		GroveID string `json:"groveId"`
-		*Alias
-	}{
-		Alias: (*Alias)(r),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	if r.ProjectID == "" && aux.GroveID != "" {
-		r.ProjectID = aux.GroveID
-	}
-	return nil
-}
-
 // RefreshCache triggers a cache refresh for a linked project.
 func (s *projectService) RefreshCache(ctx context.Context, projectID string) (*ProjectCacheRefreshResponse, error) {
 	resp, err := s.c.post(ctx, "/api/v1/projects/"+projectID+"/workspace/cache/refresh", nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectCacheRefreshResponse](resp)
+	return apiclient.DecodeRequired[ProjectCacheRefreshResponse](resp)
 }
 
 // GetCacheStatus returns the cache status for a project workspace.
@@ -518,7 +484,7 @@ func (s *projectService) GetCacheStatus(ctx context.Context, projectID string) (
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectCacheStatusResponse](resp)
+	return apiclient.DecodeRequired[ProjectCacheStatusResponse](resp)
 }
 
 // Clone creates a new project seeded from an existing project's configuration.
@@ -527,5 +493,5 @@ func (s *projectService) Clone(ctx context.Context, sourceID string, req ClonePr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }

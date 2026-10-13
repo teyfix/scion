@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
@@ -67,22 +68,12 @@ func (s *MessageStore) WithPublisher(p MessagePublisher) *MessageStore {
 }
 
 func entMessageToStore(e *ent.Message) *store.Message {
-	// Read-time visibility backfill (design §4.6):
-	// Old rows have empty visibility. Normalise so every consumer sees a
-	// consistent value without requiring a data migration.
-	vis := e.Visibility
-	if vis == "" {
-		if e.Type == "assistant-reply" {
-			vis = "verbose"
-		} else {
-			vis = "normal"
-		}
-	}
-
 	var conversationID string
 	if e.ConversationID != nil {
 		conversationID = e.ConversationID.String()
 	}
+	senderProjectID := uuidPtrToStringPtr(e.SenderProjectID)
+	recipientProjectID := uuidPtrToStringPtr(e.RecipientProjectID)
 
 	return &store.Message{
 		ID:                    e.ID.String(),
@@ -101,12 +92,23 @@ func entMessageToStore(e *ent.Message) *store.Message {
 		Channel:               e.Channel,
 		ThreadID:              e.ThreadID,
 		ConversationID:        conversationID,
-		Visibility:            vis,
 		CreatedAt:             e.Created,
+		SenderProjectID:       senderProjectID,
+		RecipientProjectID:    recipientProjectID,
 		DispatchState:         e.DispatchState,
 		DispatchedAt:          e.DispatchedAt,
 		DispatchFailureReason: e.DispatchFailureReason,
 	}
+}
+
+// uuidPtrToStringPtr converts a nullable UUID column to the nullable string
+// form used by store models.
+func uuidPtrToStringPtr(u *uuid.UUID) *string {
+	if u == nil {
+		return nil
+	}
+	v := u.String()
+	return &v
 }
 
 // CreateMessage persists a new message and announces it via the publisher.
@@ -151,10 +153,22 @@ func (s *MessageStore) CreateMessage(ctx context.Context, msg *store.Message) er
 		}
 		create.SetConversationID(cid)
 	}
-	if msg.Visibility != "" {
-		create.SetVisibility(msg.Visibility)
+	// Cross-project provenance (ptone/scion#2282). An absent or empty stamp
+	// persists as NULL; a malformed one is rejected like any other bad ID.
+	if msg.SenderProjectID != nil && *msg.SenderProjectID != "" {
+		spid, err := parseUUID(*msg.SenderProjectID)
+		if err != nil {
+			return err
+		}
+		create.SetSenderProjectID(spid)
 	}
-
+	if msg.RecipientProjectID != nil && *msg.RecipientProjectID != "" {
+		rpid, err := parseUUID(*msg.RecipientProjectID)
+		if err != nil {
+			return err
+		}
+		create.SetRecipientProjectID(rpid)
+	}
 	if msg.Type == "" {
 		create.SetType("instruction")
 	}
@@ -163,6 +177,11 @@ func (s *MessageStore) CreateMessage(ctx context.Context, msg *store.Message) er
 	}
 	if msg.DispatchedAt != nil {
 		create.SetDispatchedAt(*msg.DispatchedAt)
+	}
+	// A row may be born failed (e.g. a group member that is not
+	// deliverable), so its reason must persist with the same write.
+	if msg.DispatchFailureReason != nil {
+		create.SetDispatchFailureReason(*msg.DispatchFailureReason)
 	}
 	if !msg.CreatedAt.IsZero() {
 		create.SetCreated(msg.CreatedAt)
@@ -237,28 +256,30 @@ func (s *MessageStore) GetMessagesByIDs(ctx context.Context, ids []string) (map[
 // both the created timestamp and the message ID. Format: base64(RFC3339Nano + "," + uuid).
 // This avoids a DB round-trip on decode and makes pagination resilient to message deletion.
 func encodeCursor(created time.Time, id string) string {
-	raw := created.Format(time.RFC3339Nano) + "," + id
+	raw := created.UTC().Format(time.RFC3339Nano) + "," + id
 	return base64.URLEncoding.EncodeToString([]byte(raw))
 }
 
 // decodeCursor is the inverse of encodeCursor. It returns the created timestamp and UUID
 // embedded in the cursor, or an error if the cursor is malformed.
 func decodeCursor(cursor string) (time.Time, uuid.UUID, error) {
+	// Every failure wraps store.ErrInvalidInput: a malformed cursor is caller
+	// error, which the hub maps to HTTP 400 rather than 500.
 	raw, err := base64.URLEncoding.DecodeString(cursor)
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("base64 decode: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: base64 decode: %w", store.ErrInvalidInput, err)
 	}
 	parts := strings.SplitN(string(raw), ",", 2)
 	if len(parts) != 2 {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("expected 'timestamp,id' format")
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: expected 'timestamp,id' format", store.ErrInvalidInput)
 	}
 	ts, err := time.Parse(time.RFC3339Nano, parts[0])
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse timestamp: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: parse timestamp: %w", store.ErrInvalidInput, err)
 	}
 	id, err := uuid.Parse(parts[1])
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse id: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: parse id: %w", store.ErrInvalidInput, err)
 	}
 	return ts, id, nil
 }
@@ -267,7 +288,7 @@ func decodeCursor(cursor string) (time.Time, uuid.UUID, error) {
 // A binding is supplied by endpoint callers that must reject cursors reused
 // across different resources or filters.
 func encodeListCursor(created time.Time, id, binding string) string {
-	raw := created.Format(time.RFC3339Nano) + "," + id
+	raw := created.UTC().Format(time.RFC3339Nano) + "," + id
 	if binding != "" {
 		raw += "," + binding
 	}
@@ -275,27 +296,68 @@ func encodeListCursor(created time.Time, id, binding string) string {
 }
 
 func decodeListCursor(cursor, binding string) (time.Time, uuid.UUID, error) {
+	// Every failure wraps store.ErrInvalidInput: a malformed or mismatched
+	// cursor is caller error, which the hub maps to HTTP 400 rather than 500.
 	raw, err := base64.URLEncoding.DecodeString(cursor)
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("base64 decode: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: base64 decode: %w", store.ErrInvalidInput, err)
 	}
 	parts := strings.SplitN(string(raw), ",", 3)
 	if len(parts) < 2 || (binding == "" && len(parts) != 2) || (binding != "" && (len(parts) != 3 || parts[2] != binding)) {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("cursor does not match this list")
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: cursor does not match this list", store.ErrInvalidInput)
 	}
 	ts, err := time.Parse(time.RFC3339Nano, parts[0])
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse timestamp: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: parse timestamp: %w", store.ErrInvalidInput, err)
 	}
 	id, err := uuid.Parse(parts[1])
 	if err != nil {
-		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse id: %w", err)
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: parse id: %w", store.ErrInvalidInput, err)
 	}
 	return ts, id, nil
 }
 
+// messageCreatedAfter returns the predicate "created is strictly after t".
+//
+// On SQLite created holds Go's default time text, and a row written before
+// the UTC store boundary existed may still carry a monotonic-clock suffix
+// (" m=+0.0336"), while t (bound by timeArg) never does. A raw text
+// comparison then puts a suffixed row at exactly t after t, so the chat
+// "around" read (After = the anchor's read-back CreatedAt) returned the
+// anchor and its same-instant neighbours as newer (ptone/scion#2553). The
+// predicate is therefore
+//
+//	created > t AND timeColumnExpr(created) > t
+//
+// The raw term keeps the range seek on the (…, created, id) indexes, and it
+// is implied by the normalized term (the normalized text is a prefix of the
+// stored text), so it never excludes a row the normalized term keeps. The
+// normalized term drops the same-instant suffixed rows. Both assume UTC text,
+// which the store boundary writes and the utc-timestamp-normalize maintenance
+// operation establishes for legacy rows.
+//
+// Before needs no such treatment: a suffixed row at exactly t already sorts
+// after t's text, so the raw created < t excludes it.
+//
+// On Postgres created is timestamptz and this is a plain comparison.
+func messageCreatedAfter(t time.Time) predicate.Message {
+	return func(s *entsql.Selector) {
+		if s.Dialect() == dialect.Postgres {
+			message.CreatedGT(t)(s)
+			return
+		}
+		arg := timeArg(s.Dialect(), t)
+		raw := s.C(message.FieldCreated)
+		norm := timeColumnExpr(s, message.FieldCreated)
+		s.Where(entsql.P(func(b *entsql.Builder) {
+			b.WriteString(raw).WriteString(" > ").Arg(arg).
+				WriteString(" AND ").WriteString(norm).WriteString(" > ").Arg(arg)
+		}))
+	}
+}
+
 // ListMessages returns messages matching the given filter, ordered by
-// created_at DESC.
+// created_at descending unless opts.SortDir is "asc".
 func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFilter, opts store.ListOptions) (*store.ListResult[store.Message], error) {
 	query := s.client.Message.Query()
 
@@ -330,6 +392,9 @@ func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFil
 	if filter.Type != "" {
 		query.Where(message.TypeEQ(filter.Type))
 	}
+	if filter.ExcludeType != "" {
+		query.Where(message.TypeNEQ(filter.ExcludeType))
+	}
 	if filter.Channel != "" {
 		query.Where(message.ChannelEQ(filter.Channel))
 	}
@@ -343,57 +408,26 @@ func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFil
 		}
 		query.Where(message.ConversationIDEQ(cid))
 	}
-	// Visibility filter with NULL backfill awareness (review R1 fix):
-	// Old rows have NULL visibility. The read-time backfill in entMessageToStore
-	// normalises after fetch, but a simple IN predicate drops NULL rows before
-	// they reach the Go layer. We expand the predicate to mirror the backfill
-	// logic: NULL + type != "assistant-reply" → normal; NULL + type = "assistant-reply" → verbose.
-	if len(filter.Visibility) > 0 {
-		var preds []predicate.Message
-		for _, v := range filter.Visibility {
-			switch v {
-			case "normal":
-				preds = append(preds,
-					message.VisibilityEQ("normal"),
-					message.And(
-						message.Or(
-							message.VisibilityIsNil(),
-							message.VisibilityEQ(""),
-						),
-						message.TypeNEQ("assistant-reply"),
-					),
-				)
-			case "verbose":
-				preds = append(preds,
-					message.VisibilityEQ("verbose"),
-					message.And(
-						message.Or(
-							message.VisibilityIsNil(),
-							message.VisibilityEQ(""),
-						),
-						message.TypeEQ("assistant-reply"),
-					),
-				)
-			default: // "full" or future values
-				preds = append(preds, message.VisibilityEQ(v))
-			}
-		}
-		query.Where(message.Or(preds...))
-	}
 	if !filter.Before.IsZero() {
 		query.Where(message.CreatedLT(filter.Before))
 	}
 	if !filter.After.IsZero() {
-		query.Where(message.CreatedGT(filter.After))
+		query.Where(messageCreatedAfter(filter.After))
 	}
 
 	// totalCount represents the total number of messages matching the base
 	// filter (before cursor pagination is applied). Clone and count before
 	// adding the cursor predicate so the count stays stable across pages.
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	var totalCount int
+	if !opts.SkipTotalCount {
+		var err error
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	ascending := strings.EqualFold(opts.SortDir, "asc")
 
 	// Apply cursor-based keyset pagination.
 	// The cursor is a self-contained base64-encoded string carrying (created, id).
@@ -403,19 +437,44 @@ func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFil
 		if err != nil {
 			return nil, fmt.Errorf("invalid cursor: %w", err)
 		}
-		query.Where(message.Or(
-			message.CreatedLT(cursorCreated),
-			message.And(
-				message.CreatedEQ(cursorCreated),
-				message.IDLT(cursorID),
-			),
-		))
+		if ascending {
+			query.Where(message.Or(
+				message.CreatedGT(cursorCreated),
+				message.And(
+					message.CreatedEQ(cursorCreated),
+					message.IDGT(cursorID),
+				),
+			))
+		} else {
+			query.Where(message.Or(
+				message.CreatedLT(cursorCreated),
+				message.And(
+					message.CreatedEQ(cursorCreated),
+					message.IDLT(cursorID),
+				),
+			))
+		}
 	}
 
+	// The keyset cursor and the ORDER BY use the raw created column so the
+	// (conversation_id, channel, created, id) and (thread_id, channel,
+	// created, id) indexes serve both the seek and the order, with no sort.
+	// On SQLite a legacy row whose stored text still carries a
+	// monotonic-clock suffix can therefore order after a suffix-free row at
+	// the same instant, and a page boundary at such a tie can repeat or skip
+	// it. That ordering is left to the utc-timestamp-normalize maintenance
+	// operation, which rewrites legacy rows to canonical text, rather than
+	// paid for with a sort on every page (ptone/scion#2553).
 	limit := clampLimit(opts.Limit)
+	createdOrder := entsql.OrderDesc()
+	idOrder := entsql.OrderDesc()
+	if ascending {
+		createdOrder = entsql.OrderAsc()
+		idOrder = entsql.OrderAsc()
+	}
 	entities, err := query.
-		Order(message.ByCreated(entsql.OrderDesc())).
-		Order(message.ByID(entsql.OrderDesc())).
+		Order(message.ByCreated(createdOrder)).
+		Order(message.ByID(idOrder)).
 		Limit(limit + 1).
 		All(ctx)
 	if err != nil {
@@ -481,6 +540,29 @@ func (s *MessageStore) PurgeOldMessages(ctx context.Context, readCutoff time.Tim
 	return n, nil
 }
 
+// PurgeFailedMessages removes messages with dispatch_state="failed" whose
+// created timestamp is before cutoff. Returns the number of messages removed.
+// Unlike PurgeOldMessages, this filters strictly on dispatch_state so
+// successfully delivered (dispatched) message history is never touched.
+// Scoped to agent recipients only (message.RecipientHasPrefix "agent:"):
+// only a message addressed to an agent can have genuinely and irrecoverably
+// failed dispatch. A "user:" recipient row reaching "failed" only ever came
+// from ExpireStuckPendingMessages sweeping a writer bug (nc-promote-busy);
+// deleting it would destroy real chat history the user never saw fail.
+func (s *MessageStore) PurgeFailedMessages(ctx context.Context, cutoff time.Time) (int, error) {
+	n, err := s.client.Message.Delete().
+		Where(
+			message.DispatchStateEQ(store.MessageDispatchFailed),
+			message.CreatedLT(cutoff),
+			message.RecipientHasPrefix("agent:"),
+		).
+		Exec(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return n, nil
+}
+
 // SetMessageConversationID updates the conversation_id on an existing message.
 // Used by Phase 4 backfill to link legacy messages to Conversation records.
 func (s *MessageStore) SetMessageConversationID(ctx context.Context, messageID, conversationID string) error {
@@ -518,6 +600,45 @@ func (s *MessageStore) CountUnbackfilledMessages(ctx context.Context, projectID 
 		query.Where(message.ProjectIDEQ(pid))
 	}
 	count, err := query.Count(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return count, nil
+}
+
+// CountUnreachableUnbackfilledMessages returns the number of messages with
+// a NULL conversation_id whose project_id does not reference an existing
+// project row. These are permanently unattributable by the per-project
+// backfill because ListProjects never returns their project (DEF-111).
+//
+// The predicate here — "unbackfilled AND project_id NOT IN (SELECT id FROM
+// projects)" — is the inverse of what the backfill can reach.
+//
+// DEPENDENCY: this count is correct only because ListProjects (with an
+// empty ProjectFilter) applies no unconditional filter — no soft-delete,
+// no archived exclusion — so it returns every row in the projects table,
+// and NOT EXISTS is its exact complement. If ListProjects ever adds an
+// unconditional filter, this counter would undercount the unreachable
+// population (some messages whose projects are filtered out of ListProjects
+// would be classified as reachable when the backfill cannot reach them),
+// relocating the alarm-fatigue bug rather than fixing it.
+//
+// GATE (M7, DEF-112): TestReachableCountConsistency_DEF112 enforces this
+// invariant. TestUnreachableCounterTableNames guards the raw SQL identifiers
+// against Ent schema renames.
+func (s *MessageStore) CountUnreachableUnbackfilledMessages(ctx context.Context) (int, error) {
+	count, err := s.client.Message.Query().
+		Where(
+			message.ConversationIDIsNil(),
+			func(sel *entsql.Selector) {
+				sel.Where(entsql.P(func(b *entsql.Builder) {
+					b.WriteString("NOT EXISTS (SELECT 1 FROM projects WHERE projects.id = ").
+						WriteString(sel.C(message.FieldProjectID)).
+						WriteString(")")
+				}))
+			},
+		).
+		Count(ctx)
 	if err != nil {
 		return 0, mapError(err)
 	}

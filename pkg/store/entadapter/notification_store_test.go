@@ -18,9 +18,12 @@ package entadapter
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
 	"github.com/google/uuid"
@@ -301,4 +304,434 @@ func (p *countingPublisher) count(t NotificationEventType) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.counts[t]
+}
+
+// ---------------------------------------------------------------------------
+// ClaimNotificationForDispatch tests
+// ---------------------------------------------------------------------------
+
+func TestClaimNotificationForDispatch_CAS(t *testing.T) {
+	ctx := context.Background()
+	s := newTestNotificationStore(t)
+
+	notifID := uuid.NewString()
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             notifID,
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      uuid.NewString(),
+		SubscriberType: "agent",
+		SubscriberID:   "some-agent",
+		Status:         "COMPLETED",
+		Message:        "done",
+	}))
+
+	// First claim should succeed.
+	claimed, err := s.ClaimNotificationForDispatch(ctx, notifID)
+	require.NoError(t, err)
+	assert.True(t, claimed, "first claim should succeed")
+
+	// Second claim should fail (already dispatched).
+	claimed2, err := s.ClaimNotificationForDispatch(ctx, notifID)
+	require.NoError(t, err)
+	assert.False(t, claimed2, "second claim must fail")
+
+	// Unknown notification returns false, nil.
+	claimed3, err := s.ClaimNotificationForDispatch(ctx, uuid.NewString())
+	require.NoError(t, err)
+	assert.False(t, claimed3, "unknown notification must not be claimed")
+}
+
+func TestClaimNotificationForDispatch_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newTestNotificationStore(t)
+
+	notifID := uuid.NewString()
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             notifID,
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      uuid.NewString(),
+		SubscriberType: "agent",
+		SubscriberID:   "some-agent",
+		Status:         "COMPLETED",
+		Message:        "done",
+	}))
+
+	const racers = 8
+	wins := make(chan bool, racers)
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			defer wg.Done()
+			claimed, err := s.ClaimNotificationForDispatch(ctx, notifID)
+			if err == nil {
+				wins <- claimed
+			}
+		}()
+	}
+	wg.Wait()
+	close(wins)
+
+	var winCount int
+	for w := range wins {
+		if w {
+			winCount++
+		}
+	}
+	assert.Equal(t, 1, winCount, "exactly one racer must win the claim")
+}
+
+// ---------------------------------------------------------------------------
+// UnmarkNotificationDispatched tests
+// ---------------------------------------------------------------------------
+
+func TestUnmarkNotificationDispatched(t *testing.T) {
+	ctx := context.Background()
+	s := newTestNotificationStore(t)
+
+	notifID := uuid.NewString()
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             notifID,
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      uuid.NewString(),
+		SubscriberType: "agent",
+		SubscriberID:   "some-agent",
+		Status:         "COMPLETED",
+		Message:        "done",
+	}))
+
+	// Mark dispatched.
+	require.NoError(t, s.MarkNotificationDispatched(ctx, notifID))
+
+	// Unmark.
+	require.NoError(t, s.UnmarkNotificationDispatched(ctx, notifID))
+
+	// Should be claimable again.
+	claimed, err := s.ClaimNotificationForDispatch(ctx, notifID)
+	require.NoError(t, err)
+	assert.True(t, claimed, "notification should be claimable after unmark")
+}
+
+// ---------------------------------------------------------------------------
+// GetUndispatchedAgentNotifications tests
+// ---------------------------------------------------------------------------
+
+func TestGetUndispatchedAgentNotifications_SweepMode(t *testing.T) {
+	ctx := context.Background()
+	client := enttest.NewClient(t)
+	s := NewNotificationStore(client)
+
+	projectID := uuid.New()
+	oldTime := time.Now().Add(-2 * time.Minute) // beyond 60s grace period
+
+	// Create project and agent records required for the sweep-mode EXISTS
+	// subquery (which filters for agents with a non-empty RuntimeBrokerID).
+	_, err := client.Project.Create().
+		SetID(projectID).
+		SetName("Sweep Project").
+		SetSlug("sweep-project").
+		Save(ctx)
+	require.NoError(t, err)
+	_, err = client.Agent.Create().
+		SetID(uuid.New()).
+		SetSlug("agent-a").
+		SetName("Agent A").
+		SetProjectID(projectID).
+		SetRuntimeBrokerID("some-broker").
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create an old undispatched agent notification (beyond 60s grace period).
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: store.SubscriberTypeAgent,
+		SubscriberID:   "agent-a",
+		Status:         "COMPLETED",
+		Message:        "done",
+		CreatedAt:      oldTime, // set at creation (immutable field)
+	}))
+
+	// Create a recent undispatched agent notification (within grace period).
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: store.SubscriberTypeAgent,
+		SubscriberID:   "agent-b",
+		Status:         "COMPLETED",
+		Message:        "also done",
+		// CreatedAt defaults to now (within grace period)
+	}))
+
+	// Create a dispatched agent notification (should be excluded).
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: store.SubscriberTypeAgent,
+		SubscriberID:   "agent-c",
+		Status:         "COMPLETED",
+		Message:        "dispatched",
+		Dispatched:     true,
+		CreatedAt:      oldTime,
+	}))
+
+	// Create an undispatched USER notification (should be excluded).
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: "user",
+		SubscriberID:   "user-1",
+		Status:         "COMPLETED",
+		Message:        "user notif",
+		CreatedAt:      oldTime,
+	}))
+
+	// Sweep mode (empty brokerID)
+	notifs, err := s.GetUndispatchedAgentNotifications(ctx, "")
+	require.NoError(t, err)
+
+	// Should only return the old agent notification
+	require.Len(t, notifs, 1)
+	assert.Equal(t, "agent-a", notifs[0].SubscriberID)
+	assert.False(t, notifs[0].Dispatched)
+}
+
+func TestGetUndispatchedAgentNotifications_BrokerFilter(t *testing.T) {
+	ctx := context.Background()
+	client := enttest.NewClient(t)
+	s := NewNotificationStore(client)
+
+	projectID := uuid.New()
+	brokerID := "broker-for-test"
+
+	// Create a project (required as FK for agents).
+	_, err := client.Project.Create().
+		SetID(projectID).
+		SetName("Test Project").
+		SetSlug("test-project").
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create an agent with the target broker.
+	agentID := uuid.New()
+	_, err = client.Agent.Create().
+		SetID(agentID).
+		SetSlug("agent-on-broker").
+		SetName("Agent On Broker").
+		SetProjectID(projectID).
+		SetRuntimeBrokerID(brokerID).
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create another agent with a different broker.
+	otherAgentID := uuid.New()
+	_, err = client.Agent.Create().
+		SetID(otherAgentID).
+		SetSlug("agent-other-broker").
+		SetName("Agent Other Broker").
+		SetProjectID(projectID).
+		SetRuntimeBrokerID("different-broker").
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create undispatched notifications for both agents, backdated past grace period.
+	oldTime := time.Now().Add(-2 * time.Minute)
+
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: store.SubscriberTypeAgent,
+		SubscriberID:   "agent-on-broker",
+		Status:         "COMPLETED",
+		Message:        "msg1",
+		CreatedAt:      oldTime,
+	}))
+
+	require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+		ID:             uuid.NewString(),
+		SubscriptionID: uuid.NewString(),
+		AgentID:        uuid.NewString(),
+		ProjectID:      projectID.String(),
+		SubscriberType: store.SubscriberTypeAgent,
+		SubscriberID:   "agent-other-broker",
+		Status:         "COMPLETED",
+		Message:        "msg2",
+		CreatedAt:      oldTime,
+	}))
+
+	// Filter by brokerID.
+	notifs, err := s.GetUndispatchedAgentNotifications(ctx, brokerID)
+	require.NoError(t, err)
+	require.Len(t, notifs, 1, "should only return notifications for agents on the target broker")
+	assert.Equal(t, "agent-on-broker", notifs[0].SubscriberID)
+
+	// Filter by the other broker.
+	notifs2, err := s.GetUndispatchedAgentNotifications(ctx, "different-broker")
+	require.NoError(t, err)
+	require.Len(t, notifs2, 1)
+	assert.Equal(t, "agent-other-broker", notifs2[0].SubscriberID)
+
+	// Sweep mode (all) returns both.
+	all, err := s.GetUndispatchedAgentNotifications(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, all, 2)
+}
+
+func TestPurgeOrphanedNotifications(t *testing.T) {
+	ctx := context.Background()
+	client := enttest.NewClient(t)
+	s := NewNotificationStore(client)
+
+	projectID := uuid.New()
+	_, err := client.Project.Create().SetID(projectID).SetName("GC Project").SetSlug("gc-project").Save(ctx)
+	require.NoError(t, err)
+	liveAgentID := uuid.New()
+	_, err = client.Agent.Create().SetID(liveAgentID).SetSlug("live").SetName("Live").
+		SetProjectID(projectID).Save(ctx)
+	require.NoError(t, err)
+	liveSub := &store.NotificationSubscription{
+		ID: uuid.NewString(), Scope: store.SubscriptionScopeAgent, AgentID: liveAgentID.String(),
+		SubscriberType: "user", SubscriberID: "user-1", ProjectID: projectID.String(),
+		TriggerActivities: []string{"DELETED"}, CreatedBy: "tester",
+	}
+	require.NoError(t, s.CreateNotificationSubscription(ctx, liveSub))
+
+	newNotif := func(agentID, subID string, acked bool) string {
+		t.Helper()
+		id := uuid.NewString()
+		require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+			ID: id, SubscriptionID: subID, AgentID: agentID, ProjectID: projectID.String(),
+			SubscriberType: "user", SubscriberID: "user-1", Status: "DELETED", Message: "deleted",
+		}))
+		if acked {
+			require.NoError(t, s.AcknowledgeNotification(ctx, id))
+		}
+		return id
+	}
+	goneAgent, goneSub := uuid.NewString(), uuid.NewString()
+	orphanAcked := newNotif(goneAgent, goneSub, true)
+	orphanUnacked := newNotif(goneAgent, goneSub, false)
+	agentLive := newNotif(liveAgentID.String(), goneSub, true)
+	subLive := newNotif(goneAgent, liveSub.ID, true)
+
+	purged, err := s.PurgeOrphanedNotifications(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, purged)
+
+	_, err = s.GetNotification(ctx, orphanAcked)
+	assert.ErrorIs(t, err, store.ErrNotFound, "acknowledged orphan is removed")
+	for name, id := range map[string]string{
+		"unacknowledged orphan": orphanUnacked,
+		"agent still present":   agentLive,
+		"subscription present":  subLive,
+	} {
+		_, err := s.GetNotification(ctx, id)
+		assert.NoError(t, err, "%s must be kept", name)
+	}
+
+	purged, err = s.PurgeOrphanedNotifications(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, purged, "a second run removes nothing")
+}
+
+func TestPurgeOrphanedNotifications_DeletesInBatches(t *testing.T) {
+	ctx := context.Background()
+	client := enttest.NewClient(t)
+	s := NewNotificationStore(client)
+
+	prev := orphanPurgeBatchSize
+	orphanPurgeBatchSize = 2
+	t.Cleanup(func() { orphanPurgeBatchSize = prev })
+
+	var deletes int
+	client.Notification.Use(func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if m.Op().Is(ent.OpDelete) {
+				deletes++
+			}
+			return next.Mutate(ctx, m)
+		})
+	})
+
+	projectID := uuid.New()
+	_, err := client.Project.Create().SetID(projectID).SetName("Batch Project").SetSlug("batch-project").Save(ctx)
+	require.NoError(t, err)
+	const orphans = 5
+	for i := 0; i < orphans; i++ {
+		id := uuid.NewString()
+		require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+			ID: id, SubscriptionID: uuid.NewString(), AgentID: uuid.NewString(),
+			ProjectID: projectID.String(), SubscriberType: "user", SubscriberID: "user-1",
+			Status: "DELETED", Message: "deleted",
+		}))
+		require.NoError(t, s.AcknowledgeNotification(ctx, id))
+	}
+
+	purged, err := s.PurgeOrphanedNotifications(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, orphans, purged, "every orphan is removed across batches")
+	assert.Equal(t, 3, deletes, "5 rows in batches of 2 take 3 delete statements")
+
+	purged, err = s.PurgeOrphanedNotifications(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, purged)
+}
+
+// A full batch whose delete removes no rows ends the purge instead of
+// selecting the same rows again.
+func TestPurgeOrphanedNotifications_StopsWhenDeleteRemovesNothing(t *testing.T) {
+	ctx := context.Background()
+	client := enttest.NewClient(t)
+	s := NewNotificationStore(client)
+
+	prev := orphanPurgeBatchSize
+	orphanPurgeBatchSize = 2
+	t.Cleanup(func() { orphanPurgeBatchSize = prev })
+
+	projectID := uuid.New()
+	_, err := client.Project.Create().SetID(projectID).SetName("Stuck Project").SetSlug("stuck-project").Save(ctx)
+	require.NoError(t, err)
+	for i := 0; i < orphanPurgeBatchSize; i++ {
+		id := uuid.NewString()
+		require.NoError(t, s.CreateNotification(ctx, &store.Notification{
+			ID: id, SubscriptionID: uuid.NewString(), AgentID: uuid.NewString(),
+			ProjectID: projectID.String(), SubscriberType: "user", SubscriberID: "user-1",
+			Status: "DELETED", Message: "deleted",
+		}))
+		require.NoError(t, s.AcknowledgeNotification(ctx, id))
+	}
+
+	// Every delete removes nothing. Past a few attempts, fail the delete
+	// so a looping purge returns an error instead of hanging the test.
+	var deletes int
+	client.Notification.Use(func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if !m.Op().Is(ent.OpDelete) {
+				return next.Mutate(ctx, m)
+			}
+			deletes++
+			if deletes > 5 {
+				return nil, errors.New("purge kept deleting the same rows")
+			}
+			return 0, nil
+		})
+	})
+
+	purged, err := s.PurgeOrphanedNotifications(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, purged)
+	assert.Equal(t, 1, deletes, "the purge stops after one delete that removes nothing")
 }

@@ -21,35 +21,48 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/k8s"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
+	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
+	"k8s.io/client-go/kubernetes"
 )
 
 // ServerConfig holds configuration for the Runtime Broker API server.
 type ServerConfig struct {
+	// DeleteClock, for tests only, replaces time.Now as the clock the delete
+	// notAfter check reads (see delete_not_after.go). nil means time.Now.
+	DeleteClock func() time.Time
+
 	// Port is the HTTP port to listen on.
 	Port int
 	// Host is the address to bind to (e.g., "0.0.0.0" or "127.0.0.1").
@@ -65,14 +78,24 @@ type ServerConfig struct {
 	// into agent containers. Used for local development where containers
 	// need a bridge address (e.g. host.containers.internal) instead of localhost.
 	ContainerHubEndpoint string
+	// ColocatedPublicHubEndpoint is the co-located hub's public URL when this
+	// host does not serve it, so containers cannot reach it (e.g. a Cloud Run
+	// URL derived from the IAP audience on a single-node VM). On the docker
+	// and podman runtimes, an agent hub endpoint equal to it is replaced by
+	// that runtime's ColocatedRuntimeHubEndpoints entry. Empty disables the
+	// rewrite.
+	ColocatedPublicHubEndpoint string
+	// ColocatedRuntimeHubEndpoints maps a dispatch runtime ("docker",
+	// "podman") to the URL that replaces ColocatedPublicHubEndpoint for its
+	// agents. It is independent of the broker's default runtime, so a
+	// kubernetes-default broker still rewrites agents dispatched through a
+	// docker profile. A runtime without an entry keeps the public URL.
+	ColocatedRuntimeHubEndpoints map[string]string
 	// HubListenPort is the port the co-located hub HTTP server is listening
 	// on (e.g. 8080 for the combined web+API server). Used by cloudrun-sandbox
 	// to construct the link-local hub endpoint for sandboxes. Zero means the
 	// hub listen port is not known (remote broker, non-colocated mode).
 	HubListenPort int
-
-	// InstanceAuthorityPath is trusted launcher input, never agent configuration.
-	InstanceAuthorityPath string
 
 	// BrokerID is a unique identifier for this runtime broker.
 	BrokerID string
@@ -98,6 +121,19 @@ type ServerConfig struct {
 	HubEnabled bool
 	// HubToken is the authentication token for the Hub API.
 	HubToken string
+	// HostCredentials makes a co-located broker eligible to give its agents
+	// the host's harness-declared credential files. The caller sets it only
+	// in workstation mode with dev auth enabled
+	// (config.HostCredentialsEligible). Each start additionally requires a
+	// verified co-located hub connection on a loopback endpoint and the
+	// use_host_credentials setting, re-read per start
+	// (colocatedHostCredentials).
+	HostCredentials bool
+	// WorkstationMode is set when this broker runs inside a workstation-mode
+	// server (not hosted mode). Only then may a worktree-per-agent dispatch
+	// for a linked checkout use a local worktree of that checkout
+	// (resolveLinkedCheckout).
+	WorkstationMode bool
 
 	// Template cache settings
 	// TemplateCacheDir is the directory for caching templates fetched from the Hub.
@@ -139,7 +175,8 @@ type ServerConfig struct {
 
 	// Workspace sync settings
 	// StorageBucket is the GCS bucket name for workspace storage.
-	// Used when workspace sync requests don't specify a bucket.
+	// Used when workspace sync requests, or a create request carrying a
+	// workspace upload, don't specify a bucket.
 	StorageBucket string
 	// WorktreeBase is the base directory for agent worktrees.
 	// Used as a fallback when resolving workspace paths.
@@ -159,11 +196,53 @@ type ServerConfig struct {
 	// projected secrets. Defaults to true; set false to block such dispatches.
 	AllowContainerScriptHarnesses bool
 
-	// NFSConfig holds NFS workspace storage settings for this broker.
-	// When non-nil with shares configured, the broker can provision and
-	// clean up NFS-backed workspace subtrees. Used by deleteProject (N1-6)
-	// to also remove the NFS project subtree on project deletion.
+	// NFSConfig holds NFS workspace storage settings for this broker. The
+	// server command sets it from server.workspace_storage when the backend
+	// is "nfs" (see brokerNFSConfig in cmd). When non-nil with shares
+	// configured, the broker constructs an NFSMountReconciler that mounts
+	// each share at <MountRoot>/<share.ID> in the background at startup,
+	// reports per-share state in /healthz, and re-checks the shares before
+	// NFS-backed agent dispatches. Nil leaves all NFS handling off.
 	NFSConfig *config.V1NFSConfig
+
+	// WorkspaceStorageBackend is the configured server.workspace_storage
+	// backend name ("" means "local"). It is reported to the hub, with
+	// NFSConfig's first share, as the broker's workspace storage descriptor
+	// (see BuildWorkspaceStorageDescriptor).
+	WorkspaceStorageBackend string
+
+	// DefaultProfile is the broker's default (active) profile name from its
+	// settings (active_profile), reported to the hub on every heartbeat. A
+	// pointer to "" reports that the settings name no active profile; nil
+	// (settings failed to load) omits it, so the hub keeps its value.
+	DefaultProfile *string
+
+	// NFSMountChecker overrides the mount layer the NFS reconciler uses.
+	// Nil selects ExecMountChecker (mount(8)/umount(8)); tests set a fake.
+	NFSMountChecker MountChecker
+
+	// NFSHostMounter, when set, is the host's single NFS mount owner: a
+	// host-bind instance registers its requirement with it and uses
+	// its shared reconciler instead of building and running its own; a
+	// Kubernetes or Cloud Run instance keeps its own verify-only check.
+	NFSHostMounter *HostNFSMounter
+
+	// SharedCaches, when set, are a flat host's caches: the server uses
+	// its own partition of the file caches and the host's GitHub
+	// resolution cache instead of opening its own, and never closes the
+	// shared one (the host does).
+	SharedCaches *SharedCaches
+
+	// WorkspaceLocks coordinates operations on shared local paths with
+	// every other Runtime Broker server of the process. The flat
+	// host passes one service to all its instances; nil gives this server
+	// its own.
+	WorkspaceLocks *WorkspaceLocks
+
+	// FlatInstance, when set, makes this server host exactly one flat Runtime
+	// Broker instance bound to one runtime target (see FlatInstanceConfig).
+	// Nil keeps the legacy, profile-resolving Runtime Broker.
+	FlatInstance *FlatInstanceConfig
 
 	// ColocatedStorage is the storage backend of a Hub running co-located in the
 	// same process. When set and backed by the local filesystem, the broker
@@ -199,7 +278,27 @@ type Server struct {
 	mux        *http.ServeMux
 	mu         sync.RWMutex
 	startTime  time.Time
-	version    string
+	// servicesStarted is set once startServices begins (Started).
+	servicesStarted bool
+
+	// nfsCleanupWG tracks background NFS project tree removals started by
+	// project delete (startNFSProjectTreeCleanup), so tests can wait for them.
+	nfsCleanupWG sync.WaitGroup
+
+	// workspaceDownload replaces gcp.SyncFromGCS for the GCS workspace
+	// bootstrap (create-time and handleWorkspaceApply) when set (see
+	// SetWorkspaceDownloader).
+	workspaceDownload func(ctx context.Context, bucket, prefix, localPath string) error
+	version           string
+
+	// Workspace transfer and project delete steps, like workspaceDownload:
+	// each replaces its real implementation when set (see the setters in
+	// workspace_handlers.go), per Server, so tests can fake one without
+	// racing parallel tests. Guarded by mu.
+	workspaceUpload      func(ctx context.Context, localPath, bucket, prefix string) error
+	manifestUpload       func(ctx context.Context, bucket, storagePath string, manifest *transfer.Manifest) error
+	projectWorkspaceStat func(path string) (os.FileInfo, error)
+	projectPathAbs       func(path string) (string, error)
 
 	// Hub connections (replaces single hubClient, heartbeat, controlChannel, etc.)
 	hubConnections map[string]*HubConnection // keyed by connection name
@@ -221,50 +320,162 @@ type Server struct {
 	// Caches GitHub API resolution results to avoid redundant API calls.
 	ghResolutionCache *agent.GitHubResolutionCache
 
-	// Multi-key auth middleware. authMiddlewarePublicationMu orders every
-	// published authority transition with its complete key snapshot and
-	// UpdateKeys call, preventing an older snapshot from winning afterward.
-	brokerAuthMiddleware        *MultiKeyBrokerAuthMiddleware
-	authMiddlewarePublicationMu sync.Mutex
-	// authMiddlewarePublicationHook is a test-only synchronization point.
+	// Multi-key auth middleware. authMiddlewareMu serializes
+	// buildAuthMiddleware, the only writer of the field below. Lock order: a
+	// connection's lifecycleMu, then authorityMu (when publishing), then
+	// authMiddlewareMu, then hubMu, then a connection's mu. Invalidation
+	// does not wait for authorityMu until server locks have been released. HubConnection.start also takes hubMu directly, via
+	// the heartbeat's project filter (lifecycleMu before hubMu). Requests
+	// read the field with an atomic load (loadBrokerMiddleware) and take no
+	// lock, so they never wait on a rebuild.
+	authMiddlewareMu     sync.Mutex
+	brokerAuthMiddleware atomic.Pointer[MultiKeyBrokerAuthMiddleware]
+	// Test-only synchronization points; set before concurrent operations.
 	authMiddlewarePublicationHook func(stage string, keys []secretKeyEntry)
+	hubConnectionLifecycleHook    func(stage string)
 
 	// Credential watching (watches MultiStore directory)
 	multiCredStore  *brokercredentials.MultiStore
 	credLastScan    time.Time
 	credWatcherStop chan struct{}
 
-	// hubConnectionLifecycleHook is a test-only synchronization point for Hub
-	// connection credential transitions. Production servers leave it nil.
-	hubConnectionLifecycleHook func(stage string)
-
 	// dispatchAttempts tracks request-id based create-attempt state for
 	// idempotency and auditability.
 	dispatchAttempts   map[string]*dispatchAttempt
 	dispatchAttemptsMu sync.Mutex
 
+	// launchRegistry is this replica's local bookkeeping for in-flight async
+	// launches (design t1-async-create-v11.md §3.8.1, §7 P1b-1). It is an
+	// optimisation only -- correctness comes from the Hub's answers.
+	launchRegistry *launchRegistry
+	// startsInFlight tracks the starts running on the start, restart and
+	// synchronous create handlers (start_tracker.go). The heartbeat reports
+	// them, stop waits for its agent's, and Shutdown waits for all.
+	startsInFlight *startTracker
+	// launchInstanceID identifies this broker process as a launch owner
+	// (design §3.2's LaunchInstanceID / launch_owner), generated once here at
+	// startup.
+	launchInstanceID string
+
+	// launchTimingOverride replaces the launch sender's default retry
+	// backoffs (and, when its keepaliveInterval is positive, the per-launch
+	// keepalive interval) for every sender built on this server (see
+	// newLaunchSender). Nil in production; only tests set it.
+	launchTimingOverride *launchTimings
+
+	// syncStartSupersedeWait overrides defaultSyncStartSupersedeWait when
+	// positive (see beginSyncStart). Zero in production.
+	syncStartSupersedeWait time.Duration
+
 	stateDir string
+
+	// ownership is a flat instance's durable ownership record store
+	// (ownership.go); nil for a legacy Runtime Broker.
+	ownership *OwnershipStore
+	// ownedStarts maps a run ID to its in-flight ownership mirror
+	// (installOwnedStart / completeOwnedStart).
+	ownedStarts sync.Map
+	// unmirroredUIDs holds the object UIDs from the journals of this
+	// instance's launches whose ownership recording failed; launch cleanup
+	// may delete them although the record may lack them (launchHandleOwned).
+	// The value is the creating run, kept for diagnosis only: ownership is
+	// decided by the UID, which is immutable and unique on every runtime a
+	// flat instance can use (each must confirm absence by identity).
+	unmirroredUIDs sync.Map
+	// ownershipSetupErr refuses a flat instance whose manager could not be
+	// owner-scoped (startServices).
+	ownershipSetupErr error
 
 	// auxiliaryRuntimes holds runtime+manager pairs for non-default runtimes
 	// created via profile resolution (e.g. kubernetes when default is docker).
 	// Used by LookupContainerID/LookupAgent as a fallback when the default
 	// manager can't find an agent.
+	//
+	// Keyed by auxiliaryRuntimeIdentity (a per-instance key, not the runtime
+	// type); read through sortedAuxiliaryRuntimes or
+	// findAuxiliaryRuntimeByType rather than indexing by type.
 	auxiliaryRuntimes   map[string]auxiliaryRuntime
 	auxiliaryRuntimesMu sync.RWMutex
 
-	// projectProvisionMu serializes worktree provisioning per project on this
-	// node. Without this, concurrent agent creations for the same project could
-	// race inside ProvisionShared (double-clone / corrupt .git state).
-	// Key: ProjectID (or ProjectPath if ID is empty).
-	projectProvisionMu sync.Map
+	// resolveAuxiliaryRuntime resolves the runtime.Runtime for a project path
+	// and profile name when discovering or creating auxiliary runtimes, and
+	// in resolveManagerForOpts when settings resolve to something other than
+	// the broker's default runtime. It is a field (defaulting to
+	// agent.ResolveRuntime, set in New) rather than a direct call, so tests
+	// can substitute a stub that does not require live cluster/network
+	// access — resolving a real Kubernetes runtime calls Verify() against
+	// the API server.
+	resolveAuxiliaryRuntime func(projectPath, agentName, profileFlag string) scionrt.Runtime
 
-	// agentLifecycleMu excludes overlapping create/start/stop/restart/delete
-	// mutations of one project-scoped retained agent.
-	agentLifecycleMu      sync.Map
-	agentLifecycleAliases sync.Map
+	// saDiscoveryCache holds the background ServiceAccount annotation
+	// discovery results behind the heartbeat's service account report
+	// (sa_mappings_report.go), created on first use by saDiscovery. Tests
+	// may set it before first use. saDiscoveryClients keeps the Kubernetes
+	// client built for a profile with no live runtime, keyed by
+	// (runtime type, kubeconfig, context).
+	saDiscoveryCache *saDiscoveryCache
+	// loadMappingSettings, when set before the server starts, replaces the
+	// settings loader of the heartbeat's service account report
+	// (loadHeartbeatMappingSettings). Tests use it.
+	loadMappingSettings  func() (*config.VersionedSettings, error)
+	saDiscoveryOnce      sync.Once
+	saDiscoveryClients   map[string]kubernetes.Interface
+	saDiscoveryClientsMu sync.Mutex
+	// newDiscoveryClient, when set, replaces the Kubernetes client builder
+	// of saDiscoveryClientset (kubeconfig path, context, timeout). Tests
+	// use it.
+	newDiscoveryClient func(kubeconfig, context string, timeout time.Duration) (kubernetes.Interface, error)
+
+	// loadSettings, when non-nil, replaces config.LoadEffectiveSettings in
+	// resolveManagerForOptsStrict (handlers.go). nil, the default, uses the
+	// real loader; tests set it per fixture to exercise each settings
+	// outcome.
+	loadSettings func(projectDir string) (*config.VersionedSettings, []string, error)
+
+	// assignKSAClientset, when non-nil, replaces assignDiscoveryClientset in
+	// resolveKubernetesAssignIdentity: it returns the Kubernetes client used
+	// to discover an annotated ServiceAccount for a GCP identity "assign"
+	// dispatch on the dispatch's resolved manager. Tests set it to a fake
+	// clientset.
+	assignKSAClientset func(mgr agent.Manager) (kubernetes.Interface, error)
+
+	// agentOwnRuntimes memoises the runtime an existing agent's saved
+	// profile resolves to (see ensureAgentOwnRuntime), keyed by project dir
+	// and profile; agentOwnRuntimeGroup collapses concurrent resolutions of
+	// one key into a single call. Failed resolutions are not stored.
+	agentOwnRuntimes     sync.Map
+	agentOwnRuntimeGroup singleflight.Group
+
+	// workspaceLocks serializes operations on shared local paths (worktree
+	// provisioning, project and agent file cleanup) with every server of
+	// the process that shares it (workspace_locks.go).
+	workspaceLocks     *WorkspaceLocks
+	workspaceLocksOnce sync.Once
+
+	// flatK8sIdentity is a flat instance's own Kubernetes GCP identity
+	// policy, snapshotted when the server is built (flat_k8s_identity.go).
+	flatK8sIdentity flatKubernetesIdentityPolicy
 
 	// NFS mount reconciler (nil when backend != "nfs")
 	nfsMountReconciler *NFSMountReconciler
+	// nfsHostOwned is set when nfsMountReconciler is the host mounter's:
+	// the host runs its loop, this server never does.
+	nfsHostOwned bool
+	// hostSetupErr refuses an instance whose host-level setup failed (an
+	// NFS requirement incompatible with another instance's).
+	hostSetupErr error
+	// exportIDs reads (or creates) the export identity marker reported in
+	// the workspace storage descriptor.
+	exportIDs exportIDProbe
+	// NFS reconcile loop state (all unused when nfsMountReconciler is nil).
+	// nfsStartupReconcileDone is closed once the loop's first pass has
+	// finished; nfsReconcileStopped is closed when the loop exits.
+	nfsStartupReconcileDone chan struct{}
+	nfsReconcileStopped     chan struct{}
+	nfsReconcileOnce        sync.Once
+	nfsReconcileCancel      context.CancelFunc
+	// nfsReconcileInterval overrides DefaultNFSReconcileInterval (tests).
+	nfsReconcileInterval time.Duration
 
 	// Dedicated request logger (nil = disabled)
 	requestLogger *slog.Logger
@@ -273,9 +484,11 @@ type Server struct {
 	dedicatedMessageLog *slog.Logger
 
 	// Subsystem loggers for handler methods
-	agentLifecycleLog *slog.Logger
-	messageLog        *slog.Logger
-	envSecretLog      *slog.Logger
+	agentLifecycleMu      sync.Map
+	agentLifecycleAliases sync.Map
+	agentLifecycleLog     *slog.Logger
+	messageLog            *slog.Logger
+	envSecretLog          *slog.Logger
 }
 
 // auxiliaryRuntime pairs a runtime with its manager for non-default runtimes.
@@ -318,23 +531,78 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 		dispatchAttempts:  make(map[string]*dispatchAttempt),
 		auxiliaryRuntimes: make(map[string]auxiliaryRuntime),
 
+		// Defaults to the real profile-resolution path; tests substitute a
+		// stub that does not require live cluster/network access (see
+		// discoverAuxiliaryRuntimesForProjects and resolveManagerForOpts).
+		resolveAuxiliaryRuntime: agent.ResolveRuntime,
+		launchRegistry:          newLaunchRegistry(),
+		startsInFlight:          newStartTracker(),
+		launchInstanceID:        uuid.NewString(),
+
 		// Subsystem loggers
 		agentLifecycleLog: logging.Subsystem("broker.agent-lifecycle"),
 		messageLog:        logging.Subsystem("broker.messages"),
 		envSecretLog:      logging.Subsystem("broker.env-secrets"),
 	}
+	// A flat instance's own loggers carry its identity, so several
+	// instances in one process log distinguishably without changing the
+	// process-wide default logger.
+	if fi := srv.flatInstance(); fi != nil {
+		attrs := []any{slog.String(logging.AttrBrokerID, fi.Identity.RuntimeBrokerID), slog.String("instance", fi.Instance.Key)}
+		srv.agentLifecycleLog = srv.agentLifecycleLog.With(attrs...)
+		srv.messageLog = srv.messageLog.With(attrs...)
+		srv.envSecretLog = srv.envSecretLog.With(attrs...)
+	}
 
+	srv.workspaceLocks = cfg.WorkspaceLocks
+	if srv.workspaceLocks == nil {
+		srv.workspaceLocks = NewWorkspaceLocks()
+	}
 	srv.stateDir = cfg.StateDir
 	if srv.stateDir == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
+		if dir, err := DefaultStateDir(cfg.BrokerID); err != nil {
 			slog.Warn("Failed to resolve user home directory for state dir", "error", err)
 		} else {
-			brokerDir := cfg.BrokerID
-			if brokerDir == "" {
-				brokerDir = "default"
-			}
-			srv.stateDir = filepath.Join(homeDir, ".scion", "runtime-broker-state", brokerDir)
+			srv.stateDir = dir
+		}
+	}
+	if fi := srv.flatInstance(); fi != nil {
+		srv.flatK8sIdentity = newFlatKubernetesIdentityPolicy(fi)
+	}
+	if fi := srv.flatInstance(); fi != nil {
+		// Fail closed: without an exact absence check a deleted agent's
+		// record and slug could never be finished (a delete request is not
+		// confirmed absence).
+		if _, ok := rt.(scionrt.ResourceAbsenceChecker); !ok {
+			srv.ownershipSetupErr = fmt.Errorf("flat Runtime Broker %s: its runtime (%T) cannot confirm that a deleted object is gone, so it cannot serve as a flat instance", fi.Identity.RuntimeBrokerID, rt)
+			slog.Error("Flat Runtime Broker instance will not serve", "error", srv.ownershipSetupErr)
+		}
+	}
+	if fi := srv.flatInstance(); fi != nil && srv.stateDir == "" {
+		// Fail closed: without a state root there are no ownership records.
+		srv.ownershipSetupErr = fmt.Errorf("flat Runtime Broker %s: no state directory for its ownership records", fi.Identity.RuntimeBrokerID)
+		slog.Error("Flat Runtime Broker instance will not serve", "error", srv.ownershipSetupErr)
+	}
+	if fi := srv.flatInstance(); fi != nil && srv.stateDir != "" {
+		// A flat instance owns only what its records and its reserved
+		// label say it owns (ptone/scion#3274).
+		srv.ownership = NewOwnershipStore(srv.stateDir, fi.Identity.RuntimeBrokerID)
+		srv.ownership.SetConflicting(fi.ConflictingOwnershipKeys)
+		srv.workspaceLocks.registerWorkspaceUser(srv, &workspaceUser{
+			instance:        fi.Identity.RuntimeBrokerID,
+			projectInUse:    srv.ownership.HasLiveAgents,
+			slugReservation: srv.ownership.SlugReservation,
+		})
+		if am, ok := mgr.(ownerScopedManager); !ok {
+			// Fail closed: a manager that cannot be restricted to this
+			// instance's objects would serve every instance's agents.
+			srv.ownershipSetupErr = fmt.Errorf("flat Runtime Broker %s: its agent manager (%T) cannot be restricted to this instance's objects", fi.Identity.RuntimeBrokerID, mgr)
+			slog.Error("Flat Runtime Broker instance will not serve", "error", srv.ownershipSetupErr)
+		} else {
+			am.SetOwner(agent.OwnerScope{RuntimeBrokerID: fi.Identity.RuntimeBrokerID,
+				FileAgentOwned: srv.fileAgentOwned, RetainedRunOwned: srv.retainedRunOwned, EntryUnresolved: srv.ownership.ConflictingLabels,
+				EntryPathTrusted: trustedEntryProjectPath, LaunchHandleOwned: srv.launchHandleOwned,
+				WorkspaceLock: srv.locks().Lock})
 		}
 	}
 	if srv.stateDir != "" {
@@ -343,28 +611,91 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 		}
 	}
 
-	// Initialize NFS mount reconciler when NFS storage is configured.
-	// This only constructs the reconciler; Reconcile() is called in Start().
-	if cfg.NFSConfig != nil && len(cfg.NFSConfig.Shares) > 0 {
-		nfsLog := logging.Subsystem("broker.nfs-mount")
-		checker := NewExecMountChecker(nfsLog)
-		srv.nfsMountReconciler = NewNFSMountReconciler(cfg.NFSConfig, checker, nfsLog)
-		slog.Info("NFS mount reconciler initialized",
-			"shares", len(cfg.NFSConfig.Shares),
-			"mountRoot", cfg.NFSConfig.MountRoot)
+	// A host-bind instance of a host with a single NFS mount owner uses
+	// that owner's reconciler (registered requirement, shared status, one
+	// mounter); everything else builds its own below.
+	hostNFS := cfg.NFSHostMounter != nil && cfg.NFSConfig != nil && len(cfg.NFSConfig.Shares) > 0 &&
+		rt != nil && !NFSWarnOnlyRuntime(rt.Name())
+	if hostNFS && srv.ownershipSetupErr != nil {
+		// The instance refuses at StartServices, after the host mounter
+		// has started; its requirement must not reach the union, which
+		// cannot shrink once the mounter runs. It builds no reconciler
+		// either.
+		slog.Warn("Runtime Broker instance cannot serve; its NFS mount requirement is not registered", "error", srv.ownershipSetupErr)
+	} else if hostNFS {
+		key := cfg.BrokerID
+		if fi := srv.flatInstance(); fi != nil {
+			key = fi.Instance.Key
+		}
+		r, err := cfg.NFSHostMounter.Register(key, rt.Name(), cfg.NFSConfig)
+		if err != nil {
+			srv.hostSetupErr = err
+			slog.Error("Runtime Broker instance will not serve", "error", err)
+		} else if r != nil {
+			srv.nfsMountReconciler = r
+			srv.nfsHostOwned = true
+			done := make(chan struct{})
+			srv.nfsStartupReconcileDone = done
+			go func() { <-cfg.NFSHostMounter.FirstPassDone(); close(done) }()
+		}
 	}
 
-	// Initialize Hub integration if enabled
-	if cfg.HubEnabled && (cfg.HubEndpoint != "" || cfg.InMemoryCredentials != nil) {
+	// Initialize NFS mount reconciler when NFS storage is configured.
+	// This only constructs the reconciler; its loop is started in Start().
+	if !hostNFS && cfg.NFSConfig != nil && len(cfg.NFSConfig.Shares) > 0 {
+		nfsLog := logging.Subsystem("broker.nfs-mount")
+		checker := cfg.NFSMountChecker
+		if checker == nil {
+			checker = NewExecMountChecker(nfsLog)
+		}
+		srv.nfsMountReconciler = NewNFSMountReconciler(cfg.NFSConfig, checker, nfsLog)
+		// On Kubernetes and Cloud Run the platform mounts the export into
+		// the agent, so the broker never mounts it; it only verifies.
+		if rt != nil && NFSWarnOnlyRuntime(rt.Name()) {
+			srv.nfsMountReconciler.SetVerifyOnly(fmt.Sprintf(
+				"the broker's default runtime is %s, so the broker does not mount it", rt.Name()))
+		}
+		srv.nfsStartupReconcileDone = make(chan struct{})
+		srv.nfsReconcileStopped = make(chan struct{})
+		slog.Info("NFS mount reconciler initialized",
+			"shares", len(cfg.NFSConfig.Shares),
+			"mountRoot", cfg.NFSConfig.MountRoot,
+			"autoMount", cfg.NFSConfig.AutoMount,
+			"brokerMounts", srv.nfsMountReconciler.MountsShares())
+		if srv.nfsMountReconciler.MountsShares() {
+			if err := srv.nfsMountReconciler.mountPrivilegeError(); err != nil {
+				slog.Warn("server.workspace_storage.nfs.auto_mount is on but the broker cannot mount; shares are checked only",
+					"reason", err)
+			}
+		}
+	}
+
+	// Initialize Hub integration if enabled. A flat instance that may not be
+	// hosted here (no Hub in the same process) sets up no Hub connection at
+	// all; Start refuses it.
+	if cfg.HubEnabled && (cfg.HubEndpoint != "" || cfg.InMemoryCredentials != nil || srv.flatInstance().remoteActivated()) && srv.flatHostingError() == nil {
 		if err := srv.initHubIntegration(); err != nil {
 			slog.Warn("Failed to initialize Hub integration", "error", err)
 		}
 	}
 
-	srv.configureInstanceAuthority(rt)
 	srv.registerRoutes()
 
 	return srv
+}
+
+// DefaultStateDir is a Runtime Broker's state root when ServerConfig.StateDir
+// is not set: ~/.scion/runtime-broker-state/<brokerID> ("default" when the
+// ID is empty).
+func DefaultStateDir(brokerID string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if brokerID == "" {
+		brokerID = "default"
+	}
+	return filepath.Join(homeDir, ".scion", "runtime-broker-state", brokerID), nil
 }
 
 // RuntimeName returns the name of the currently active container runtime.
@@ -372,6 +703,31 @@ func (s *Server) RuntimeName() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.runtime.Name()
+}
+
+// defaultPair returns one consistent snapshot of the broker's default
+// manager and runtime, read under s.mu: SwapRuntime replaces both together
+// while requests are in flight. A caller that uses both takes one snapshot
+// and uses it throughout, so it never pairs the old manager with the new
+// runtime. Callers must not hold s.mu.
+func (s *Server) defaultPair() (agent.Manager, scionrt.Runtime) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.manager, s.runtime
+}
+
+// currentManager returns the broker's default manager, read under s.mu
+// (see defaultPair). Callers must not hold s.mu.
+func (s *Server) currentManager() agent.Manager {
+	mgr, _ := s.defaultPair()
+	return mgr
+}
+
+// currentRuntime returns the broker's default runtime, read under s.mu
+// (see defaultPair). Callers must not hold s.mu.
+func (s *Server) currentRuntime() scionrt.Runtime {
+	_, rt := s.defaultPair()
+	return rt
 }
 
 // SwapRuntime replaces the broker's container runtime and agent manager.
@@ -383,7 +739,6 @@ func (s *Server) RuntimeName() string {
 func (s *Server) SwapRuntime(rt scionrt.Runtime) {
 	s.mu.Lock()
 	old := s.runtime.Name()
-	s.configureInstanceAuthority(rt)
 	s.runtime = rt
 	newMgr := agent.NewManager(rt)
 	s.manager = newMgr
@@ -398,6 +753,7 @@ func (s *Server) SwapRuntime(rt scionrt.Runtime) {
 		conn.mu.RUnlock()
 		if hb != nil {
 			hb.SwapManager(newMgr)
+			hb.SetDefaultRuntime(rt)
 		}
 	}
 	s.hubMu.RUnlock()
@@ -408,65 +764,46 @@ func (s *Server) SwapRuntime(rt scionrt.Runtime) {
 	)
 }
 
-// initHubIntegration initializes the shared template cache and hub connections.
+// initHubIntegration opens the broker caches and the hub connections.
 func (s *Server) initHubIntegration() error {
-	// 1. Initialize shared template cache
+	if sc := s.config.SharedCaches; sc != nil {
+		// A flat host's instance: its own partition of the file caches and
+		// the host's shared GitHub resolution cache.
+		fc, err := sc.forInstance(s.config.BrokerID)
+		if err != nil {
+			return fmt.Errorf("failed to open the instance's broker caches: %w", err)
+		}
+		s.cache, s.hcCache, s.skCache, s.ghResolutionCache = fc.templates, fc.harnessConfigs, fc.skills, sc.GitHub
+		return s.initHubConnections()
+	}
 	cacheDir := s.config.TemplateCacheDir
 	if cacheDir == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("failed to get home directory: %w", err)
+		var err error
+		if cacheDir, err = defaultTemplateCacheDir(); err != nil {
+			return err
 		}
-		cacheDir = filepath.Join(homeDir, ".scion", "cache", "templates")
 	}
+	// The template cache, and the harness-config and skill caches in
+	// sibling directories so the content-addressed stores stay independent.
+	fc, err := openFileCaches(cacheDir, s.config.TemplateCacheMaxSize)
+	if err != nil {
+		return err
+	}
+	s.cache, s.hcCache, s.skCache = fc.templates, fc.harnessConfigs, fc.skills
+	// The GitHub resolution cache holds resolution metadata, not file
+	// content; nil is safe (resolution then runs uncached).
+	s.ghResolutionCache = openGitHubResolutionCache()
 
 	maxSize := s.config.TemplateCacheMaxSize
 	if maxSize <= 0 {
 		maxSize = templatecache.DefaultMaxSize
 	}
+	slog.Info("Broker caches initialized", "cache", cacheDir, "max_size_mb", maxSize/(1024*1024))
+	return s.initHubConnections()
+}
 
-	cache, err := templatecache.New(cacheDir, maxSize)
-	if err != nil {
-		return fmt.Errorf("failed to initialize template cache: %w", err)
-	}
-	s.cache = cache
-
-	// 1b. Initialize the harness-config cache alongside the template cache,
-	// under a sibling directory so the two content-addressed stores stay
-	// independent.
-	hcCacheDir := filepath.Join(filepath.Dir(cacheDir), "harness-configs")
-	hcCache, err := templatecache.New(hcCacheDir, maxSize)
-	if err != nil {
-		return fmt.Errorf("failed to initialize harness-config cache: %w", err)
-	}
-	s.hcCache = hcCache
-
-	// 1c. Initialize the skill cache for broker-side caching of resolved
-	// skill content, keyed by content hash.
-	skCacheDir := filepath.Join(filepath.Dir(cacheDir), "skills")
-	skCacheMaxSize := int64(500 * 1024 * 1024) // 500MB default
-	skCache, err := templatecache.New(skCacheDir, skCacheMaxSize)
-	if err != nil {
-		return fmt.Errorf("failed to initialize skill cache: %w", err)
-	}
-	s.skCache = skCache
-
-	// 1d. Initialize the GitHub resolution cache for broker-side caching of
-	// GitHub skill resolution metadata (not file content).
-	ghResDir, err := agent.GitHubResolutionCacheDir()
-	if err != nil {
-		slog.Warn("github resolution cache: cannot determine cache dir", "error", err)
-	} else {
-		ghCache, err := agent.NewGitHubResolutionCache(ghResDir, agent.DefaultResolutionCacheTTL)
-		if err != nil {
-			slog.Warn("github resolution cache: init failed (running uncached)", "error", err)
-			// nil cache is safe — resolver falls through to API call
-		} else {
-			s.ghResolutionCache = ghCache
-			slog.Info("GitHub resolution cache initialized", "dir", ghResDir, "ttl", agent.DefaultResolutionCacheTTL)
-		}
-	}
-
+// initHubConnections sets up the hub connections (after the caches).
+func (s *Server) initHubConnections() error {
 	// 2. Initialize hub connections map (already done in New)
 
 	// 3. Handle InMemoryCredentials -> "local" connection (co-located mode)
@@ -497,6 +834,37 @@ func (s *Server) initHubIntegration() error {
 			s.hubMu.Unlock()
 			slog.Info("Created local hub connection (co-located mode)", "name", creds.Name, "brokerID", creds.BrokerID)
 		}
+	}
+
+	// A flat instance is served only through the embedded registration's
+	// in-memory credentials: it never loads the legacy multi-store,
+	// broker-credentials.json or a config-derived connection, so the
+	// steps below are skipped and no credential watcher is started.
+	if s.isFlat() {
+		// A validated remote activation connects only with the instance's
+		// own credentials (contract R10).
+		for i := range s.flatInstance().RemoteCredentials {
+			c := s.flatInstance().RemoteCredentials[i]
+			if c.Name == "" {
+				c.Name = brokercredentials.DeriveHubName(c.HubEndpoint)
+			}
+			if _, exists := s.hubConnections[c.Name]; exists {
+				continue
+			}
+			conn, err := s.createHubConnection(c.Name, &c)
+			if err != nil {
+				slog.Warn("Failed to create hub connection from instance credentials", "name", c.Name, "error", err)
+				continue
+			}
+			s.hubMu.Lock()
+			s.hubConnections[c.Name] = conn
+			s.hubMu.Unlock()
+		}
+		s.buildAuthMiddleware()
+		slog.Info("Hub integration initialized for flat Runtime Broker instance",
+			"connections", len(s.hubConnections),
+			"runtimeBrokerID", s.flatInstance().Identity.RuntimeBrokerID)
+		return nil
 	}
 
 	// 4. Load MultiStore credentials
@@ -562,8 +930,7 @@ func (s *Server) initHubIntegration() error {
 
 	slog.Info("Hub integration initialized",
 		"connections", len(s.hubConnections),
-		"cache", cacheDir,
-		"max_size_mb", maxSize/(1024*1024),
+		"shared_caches", s.config.SharedCaches != nil,
 	)
 
 	return nil
@@ -633,8 +1000,8 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
 	}
-	conn.authorityReady.Store(true)
 
+	conn.authorityReady.Store(true)
 	return conn, nil
 }
 
@@ -685,8 +1052,8 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		HCResolver:      hcResolver,
 		Status:          ConnectionStatusDisconnected,
 	}
-	conn.authorityReady.Store(true)
 
+	conn.authorityReady.Store(true)
 	return conn, nil
 }
 
@@ -760,14 +1127,16 @@ func (s *Server) tryLegacyCredentials() {
 // buildAuthMiddleware creates or rebuilds the multi-key auth middleware
 // from all hub connections' secret keys.
 func (s *Server) buildAuthMiddleware() {
-	s.authMiddlewarePublicationMu.Lock()
-	defer s.authMiddlewarePublicationMu.Unlock()
+	// Runs from the credential watcher and from reinitialize goroutines;
+	// one at a time, each from a fresh read, so an older read cannot
+	// overwrite a newer one.
+	s.authMiddlewareMu.Lock()
+	defer s.authMiddlewareMu.Unlock()
 	s.buildAuthMiddlewareLocked()
 }
 
-// buildAuthMiddlewareLocked snapshots and publishes one complete authority
-// view. Callers must hold authMiddlewarePublicationMu so an older snapshot
-// cannot overwrite keys published for a later authority transition.
+// buildAuthMiddlewareLocked publishes a complete key snapshot. The caller
+// holds authMiddlewareMu, including across any authority transition.
 func (s *Server) buildAuthMiddlewareLocked() {
 	s.hubMu.RLock()
 	var keys []secretKeyEntry
@@ -775,12 +1144,9 @@ func (s *Server) buildAuthMiddlewareLocked() {
 		conn.mu.RLock()
 		if conn.authorityReady.Load() && len(conn.SecretKey) > 0 {
 			keys = append(keys, secretKeyEntry{
-				hubName:     conn.Name,
-				brokerID:    conn.BrokerID,
-				hubEndpoint: conn.HubEndpoint,
-				generation:  conn.authorityGeneration.Load(),
-				secretKey:   append([]byte(nil), conn.SecretKey...),
-				connection:  conn,
+				hubName: conn.Name, brokerID: conn.BrokerID, hubEndpoint: conn.HubEndpoint,
+				generation: conn.authorityGeneration.Load(),
+				secretKey:  append([]byte(nil), conn.SecretKey...), connection: conn,
 			})
 		}
 		conn.mu.RUnlock()
@@ -791,12 +1157,18 @@ func (s *Server) buildAuthMiddlewareLocked() {
 	}
 
 	if !s.config.BrokerAuthEnabled {
-		s.brokerAuthMiddleware = nil
+		s.brokerAuthMiddleware.Store(nil)
 		return
 	}
 
-	if s.brokerAuthMiddleware == nil {
-		s.brokerAuthMiddleware = NewMultiKeyBrokerAuthMiddleware(
+	mw := s.brokerAuthMiddleware.Load()
+	if mw == nil {
+		// Keep standalone bootstrap behavior until a signing key has been
+		// registered. Once established, middleware survives empty key sets.
+		if len(keys) == 0 {
+			return
+		}
+		mw = NewMultiKeyBrokerAuthMiddleware(
 			true,
 			5*time.Minute,
 			!s.config.BrokerAuthStrictMode,
@@ -808,7 +1180,8 @@ func (s *Server) buildAuthMiddlewareLocked() {
 		}
 	}
 
-	s.brokerAuthMiddleware.UpdateKeys(keys)
+	mw.UpdateKeys(keys)
+	s.brokerAuthMiddleware.Store(mw)
 }
 
 func isLoopbackHost(host string) bool {
@@ -825,10 +1198,7 @@ func (s *Server) authKeyCount() int {
 	defer s.hubMu.RUnlock()
 	count := 0
 	for _, conn := range s.hubConnections {
-		conn.mu.RLock()
-		ready := conn.authorityReady.Load() && len(conn.SecretKey) > 0
-		conn.mu.RUnlock()
-		if ready {
+		if conn.authorityReady.Load() && len(conn.snapshot().SecretKey) > 0 {
 			count++
 		}
 	}
@@ -871,6 +1241,25 @@ func (s *Server) validateBrokerAuthStartup() error {
 	}
 
 	return nil
+}
+
+// SetWorkspaceDownloader replaces the GCS download used to bootstrap an
+// agent workspace from a hub workspace upload. nil restores the default.
+// This is useful for testing.
+func (s *Server) SetWorkspaceDownloader(fn func(ctx context.Context, bucket, prefix, localPath string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspaceDownload = fn
+}
+
+// workspaceDownloader returns the GCS workspace bootstrap download.
+func (s *Server) workspaceDownloader() func(ctx context.Context, bucket, prefix, localPath string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.workspaceDownload != nil {
+		return s.workspaceDownload
+	}
+	return gcp.SyncFromGCS
 }
 
 // SetRequestLogger sets the dedicated request logger.
@@ -939,72 +1328,11 @@ func (s *Server) GetHydrator() *templatecache.Hydrator {
 	return nil
 }
 
-// Start starts the HTTP server.
+// Start starts the broker's services and its own HTTP listener, and blocks
+// until ctx is done (then shuts down) or the listener fails.
 func (s *Server) Start(ctx context.Context) error {
-	s.mu.Lock()
-	s.startTime = time.Now()
-	if err := s.validateBrokerAuthStartup(); err != nil {
-		s.mu.Unlock()
+	if err := s.startServices(ctx, true); err != nil {
 		return err
-	}
-
-	handler := s.applyMiddleware(s.mux)
-
-	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
-		Handler:      handler,
-		ReadTimeout:  s.config.ReadTimeout,
-		WriteTimeout: s.config.WriteTimeout,
-	}
-	s.mu.Unlock()
-
-	slog.Info("Runtime Broker API server starting",
-		"host", s.config.Host,
-		"port", s.config.Port,
-	)
-	if s.config.Debug {
-		slog.Debug("Broker details",
-			"brokerID", s.config.BrokerID,
-			"brokerName", s.config.BrokerName,
-			"hub_endpoint", s.config.HubEndpoint,
-			"hub_connections", len(s.hubConnections),
-		)
-	}
-
-	// Discover auxiliary runtimes (e.g. Kubernetes) from project settings
-	// so that agents running on non-default runtimes can be found after
-	// a broker restart.
-	s.discoverAuxiliaryRuntimes()
-
-	// Reconcile NFS mounts at startup (ensure configured shares are mounted).
-	if s.nfsMountReconciler != nil {
-		if err := s.nfsMountReconciler.Reconcile(); err != nil {
-			slog.Warn("NFS mount reconciliation returned error at startup", "error", err)
-		}
-		if !s.nfsMountReconciler.IsHealthy() {
-			slog.Error("NFS mounts unhealthy at startup",
-				"detail", s.nfsMountReconciler.HealthCheckString())
-		} else {
-			slog.Info("NFS mounts reconciled at startup",
-				"status", s.nfsMountReconciler.HealthCheckString())
-		}
-	}
-
-	// Start all hub connections' services
-	s.hubMu.RLock()
-	for name, conn := range s.hubConnections {
-		if err := conn.Start(ctx, s); err != nil {
-			slog.Error("Failed to start hub connection", "name", name, "error", err)
-		}
-	}
-	s.hubMu.RUnlock()
-
-	// Log a summary of all hub connections
-	s.logHubConnections()
-
-	// Start credential watcher for dynamic reload
-	if s.config.HubEnabled && s.multiCredStore != nil {
-		s.startCredentialWatcher(ctx)
 	}
 
 	errCh := make(chan error, 1)
@@ -1023,8 +1351,198 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
+// Started reports whether the server's services were started.
+func (s *Server) Started() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.servicesStarted
+}
+
+// StartServices starts everything Start does except the HTTP listener: hub
+// connections (control channel, heartbeat), NFS checks and the credential
+// watcher. It returns once they are started. A host that owns the listener
+// (several Runtime Broker instances in one process) serves Handler itself
+// and calls Shutdown when done.
+func (s *Server) StartServices(ctx context.Context) error {
+	return s.startServices(ctx, false)
+}
+
+// startServices is Start without serving; withListener also builds the
+// server's own http.Server.
+func (s *Server) startServices(ctx context.Context, withListener bool) error {
+	// A flat instance is served only co-located with its Hub or after the
+	// host validated its remote activation
+	// (flat_runtime_broker_remote_unsupported otherwise); refuse before
+	// serving, connecting or accepting any dispatch.
+	if err := s.flatHostingError(); err != nil {
+		return err
+	}
+	if s.ownershipSetupErr != nil {
+		return s.ownershipSetupErr
+	}
+	if s.hostSetupErr != nil {
+		return s.hostSetupErr
+	}
+
+	s.mu.Lock()
+	s.startTime = time.Now()
+	s.servicesStarted = true
+	if err := s.validateBrokerAuthStartup(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+
+	if withListener {
+		s.httpServer = &http.Server{
+			Addr:         fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
+			Handler:      s.applyMiddleware(s.mux),
+			ReadTimeout:  s.config.ReadTimeout,
+			WriteTimeout: s.config.WriteTimeout,
+		}
+	}
+	s.mu.Unlock()
+
+	slog.Info("Runtime Broker API server starting",
+		"host", s.config.Host,
+		"port", s.config.Port,
+	)
+	if s.config.Debug {
+		slog.Debug("Broker details",
+			"brokerID", s.config.BrokerID,
+			"brokerName", s.config.BrokerName,
+			"hub_endpoint", s.config.HubEndpoint,
+			"hub_connections", len(s.hubConnections),
+		)
+	}
+
+	// Runtime broker boot hook: warn about legacy environment variables
+	// scion no longer reads, before scanning projects/. This is the
+	// broker-boot half of the legacy-migration hook points;
+	// the CLI equivalent is Execute()/rootCmd.PersistentPreRunE in
+	// cmd/root.go (skipped for "start" under the "server"/"runtime-broker"
+	// subtree — this hook reports instead), and the hub equivalent is
+	// cmd/server_foreground.go:runServerStart. Both this hook and the hub's
+	// share config's process-wide sync.Once (WarnRemovedLegacyEnvOnce), so
+	// a combined `--enable-hub --enable-runtime-broker` process reports
+	// once, not twice. On-disk layout migration is expected to run at this
+	// same hook point.
+	config.WarnRemovedLegacyEnvOnce(os.Getenv, config.NewSlogReporter())
+	// Legacy settings and marker key migration (as projects load) reports
+	// through slog here too. This is already the default, but set it
+	// explicitly so all three boot hooks (CLI, hub, broker) are visible at
+	// their call sites.
+	config.SetProjectMigrationReporter(config.NewSlogReporter())
+	// Migrate the global ~/.scion layout before scanning projects/ below.
+	if globalDir, err := config.GetGlobalDir(); err == nil {
+		config.MigrateLegacyGlobalLayoutOnce(globalDir, config.NewSlogReporter())
+	} else {
+		slog.Warn("skipping legacy layout migration: could not resolve global directory", "error", err)
+	}
+
+	// Discover auxiliary runtimes (e.g. Kubernetes) from project settings
+	// so that agents running on non-default runtimes can be found after
+	// a broker restart. A flat instance serves only its single target and
+	// never resolves profiles, so it has no auxiliary runtimes.
+	if !s.isFlat() {
+		s.discoverAuxiliaryRuntimes()
+	}
+
+	// Check (and, with nfs.auto_mount, mount) the configured NFS shares.
+	// This runs in the background: an NFS mount or mountpoint check against
+	// an unreachable server can block for minutes, and a failed mount must
+	// not delay or stop the broker from serving projects that do not use
+	// NFS. Until the first pass finishes, /healthz reports the shares as not
+	// reconciled.
+	s.startNFSReconcileLoop(ctx)
+
+	// Start all hub connections' services. Start is called without
+	// s.hubMu held: it takes the connection's lifecycle lock and, inside,
+	// s.hubMu itself.
+	for _, conn := range s.hubConnectionList() {
+		if err := conn.Start(ctx, s); err != nil {
+			slog.Error("Failed to start hub connection", "name", conn.Name, "error", err)
+		}
+	}
+
+	// Log a summary of all hub connections
+	s.logHubConnections()
+
+	// Start credential watcher for dynamic reload
+	if s.config.HubEnabled && s.multiCredStore != nil {
+		s.startCredentialWatcher(ctx)
+	}
+
+	return nil
+}
+
+// startNFSReconcileLoop starts the NFS reconciler's background loop (see
+// NFSMountReconciler.Run). It is a no-op when NFS is not configured, and
+// starts at most one loop per Server. The loop stops when ctx is cancelled
+// or Shutdown is called.
+func (s *Server) startNFSReconcileLoop(ctx context.Context) {
+	if s.nfsMountReconciler == nil || s.nfsHostOwned {
+		return // none, or the host mounter runs it
+	}
+	s.nfsReconcileOnce.Do(func() {
+		loopCtx, cancel := context.WithCancel(ctx)
+		s.mu.Lock()
+		s.nfsReconcileCancel = cancel
+		s.mu.Unlock()
+		go func() {
+			defer close(s.nfsReconcileStopped)
+			s.nfsMountReconciler.Run(loopCtx, s.nfsReconcileInterval, func() {
+				s.logNFSStartupResult()
+				close(s.nfsStartupReconcileDone)
+			})
+		}()
+	})
+}
+
+// logNFSStartupResult logs the outcome of the first reconcile pass. Failures
+// are recorded per share (surfaced in /healthz and by scion doctor) and
+// never stop the broker.
+func (s *Server) logNFSStartupResult() {
+	r := s.nfsMountReconciler
+	if r.IsHealthy() {
+		slog.Info("NFS mounts checked at startup",
+			"status", r.HealthCheckString(), "autoMount", r.AutoMount())
+		return
+	}
+	slog.Error("NFS mounts unhealthy at startup; the broker keeps serving",
+		"detail", r.HealthCheckString(), "autoMount", r.AutoMount())
+}
+
+// ghResolutionCacheCloseTimeout bounds how long Shutdown waits for
+// background refreshes of the GitHub resolution cache before writing it to
+// disk (see GitHubResolutionCache.Close).
+const ghResolutionCacheCloseTimeout = 10 * time.Second
+
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Stop the heartbeat service account report's background discovery.
+	s.saDiscovery().stop()
+
+	// Close the resolution cache: wait, within a bound, for background
+	// refreshes still running, then write any entries still waiting for
+	// their delayed write. Deferred so it runs on every return path, and
+	// after the HTTP server has drained, when in-flight requests have
+	// finished adding to it.
+	//
+	// parentCtx keeps the caller's ctx: ctx is reassigned below to the
+	// drain timeout, whose cancel runs before this deferred func, so a
+	// bound derived from it would already be cancelled here.
+	parentCtx := ctx
+	defer func() {
+		if s.ghResolutionCache == nil || s.config.SharedCaches != nil {
+			return // none, or the host's, which the host closes
+		}
+		closeCtx, cancel := context.WithTimeout(parentCtx, ghResolutionCacheCloseTimeout)
+		defer cancel()
+		if err := s.ghResolutionCache.Close(closeCtx); err != nil {
+			slog.Warn("GitHub resolution cache closed before background refreshes finished", "error", err)
+		}
+	}()
+
 	// Stop credential watcher
 	s.mu.RLock()
 	srv := s.httpServer
@@ -1036,23 +1554,66 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		close(credWatcherStop)
 	}
 
-	// Stop all hub connections
-	s.hubMu.RLock()
-	for _, conn := range s.hubConnections {
-		conn.Stop()
+	// Stop the NFS reconcile loop. Cancelling its context kills a mount
+	// command in progress (its whole process group), so the loop ends
+	// promptly; it is not waited for.
+	s.mu.RLock()
+	nfsCancel := s.nfsReconcileCancel
+	s.mu.RUnlock()
+	if nfsCancel != nil {
+		nfsCancel()
 	}
-	s.hubMu.RUnlock()
+
+	// Cancel every start still running on a start, restart or create
+	// handler and wait for Run's deferred cleanup, before the hub
+	// connections and the HTTP server drain, so no start outlives the
+	// starts this process last reported in flight.
+	// One deadline covers both this wait and the HTTP drain below.
+	ctx, cancel := context.WithTimeout(ctx, shutdownDeadline)
+	defer cancel()
+	if !s.startsInFlight.cancelAllAndWait(ctx) {
+		s.agentLifecycleLog.Warn("Shutdown proceeding before every cancelled start finished its cleanup")
+	}
+
+	// Stop all hub connections for good, without s.hubMu held (see
+	// Start). A Start or reinitialize still queued on a connection does
+	// nothing once it is closed.
+	var closing []<-chan struct{}
+	for _, conn := range s.hubConnectionList() {
+		closing = append(closing, conn.closeAsync())
+	}
+	var drainErr error
+waitForConnections:
+	for _, done := range closing {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			drainErr = ctx.Err()
+			break waitForConnections
+		}
+	}
 
 	if srv == nil {
-		return nil
+		return drainErr
 	}
 
 	slog.Info("Runtime Broker API server shutting down...")
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	// http.Server.Shutdown closes listeners even when ctx has expired.
+	// A timed-out lease drain must never bypass that listener closure.
+	return errors.Join(drainErr, srv.Shutdown(ctx))
+}
 
-	return srv.Shutdown(ctx)
+// hubConnectionList returns the current hub connections, read under
+// s.hubMu, so callers can run lifecycle operations without holding it.
+func (s *Server) hubConnectionList() []*HubConnection {
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	conns := make([]*HubConnection, 0, len(s.hubConnections))
+	for _, conn := range s.hubConnections {
+		conns = append(conns, conn)
+	}
+	return conns
 }
 
 // Handler returns the HTTP handler for the server.
@@ -1061,16 +1622,73 @@ func (s *Server) Handler() http.Handler {
 	return s.applyMiddleware(s.mux)
 }
 
+// PrefixedHandler serves this server's routes under prefix (for example
+// "/instances/<runtimeBrokerID>"), for a host that runs several Runtime
+// Broker instances behind one listener (ptone/scion#3273). The broker
+// authentication verifies the request signature over the full, prefixed
+// path the Hub signed; only then is the prefix removed and the request
+// handled exactly as Handler would handle the unprefixed path. The health
+// endpoints under the prefix stay unauthenticated. A path outside the prefix
+// is 404.
+func (s *Server) PrefixedHandler(prefix string) http.Handler {
+	prefix = strings.TrimSuffix(prefix, "/")
+	inner := http.StripPrefix(prefix, s.innerMiddleware(s.mux))
+	authenticated := s.outerMiddleware(inner)
+	health := otelhttp.NewHandler(inner, "broker")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rest, ok := strings.CutPrefix(r.URL.Path, prefix)
+		if !ok || (rest != "" && !strings.HasPrefix(rest, "/")) {
+			http.NotFound(w, r)
+			return
+		}
+		if rest == "/healthz" || rest == "/readyz" {
+			health.ServeHTTP(w, r)
+			return
+		}
+		authenticated.ServeHTTP(w, r)
+	})
+}
+
 // getAuxiliaryManagers returns the managers for all registered auxiliary runtimes.
 func (s *Server) getAuxiliaryManagers() []agent.Manager {
-	s.auxiliaryRuntimesMu.RLock()
-	defer s.auxiliaryRuntimesMu.RUnlock()
-
-	managers := make([]agent.Manager, 0, len(s.auxiliaryRuntimes))
-	for _, aux := range s.auxiliaryRuntimes {
+	entries := s.sortedAuxiliaryRuntimes()
+	managers := make([]agent.Manager, 0, len(entries))
+	for _, aux := range entries {
 		managers = append(managers, aux.Manager)
 	}
 	return managers
+}
+
+// namedAuxiliaryRuntime pairs an auxiliaryRuntime with the identity key it is
+// stored under, for callers (logging, debugging) that want both.
+type namedAuxiliaryRuntime struct {
+	identity string
+	auxiliaryRuntime
+}
+
+// sortedAuxiliaryRuntimes returns a snapshot of the currently registered
+// auxiliary runtimes ordered by identity key. More than one auxiliary
+// runtime of the same type can be registered (see
+// auxiliaryRuntimeIdentity), so first-match-wins consumers (LookupAgent,
+// resolveAgentRuntimeTarget, and LookupContainerID via auxListAgentsSorted,
+// which sorts the same keys) need a deterministic iteration order — the
+// same pattern resolveDeleteTarget already used for its manager list —
+// rather than depending on Go's randomized map order.
+func (s *Server) sortedAuxiliaryRuntimes() []namedAuxiliaryRuntime {
+	s.auxiliaryRuntimesMu.RLock()
+	defer s.auxiliaryRuntimesMu.RUnlock()
+
+	keys := make([]string, 0, len(s.auxiliaryRuntimes))
+	for k := range s.auxiliaryRuntimes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	entries := make([]namedAuxiliaryRuntime, 0, len(keys))
+	for _, k := range keys {
+		entries = append(entries, namedAuxiliaryRuntime{identity: k, auxiliaryRuntime: s.auxiliaryRuntimes[k]})
+	}
+	return entries
 }
 
 // discoverAuxiliaryRuntimes scans project settings for runtime profiles that
@@ -1078,20 +1696,15 @@ func (s *Server) getAuxiliaryManagers() []agent.Manager {
 // non-default runtimes are registered as auxiliary runtimes so that agents
 // running on them (e.g. Kubernetes pods) can be found after a broker restart.
 func (s *Server) discoverAuxiliaryRuntimes() {
-	defaultRT := s.runtime.Name()
-
 	// Collect project paths to scan
 	var projectPaths []string
 
-	// Hub-managed projects: ~/.scion/{projects,groves}/<slug>/.scion/
+	// Hub-managed projects: ~/.scion/projects/<slug>/.scion/
 	globalDir, err := config.GetGlobalDir()
 	if err == nil {
-		for _, dirName := range []string{"projects", "groves"} {
-			projectsDir := filepath.Join(globalDir, dirName)
-			entries, err := os.ReadDir(projectsDir)
-			if err != nil {
-				continue
-			}
+		projectsDir := filepath.Join(globalDir, "projects")
+		entries, err := os.ReadDir(projectsDir)
+		if err == nil {
 			for _, e := range entries {
 				if !e.IsDir() {
 					continue
@@ -1109,7 +1722,57 @@ func (s *Server) discoverAuxiliaryRuntimes() {
 		projectPaths = append(projectPaths, pd)
 	}
 
-	discovered := make(map[string]bool)
+	s.discoverAuxiliaryRuntimesForProjects(projectPaths)
+}
+
+// logUnresolvedAuxiliaryProfile reports a settings profile whose runtime
+// could not be built during auxiliary runtime discovery
+// (ptone/scion#3605). For the active profile that is a warning. Any other
+// profile (for example a Kubernetes profile on a host without cluster
+// access) is reported at Info with a hint: it only matters if agents use it.
+func logUnresolvedAuxiliaryProfile(profileName, activeProfile string, resolved scionrt.Runtime) {
+	var cause error
+	if er, ok := resolved.(*scionrt.ErrorRuntime); ok {
+		cause = er.Err
+	}
+	if profileName == activeProfile {
+		slog.Warn("Failed to resolve the runtime of the active profile", "profile", profileName, "error", cause)
+		return
+	}
+	slog.Info("Runtime of a non-active profile is not available on this broker; agents that use it are not found until it resolves",
+		"profile", profileName, "error", cause,
+		"hint", "fix the profile's runtime configuration if agents use it, or remove the profile")
+}
+
+// discoverAuxiliaryRuntimesForProjects scans the given project settings
+// directories for runtime profiles that resolve to a runtime different from
+// the broker's default, and registers each distinct resolved runtime once.
+//
+// De-duplication is keyed by the resolved runtime's IDENTITY (see
+// auxiliaryRuntimeIdentity), not by its TYPE: two profiles that resolve to
+// different Kubernetes clusters/contexts/namespaces are distinct runtimes and
+// must both be registered, while two profiles that resolve to the same
+// underlying runtime must be registered once. Keying by type alone would
+// register only one of several distinct same-type runtimes, chosen by map
+// iteration order. See ptone/scion#2260.
+//
+// Iteration over profile names is sorted so registration does not depend on
+// map order.
+//
+// Split out from discoverAuxiliaryRuntimes so tests can exercise resolution,
+// de-duplication and registration directly, without depending on the
+// broker's on-disk project discovery.
+func (s *Server) discoverAuxiliaryRuntimesForProjects(projectPaths []string) {
+	defRT := s.currentRuntime()
+	// Compared against every resolved profile below so that a profile
+	// pointing at the broker's own runtime instance — not merely the same
+	// TYPE as the broker's default — is recognized and skipped. A broker
+	// whose default is Kubernetes must still register a profile aimed at a
+	// different cluster/context/namespace as an auxiliary runtime; comparing
+	// types alone would wrongly treat it as "the default" and drop it.
+	defaultIdentity := auxiliaryRuntimeIdentity(defRT)
+
+	discoveredIdentities := make(map[string]bool)
 
 	for _, gp := range projectPaths {
 		vs, _, _ := config.LoadEffectiveSettings(gp)
@@ -1117,68 +1780,323 @@ func (s *Server) discoverAuxiliaryRuntimes() {
 			continue
 		}
 
+		profileNames := make([]string, 0, len(vs.Profiles))
 		for profileName := range vs.Profiles {
-			_, runtimeType, err := vs.ResolveRuntime(profileName)
-			if err != nil || runtimeType == defaultRT || discovered[runtimeType] {
-				continue
-			}
-			discovered[runtimeType] = true
+			profileNames = append(profileNames, profileName)
+		}
+		sort.Strings(profileNames)
 
-			resolved := agent.ResolveRuntime(gp, "", profileName)
-			if resolved.Name() == "error" {
-				slog.Warn("Failed to resolve auxiliary runtime",
-					"runtime", runtimeType, "profile", profileName)
+		for _, profileName := range profileNames {
+			// Only used here to skip profiles whose runtime entry doesn't
+			// exist at all; the actual default/de-dup comparisons below are
+			// by resolved IDENTITY, not by this settings-level type string,
+			// so settings spellings that alias one runtime type (e.g. "k8s"
+			// and "kubernetes") don't register twice.
+			if _, _, err := vs.ResolveRuntime(profileName); err != nil {
 				continue
 			}
+
+			resolved := s.resolveAuxiliaryRuntime(gp, "", profileName)
+			if resolved.Name() == "error" {
+				logUnresolvedAuxiliaryProfile(profileName, vs.ActiveProfile, resolved)
+				continue
+			}
+
+			identity := auxiliaryRuntimeIdentity(resolved)
+			if identity == defaultIdentity || discoveredIdentities[identity] {
+				continue
+			}
+			discoveredIdentities[identity] = true
 
 			mgr := agent.NewManager(resolved)
 			s.auxiliaryRuntimesMu.Lock()
-			s.auxiliaryRuntimes[resolved.Name()] = auxiliaryRuntime{Runtime: resolved, Manager: mgr}
+			s.auxiliaryRuntimes[identity] = auxiliaryRuntime{Runtime: resolved, Manager: mgr}
 			s.auxiliaryRuntimesMu.Unlock()
 
 			slog.Info("Discovered auxiliary runtime from project settings",
-				"runtime", resolved.Name(), "profile", profileName)
+				"runtime", resolved.Name(), "identity", identity, "profile", profileName)
 		}
 	}
+}
+
+// auxiliaryRuntimeIdentity returns a key that identifies a specific resolved
+// runtime INSTANCE, not merely its type. It is used to de-duplicate
+// discovered auxiliary runtimes, as the key under which they are stored in
+// Server.auxiliaryRuntimes, and to compare a resolved profile against the
+// broker's own default runtime — so that two distinct instances of the same
+// runtime type (e.g. Kubernetes pointed at different clusters/contexts/
+// namespaces) are tracked and addressed separately, while two profiles that
+// resolve to the same instance collapse to one entry.
+//
+// The type component always comes from rt.Name() — the runtime's own
+// canonical name — never from a settings-level type string: two settings
+// spellings that alias one runtime type (e.g. "k8s" and "kubernetes", both
+// accepted by runtime.GetRuntime) must produce the same identity.
+//
+// Extra fields are appended only for a runtime type with per-instance config
+// that both (a) varies between two profiles of the same type on one broker
+// process and (b) is actually consumed by the runtime, so it genuinely
+// distinguishes one reachable target from another: Kubernetes (context,
+// namespace). Every other type keeps the bare type-name identity today:
+//
+//   - Docker/Podman: Host is assigned onto DockerRuntime/PodmanRuntime from
+//     settings, but neither runtime reads it back (no -H/--host flag, no
+//     DOCKER_HOST/CONTAINER_HOST wiring) — every instance talks to the same
+//     local daemon regardless of Host, so Host cannot distinguish one from
+//     another. It also isn't normalized (an empty host, "unix:///var/run/
+//     docker.sock" and "/var/run/docker.sock" would otherwise be three
+//     identities for one daemon). If per-host Docker/Podman is wanted later,
+//     it belongs with the change that wires Host into the command actually
+//     run, together with socket-spelling normalization.
+//   - Cloud Run: ProjectID/Location are resolved lazily from GCE metadata
+//     when auto-detected, so an unresolved instance and the same instance
+//     after its first API call would otherwise produce two identities for
+//     one target, and reading them here would be unsynchronized with
+//     CloudRunRuntime's own resolution: that path holds a mutex while it
+//     writes ProjectID/Location, and this identity function does not take
+//     that lock. Project/region disambiguation for Cloud Run is a follow-up,
+//     not made here.
+//   - Apple container, Cloud Run Sandbox: no per-instance config exists at
+//     all today.
+func auxiliaryRuntimeIdentity(rt scionrt.Runtime) string {
+	switch r := rt.(type) {
+	case *scionrt.KubernetesRuntime:
+		ctx := ""
+		if r.Client != nil {
+			ctx = r.Client.CurrentContext
+		}
+		return fmt.Sprintf("%s|context=%s|namespace=%s", rt.Name(), ctx, r.DefaultNamespace)
+	default:
+		return rt.Name()
+	}
+}
+
+// canonicalRuntimeTypeName normalizes "k8s" to "kubernetes" for comparing a
+// profile's declared type against a resolved runtime's Name(): "k8s" and
+// "kubernetes" both resolve to the same KubernetesRuntime (see
+// runtime.GetRuntime), but Name() always returns "kubernetes". Other
+// settings-level aliases of "kubernetes" (e.g. "remote") are not normalized
+// here, so a profile declared with one of those falls through to full
+// resolution instead of being matched by this cheap comparison.
+func canonicalRuntimeTypeName(runtimeType string) string {
+	if runtimeType == "k8s" {
+		return "kubernetes"
+	}
+	return runtimeType
+}
+
+// defaultRuntimeMatchesProfile reports whether a profile's settings-declared
+// runtime type (and, for Kubernetes, target cluster/namespace) is the same as
+// the broker's own default runtime — WITHOUT fully resolving the profile
+// (runtime.GetRuntime, which for Kubernetes also calls Client.Verify(), a
+// live API round trip). This lets resolveManagerForOpts return the shared
+// manager for the common case (a start on the broker's own default) at the
+// cost of a settings-string comparison, instead of paying a network call —
+// and risking a start failing on a transient Verify error — for every single
+// agent start.
+//
+// A false result does not mean "this is definitely a different runtime"; it
+// means the cheap check could not prove a match, so the caller should fall
+// back to fully resolving the profile for a conclusive answer.
+func (s *Server) defaultRuntimeMatchesProfile(runtimeType string, rtConfig config.V1RuntimeConfig) bool {
+	return runtimeMatchesProfile(s.currentRuntime(), runtimeType, rtConfig)
+}
+
+// runtimeMatchesProfile is defaultRuntimeMatchesProfile for a given
+// runtime, so a caller that read the default runtime under s.mu can check
+// its own snapshot.
+func runtimeMatchesProfile(def scionrt.Runtime, runtimeType string, rtConfig config.V1RuntimeConfig) bool {
+	if canonicalRuntimeTypeName(runtimeType) != def.Name() {
+		return false
+	}
+
+	defaultK8s, isDefaultK8s := def.(*scionrt.KubernetesRuntime)
+	if !isDefaultK8s {
+		// Every non-Kubernetes type uses the bare type-name identity
+		// (see auxiliaryRuntimeIdentity): a type match is an identity match,
+		// so there is nothing further to resolve.
+		return true
+	}
+	if defaultK8s.Client == nil {
+		return false
+	}
+
+	context := rtConfig.Context
+	if context == "" {
+		// An unset context targets the kubeconfig's current context. Resolve
+		// it the same way runtime.GetRuntime does (k8s.NewClientWithContext),
+		// but without the Verify() call that follows it there: building the
+		// client only reads local kubeconfig/in-cluster files, it never
+		// dials the cluster. A failure here is not conclusive — e.g. no
+		// kubeconfig reachable from this process — so fall back to the full
+		// resolution path rather than guessing.
+		client, err := k8s.NewClientWithContext(os.Getenv("KUBECONFIG"), "")
+		if err != nil {
+			return false
+		}
+		context = client.CurrentContext
+	}
+	if context != defaultK8s.Client.CurrentContext {
+		return false
+	}
+
+	namespace := rtConfig.Namespace
+	if namespace == "" {
+		namespace = scionrt.DefaultKubernetesNamespace()
+	}
+	return namespace == defaultK8s.DefaultNamespace
+}
+
+// ErrAgentListUnavailable wraps a runtime.List failure encountered while
+// resolving an agent slug (e.g. LookupAgent, LookupContainerID). It is
+// distinct from "no such agent": the container runtime itself failed to
+// respond (e.g. an intermittent `docker ps` error), so the caller should
+// treat this as retryable rather than reporting the agent as missing.
+var ErrAgentListUnavailable = errors.New("agent runtime listing temporarily unavailable")
+
+// ErrAgentNotFound marks a lookup result from LookupContainerID that must be
+// treated the same as a genuine "no such agent": either the runtime listing
+// succeeded but no agent matched the requested slug/project, or a matching
+// agent record was found but carries no resolvable container id at all (no
+// "scion.container.id" label, no ContainerID, no ID) — e.g. a malformed or
+// partial runtime entry that carries no container id — nothing addressable
+// to stop. In both cases there is nothing present to act on, so callers use
+// errors.Is(err, ErrAgentNotFound) to fold this into the idempotent "not
+// found" path (skip stop, proceed to start on restart) rather than
+// aborting. This is distinct from any other lookup failure (a runtime
+// listing error, an ambiguous match), which reflects a real problem
+// resolving an agent that may well exist and must still be surfaced as an
+// error rather than treated as "not found".
+var ErrAgentNotFound = errors.New("agent not found")
+
+// agentNotFoundError implements the existing "agent '<slug>' not found"
+// message while allowing errors.Is(err, ErrAgentNotFound) to match it.
+type agentNotFoundError struct{ slug string }
+
+func (e *agentNotFoundError) Error() string {
+	return fmt.Sprintf("agent '%s' not found", e.slug)
+}
+
+func (e *agentNotFoundError) Is(target error) bool {
+	return target == ErrAgentNotFound
 }
 
 // LookupContainerID implements AgentLookup interface.
 // It looks up an agent by slug and returns its container ID.
 // projectID scopes the lookup to prevent cross-project collision.
+// See lookupAgentTarget for the resolution rules and error types.
 func (s *Server) LookupContainerID(ctx context.Context, slug, projectID string) (string, error) {
-	if s.manager == nil {
-		return "", fmt.Errorf("agent manager not available")
+	containerID, _, _, err := s.lookupAgentTarget(ctx, slug, projectID)
+	return containerID, err
+}
+
+// lookupAgentTarget resolves an agent slug to its container identifier
+// (container ID for docker/podman, pod name for k8s, or whatever a runtime
+// reports) and also returns the agent.Manager and scionrt.Runtime pair
+// whose List call produced the match, so a caller that goes on to act on
+// the target (e.g. Stop, Exec) sends the operation to the same runtime the
+// identifier came from rather than to a manager or runtime re-derived by a
+// second, independent lookup. The manager and runtime are paired at the
+// stage that produced the match — the default runtime's own manager and
+// runtime together when the default stage matches, or the single
+// auxiliaryRuntime entry auxListAgentsSorted matched against — so there is
+// no point at which one is resolved independently of the other.
+//
+// Resolution runs in two stages, each consulting the default runtime first
+// and then every auxiliary runtime in sorted identity order (auxListAgentsSorted):
+//
+//  1. a project-scoped search (scion.name plus the project label);
+//  2. only when projectID is set and stage 1 found nothing, a slug-only
+//     search that accepts just containers carrying no project label at all
+//     (pre-label or solo/CLI containers — see agentsWithoutProjectLabel).
+//
+// Errors:
+//   - a default-runtime List failure, in either stage, wraps
+//     ErrAgentListUnavailable;
+//   - an auxiliary-runtime List failure is decisive only when no runtime
+//     produced a match in that stage: a match found on another runtime is
+//     authoritative over an error seen along the way, but "no match after a
+//     failed List" wraps ErrAgentListUnavailable rather than claiming the
+//     agent is absent, and ends the lookup without running the next stage;
+//   - more than one matching entry returns uniqueAgentEntry's (unwrapped)
+//     ambiguity error;
+//   - no match at all, or a matched record carrying no container identifier
+//     (nothing addressable to act on), satisfies errors.Is(err,
+//     ErrAgentNotFound).
+//
+// Every error errs toward an explicit failure, never toward a false
+// not-found or a wrong target.
+func (s *Server) lookupAgentTarget(ctx context.Context, slug, projectID string) (string, agent.Manager, scionrt.Runtime, error) {
+	m, err := s.lookupAgentMatch(ctx, slug, projectID)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return m.containerID, m.manager, m.runtime, nil
+}
+
+// agentMatch is the result of lookupAgentMatch: the container identifier,
+// the manager and runtime that listed it, and the listed entry itself.
+//
+// matched reports that exactly one entry matched. It is also set alongside
+// the ErrAgentNotFound returned for a matched entry that carries no
+// container identifier: there is nothing to act on, but the entry's listed
+// name and project path are still the agent's.
+type agentMatch struct {
+	containerID string
+	manager     agent.Manager
+	runtime     scionrt.Runtime
+	entry       api.AgentInfo
+	matched     bool
+}
+
+// lookupAgentMatch is lookupAgentTarget's search, returning the matched
+// entry as well, so a caller that needs the agent's listed name or project
+// path reads them from the same entry it acts on. Resolution order and
+// errors are exactly lookupAgentTarget's.
+func (s *Server) lookupAgentMatch(ctx context.Context, slug, projectID string) (agentMatch, error) {
+	defMgr, defRT := s.defaultPair()
+	if defMgr == nil {
+		return agentMatch{}, fmt.Errorf("agent manager not available")
 	}
 
 	slug = strings.ToLower(slug)
 
-	filter := map[string]string{"scion.name": slug}
-	agents, err := s.manager.List(ctx, filter)
-	if err != nil {
-		return "", fmt.Errorf("failed to list agents: %w", err)
+	filter := scopedNameFilter(slug, projectID)
+
+	// The agent's own runtime, when known (ensureAgentOwnRuntime), is the
+	// only one searched; a failed List there is ErrAgentListUnavailable.
+	if own := s.ownRuntimeFor(ctx); own != nil {
+		agents, err := listInOwnRuntime(ctx, own, slug, projectID)
+		if err != nil {
+			return agentMatch{}, err
+		}
+		return agentMatchFrom(slug, agents, own.mgr, own.rt)
 	}
-	agents = agentsForProject(agents, projectID)
+
+	// A recorded runtime type (ptone/scion#2748) can exclude the default
+	// runtime; auxListAgentsSorted applies the same restriction.
+	useDefault := s.defaultRuntimeAllowed(ctx)
+	var agents []api.AgentInfo
+	var err error
+	if useDefault {
+		agents, err = defMgr.List(ctx, filter)
+		if err != nil {
+			return agentMatch{}, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
+		}
+		agents = agentsForProject(agents, projectID)
+	}
+	matchManager := defMgr
+	matchRuntime := defRT
 
 	// Fall back to auxiliary runtimes (e.g. kubernetes when default is docker)
 	if len(agents) == 0 {
-		s.auxiliaryRuntimesMu.RLock()
-		auxRuntimes := make(map[string]auxiliaryRuntime, len(s.auxiliaryRuntimes))
-		for k, v := range s.auxiliaryRuntimes {
-			auxRuntimes[k] = v
+		auxAgents, auxManager, auxRuntime, auxErr := s.auxListAgentsSorted(ctx, slug, false, filter, func(a []api.AgentInfo) []api.AgentInfo { return agentsForProject(a, projectID) })
+		if auxErr != nil {
+			return agentMatch{}, auxErr
 		}
-		s.auxiliaryRuntimesMu.RUnlock()
-
-		for rtName, aux := range auxRuntimes {
-			auxAgents, auxErr := aux.Manager.List(ctx, filter)
-			if auxErr == nil {
-				auxAgents = agentsForProject(auxAgents, projectID)
-			}
-			if auxErr == nil && len(auxAgents) > 0 {
-				agents = auxAgents
-				slog.Debug("Agent found via auxiliary runtime", "slug", slug, "runtime", rtName)
-				break
-			}
-		}
+		agents = auxAgents
+		matchManager = auxManager
+		matchRuntime = auxRuntime
 	}
 
 	// Backward compatibility: retry without project filter, but only accept
@@ -1187,91 +2105,273 @@ func (s *Server) LookupContainerID(ctx context.Context, slug, projectID string) 
 	// project-scoped request, or same-slug agents across projects would collide.
 	if len(agents) == 0 && projectID != "" {
 		fallbackFilter := map[string]string{"scion.name": slug}
-		agents, err = s.manager.List(ctx, fallbackFilter)
-		agents = agentsWithoutProjectLabel(agents)
-		if err == nil && len(agents) == 0 {
-			s.auxiliaryRuntimesMu.RLock()
-			auxRuntimes := make(map[string]auxiliaryRuntime, len(s.auxiliaryRuntimes))
-			for k, v := range s.auxiliaryRuntimes {
-				auxRuntimes[k] = v
+		if useDefault {
+			agents, err = defMgr.List(ctx, fallbackFilter)
+			if err != nil {
+				return agentMatch{}, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
 			}
-			s.auxiliaryRuntimesMu.RUnlock()
-
-			for rtName, aux := range auxRuntimes {
-				auxAgents, auxErr := aux.Manager.List(ctx, fallbackFilter)
-				if auxErr == nil {
-					auxAgents = agentsWithoutProjectLabel(auxAgents)
-				}
-				if auxErr == nil && len(auxAgents) > 0 {
-					agents = auxAgents
-					slog.Debug("Agent found via auxiliary runtime (fallback)", "slug", slug, "runtime", rtName)
-					break
-				}
+			agents = agentsWithoutProjectLabel(agents)
+		}
+		matchManager = defMgr
+		matchRuntime = defRT
+		if len(agents) == 0 {
+			auxAgents, auxManager, auxRuntime, auxErr := s.auxListAgentsSorted(ctx, slug, true, fallbackFilter, agentsWithoutProjectLabel)
+			if auxErr != nil {
+				return agentMatch{}, auxErr
 			}
+			agents = auxAgents
+			matchManager = auxManager
+			matchRuntime = auxRuntime
 		}
 	}
 
+	return agentMatchFrom(slug, agents, matchManager, matchRuntime)
+}
+
+// lookupAgentMatchForRun is the lookup of a run-scoped stop
+// (ptone/scion#2550). With a run it resolves exactly as a run-scoped
+// delete does (resolveDeleteTarget): the same candidates
+// (collectTargetCandidates: every runtime allManagers lists, the project
+// scoping and legacy-path check of collectAgentCandidates, and the walk of
+// the other runtimes when the agent's own runtime holds no container) and
+// the same run filter (selectDeleteCandidates). So for the same project,
+// name, run and runtime state, stop and delete pick the same entry, or
+// both answer that another run holds the name:
+//   - an entry labelled runID is the match;
+//   - entries labelled with other runs are never the match; when only
+//     they hold the name, the result is otherRunsHoldNameError naming their
+//     run ("" for several), the run-mismatch answer;
+//   - without an entry of runID, a legacy container with no run label
+//     matches by name, and a file-only entry only while no other run holds
+//     the name;
+//   - nothing left is ErrAgentNotFound; more than one entry left is an
+//     ambiguity error (fail closed);
+//   - a runtime that could not be listed, with no single match found,
+//     wraps ErrAgentListUnavailable rather than answering not found or
+//     mismatch, as a delete answers errDeleteTargetUnknown.
+//
+// With an empty runID it is exactly lookupAgentMatch, so a stop naming no
+// run (an older hub, or an agent with no run ID) behaves as before.
+func (s *Server) lookupAgentMatchForRun(ctx context.Context, slug, projectID, runID string) (agentMatch, error) {
+	if runID == "" {
+		return s.lookupAgentMatch(ctx, slug, projectID)
+	}
+	if defMgr, _ := s.defaultPair(); defMgr == nil {
+		return agentMatch{}, fmt.Errorf("agent manager not available")
+	}
+	slug = strings.ToLower(slug)
+	cands, listErr := s.collectTargetCandidates(ctx, slug, projectID, "Agent stop")
+	targets, mismatch, current := selectDeleteCandidates(cands, runID)
+	// The order of the cases is resolveDeleteTarget's.
+	switch {
+	case mismatch && listErr != nil:
+		return agentMatch{}, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, listErr)
+	case mismatch:
+		return agentMatch{}, &otherRunsHoldNameError{slug: slug, currentRunID: current}
+	case len(targets) > 1:
+		return agentMatch{}, fmt.Errorf("agent '%s' is ambiguous: %d agents match in project %q", slug, len(targets), projectID)
+	case len(targets) == 1:
+		c := targets[0]
+		return agentMatchFrom(slug, []api.AgentInfo{c.entry}, c.mgr, s.runtimeOfManager(c.mgr))
+	case listErr != nil:
+		return agentMatch{}, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, listErr)
+	default:
+		return agentMatch{}, &agentNotFoundError{slug: slug}
+	}
+}
+
+// otherRunsHoldNameError is a run-scoped stop lookup's result when only
+// entries labelled with runs other than the requested one hold the name
+// (lookupAgentMatchForRun). Nothing of the requested run exists, so this is
+// a run mismatch, as for a run-scoped delete. currentRunID is the run
+// holding the name when all those container entries share one, else empty
+// (otherRunContainerID).
+type otherRunsHoldNameError struct {
+	slug         string
+	currentRunID string
+}
+
+func (e *otherRunsHoldNameError) Error() string {
+	return fmt.Sprintf("agent '%s': every listed entry belongs to another run", e.slug)
+}
+
+// listInOwnRuntime lists agent slug in the agent's own runtime with the
+// project scoping lookupAgentMatch and LookupAgent use: entries labelled for
+// projectID, else (with a projectID) entries carrying no project label. A
+// failed List wraps ErrAgentListUnavailable.
+func listInOwnRuntime(ctx context.Context, own *agentOwnRuntime, slug, projectID string) ([]api.AgentInfo, error) {
+	agents, err := own.mgr.List(ctx, scopedNameFilter(slug, projectID))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
+	}
+	agents = agentsForProject(agents, projectID)
+	if len(agents) == 0 && projectID != "" {
+		agents, err = own.mgr.List(ctx, map[string]string{"scion.name": slug})
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
+		}
+		agents = agentsWithoutProjectLabel(agents)
+	}
+	return agents, nil
+}
+
+// agentMatchFrom builds lookupAgentMatch's result from the entries the
+// runtime behind matchManager/matchRuntime listed for slug.
+func agentMatchFrom(slug string, agents []api.AgentInfo, matchManager agent.Manager, matchRuntime scionrt.Runtime) (agentMatch, error) {
 	if len(agents) == 0 {
-		return "", fmt.Errorf("agent '%s' not found", slug)
+		return agentMatch{}, &agentNotFoundError{slug: slug}
 	}
 
-	agent := agents[0]
+	entry, err := uniqueAgentEntry(slug, agents)
+	if err != nil {
+		return agentMatch{}, err
+	}
 
 	// Get container ID - prefer label, then ContainerID from runtime, then ID
-	containerID := agent.Labels["scion.container.id"]
+	containerID := entry.Labels["scion.container.id"]
 	if containerID == "" {
-		containerID = agent.ContainerID
+		containerID = entry.ContainerID
 	}
 	if containerID == "" {
-		containerID = agent.ID
+		containerID = entry.ID
 	}
 	if containerID == "" {
-		return "", fmt.Errorf("agent '%s' has no container ID", slug)
+		return agentMatch{manager: matchManager, runtime: matchRuntime, entry: entry, matched: true},
+			fmt.Errorf("agent '%s' has no container ID: %w", slug, ErrAgentNotFound)
 	}
 
-	return containerID, nil
+	return agentMatch{containerID: containerID, manager: matchManager, runtime: matchRuntime, entry: entry, matched: true}, nil
 }
+
+// auxListAgentsSorted queries every currently registered auxiliary runtime
+// with filter, in sorted identity order (the same order allManagers() uses),
+// and returns the first non-empty match after filterAgents narrows it, together
+// with the agent.Manager whose List call produced that match.
+//
+// A match is authoritative: once one auxiliary runtime's List call succeeds
+// and filterAgents leaves at least one entry, the remaining auxiliary
+// runtimes are not consulted at all, regardless of whether an earlier one
+// in the sorted order failed to list. Only when no auxiliary runtime
+// produces a match does a List error along the way turn into an
+// ErrAgentListUnavailable-wrapped error — an error from a runtime that was
+// never going to match must not block a genuine match found elsewhere, but
+// a failed List on the one runtime that may hold the agent must not be
+// misread as "not found" either. The fixed iteration order keeps the
+// outcome the same from one call to the next instead of depending on Go's
+// randomized map order.
+//
+// slug and fallback are used only for the debug line logged on a match.
+//
+// The returned agent.Manager and scionrt.Runtime are always the pair
+// registered together for the same auxiliary runtime identity (auxiliaryRuntime
+// stores them together), so a caller never has to re-derive one from the
+// other: they are paired at the moment the match is found, not looked up
+// again afterward.
+func (s *Server) auxListAgentsSorted(ctx context.Context, slug string, fallback bool, filter map[string]string, filterAgents func([]api.AgentInfo) []api.AgentInfo) ([]api.AgentInfo, agent.Manager, scionrt.Runtime, error) {
+	var listErr error
+	for _, aux := range s.sortedAuxiliaryRuntimesFor(ctx) {
+		rtName := aux.identity
+		auxAgents, auxErr := aux.Manager.List(ctx, filter)
+		if auxErr != nil {
+			if listErr == nil {
+				listErr = fmt.Errorf("%w %q: %v", errAuxiliaryRuntimeList, rtName, auxErr)
+			}
+			continue
+		}
+		if matched := filterAgents(auxAgents); len(matched) > 0 {
+			msg := "Agent found via auxiliary runtime"
+			if fallback {
+				msg += " (fallback)"
+			}
+			slog.Debug(msg, "slug", slug, "runtime", rtName)
+			return matched, aux.Manager, aux.Runtime, nil
+		}
+	}
+	if listErr != nil {
+		return nil, nil, nil, fmt.Errorf("%w: %w", ErrAgentListUnavailable, listErr)
+	}
+	return nil, nil, nil, nil
+}
+
+// errAuxiliaryRuntimeList marks an ErrAgentListUnavailable error that came
+// from an auxiliary runtime's List call (the default runtime listed
+// successfully), so a caller can treat it differently from a default-runtime
+// failure.
+var errAuxiliaryRuntimeList = errors.New("auxiliary runtime")
 
 // LookupAgent implements AgentLookup interface.
 // It looks up an agent by slug and returns detailed info including the runtime.
 // projectID scopes the lookup to prevent cross-project collision.
 func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*AgentLookupResult, error) {
-	if s.manager == nil {
+	defMgr, defRT := s.defaultPair()
+	if defMgr == nil {
 		return nil, fmt.Errorf("agent manager not available")
 	}
 
 	slug = strings.ToLower(slug)
-	filter := map[string]string{"scion.name": slug}
+	filter := scopedNameFilter(slug, projectID)
 
-	// Try default manager first
-	agents, err := s.manager.List(ctx, filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list agents: %w", err)
+	// The PTY attach paths reach here without handleAgentByID, so the
+	// agent's own runtime is resolved here (see ensureAgentOwnRuntime),
+	// with the hub's projectPath hint when the caller attached one
+	// (withProjectPathHint). When known, it is the only runtime searched.
+	if agentOwnRuntimeFrom(ctx) == nil {
+		ctx = s.ensureAgentOwnRuntime(ctx, slug, projectID, projectPathHintFrom(ctx))
 	}
-	agents = agentsForProject(agents, projectID)
+	own := s.ownRuntimeFor(ctx)
 
-	runtimeName := s.runtime.Name()
-	var matchedRuntime scionrt.Runtime
-
-	// Fall back to auxiliary runtimes
-	if len(agents) == 0 {
-		s.auxiliaryRuntimesMu.RLock()
-		auxRuntimes := make(map[string]auxiliaryRuntime, len(s.auxiliaryRuntimes))
-		for k, v := range s.auxiliaryRuntimes {
-			auxRuntimes[k] = v
+	var agents []api.AgentInfo
+	var err error
+	if own != nil {
+		agents, err = listInOwnRuntime(ctx, own, slug, projectID)
+		if err != nil {
+			return nil, err
 		}
-		s.auxiliaryRuntimesMu.RUnlock()
+	} else {
+		// Try default manager first
+		agents, err = defMgr.List(ctx, filter)
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
+		}
+		agents = agentsForProject(agents, projectID)
+	}
 
-		for rtName, aux := range auxRuntimes {
+	runtimeName := defRT.Name()
+	var matchedRuntime scionrt.Runtime
+	if own != nil {
+		runtimeName = own.rt.Name()
+		matchedRuntime = own.rt
+	}
+
+	// listUnavailable tracks whether any consulted runtime's List call itself
+	// failed (as opposed to succeeding with zero matches). A failure here must
+	// not be indistinguishable from "no such agent": the caller (the PTY
+	// stream classifier) needs to tell a genuinely missing agent (4404,
+	// terminal) from a runtime that briefly could not answer (4503, retry).
+	var listUnavailable bool
+
+	// Fall back to auxiliary runtimes, in a deterministic (identity-sorted)
+	// order: more than one auxiliary runtime can share a type, and in
+	// pathological overlap cases (e.g. two Kubernetes namespace-scoped
+	// entries plus one with ListAllNamespaces) more than one could plausibly
+	// answer for the same slug.
+	if len(agents) == 0 && own == nil {
+		for _, aux := range s.sortedAuxiliaryRuntimes() {
 			auxAgents, auxErr := aux.Manager.List(ctx, filter)
-			if auxErr == nil {
-				auxAgents = agentsForProject(auxAgents, projectID)
+			if auxErr != nil {
+				listUnavailable = true
+				continue
 			}
-			if auxErr == nil && len(auxAgents) > 0 {
+			auxAgents = agentsForProject(auxAgents, projectID)
+			if len(auxAgents) > 0 {
 				agents = auxAgents
-				runtimeName = rtName
+				// runtimeName must stay a canonical runtime type (e.g.
+				// "kubernetes"), not the aux map key: that key is a
+				// per-instance identity (see auxiliaryRuntimeIdentity) so
+				// distinct same-type runtimes can be tracked separately.
+				runtimeName = aux.Runtime.Name()
 				matchedRuntime = aux.Runtime
-				slog.Debug("Agent found via auxiliary runtime", "slug", slug, "runtime", rtName)
+				slog.Debug("Agent found via auxiliary runtime", "slug", slug, "runtime", aux.identity)
 				break
 			}
 		}
@@ -1281,28 +2381,28 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	// containers that lack a project label (pre-existing agents or solo/CLI
 	// mode). A container labeled for a different project must not match a
 	// project-scoped request, or same-slug agents across projects would collide.
-	if len(agents) == 0 && projectID != "" {
+	if len(agents) == 0 && projectID != "" && own == nil {
 		fallbackFilter := map[string]string{"scion.name": slug}
-		agents, err = s.manager.List(ctx, fallbackFilter)
+		agents, err = defMgr.List(ctx, fallbackFilter)
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to list agents: %w", ErrAgentListUnavailable, err)
+		}
 		agents = agentsWithoutProjectLabel(agents)
-		if err == nil && len(agents) == 0 {
-			s.auxiliaryRuntimesMu.RLock()
-			auxRuntimes := make(map[string]auxiliaryRuntime, len(s.auxiliaryRuntimes))
-			for k, v := range s.auxiliaryRuntimes {
-				auxRuntimes[k] = v
-			}
-			s.auxiliaryRuntimesMu.RUnlock()
-
-			for rtName, aux := range auxRuntimes {
+		if len(agents) == 0 {
+			for _, aux := range s.sortedAuxiliaryRuntimes() {
 				auxAgents, auxErr := aux.Manager.List(ctx, fallbackFilter)
-				if auxErr == nil {
-					auxAgents = agentsWithoutProjectLabel(auxAgents)
+				if auxErr != nil {
+					listUnavailable = true
+					continue
 				}
-				if auxErr == nil && len(auxAgents) > 0 {
+				auxAgents = agentsWithoutProjectLabel(auxAgents)
+				if len(auxAgents) > 0 {
 					agents = auxAgents
-					runtimeName = rtName
+					// See the identity note above: use the runtime's own
+					// type, not the per-instance aux map key.
+					runtimeName = aux.Runtime.Name()
 					matchedRuntime = aux.Runtime
-					slog.Debug("Agent found via auxiliary runtime (fallback)", "slug", slug, "runtime", rtName)
+					slog.Debug("Agent found via auxiliary runtime (fallback)", "slug", slug, "runtime", aux.identity)
 					break
 				}
 			}
@@ -1310,10 +2410,16 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	}
 
 	if len(agents) == 0 {
+		if listUnavailable {
+			return nil, fmt.Errorf("%w: an auxiliary runtime failed to list agents while resolving '%s'", ErrAgentListUnavailable, slug)
+		}
 		return nil, fmt.Errorf("agent '%s' not found", slug)
 	}
 
-	ag := agents[0]
+	ag, err := uniqueAgentEntry(slug, agents)
+	if err != nil {
+		return nil, err
+	}
 
 	containerID := ag.Labels["scion.container.id"]
 	if containerID == "" {
@@ -1324,17 +2430,41 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	}
 
 	// Determine the exec user from the runtime that owns this agent.
+	// resolvedRuntime is the same one that produced ag: nil matchedRuntime
+	// means the primary defMgr/defRT pair matched.
+	resolvedRuntime := matchedRuntime
+	if resolvedRuntime == nil {
+		resolvedRuntime = defRT
+	}
 	execUser := "scion"
-	if matchedRuntime != nil {
-		execUser = matchedRuntime.ExecUser()
-	} else if s.runtime != nil {
-		execUser = s.runtime.ExecUser()
+	if resolvedRuntime != nil {
+		execUser = resolvedRuntime.ExecUser()
 	}
 
+	// resolvedRuntime (computed above) is also the live instance that
+	// actually produced this match: matchedRuntime is set on every
+	// auxiliary-runtime match path above (including the no-project-label
+	// fallback stage), and stays nil only when the match came from the
+	// primary manager, in which case it's defRT. Callers use this to
+	// ask capability questions (e.g. scionrt.HasAttachSupport) about the
+	// runtime that actually owns the agent, not assume it is the broker's
+	// default.
 	result := &AgentLookupResult{
 		ContainerID: containerID,
 		RuntimeName: runtimeName,
 		ExecUser:    execUser,
+		// Phase is deliberately re-read from the runtime directly
+		// (rawRuntimePhase), not taken from ag.Phase above: ag came from
+		// defMgr.List / aux.Manager.List, which is agent.Manager's merged
+		// view (runtime status overlaid with agent-info.json). That overlay
+		// can keep reporting a stale "stopped"/"error" phase for a
+		// container that has since restarted or is still starting up (see
+		// pkg/agent/list.go's own reconciliation comment). Callers that
+		// need to know the container's actual state right now — like
+		// classifyAttachEnd's stopped check — need the runtime's own
+		// unmerged phase instead.
+		Phase:   rawRuntimePhase(ctx, resolvedRuntime, slug, containerID),
+		Runtime: resolvedRuntime,
 	}
 
 	// Include K8s metadata if available
@@ -1345,10 +2475,7 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	// For kubernetes agents, include the Go K8s client for direct API access
 	// (avoids needing kubectl in PATH and reuses the broker's auth)
 	if runtimeName == "kubernetes" || runtimeName == "k8s" {
-		if matchedRuntime == nil {
-			matchedRuntime = s.runtime
-		}
-		if k8sRT, ok := matchedRuntime.(*scionrt.KubernetesRuntime); ok && k8sRT.Client != nil {
+		if k8sRT, ok := resolvedRuntime.(*scionrt.KubernetesRuntime); ok && k8sRT.Client != nil {
 			result.K8sConfig = k8sRT.Client.Config
 			result.K8sClientset = k8sRT.Client.Clientset
 		}
@@ -1357,13 +2484,101 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	return result, nil
 }
 
+// rawRuntimePhase best-effort re-resolves containerID's lifecycle phase
+// directly from rt.List, bypassing agent.Manager's agent-info.json overlay
+// entirely (unlike the ag.Phase LookupAgent's caller already has, which came
+// from that merged view). It never errors: a failed list call, a nil
+// runtime, or a containerID that no longer appears in the listing all return
+// "", which runningResultFromPhase (pty_classifier.go) already treats as
+// unknown rather than guessing running or stopped. The name-only filter
+// (matching LookupContainerID/LookupAgent's own backward-compat fallback
+// filter) is intentionally broader than scopedNameFilter's project-scoped
+// one — this runs after LookupAgent has already uniquely resolved
+// containerID by whichever filter matched (the primary, auxiliary, or
+// backward-compat fallback path), so matching back by containerID rather
+// than re-deriving which filter won is both simpler and exact.
+func rawRuntimePhase(ctx context.Context, rt scionrt.Runtime, slug, containerID string) string {
+	if rt == nil || containerID == "" {
+		return ""
+	}
+	agents, err := rt.List(ctx, map[string]string{"scion.name": slug})
+	if err != nil {
+		return ""
+	}
+	for _, a := range agents {
+		id := a.Labels["scion.container.id"]
+		if id == "" {
+			id = a.ContainerID
+		}
+		if id == "" {
+			id = a.ID
+		}
+		if id == containerID {
+			return a.Phase
+		}
+	}
+	return ""
+}
+
+// scopedNameFilter builds the Runtime.List label filter for a slug lookup,
+// including the project scope label when a project is known so that runtimes
+// can narrow the listing themselves (ptone/scion#1819).
+func scopedNameFilter(slug, projectID string) map[string]string {
+	filter := map[string]string{"scion.name": slug}
+	if projectID != "" {
+		filter[projectkeys.LabelProjectID] = projectID
+	}
+	return filter
+}
+
+// uniqueAgentEntry returns the single runtime entry in agents, failing closed
+// when more than one distinct container matches rather than acting on
+// whichever entry the runtime happened to list first.
+func uniqueAgentEntry(slug string, agents []api.AgentInfo) (api.AgentInfo, error) {
+	distinct := dedupeAgentEntries(agents)
+	if len(distinct) > 1 {
+		return api.AgentInfo{}, fmt.Errorf("agent '%s' is ambiguous: %d containers match", slug, len(distinct))
+	}
+	return distinct[0], nil
+}
+
+// dedupeAgentEntries collapses entries that refer to the same backing
+// container (the same container can be reported more than once, e.g. by a
+// runtime that is registered both as default and auxiliary). Entries are
+// keyed by operation ID (scionrt.AgentOperationID), so same-named
+// Kubernetes pods in two namespaces stay distinct (and a lookup matching
+// both is ambiguous) rather than collapsing to whichever was listed first;
+// for other runtimes that is the container ID.
+func dedupeAgentEntries(agents []api.AgentInfo) []api.AgentInfo {
+	if len(agents) < 2 {
+		return agents
+	}
+	seen := make(map[string]bool, len(agents))
+	out := make([]api.AgentInfo, 0, len(agents))
+	for _, a := range agents {
+		key := scionrt.AgentOperationID(a)
+		if key == "" {
+			key = a.ID
+		}
+		if key == "" {
+			key = "path:" + a.ProjectPath + "|" + a.Name
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, a)
+	}
+	return out
+}
+
 func agentsForProject(agents []api.AgentInfo, projectID string) []api.AgentInfo {
 	if projectID == "" {
 		return agents
 	}
 	filtered := make([]api.AgentInfo, 0, len(agents))
 	for _, agent := range agents {
-		if projectcompat.ProjectIDFromLabels(agent.Labels) == projectID {
+		if projectkeys.ProjectIDFromLabels(agent.Labels) == projectID {
 			filtered = append(filtered, agent)
 		}
 	}
@@ -1394,12 +2609,21 @@ func (s *Server) startCredentialWatcher(ctx context.Context) {
 
 	s.credWatcherStop = make(chan struct{})
 	go s.credentialWatchLoop(ctx)
-	slog.Info("Credential watcher started", "interval", "10s")
+	slog.Info("Credential watcher started", "interval", credentialWatchInterval.String())
 }
+
+const (
+	// credentialWatchInterval is how often the credential watcher checks
+	// for changed credentials and retries failed reinitializes.
+	credentialWatchInterval = 10 * time.Second
+	// reinitRetryMaxDelay caps the backoff between retries of a
+	// credential set whose reinitialize keeps failing.
+	reinitRetryMaxDelay = 5 * time.Minute
+)
 
 // credentialWatchLoop is the main credential watching loop.
 func (s *Server) credentialWatchLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(credentialWatchInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1427,6 +2651,15 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		return fmt.Errorf("failed to check credentials: %w", err)
 	}
 	if !changed {
+		// Retry credential sets whose reinitialize failed on an earlier
+		// tick, once their backoff has passed; the file has not changed,
+		// so nothing else would.
+		for _, conn := range s.hubConnectionList() {
+			if conn.retryFailedReinitialize() {
+				slog.Debug("Retrying failed reinitialize of hub connection", "name", conn.Name)
+				s.applyReinitializeAsync(ctx, conn)
+			}
+		}
 		return nil
 	}
 	s.credLastScan = scanTime
@@ -1439,162 +2672,128 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		newCreds[creds[i].Name] = &creds[i]
 	}
 
-	type credentialUpdate struct {
-		name        string
-		connection  *HubConnection
-		credentials *brokercredentials.BrokerCredentials
-	}
-	type credentialRemoval struct {
-		name       string
-		connection *HubConnection
-	}
+	// Lifecycle operations (Start, Stop, Reinitialize) run outside s.hubMu:
+	// they wait on the connection's lifecycle lock, and Start takes
+	// s.hubMu itself.
+	var removed, added []*HubConnection
+	var reinit []*HubConnection
 
-	var removals []credentialRemoval
-	var additions []*brokercredentials.BrokerCredentials
-	var existing []credentialUpdate
-
-	// Only snapshot work while holding hubMu. In particular, never wait for a
-	// connection lifecycle or authority lease here: authenticated handlers
-	// retain the latter and may need hubMu while dispatching.
 	s.hubMu.Lock()
-	if s.hubConnectionLifecycleHook != nil {
-		s.hubConnectionLifecycleHook("hub-locked")
-	}
+
+	// Detect removals: connections that exist but are not in newCreds
+	// (skip "local" connection which comes from InMemoryCredentials)
 	for name, conn := range s.hubConnections {
 		if name == "local" && s.config.InMemoryCredentials != nil {
 			continue
 		}
 		if _, exists := newCreds[name]; !exists {
 			slog.Info("Removing hub connection", "name", name)
-			removals = append(removals, credentialRemoval{name: name, connection: conn})
+			removed = append(removed, conn)
 		}
-	}
-	for name, credentials := range newCreds {
-		if conn, ok := s.hubConnections[name]; ok {
-			existing = append(existing, credentialUpdate{
-				name:        name,
-				connection:  conn,
-				credentials: credentials,
-			})
-		} else {
-			additions = append(additions, credentials)
-		}
-	}
-	s.hubMu.Unlock()
-	if len(removals) > 0 && s.hubConnectionLifecycleHook != nil {
-		s.hubConnectionLifecycleHook("removal-candidates-snapshotted")
 	}
 
-	// Serialize detachment with Reinitialize. Lifecycle ownership is acquired
-	// outside hubMu, then the exact snapshotted pointer is revalidated and
-	// detached under hubMu. Revocation, lease draining, and service shutdown
-	// all complete before lifecycle ownership is released.
-	for _, removal := range removals {
+	// Detect additions and modifications
+	for name, c := range newCreds {
+		existingConn, exists := s.hubConnections[name]
+		if !exists {
+			// New connection
+			conn, err := s.createHubConnection(name, c)
+			if err != nil {
+				slog.Warn("Failed to create new hub connection", "name", name, "error", err)
+				continue
+			}
+			s.hubConnections[name] = conn
+			slog.Info("Added new hub connection", "name", name, "brokerID", c.BrokerID)
+
+			added = append(added, conn)
+		} else {
+			// Check if credentials changed. Compare against the latest
+			// requested credentials, which an earlier reload's
+			// reinitialize may not have applied yet.
+			existingCreds := existingConn.latestCredentials()
+			if existingCreds == nil ||
+				existingCreds.BrokerID != c.BrokerID ||
+				existingCreds.SecretKey != c.SecretKey ||
+				existingCreds.HubEndpoint != c.HubEndpoint {
+
+				slog.Info("Reinitializing hub connection", "name", name)
+				existingConn.requestReinitialize(c)
+				reinit = append(reinit, existingConn)
+			} else if existingConn.retryFailedReinitialize() {
+				// Unchanged, but its last reinitialize failed and its
+				// backoff has passed: retry it.
+				slog.Debug("Retrying failed reinitialize of hub connection", "name", name)
+				reinit = append(reinit, existingConn)
+			}
+		}
+	}
+
+	s.hubMu.Unlock()
+
+	// A removed connection is closed, not just stopped, so that a Start
+	// or reinitialize still queued on it cannot restart its services.
+	for _, conn := range removed {
+		// Acquire lifecycle ownership outside hubMu, then detach only the
+		// exact pointer snapshotted above. A running reinitialize finishes
+		// before detachment; queued ones observe the terminal closed state.
 		if s.hubConnectionLifecycleHook != nil {
 			s.hubConnectionLifecycleHook("removal-waiting")
 		}
-		removal.connection.reinitializeMu.Lock()
-		if s.hubConnectionLifecycleHook != nil {
-			s.hubConnectionLifecycleHook("removal-locked")
-		}
-
-		detached := false
-		s.authMiddlewarePublicationMu.Lock()
+		conn.lifecycleMu.Lock()
+		s.authMiddlewareMu.Lock()
 		s.hubMu.Lock()
-		if s.hubConnections[removal.name] == removal.connection {
-			delete(s.hubConnections, removal.name)
-			// Revoke the stale middleware entry as part of detachment. These
-			// atomics do not wait for authority leases, so the hub map lock is
-			// still held only for the exact-pointer state transition.
-			removal.connection.authorityReady.Store(false)
-			removal.connection.authorityGeneration.Add(1)
-			detached = true
+		detached := s.hubConnections[conn.Name] == conn
+		if detached {
+			delete(s.hubConnections, conn.Name)
+			conn.revokeAuthority()
 		}
 		s.hubMu.Unlock()
-		if !detached {
-			s.authMiddlewarePublicationMu.Unlock()
-			removal.connection.reinitializeMu.Unlock()
-			continue
+		if detached {
+			s.buildAuthMiddlewareLocked()
 		}
-		if s.hubConnectionLifecycleHook != nil {
-			s.hubConnectionLifecycleHook("connections-detached")
+		s.authMiddlewareMu.Unlock()
+		if detached {
+			if s.hubConnectionLifecycleHook != nil {
+				s.hubConnectionLifecycleHook("authority-revoked")
+			}
+			conn.closeLocked()
 		}
-
-		s.buildAuthMiddlewareLocked()
-		s.authMiddlewarePublicationMu.Unlock()
-		if s.hubConnectionLifecycleHook != nil {
-			s.hubConnectionLifecycleHook("authority-revoked")
-		}
-		removal.connection.Stop()
-		if s.hubConnectionLifecycleHook != nil {
-			s.hubConnectionLifecycleHook("removal-complete")
-		}
-		removal.connection.reinitializeMu.Unlock()
+		conn.lifecycleMu.Unlock()
 	}
-
-	for _, credentials := range additions {
-		conn, err := s.createHubConnection(credentials.Name, credentials)
-		if err != nil {
-			slog.Warn("Failed to create new hub connection", "name", credentials.Name, "error", err)
-			continue
-		}
-
-		s.hubMu.Lock()
-		_, alreadyAdded := s.hubConnections[credentials.Name]
-		if !alreadyAdded {
-			s.hubConnections[credentials.Name] = conn
-		}
-		s.hubMu.Unlock()
-		if alreadyAdded {
-			continue
-		}
-
-		slog.Info("Added new hub connection", "name", credentials.Name, "brokerID", credentials.BrokerID)
+	// Start services for the new connections.
+	for _, conn := range added {
 		go func(conn *HubConnection) {
 			if err := conn.Start(ctx, s); err != nil {
 				slog.Error("Failed to start new hub connection", "name", conn.Name, "error", err)
 			}
 		}(conn)
 	}
-
-	for _, update := range existing {
-		update.connection.mu.RLock()
-		existingCredentials := update.connection.Credentials
-		credentialsChanged := existingCredentials == nil ||
-			existingCredentials.BrokerID != update.credentials.BrokerID ||
-			existingCredentials.SecretKey != update.credentials.SecretKey ||
-			existingCredentials.HubEndpoint != update.credentials.HubEndpoint
-		update.connection.mu.RUnlock()
-		if !credentialsChanged {
-			continue
-		}
-
-		slog.Info("Reinitializing hub connection", "name", update.name)
-		go func(conn *HubConnection, credentials *brokercredentials.BrokerCredentials) {
-			if err := conn.Reinitialize(ctx, s, credentials); err != nil {
-				slog.Error("Failed to reinitialize hub connection", "name", conn.Name, "error", err)
-			}
-		}(update.connection, update.credentials)
+	for _, conn := range reinit {
+		s.applyReinitializeAsync(ctx, conn)
 	}
 
-	// Rebuild auth middleware with updated keys
+	// Rebuild for added and removed connections. Reinitialized connections
+	// rebuild again once their reinitialize has finished (above).
 	s.buildAuthMiddleware()
 
 	return nil
 }
 
-// hasPublishedHubConnection reports whether the exact connection object is
-// still registered. Pointer identity makes credential removal terminal even
-// when an older asynchronous Reinitialize call was already queued.
-func (s *Server) hasPublishedHubConnection(connection *HubConnection) bool {
-	s.hubMu.RLock()
-	defer s.hubMu.RUnlock()
-	for _, published := range s.hubConnections {
-		if published == connection {
-			return true
+// applyReinitializeAsync applies the connection's requested
+// reinitialize on a new goroutine. A failed reinitialize is logged by
+// applyRequestedReinitialize and retried on a later credential watcher
+// tick, with backoff (see retryFailedReinitialize).
+func (s *Server) applyReinitializeAsync(ctx context.Context, conn *HubConnection) {
+	go func() {
+		applied, _ := conn.applyRequestedReinitialize(ctx, s)
+		if applied {
+			// The new credentials are in place only now, so a
+			// credential change takes effect here, after reinitialize.
+			// Rebuild even if a later step of the reinitialize failed,
+			// so what is in effect matches what the connection holds.
+			s.buildAuthMiddleware()
 		}
-	}
-	return false
+	}()
 }
 
 // buildProjectFilterForHub builds a project filter function for a specific hub endpoint.
@@ -1616,11 +2815,12 @@ func (s *Server) buildProjectFilterForHub(hubEndpoint string) func(string) bool 
 		// For now, try to find the project's settings to determine its hub endpoint.
 		// This requires the agent manager to provide project paths.
 		// As a simple implementation, we scan agents and check their project settings.
-		if s.manager == nil {
+		mgr := s.currentManager()
+		if mgr == nil {
 			return true // Can't filter without a manager
 		}
 
-		agents, err := s.manager.List(context.Background(), nil)
+		agents, err := mgr.List(context.Background(), nil)
 		if err != nil {
 			return true // Allow on error
 		}
@@ -1662,13 +2862,15 @@ func (s *Server) isMultiHubMode() bool {
 	return len(s.hubConnections) > 1
 }
 
-// hasRegisteredHubAuthority distinguishes Hub credential-backed ingress from
-// ordinary standalone CLI/Manager use. It remains true while a credential is
-// rebuilding or invalid so a scoped request cannot fall back to local config.
+// hasRegisteredHubAuthority remains true while credentials are rebuilding
+// or invalid, so a scoped request cannot fall back to standalone config.
 func (s *Server) hasRegisteredHubAuthority() bool {
-	if !s.config.BrokerAuthEnabled {
-		return false
-	}
+	return s.config.BrokerAuthEnabled && s.hasConfiguredHubAuthority()
+}
+
+// hasConfiguredHubAuthority keeps a configured Hub create in the hosted
+// contract even when verification is disabled; it cannot become a local create.
+func (s *Server) hasConfiguredHubAuthority() bool {
 	s.hubMu.RLock()
 	defer s.hubMu.RUnlock()
 	for _, conn := range s.hubConnections {
@@ -1690,16 +2892,6 @@ func (s *Server) isGlobalProject(projectID, projectPath string) bool {
 	return projectID == "global" || (projectID == "" && projectPath == "")
 }
 
-// resolveHydrator resolves the hydrator for a request, routing to the correct
-// hub connection based on the X-Scion-Hub-Connection header.
-func (s *Server) resolveHydrator(r *http.Request) *templatecache.Hydrator {
-	conn := s.resolveHubConnection(r)
-	if conn != nil {
-		return conn.Hydrator
-	}
-	return nil
-}
-
 // resolveHubConnection resolves the hub connection for a request, routing to
 // the correct connection based on the X-Scion-Hub-Connection header.
 func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
@@ -1711,20 +2903,65 @@ func (s *Server) resolveHubConnection(r *http.Request) *HubConnection {
 		s.hubMu.RLock()
 		conn, ok := s.hubConnections[connName]
 		s.hubMu.RUnlock()
-		if ok && (conn.Hydrator != nil || conn.HCResolver != nil) {
+		if ok && conn.Hydrator != nil {
 			return conn
 		}
 	}
 
-	// Fallback: return first available connection with a hydrator or resolver
+	// Fallback: return first available connection with a hydrator
 	s.hubMu.RLock()
 	defer s.hubMu.RUnlock()
 	for _, conn := range s.hubConnections {
-		if conn.Hydrator != nil || conn.HCResolver != nil {
+		if conn.Hydrator != nil {
 			return conn
 		}
 	}
 	return nil
+}
+
+// resolveHubNameForLaunch picks the hub connection name a launch's reports
+// should target, following design t1-async-create-v11.md §3.8.5's routing
+// order, stopping at the first that resolves to a connection with a
+// HubClient: (1) the X-Scion-Hub-Connection header (set by the control
+// channel, controlchannel.go); (2) the hub whose key authenticated the
+// request (brokerauth.go's authenticatingHubConnFromContext); (3) the only
+// connection. Returns "" when none of these resolve (e.g. more than one
+// connection and neither 1 nor 2 identified one) — the sender then fans out
+// to every connection with a HubClient (routing rule 4), exactly as
+// reportMessageFailure does.
+func (s *Server) resolveHubNameForLaunch(r *http.Request) string {
+	if authority, ok := authenticatedBrokerAuthority(r); ok {
+		return authority.hubName
+	}
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+
+	if connName := r.Header.Get("X-Scion-Hub-Connection"); connName != "" {
+		if conn, ok := s.hubConnections[connName]; ok && conn.HubClient != nil {
+			return connName
+		}
+	}
+	if connName := authenticatingHubConnFromContext(r.Context()); connName != "" {
+		if conn, ok := s.hubConnections[connName]; ok && conn.HubClient != nil {
+			return connName
+		}
+	}
+	var only string
+	count := 0
+	for name, conn := range s.hubConnections {
+		if conn.HubClient == nil {
+			continue
+		}
+		only = name
+		count++
+		if count > 1 {
+			return ""
+		}
+	}
+	if count == 1 {
+		return only
+	}
+	return ""
 }
 
 // resolveHubEndpointFromRequest returns the hub endpoint for the hub connection
@@ -1743,22 +2980,9 @@ func (s *Server) resolveHubEndpointFromRequest(r *http.Request) string {
 	conn, ok := s.hubConnections[connName]
 	s.hubMu.RUnlock()
 	if ok {
-		return conn.HubEndpoint
+		return conn.snapshot().HubEndpoint
 	}
 	return ""
-}
-
-// getFirstHeartbeat returns the heartbeat service from the first available connection.
-// Used for backward compat with single-hub references (e.g., force heartbeat after stop).
-func (s *Server) getFirstHeartbeat() *HeartbeatService {
-	s.hubMu.RLock()
-	defer s.hubMu.RUnlock()
-	for _, conn := range s.hubConnections {
-		if conn.Heartbeat != nil {
-			return conn.Heartbeat
-		}
-	}
-	return nil
 }
 
 // logHubConnections logs a summary of all active hub connections.
@@ -1773,22 +2997,27 @@ func (s *Server) logHubConnections() {
 	}
 
 	for _, conn := range s.hubConnections {
+		// Reinitialize writes these fields under conn.mu.
+		snap := conn.snapshot()
+		endpoint := snap.HubEndpoint
+		authMode := snap.AuthMode
+		hasHeartbeat := snap.Heartbeat != nil
+		hasControlChannel := snap.HasControlChannel
+
 		attrs := []slog.Attr{
 			slog.String("name", conn.Name),
-			slog.String("endpoint", conn.HubEndpoint),
+			slog.String("endpoint", endpoint),
 			slog.String("status", string(conn.GetStatus())),
 		}
 
-		if conn.AuthMode != "" {
-			attrs = append(attrs, slog.String("auth", string(conn.AuthMode)))
+		if authMode != "" {
+			attrs = append(attrs, slog.String("auth", string(authMode)))
 		}
 
 		if conn.IsColocated {
 			attrs = append(attrs, slog.Bool("colocated", true))
 		}
 
-		hasHeartbeat := conn.Heartbeat != nil
-		hasControlChannel := conn.ControlChannel != nil
 		attrs = append(attrs,
 			slog.Bool("heartbeat", hasHeartbeat),
 			slog.Bool("control_channel", hasControlChannel),
@@ -1829,13 +3058,19 @@ func (s *Server) registerRoutes() {
 	// Workspace sync routes (for Hub-initiated sync via control channel)
 	s.mux.HandleFunc("/api/v1/workspace/upload", s.handleWorkspaceUpload)
 	s.mux.HandleFunc("/api/v1/workspace/apply", s.handleWorkspaceApply)
-	s.mux.HandleFunc("/api/v1/workspace/grove-upload", s.handleProjectWorkspaceUpload)
 	s.mux.HandleFunc("/api/v1/workspace/project-upload", s.handleProjectWorkspaceUpload)
 }
 
 // applyMiddleware wraps the handler with middleware.
 func (s *Server) applyMiddleware(h http.Handler) http.Handler {
+	return s.outerMiddleware(s.innerMiddleware(h))
+}
+
+// innerMiddleware is the middleware that runs after authentication:
+// profile resolution, recovery, request logging and CORS.
+func (s *Server) innerMiddleware(h http.Handler) http.Handler {
 	// Apply middleware in reverse order (last applied runs first)
+	h = s.profileResolutionMiddleware(h)
 	h = s.recoveryMiddleware(h)
 	if s.requestLogger != nil {
 		h = logging.RequestLogMiddleware(s.requestLogger, "broker", logging.BrokerPathPatterns(), s.config.SlowRequestThreshold)(h)
@@ -1845,15 +3080,39 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	if s.config.CORSEnabled {
 		h = s.corsMiddleware(h)
 	}
-	// Apply broker auth middleware if configured
-	if s.brokerAuthMiddleware != nil {
-		h = s.brokerAuthMiddleware.Middleware(h)
-	}
+	return h
+}
+
+// outerMiddleware is broker authentication (when configured) inside OTel
+// tracing.
+func (s *Server) outerMiddleware(h http.Handler) http.Handler {
+	// The handler is built once (and once per control channel), but
+	// buildAuthMiddleware can set this component up after the handler is
+	// built, so look it up per request instead of capturing it here.
+	h = s.currentMiddlewareGate(h)
 
 	// OTel HTTP tracing (outermost - wraps all middleware for full request lifecycle)
 	h = otelhttp.NewHandler(h, "broker")
 
 	return h
+}
+
+// currentMiddlewareGate passes each request through the component that
+// buildAuthMiddleware has in place at the time, or straight to next when
+// there is none.
+func (s *Server) currentMiddlewareGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mw := s.loadBrokerMiddleware(); mw != nil {
+			mw.ServeWith(w, r, next)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loadBrokerMiddleware returns the middleware in place now, or nil.
+func (s *Server) loadBrokerMiddleware() *MultiKeyBrokerAuthMiddleware {
+	return s.brokerAuthMiddleware.Load()
 }
 
 // corsMiddleware adds CORS headers.
@@ -2005,6 +3264,14 @@ func extractAction(r *http.Request, prefix string) (id, action string) {
 		action = parts[1]
 	}
 	return
+}
+
+// HubConnectionCount returns the number of Hub connections the server has
+// (the connections its control channel and heartbeat run on).
+func (s *Server) HubConnectionCount() int {
+	s.hubMu.RLock()
+	defer s.hubMu.RUnlock()
+	return len(s.hubConnections)
 }
 
 // IsControlChannelConnected reports whether the broker has at least one live

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -25,7 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -48,21 +49,8 @@ func (r *AppleContainerRuntime) ExecUser() string {
 }
 
 func (r *AppleContainerRuntime) Run(ctx context.Context, config RunConfig) (string, error) {
-	// Serialize file and variable secrets into an env-var blob for
-	// container-side staging by sciontool init (stateless broker support).
-	if len(config.ResolvedSecrets) > 0 {
-		encoded, err := serializeSecrets(util.GetHomeDir(config.UnixUsername), config.ResolvedSecrets)
-		if err != nil {
-			return "", fmt.Errorf("failed to serialize secrets: %w", err)
-		}
-		if encoded != "" {
-			config.Env = append(config.Env, StagedSecretEnvVar+"="+encoded)
-		}
-	}
-
-	// Inject GCP telemetry credential path if the well-known secret is present
-	if credPath := findGCPTelemetryCredentialPath(config.ResolvedSecrets, util.GetHomeDir(config.UnixUsername)); credPath != "" {
-		config.Env = append(config.Env, telemetryGCPCredentialsEnvVar+"="+credPath)
+	if err := prepareContainerSecretEnv(&config); err != nil {
+		return "", err
 	}
 
 	args, err := buildCommonRunArgs(config)
@@ -107,25 +95,59 @@ func (r *AppleContainerRuntime) Run(ctx context.Context, config RunConfig) (stri
 
 	// Skip the original 'run', '-d', and '-i' from buildCommonRunArgs (indices 0, 1, 2)
 	// then strip flags that the Apple container CLI does not support.
+	// Apple's container CLI has no --group-add: warn and start unchanged.
+	newArgs = appendSharedDirGroupArgs(newArgs, config, "container", false)
 	newArgs = append(newArgs, stripUnsupportedAppleFlags(args[3:])...)
 
 	WriteRuntimeDebugFile(config, r.Command, newArgs)
 
+	// Async-launch gate immediately before the container create (design
+	// t1-async-create-v11.md §3.8.3); a no-op on the synchronous path.
+	hooks := config.launchHooks()
+	if err := hooks.checkpoint(ctx, CheckpointStepLaunching); err != nil {
+		return "", err
+	}
 	out, err := runSimpleCommand(ctx, r.Command, newArgs...)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The caller gave up while the daemon may still have been
+			// creating/starting the container. Clean up any partial result
+			// instead of leaking it. See ptone/scion#1886.
+			rollbackCancelledCreate(r.Command, config.Name, config.Labels[api.LabelRunID])
+			return "", ctx.Err()
+		}
 		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
 	}
 
 	// The output of 'container run -d' is the container ID
-	return strings.TrimSpace(out), nil
+	id := strings.TrimSpace(out)
+	reportAppleContainerCreated(hooks, config.Name, id)
+	return id, nil
 }
 
-func (r *AppleContainerRuntime) Stop(ctx context.Context, id string) error {
-	_, err := runSimpleCommand(ctx, r.Command, "stop", id)
+// Stop stops the container ref.ID. Apple's CLI uses the container name as
+// its ID, so a container recreated under the same name by another run would
+// be hit by name; when ref.RunID is set the container is first checked
+// against it (appleCheckRun) and one of another run is left running with
+// ErrRunMismatch (ptone/scion#2550).
+func (r *AppleContainerRuntime) Stop(ctx context.Context, ref RunRef) error {
+	if err := r.appleCheckRun(ctx, ref); err != nil {
+		return err
+	}
+	_, err := runSimpleCommand(ctx, r.Command, "stop", ref.ID)
 	return err
 }
 
-func (r *AppleContainerRuntime) Delete(ctx context.Context, id string) error {
+// Delete removes the container ref.ID. As for Stop, when ref.RunID is set
+// the container is checked against it first, and one of another run is
+// left untouched with ErrRunMismatch. The check is a listing, not a CLI
+// precondition: a container recreated between the listing and the kill is
+// still hit (a window of one CLI call).
+func (r *AppleContainerRuntime) Delete(ctx context.Context, ref RunRef) error {
+	if err := r.appleCheckRun(ctx, ref); err != nil {
+		return err
+	}
+	id := ref.ID
 	// Apple's `container rm` doesn't support -f and fails on running containers,
 	// so kill first (ignoring errors if already stopped) then remove.
 	_, _ = runSimpleCommand(ctx, r.Command, "kill", id)
@@ -185,10 +207,9 @@ type containerListOutput struct {
 	} `json:"configuration"`
 }
 
-func (r *AppleContainerRuntime) List(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
-	args := []string{"list", "-a", "--format", "json"}
-
-	cmd := exec.CommandContext(ctx, r.Command, args...)
+// appleListContainers returns the parsed "container list -a" output.
+func appleListContainers(ctx context.Context, command string) ([]containerListOutput, error) {
+	cmd := exec.CommandContext(ctx, command, "list", "-a", "--format", "json")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("container list failed: %w (output: %s)", err, string(out))
@@ -198,43 +219,61 @@ func (r *AppleContainerRuntime) List(ctx context.Context, labelFilter map[string
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse container list output: %w (output: %s)", err, string(out))
 	}
+	return raw, nil
+}
+
+// appleCheckRun enforces ref.RunID before Stop or Delete act on the
+// container named ref.ID. With no run ID it does nothing (name semantics,
+// as before run IDs existed). Otherwise the container is looked up in the
+// listing: one labelled with another run yields ErrRunMismatch; one of
+// ref.RunID, a legacy container with no run label (the rule k8s and the
+// broker apply), or a name the listing does not show passes, and the caller
+// proceeds as before. A listing failure is returned, and nothing is done.
+func (r *AppleContainerRuntime) appleCheckRun(ctx context.Context, ref RunRef) error {
+	if ref.RunID == "" {
+		return nil
+	}
+	raw, err := appleListContainers(ctx, r.Command)
+	if err != nil {
+		return fmt.Errorf("could not check the run of container %s: %w", ref.ID, err)
+	}
+	for _, c := range raw {
+		if c.Configuration.ID != ref.ID {
+			continue
+		}
+		if run := c.Configuration.Labels[api.LabelRunID]; run != "" && run != ref.RunID {
+			runtimeLog().Info("Left a container of another run untouched",
+				"container", ref.ID, "run_id", ref.RunID, "container_run_id", run)
+			return fmt.Errorf("container %s belongs to run %q, not %q: %w", ref.ID, run, ref.RunID, ErrRunMismatch)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (r *AppleContainerRuntime) List(ctx context.Context, labelFilter map[string]string) ([]api.AgentInfo, error) {
+	raw, err := appleListContainers(ctx, r.Command)
+	if err != nil {
+		return nil, err
+	}
 
 	var agents []api.AgentInfo
 	for _, c := range raw {
 		// Filter by labels if requested
-		if len(labelFilter) > 0 {
-			match := true
-			for k, v := range labelFilter {
-				actual := c.Configuration.Labels[k]
-				if actual == "" {
-					switch k {
-					case projectcompat.LabelProject:
-						actual = projectcompat.ProjectNameFromLabels(c.Configuration.Labels)
-					case projectcompat.LabelProjectID:
-						actual = projectcompat.ProjectIDFromLabels(c.Configuration.Labels)
-					case projectcompat.LabelProjectPath:
-						actual = projectcompat.ProjectPathFromLabels(c.Configuration.Labels)
-					}
-				}
-				if actual != v {
-					match = false
-					break
-				}
-			}
-			if !match {
-				continue
-			}
+		if !LabelsMatchFilter(c.Configuration.Labels, labelFilter) {
+			continue
 		}
 
 		info := api.AgentInfo{
 			ContainerID:     c.Configuration.ID,
+			RunID:           c.Configuration.Labels[api.LabelRunID],
 			Name:            c.Configuration.Labels["scion.name"],
 			Template:        c.Configuration.Labels["scion.template"],
 			HarnessConfig:   c.Configuration.Labels["scion.harness_config"],
 			HarnessAuth:     c.Configuration.Labels["scion.harness_auth"],
-			Project:         projectcompat.ProjectNameFromLabels(c.Configuration.Labels),
-			ProjectID:       projectcompat.ProjectIDFromLabels(c.Configuration.Labels),
-			ProjectPath:     projectcompat.ProjectPathFromLabels(c.Configuration.Labels),
+			Project:         projectkeys.ProjectNameFromLabels(c.Configuration.Labels),
+			ProjectID:       projectkeys.ProjectIDFromLabels(c.Configuration.Labels),
+			ProjectPath:     projectkeys.ProjectPathFromLabels(c.Configuration.Labels),
 			Labels:          c.Configuration.Labels,
 			Annotations:     c.Configuration.Labels,
 			ContainerStatus: c.Status.State,
@@ -321,7 +360,14 @@ func (r *AppleContainerRuntime) RemoveImage(ctx context.Context, image string) e
 }
 
 func (r *AppleContainerRuntime) PullImage(ctx context.Context, image string) error {
-	return runInteractiveCommand(r.Command, "image", "pull", image)
+	out, err := runSimpleCommand(ctx, r.Command, "image", "pull", image)
+	if err != nil {
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			return fmt.Errorf("pull %q: %w\n%s", image, err, trimmed)
+		}
+		return fmt.Errorf("pull %q: %w", image, err)
+	}
+	return nil
 }
 
 func (r *AppleContainerRuntime) Sync(ctx context.Context, id string, direction SyncDirection) error {
@@ -339,7 +385,21 @@ func (r *AppleContainerRuntime) Exec(ctx context.Context, id string, cmd []strin
 		id = resolveContainerID(agents, id)
 	}
 	args := append([]string{"exec", "--user", "scion", id}, cmd...)
-	return runSimpleCommand(ctx, r.Command, args...)
+	out, err := runSimpleCommand(ctx, r.Command, args...)
+	// A container removed after the lookup above must surface as
+	// ErrContainerNotFound, not as the command's exit (ptone/scion#3655).
+	return out, appleExecNotFound.classifyExecErr(ctx, err, out, id, r.List)
+}
+
+// ExecWithStdin runs cmd inside the container with stdin piped from the
+// given reader. The -i flag is required for `container exec` to attach
+// stdin, mirroring Docker/Podman's exec semantics. See #1355.
+func (r *AppleContainerRuntime) ExecWithStdin(ctx context.Context, id string, cmd []string, stdin io.Reader) (string, error) {
+	if agents, err := r.List(ctx, nil); err == nil {
+		id = resolveContainerID(agents, id)
+	}
+	args := append([]string{"exec", "-i", "--user", "scion", id}, cmd...)
+	return runSimpleCommandWithStdin(ctx, stdin, r.Command, args...)
 }
 
 // stripUnsupportedAppleFlags removes flag-value pairs that the Apple

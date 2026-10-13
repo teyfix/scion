@@ -15,14 +15,21 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestSharedDirPVCName(t *testing.T) {
@@ -38,7 +45,7 @@ func TestBuildPod_SharedDirs_DefaultMount(t *testing.T) {
 		Image:        "test:latest",
 		UnixUsername: "scion",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "build-cache"},
@@ -86,7 +93,7 @@ func TestBuildPod_SharedDirs_InWorkspace(t *testing.T) {
 		Image:        "test:latest",
 		UnixUsername: "scion",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "workspace-cache", InWorkspace: true},
@@ -115,7 +122,7 @@ func TestBuildPod_SharedDirs_SkipsLocalVolumesForSharedDirTargets(t *testing.T) 
 		Image:        "test:latest",
 		UnixUsername: "scion",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "build-cache"},
@@ -148,7 +155,7 @@ func TestBuildPod_NoSharedDirs(t *testing.T) {
 		Image:        "test:latest",
 		UnixUsername: "scion",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 	}
 
@@ -169,7 +176,8 @@ func TestCreateSharedDirPVCs(t *testing.T) {
 		Name:  "test-agent",
 		Image: "test:latest",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project":    "myproject",
+			"scion.project_id": "proj-1",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "build-cache"},
@@ -188,9 +196,17 @@ func TestCreateSharedDirPVCs(t *testing.T) {
 	pvcNames := make(map[string]bool)
 	for _, pvc := range pvcList.Items {
 		pvcNames[pvc.Name] = true
-		// Verify labels
-		assert.Equal(t, "myproject", pvc.Labels["scion.grove"])
-		assert.NotEmpty(t, pvc.Labels["scion.shared-dir"])
+		// Verify the exact label set — nothing beyond the canonical project
+		// labels and the shared-dir marker (no unexpected extra key survives).
+		wantDir := "build-cache"
+		if strings.Contains(pvc.Name, "artifacts") {
+			wantDir = "artifacts"
+		}
+		assert.Equal(t, map[string]string{
+			"scion.project":    "myproject",
+			"scion.project_id": "proj-1",
+			"scion.shared-dir": wantDir,
+		}, pvc.Labels)
 		// Verify access mode
 		assert.Contains(t, pvc.Spec.AccessModes, corev1.ReadWriteMany)
 		// Verify default size
@@ -210,7 +226,7 @@ func TestCreateSharedDirPVCs_CustomStorageClassAndSize(t *testing.T) {
 		Name:  "test-agent",
 		Image: "test:latest",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "data"},
@@ -253,7 +269,7 @@ func TestCreateSharedDirPVCs_ReusesExisting(t *testing.T) {
 		Name:  "test-agent",
 		Image: "test:latest",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 		SharedDirs: []api.SharedDir{
 			{Name: "build-cache"},
@@ -278,7 +294,7 @@ func TestCreateSharedDirPVCs_NoSharedDirs(t *testing.T) {
 		Name:  "test-agent",
 		Image: "test:latest",
 		Labels: map[string]string{
-			"scion.grove": "myproject",
+			"scion.project": "myproject",
 		},
 	}
 
@@ -301,32 +317,194 @@ func TestCreateSharedDirPVCs_MissingProjectLabel(t *testing.T) {
 
 	err := rt.createSharedDirPVCs(ctx, "default", config)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing scion.project or scion.grove label")
+	assert.Contains(t, err.Error(), "missing scion.project label")
 }
 
-func TestCleanupSharedDirPVCs(t *testing.T) {
-	rt, clientset, _ := newTestK8sRuntime()
-	ctx := context.Background()
-
-	// Create PVCs with project labels
-	for _, name := range []string{"scion-shared-myproject-cache", "scion-shared-myproject-data"} {
-		pvc := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: "default",
-				Labels: map[string]string{
-					"scion.grove":      "myproject",
-					"scion.shared-dir": "test",
-				},
-			},
-		}
-		_, err := clientset.CoreV1().PersistentVolumeClaims("default").Create(ctx, pvc, metav1.CreateOptions{})
-		require.NoError(t, err)
+// TestCreateSharedDirPVCs_SettingsResolvedClassAndSize feeds createSharedDirPVCs
+// the Kubernetes block the start path builds from settings defaults
+// (config.ApplySharedDirDefaults): the template's explicit size wins, the
+// settings class fills the gap, and an unset size keeps the 10Gi default
+// (ptone/scion#2634).
+func TestCreateSharedDirPVCs_SettingsResolvedClassAndSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		base      *api.KubernetesConfig
+		class     string
+		size      string
+		wantClass string
+		wantSize  string
+	}{
+		{"settings class and size, no template block", nil, "standard-rwx", "1Ti", "standard-rwx", "1Ti"},
+		{"template size wins, settings class fills", &api.KubernetesConfig{SharedDirSize: "20Gi"}, "standard-rwx", "1Ti", "standard-rwx", "20Gi"},
+		{"template class wins", &api.KubernetesConfig{SharedDirStorageClass: "tpl-rwx"}, "standard-rwx", "", "tpl-rwx", defaultSharedDirSize},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt, clientset, _ := newTestK8sRuntime()
+			ctx := context.Background()
+			cfg := RunConfig{
+				Name:       "test-agent",
+				Image:      "test:latest",
+				Labels:     map[string]string{"scion.project": "myproject"},
+				SharedDirs: []api.SharedDir{{Name: "data"}},
+				Kubernetes: config.ApplySharedDirDefaults(tt.base, tt.class, tt.size),
+			}
+			require.NoError(t, rt.createSharedDirPVCs(ctx, "default", cfg))
 
-	rt.cleanupSharedDirPVCs(ctx, "default", "myproject")
+			pvc, err := clientset.CoreV1().PersistentVolumeClaims("default").Get(ctx, "scion-shared-myproject-data", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, pvc.Spec.StorageClassName)
+			assert.Equal(t, tt.wantClass, *pvc.Spec.StorageClassName)
+			storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+			assert.Equal(t, tt.wantSize, storageReq.String())
+		})
+	}
+}
 
-	pvcList, err := clientset.CoreV1().PersistentVolumeClaims("default").List(ctx, metav1.ListOptions{})
-	require.NoError(t, err)
-	assert.Empty(t, pvcList.Items)
+// Reusing an existing claim whose storage class differs from the requested
+// one logs a warning naming the claim, both classes and (when Pending) the
+// phase; a matching class or no requested class logs nothing.
+func TestCreateSharedDirPVCs_ReuseWarnsOnStorageClassMismatch(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	tests := []struct {
+		name          string
+		existingClass *string
+		phase         corev1.PersistentVolumeClaimPhase
+		requested     string
+		wantWarn      bool
+	}{
+		{"differs, pending", strPtr("standard"), corev1.ClaimPending, "standard-rwx", true},
+		{"differs, bound", strPtr("standard"), corev1.ClaimBound, "standard-rwx", true},
+		{"existing unset", nil, corev1.ClaimBound, "standard-rwx", true},
+		{"same class", strPtr("standard-rwx"), corev1.ClaimBound, "standard-rwx", false},
+		{"no class requested", strPtr("standard"), corev1.ClaimBound, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			setRuntimeLogHandler(t, slog.NewTextHandler(&buf, nil))
+
+			rt, clientset, _ := newTestK8sRuntime()
+			ctx := context.Background()
+			_, err := clientset.CoreV1().PersistentVolumeClaims("default").Create(ctx, &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "scion-shared-myproject-build-cache", Namespace: "default"},
+				Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: tt.existingClass},
+				Status:     corev1.PersistentVolumeClaimStatus{Phase: tt.phase},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			cfg := RunConfig{
+				Labels:     map[string]string{"scion.project": "myproject"},
+				SharedDirs: []api.SharedDir{{Name: "build-cache"}},
+				Kubernetes: &api.KubernetesConfig{SharedDirStorageClass: tt.requested},
+			}
+			require.NoError(t, rt.createSharedDirPVCs(ctx, "default", cfg))
+
+			out := buf.String()
+			if !tt.wantWarn {
+				assert.NotContains(t, out, "level=WARN")
+				return
+			}
+			assert.Contains(t, out, "level=WARN")
+			assert.Contains(t, out, "pvc=scion-shared-myproject-build-cache")
+			assert.Contains(t, out, "requested_storage_class="+tt.requested)
+			if tt.existingClass != nil {
+				assert.Contains(t, out, "existing_storage_class="+*tt.existingClass)
+			}
+			if tt.phase == corev1.ClaimPending {
+				assert.Contains(t, out, "phase=Pending")
+			} else {
+				assert.NotContains(t, out, "phase=")
+			}
+		})
+	}
+}
+
+// SharedDirClaimExists looks up the PVC createSharedDirPVCs creates or
+// reuses, by name, in the namespace Run would use; it never creates one.
+func TestSharedDirClaimExists(t *testing.T) {
+	ctx := context.Background()
+	labels := map[string]string{"scion.project": "myproject", "scion.project_id": "proj-1"}
+	cfg := RunConfig{Labels: labels, SharedDirs: []api.SharedDir{{Name: "notes"}}}
+
+	t.Run("missing then created", func(t *testing.T) {
+		rt, clientset, _ := newTestK8sRuntime()
+		rt.DefaultNamespace = "default"
+		exists, err := rt.SharedDirClaimExists(ctx, cfg, "notes")
+		require.NoError(t, err)
+		assert.False(t, exists)
+		pvcs, err := clientset.CoreV1().PersistentVolumeClaims("default").List(ctx, metav1.ListOptions{})
+		require.NoError(t, err)
+		assert.Empty(t, pvcs.Items, "the lookup creates nothing")
+
+		require.NoError(t, rt.createSharedDirPVCs(ctx, "default", cfg))
+		exists, err = rt.SharedDirClaimExists(ctx, cfg, "notes")
+		require.NoError(t, err)
+		assert.True(t, exists)
+		exists, err = rt.SharedDirClaimExists(ctx, cfg, "other")
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+
+	t.Run("namespace label", func(t *testing.T) {
+		rt, _, _ := newTestK8sRuntime()
+		rt.DefaultNamespace = "default"
+		require.NoError(t, rt.createSharedDirPVCs(ctx, "team-a", cfg))
+		exists, err := rt.SharedDirClaimExists(ctx, cfg, "notes")
+		require.NoError(t, err)
+		assert.False(t, exists, "the claim is in another namespace")
+		withNS := RunConfig{Labels: map[string]string{"scion.project": "myproject", "scion.namespace": "team-a"}}
+		exists, err = rt.SharedDirClaimExists(ctx, withNS, "notes")
+		require.NoError(t, err)
+		assert.True(t, exists)
+	})
+
+	t.Run("get error", func(t *testing.T) {
+		rt, clientset, _ := newTestK8sRuntime()
+		clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			return true, nil, errors.New("forbidden")
+		})
+		_, err := rt.SharedDirClaimExists(ctx, cfg, "notes")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "scion-shared-myproject-notes")
+	})
+
+	t.Run("no project label", func(t *testing.T) {
+		rt, _, _ := newTestK8sRuntime()
+		_, err := rt.SharedDirClaimExists(ctx, RunConfig{}, "notes")
+		require.Error(t, err)
+	})
+}
+
+// SharedDirUsesClaim follows createSharedDirPVCs: for each case it is true
+// exactly when createSharedDirPVCs creates a claim for the dir.
+func TestSharedDirUsesClaim_MatchesCreatePath(t *testing.T) {
+	ctx := context.Background()
+	labels := map[string]string{"scion.project": "myproject", "scion.project_id": "proj-1"}
+	nfsSDS := &SharedDirRealization{Backend: "nfs", PVClaimName: "pv", SubPaths: map[string]string{"notes": "x"}, LocalDirs: map[string]bool{"cache": true}}
+	for name, tc := range map[string]struct {
+		cfg  RunConfig
+		dir  string
+		want bool
+	}{
+		"plain":                            {cfg: RunConfig{}, dir: "notes", want: true},
+		"nfs workspace with claim":         {cfg: RunConfig{WorkspaceBackendName: "nfs", NFSPVClaimName: "ws"}, dir: "notes", want: false},
+		"nfs workspace without pv_name":    {cfg: RunConfig{WorkspaceBackendName: "nfs"}, dir: "notes", want: true},
+		"other workspace backend":          {cfg: RunConfig{WorkspaceBackendName: "gke", NFSPVClaimName: "ws"}, dir: "notes", want: true},
+		"dir served from shared nfs":       {cfg: RunConfig{SharedDirStorage: nfsSDS}, dir: "notes", want: false},
+		"local dir next to shared nfs":     {cfg: RunConfig{SharedDirStorage: nfsSDS}, dir: "cache", want: true},
+		"local dir, nfs workspace + claim": {cfg: RunConfig{SharedDirStorage: nfsSDS, WorkspaceBackendName: "nfs", NFSPVClaimName: "ws"}, dir: "cache", want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt, clientset, _ := newTestK8sRuntime()
+			assert.Equal(t, tc.want, rt.SharedDirUsesClaim(tc.cfg, tc.dir))
+			cfg := tc.cfg
+			cfg.Labels = labels
+			cfg.SharedDirs = []api.SharedDir{{Name: tc.dir}}
+			require.NoError(t, rt.createSharedDirPVCs(ctx, "default", cfg))
+			pvcs, err := clientset.CoreV1().PersistentVolumeClaims("default").List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, len(pvcs.Items) == 1, "createSharedDirPVCs agrees")
+		})
+	}
 }

@@ -23,12 +23,10 @@
  *   ASKED THE WRONG SERVER QUESTION — the component renders fine and shows
  *   another scope's accounts, or none, with no error anywhere.
  *
- *   OFFERED AN ACTION THAT CANNOT WORK — hub-scoped accounts are readable by
- *   every logged-in user and writable by almost none, so any affordance
- *   rendered from a row being VISIBLE is a button that 403s for most of the
- *   hub. Creation at hub scope is refused by the Hub outright (held under #19),
- *   so there the button cannot work for ANYONE, including a hub admin whose
- *   `create` capability is true.
+ *   OFFERED AN ACTION THAT CANNOT WORK — the Hub gates each action on
+ *   capabilities returned per-scope. Both BYO registration and minting are
+ *   now available at hub scope (registration since P9, minting since Phase 2),
+ *   gated on the `create` and `mint` capabilities respectively.
  *
  * ON ASSERTING ABSENCE: "no create button" passes just as well when the
  * component failed to render, when the selector is misspelled, and when the
@@ -37,12 +35,9 @@
  * one condition that should produce it.
  */
 
-// @vitest-environment happy-dom
-
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let ScionGCPServiceAccountList: any;
+import { requestUrl } from '../../client/__fixtures__/request-url.js';
+import type { ScionGCPServiceAccountList } from './gcp-service-account-list.js';
 
 interface FetchCall {
   url: string;
@@ -59,7 +54,7 @@ function makeFetch(
   listBody: Record<string, unknown>
 ): (url: string | URL | Request, init?: RequestInit) => Promise<Response> {
   return (url, init) => {
-    calls.push({ url: String(url), method: init?.method ?? 'GET' });
+    calls.push({ url: requestUrl(url), method: init?.method ?? 'GET' });
     return Promise.resolve(
       new Response(JSON.stringify(listBody), {
         status: 200,
@@ -133,8 +128,7 @@ function iconButtons(el: HTMLElement, name: string): Element[] {
 
 describe('scion-gcp-service-account-list', () => {
   beforeAll(async () => {
-    const mod = await import('./gcp-service-account-list.js');
-    ScionGCPServiceAccountList = mod.ScionGCPServiceAccountList;
+    await import('./gcp-service-account-list.js');
   });
 
   afterEach(() => {
@@ -206,20 +200,13 @@ describe('scion-gcp-service-account-list', () => {
     });
   });
 
-  describe('creation is not offered at hub scope', () => {
+  describe('hub-scope affordances: Register and Mint are both offered', () => {
     /**
-     * THE CAPABILITY IS TRUE AND THE BUTTON MUST STILL BE ABSENT.
-     *
-     * This fixture is a hub admin: `create` is in the list capabilities. The
-     * Hub nevertheless answers 400 to a hub-scoped registration, before
-     * consulting policy, because the write path is held. So the button is not
-     * suppressed because the caller may not — it is suppressed because the
-     * operation does not exist yet, and no capability can make it exist.
-     *
-     * The project-scope control in the same test is what makes the absence
-     * mean something: same selector, same capability payload, button present.
+     * Hub-scope BYO registration was enabled on the backend in P9. The
+     * capability is the sole gate — a hub admin with `create` now sees the
+     * Register Existing button at hub scope, just as at project scope.
      */
-    it('hides Register Existing at hub scope even for a caller who may create', async () => {
+    it('shows Register Existing at hub scope when caller has create capability', async () => {
       const caps = { actions: ['create', 'list', 'mint'] };
 
       const hubEl = await createComponent(
@@ -234,12 +221,23 @@ describe('scion-gcp-service-account-list', () => {
       const hubLabels = buttonLabels(hubEl).join('|');
       const projectLabels = buttonLabels(projectEl).join('|');
 
-      expect(hubLabels).not.toContain('Register Existing');
-      // POSITIVE CONTROL: the same selector finds the button where it belongs.
+      expect(hubLabels).toContain('Register Existing');
+      // POSITIVE CONTROL: both scopes show the button when the capability is present.
       expect(projectLabels).toContain('Register Existing');
     });
 
-    it('hides Mint at hub scope, where there is no mint endpoint at all', async () => {
+    it('hides Register Existing at hub scope when caller lacks create capability', async () => {
+      const caps = { actions: ['list'] }; // no 'create'
+
+      const el = await createComponent(
+        { scope: 'hub' },
+        makeFetch([], { items: [], _capabilities: caps })
+      );
+
+      expect(buttonLabels(el).join('|')).not.toContain('Register Existing');
+    });
+
+    it('shows Mint at hub scope when caller has mint capability', async () => {
       const caps = { actions: ['create', 'mint'] };
 
       const hubEl = await createComponent(
@@ -251,25 +249,36 @@ describe('scion-gcp-service-account-list', () => {
         makeFetch([], { items: [], _capabilities: caps })
       );
 
-      expect(buttonLabels(hubEl).join('|')).not.toContain('Mint');
+      // Both scopes show Mint when the capability is present.
+      expect(buttonLabels(hubEl).join('|')).toContain('Mint');
       expect(buttonLabels(projectEl).join('|')).toContain('Mint');
     });
 
-    it('hides them in the empty state too, which is the state a new hub is in', async () => {
-      // The empty state carries its own copy of both affordances. A hub with no
-      // accounts registered yet is precisely the screen where a "Register" call
-      // to action is most tempting to a reader and most broken in fact.
+    it('hides Mint at hub scope when caller lacks mint capability', async () => {
+      const caps = { actions: ['create', 'list'] }; // no 'mint'
+
+      const el = await createComponent(
+        { scope: 'hub' },
+        makeFetch([], { items: [], _capabilities: caps })
+      );
+
+      expect(buttonLabels(el).join('|')).not.toContain('Mint');
+    });
+
+    it('shows Register and Mint in the empty state', async () => {
+      // The empty state carries its own copy of both affordances. A new hub
+      // with no accounts is where "Register" and "Mint" are most useful.
       const el = await createComponent(
         { scope: 'hub' },
         makeFetch([], { items: [], _capabilities: { actions: ['create', 'mint'] } })
       );
 
       expect(el.shadowRoot!.textContent).toContain('No GCP Service Accounts');
-      expect(buttonLabels(el).join('|')).not.toContain('Register Existing');
-      expect(buttonLabels(el).join('|')).not.toContain('Mint');
+      expect(buttonLabels(el).join('|')).toContain('Register Existing');
+      expect(buttonLabels(el).join('|')).toContain('Mint');
     });
 
-    it('hides them in compact mode too', async () => {
+    it('shows Register and Mint in compact mode', async () => {
       const caps = { actions: ['create', 'mint'] };
 
       const hubEl = await createComponent(
@@ -284,8 +293,10 @@ describe('scion-gcp-service-account-list', () => {
         })
       );
 
-      expect(buttonLabels(hubEl).join('|')).not.toContain('Register Existing');
+      expect(buttonLabels(hubEl).join('|')).toContain('Register Existing');
+      expect(buttonLabels(hubEl).join('|')).toContain('Mint');
       expect(buttonLabels(projectEl).join('|')).toContain('Register Existing');
+      expect(buttonLabels(projectEl).join('|')).toContain('Mint');
     });
   });
 
@@ -404,8 +415,54 @@ describe('scion-gcp-service-account-list', () => {
     });
   });
 
+  describe('hub-scope quota logic', () => {
+    it('isMintDisabled returns true when hub_cap is reached', async () => {
+      const caps = { actions: ['create', 'mint'] };
+      const mintQuota = {
+        project_minted: 0,
+        project_cap: 0,
+        hub_minted: 2,
+        hub_cap: 2,
+        global_minted: 2,
+        global_cap: 10,
+      };
+
+      const el = await createComponent(
+        { scope: 'hub' },
+        makeFetch([], { items: [], _capabilities: caps, mint_quota: mintQuota })
+      );
+
+      // The component exposes isMintDisabled as a private method — call it
+      // through the element to exercise scope-aware branching.
+      const disabled = (el as unknown as { isMintDisabled: () => boolean }).isMintDisabled();
+      expect(disabled).toBe(true);
+    });
+
+    it('renderQuotaInfo shows "Hub: X/Y" at hub scope', async () => {
+      const caps = { actions: ['create', 'mint'] };
+      const mintQuota = {
+        project_minted: 0,
+        project_cap: 0,
+        hub_minted: 1,
+        hub_cap: 5,
+        global_minted: 3,
+        global_cap: 10,
+      };
+
+      const el = await createComponent(
+        { scope: 'hub' },
+        makeFetch([], { items: [], _capabilities: caps, mint_quota: mintQuota })
+      );
+
+      const text = el.shadowRoot!.textContent ?? '';
+      expect(text).toContain('Hub: 1/5');
+      // Should not show "Project:" at hub scope.
+      expect(text).not.toContain('Project:');
+    });
+  });
+
   describe('links out', () => {
-    it('links parentless accounts to a detail page and project ones nowhere', async () => {
+    it('links parentless accounts to the detail page and project ones with their project', async () => {
       const hubEl = await createComponent(
         { scope: 'hub' },
         makeFetch([], { items: [account({ id: 'sa-1' })] })
@@ -419,11 +476,16 @@ describe('scion-gcp-service-account-list', () => {
       expect(hubLink).not.toBeNull();
       expect(hubLink!.getAttribute('href')).toBe('/settings/service-accounts/sa-1');
 
-      // The project row still renders its email — it just is not a link.
-      expect(projectEl.shadowRoot!.textContent).toContain('one@gcp-project-xyz');
-      expect(
-        projectEl.shadowRoot!.querySelector('a[href^="/settings/service-accounts/"]')
-      ).toBeNull();
+      // A project row links to the project-relative status view (no actions
+      // there; verify and delete stay in this list).
+      const projectLink = projectEl.shadowRoot!.querySelector(
+        'a[href^="/settings/service-accounts/"]'
+      );
+      expect(projectLink).not.toBeNull();
+      expect(projectLink!.getAttribute('href')).toBe(
+        '/settings/service-accounts/sa-p?project=proj-1'
+      );
+      expect(projectLink!.textContent).toContain('one@gcp-project-xyz');
     });
   });
 });

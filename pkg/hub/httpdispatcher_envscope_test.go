@@ -27,67 +27,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// envScopeTestHubID is the hub instance ID used by the scope-precedence tests.
-const envScopeTestHubID = "hub-envscope-1"
-
-// envScopeTestAgent returns an agent wired to every scope the hub env resolver
-// knows about, so that all four scopes are applicable.
-func envScopeTestAgent() *store.Agent {
-	return &store.Agent{
-		ID:              "agent-envscope-1",
-		Name:            "envscope-agent",
-		Slug:            "envscope-agent",
-		ProjectID:       "project-envscope-1",
-		OwnerID:         "user-envscope-1",
-		RuntimeBrokerID: "broker-envscope-1",
-		AppliedConfig:   &store.AgentAppliedConfig{},
-	}
-}
-
-// envScopeTestScopeID maps a scope constant to the scope ID used by
-// envScopeTestAgent for that scope.
-func envScopeTestScopeID(t *testing.T, scope string) string {
-	t.Helper()
-	switch scope {
-	case store.ScopeHub:
-		return envScopeTestHubID
-	case store.ScopeProject:
-		return "project-envscope-1"
-	case store.ScopeUser:
-		return "user-envscope-1"
-	case store.ScopeRuntimeBroker:
-		return "broker-envscope-1"
-	default:
-		t.Fatalf("unknown scope %q", scope)
-		return ""
-	}
-}
-
-// newEnvScopeDispatcher builds a dispatcher over a fresh in-memory store with
-// the hub ID set, and seeds key=value pairs in the requested scopes.
-func newEnvScopeDispatcher(t *testing.T, key string, valuesByScope map[string]string) (*HTTPAgentDispatcher, store.Store) {
-	t.Helper()
-	ctx := context.Background()
-	memStore := createTestStore(t)
-
-	for scope, value := range valuesByScope {
-		if _, err := memStore.UpsertEnvVar(ctx, &store.EnvVar{
-			ID:            api.NewUUID(),
-			Key:           key,
-			Value:         value,
-			Scope:         scope,
-			ScopeID:       envScopeTestScopeID(t, scope),
-			InjectionMode: store.InjectionModeAlways,
-		}); err != nil {
-			t.Fatalf("seeding %s-scoped env var: %v", scope, err)
-		}
-	}
-
-	d := NewHTTPAgentDispatcherWithClient(memStore, &mockRuntimeBrokerClient{}, false, slog.Default())
-	d.SetHubID(envScopeTestHubID)
-	return d, memStore
-}
-
 // TestEnvScopesInPrecedenceOrder_ListsAllFourScopes guards the extraction
 // hazard: the ordering helper replaced four near-identical inline blocks, and a
 // scope dropped during that extraction would produce a clean, empty result with
@@ -434,7 +373,7 @@ func TestResolveEnvFromStorage_ScopePrecedence(t *testing.T) {
 		store.ScopeRuntimeBroker: "from-broker",
 	})
 
-	resolved, err := d.resolveEnvFromStorage(ctx, envScopeTestAgent())
+	resolved, _, err := d.resolveEnvFromStorage(ctx, envScopeTestAgent())
 	if err != nil {
 		t.Fatalf("resolveEnvFromStorage: %v", err)
 	}
@@ -479,7 +418,7 @@ func TestResolveEnvFromStorage_PairwisePrecedence(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d, _ := newEnvScopeDispatcher(t, "SHARED_KEY", tc.values)
-			resolved, err := d.resolveEnvFromStorage(ctx, envScopeTestAgent())
+			resolved, _, err := d.resolveEnvFromStorage(ctx, envScopeTestAgent())
 			if err != nil {
 				t.Fatalf("resolveEnvFromStorage: %v", err)
 			}
@@ -487,6 +426,40 @@ func TestResolveEnvFromStorage_PairwisePrecedence(t *testing.T) {
 				t.Errorf("SHARED_KEY resolved to %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveEnvFromStorage_DropsReservedTarget verifies that a stored plain
+// env var targeting a name reserved for scion's own control-plane env vars
+// is dropped, even at user scope (which otherwise wins the precedence
+// ladder), while an ordinary key in the same scope still resolves normally.
+func TestResolveEnvFromStorage_DropsReservedTarget(t *testing.T) {
+	ctx := context.Background()
+	d, _ := newEnvScopeDispatcher(t, "SCION_METADATA_MODE", map[string]string{
+		store.ScopeUser: "passthrough",
+	})
+	// Seed a second, ordinary key in the same store/dispatcher to confirm the
+	// drop is specific to the reserved name.
+	if _, err := d.store.UpsertEnvVar(ctx, &store.EnvVar{
+		ID:            api.NewUUID(),
+		Key:           "ORDINARY_KEY",
+		Value:         "from-user",
+		Scope:         store.ScopeUser,
+		ScopeID:       envScopeTestScopeID(t, store.ScopeUser),
+		InjectionMode: store.InjectionModeAlways,
+	}); err != nil {
+		t.Fatalf("seeding ordinary env var: %v", err)
+	}
+
+	resolved, _, err := d.resolveEnvFromStorage(ctx, envScopeTestAgent())
+	if err != nil {
+		t.Fatalf("resolveEnvFromStorage: %v", err)
+	}
+	if v, present := resolved["SCION_METADATA_MODE"]; present {
+		t.Errorf("expected SCION_METADATA_MODE to be dropped, got %q", v)
+	}
+	if got, want := resolved["ORDINARY_KEY"], "from-user"; got != want {
+		t.Errorf("ORDINARY_KEY resolved to %q, want %q", got, want)
 	}
 }
 
@@ -500,7 +473,7 @@ func TestBuildEnvSources_ReportsBrokerScope(t *testing.T) {
 	})
 	agent := envScopeTestAgent()
 
-	resolved, err := d.resolveEnvFromStorage(ctx, agent)
+	resolved, _, err := d.resolveEnvFromStorage(ctx, agent)
 	if err != nil {
 		t.Fatalf("resolveEnvFromStorage: %v", err)
 	}
@@ -570,7 +543,7 @@ func TestEnvSources_AgreesWithResolver(t *testing.T) {
 			d, _ := newEnvScopeDispatcher(t, "SHARED_KEY", values)
 			agent := envScopeTestAgent()
 
-			resolved, err := d.resolveEnvFromStorage(ctx, agent)
+			resolved, _, err := d.resolveEnvFromStorage(ctx, agent)
 			if err != nil {
 				t.Fatalf("resolveEnvFromStorage: %v", err)
 			}
@@ -642,7 +615,7 @@ func TestResolveEnvFromStorage_SkipsInapplicableScopes(t *testing.T) {
 	agent.OwnerID = ""
 	agent.RuntimeBrokerID = ""
 
-	resolved, err := d.resolveEnvFromStorage(ctx, agent)
+	resolved, _, err := d.resolveEnvFromStorage(ctx, agent)
 	if err != nil {
 		t.Fatalf("resolveEnvFromStorage: %v", err)
 	}

@@ -28,8 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import scion_harness  # type: ignore[import-not-found]
 
-assert scion_harness.INTERFACE_VERSION >= 2, (
-    "jcode provision.py requires scion_harness INTERFACE_VERSION >= 2; "
+assert scion_harness.INTERFACE_VERSION >= 3, (
+    "jcode provision.py requires scion_harness INTERFACE_VERSION >= 3; "
     f"got {scion_harness.INTERFACE_VERSION}"
 )
 
@@ -51,6 +51,10 @@ AUTH = scion_harness.AuthSpec(
             secret_key="CODEX_AUTH",
         ),
     ],
+    # The broker stages an envelope even when it has no credentials. Honor
+    # no_auth for that implicit case; select_auth still rejects every
+    # explicit invalid or unsatisfied type before this fallback.
+    fallback_to_none_on_error=True,
 )
 
 
@@ -74,13 +78,9 @@ def _install_codex_auth(ctx: scion_harness.ProvisionContext) -> None:
 
     target = scion_harness.expand_path(CODEX_AUTH_FILE)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    tmp = target + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(content)
-        if not content.endswith("\n"):
-            handle.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
+    scion_harness.atomic_write_text(
+        target, content if content.endswith("\n") else content + "\n", mode=0o600,
+    )
 
 
 def _mcp_entry(name: str, spec: dict) -> dict:

@@ -16,9 +16,7 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -173,11 +171,6 @@ func init() {
 		cmd.Flags().StringVar(&envProjectScope, "project", "", "Project scope (bare flag infers current project, or use --project=<name|id>)")
 		cmd.Flags().Lookup("project").NoOptDefVal = scopeInferSentinel
 
-		cmd.Flags().StringVar(&envProjectScope, "grove", "", "Deprecated alias for --project")
-		cmd.Flags().Lookup("grove").NoOptDefVal = scopeInferSentinel
-		_ = cmd.Flags().MarkDeprecated("grove", "use --project instead")
-		_ = cmd.Flags().MarkHidden("grove")
-
 		cmd.Flags().StringVar(&envBrokerScope, "broker", "", "Broker scope (bare flag infers current broker, or use --broker=<name|id>)")
 		cmd.Flags().Lookup("broker").NoOptDefVal = scopeInferSentinel
 	}
@@ -198,7 +191,6 @@ func init() {
 func resolveEnvScope(cmd *cobra.Command, settings *config.Settings) (scope, scopeID string, err error) {
 	scopeSet := cmd.Flags().Changed("scope")
 	projectSet := cmd.Flags().Changed("project")
-	projectAliasSet := cmd.Flags().Changed("grove")
 	brokerSet := cmd.Flags().Changed("broker")
 
 	// Enforce mutual exclusivity
@@ -206,14 +198,14 @@ func resolveEnvScope(cmd *cobra.Command, settings *config.Settings) (scope, scop
 	if scopeSet {
 		setCount++
 	}
-	if projectSet || projectAliasSet {
+	if projectSet {
 		setCount++
 	}
 	if brokerSet {
 		setCount++
 	}
 	if setCount > 1 {
-		return "", "", fmt.Errorf("cannot specify more than one of --scope, --project, and --broker")
+		return "", "", newUsageError("cannot specify more than one of --scope, --project, and --broker")
 	}
 
 	if scopeSet {
@@ -223,11 +215,11 @@ func resolveEnvScope(cmd *cobra.Command, settings *config.Settings) (scope, scop
 		case "user", "":
 			return "user", "", nil
 		default:
-			return "", "", fmt.Errorf("invalid --scope value %q: must be 'hub' or 'user'", envScope)
+			return "", "", newUsageError("invalid --scope value %q: must be 'hub' or 'user'", envScope)
 		}
 	}
 
-	if projectSet || projectAliasSet {
+	if projectSet {
 		scope = "project"
 		projectVal := envProjectScope
 		if projectVal == scopeInferSentinel {
@@ -306,7 +298,7 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 		// Single argument: expect KEY=VALUE format
 		parts := strings.SplitN(args[0], "=", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid format: expected KEY=VALUE or KEY VALUE")
+			return newUsageError("invalid format: expected KEY=VALUE or KEY VALUE")
 		}
 		key = parts[0]
 		value = parts[1]
@@ -318,43 +310,21 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 
 	// Validate key
 	if key == "" {
-		return fmt.Errorf("key cannot be empty")
+		return newUsageError("key cannot be empty")
 	}
 	if strings.ContainsAny(key, "= \t\n") {
-		return fmt.Errorf("key cannot contain spaces, tabs, newlines, or '='")
+		return newUsageError("key cannot contain spaces, tabs, newlines, or '='")
 	}
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveEnvScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveEnvScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	// Validate --always and --as-needed are mutually exclusive
 	if envAlways && envAsNeeded {
-		return fmt.Errorf("--always and --as-needed are mutually exclusive")
+		return newUsageError("--always and --as-needed are mutually exclusive")
 	}
 
 	// Determine injection mode
@@ -441,93 +411,45 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 }
 
 func runEnvGet(cmd *cobra.Command, args []string) error {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
+	if len(args) != 1 {
+		return runEnvList(cmd, nil)
 	}
 
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveEnvScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveEnvScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
+	key := args[0]
+	opts := &hubclient.EnvScopeOptions{
+		Scope:   scope,
+		ScopeID: scopeID,
+	}
+
+	envVar, err := client.Env().Get(ctx, key, opts)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get environment variable: %w", err)
 	}
 
-	// If key is provided, get specific variable
-	if len(args) == 1 {
-		key := args[0]
-		opts := &hubclient.EnvScopeOptions{
-			Scope:   scope,
-			ScopeID: scopeID,
-		}
-
-		envVar, err := client.Env().Get(ctx, key, opts)
-		if err != nil {
-			return fmt.Errorf("failed to get environment variable: %w", err)
-		}
-
-		if envOutputJSON {
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			return enc.Encode(envVar)
-		}
-
-		if envVar.Sensitive {
-			fmt.Printf("%s=****** (sensitive, scope: %s)%s\n", envVar.Key, envVar.Scope, formatEnvAnnotations(envVar))
-		} else {
-			fmt.Printf("%s=%s%s\n", envVar.Key, envVar.Value, formatEnvAnnotations(envVar))
-		}
-		return nil
+	if wantJSON(envOutputJSON) {
+		return outputJSON(newEnvVarOutput(envVar))
 	}
 
-	// No key provided, delegate to list
-	return runEnvList(cmd, nil)
+	if envVar.Sensitive {
+		fmt.Printf("%s=****** (sensitive, scope: %s)%s\n", envVar.Key, envVar.Scope, formatEnvAnnotations(envVar))
+	} else {
+		fmt.Printf("%s=%s%s\n", envVar.Key, envVar.Value, formatEnvAnnotations(envVar))
+	}
+	return nil
 }
 
 func runEnvList(cmd *cobra.Command, _ []string) error {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveEnvScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveEnvScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	opts := &hubclient.ListEnvOptions{
 		Scope:   scope,
@@ -539,10 +461,12 @@ func runEnvList(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to list environment variables: %w", err)
 	}
 
-	if envOutputJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(resp)
+	if wantJSON(envOutputJSON) {
+		listScope := resp.Scope
+		if listScope == "" {
+			listScope = scope
+		}
+		return outputJSON(newEnvListOutput(listScope, resp.ScopeID, resp.EnvVars))
 	}
 
 	if len(resp.EnvVars) == 0 {
@@ -560,6 +484,69 @@ func runEnvList(cmd *cobra.Command, _ []string) error {
 	}
 
 	return nil
+}
+
+// envVarOutput is the JSON shape of one env var in "scion hub env get"
+// and "scion hub env list". It keeps the field names of the Hub record
+// and their omitempty rules so existing readers keep working. The one
+// change is Value: it is always present for a non-sensitive variable,
+// even when empty, and left out for a sensitive one, as in the text
+// output.
+type envVarOutput struct {
+	ID            string    `json:"id"`
+	Key           string    `json:"key"`
+	Value         *string   `json:"value,omitempty"`
+	Scope         string    `json:"scope"`
+	ScopeID       string    `json:"scopeId"`
+	Description   string    `json:"description,omitempty"`
+	Sensitive     bool      `json:"sensitive,omitempty"`
+	InjectionMode string    `json:"injectionMode,omitempty"`
+	Secret        bool      `json:"secret,omitempty"`
+	Created       time.Time `json:"created"`
+	Updated       time.Time `json:"updated"`
+	CreatedBy     string    `json:"createdBy,omitempty"`
+}
+
+// envListOutput is the JSON shape of "scion hub env list". It keeps the
+// top-level fields of the Hub list response. Scope is taken from the
+// response and falls back to the scope the command asked for.
+type envListOutput struct {
+	EnvVars []envVarOutput `json:"envVars"`
+	Scope   string         `json:"scope"`
+	ScopeID string         `json:"scopeId"`
+}
+
+func newEnvVarOutput(v *hubclient.EnvVar) envVarOutput {
+	out := envVarOutput{
+		ID:            v.ID,
+		Key:           v.Key,
+		Scope:         v.Scope,
+		ScopeID:       v.ScopeID,
+		Description:   v.Description,
+		Sensitive:     v.Sensitive,
+		InjectionMode: v.InjectionMode,
+		Secret:        v.Secret,
+		Created:       v.Created,
+		Updated:       v.Updated,
+		CreatedBy:     v.CreatedBy,
+	}
+	if !v.Sensitive {
+		value := v.Value
+		out.Value = &value
+	}
+	return out
+}
+
+func newEnvListOutput(scope, scopeID string, vars []hubclient.EnvVar) envListOutput {
+	out := envListOutput{
+		EnvVars: make([]envVarOutput, 0, len(vars)),
+		Scope:   scope,
+		ScopeID: scopeID,
+	}
+	for i := range vars {
+		out.EnvVars = append(out.EnvVars, newEnvVarOutput(&vars[i]))
+	}
+	return out
 }
 
 // formatEnvAnnotations builds an annotation string for injection mode and secret status.
@@ -583,33 +570,11 @@ func formatEnvAnnotations(v *hubclient.EnvVar) string {
 func runEnvClear(cmd *cobra.Command, args []string) error {
 	key := args[0]
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	client, scope, scopeID, ctx, cancel, err := resolveHubScope(cmd, resolveEnvScope)
 	if err != nil {
 		return err
 	}
-
-	scope, scopeID, err := resolveEnvScope(cmd, settings)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	scopeID, err = resolveScopeID(ctx, client, scope, scopeID)
-	if err != nil {
-		return err
-	}
 
 	opts := &hubclient.EnvScopeOptions{
 		Scope:   scope,

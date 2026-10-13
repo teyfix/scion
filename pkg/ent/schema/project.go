@@ -38,6 +38,14 @@ type Project struct {
 	ent.Schema
 }
 
+// Mixin of the Project. FixtureProvenanceMixin holds the creation-time
+// test-identity provenance stamp (fixture_root_id, fixture_issuer_id).
+func (Project) Mixin() []ent.Mixin {
+	return []ent.Mixin{
+		FixtureProvenanceMixin{},
+	}
+}
+
 // Fields of the Project.
 func (Project) Fields() []ent.Field {
 	return []ent.Field{
@@ -67,8 +75,11 @@ func (Project) Fields() []ent.Field {
 		field.Time("updated").
 			Default(time.Now).
 			UpdateDefault(time.Now),
+		// created_by is Immutable (written once at create); owner_id stays
+		// mutable (ownership transfer).
 		field.String("created_by").
-			Optional(),
+			Optional().
+			Immutable(),
 		field.String("owner_id").
 			Optional(),
 		field.Int64("github_installation_id").
@@ -80,6 +91,16 @@ func (Project) Fields() []ent.Field {
 			Optional(),
 		field.String("git_identity").
 			Optional(),
+
+		// Cross-project inbound messaging policy.
+		// Controls which external agents may deliver messages to this project's agents.
+		// Values: "none" (default), "members", "any".
+		field.Enum("cross_project_inbound").
+			Values("none", "members", "any").
+			Default("none"),
+		// Revision counter for optimistic concurrency on policy mutations.
+		field.Int64("cross_project_inbound_revision").
+			Default(1),
 	}
 }
 
@@ -93,6 +114,6 @@ func (Project) Edges() []ent.Edge {
 // Annotations of the Project.
 func (Project) Annotations() []schema.Annotation {
 	return []schema.Annotation{
-		entsql.Annotation{Table: "projects"},
+		entsql.Annotation{Table: "projects", Checks: fixtureStampCheck("projects")},
 	}
 }

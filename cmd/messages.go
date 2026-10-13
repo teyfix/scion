@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/spf13/cobra"
 )
@@ -109,9 +110,9 @@ func runMessagesList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("%-12s  %-14s  %-14s  %-20s  %s\n", "ID", "AGENT", "TYPE", "TIME", "MESSAGE")
-	fmt.Printf("%-12s  %-14s  %-14s  %-20s  %s\n",
-		"------------", "--------------", "--------------", "--------------------", "-------")
+	fmt.Printf("%-12s  %-14s  %-14s  %-22s  %s\n", "ID", "AGENT", "TYPE", "TIME", "MESSAGE")
+	fmt.Printf("%-12s  %-14s  %-14s  %-22s  %s\n",
+		"------------", "--------------", "--------------", "----------------------", "-------")
 	for _, m := range msgs {
 		shortID := m.ID
 		if len(shortID) > 12 {
@@ -121,7 +122,7 @@ func runMessagesList(cmd *cobra.Command, args []string) error {
 		if len(agentDisplay) > 14 {
 			agentDisplay = agentDisplay[:11] + "..."
 		}
-		timeStr := m.CreatedAt.Format("2006-01-02 15:04")
+		timeStr := clitime.Format(m.CreatedAt, clitime.Minute)
 		msgText := m.Msg
 		if len(msgText) > 60 {
 			msgText = msgText[:57] + "..."
@@ -134,7 +135,7 @@ func runMessagesList(cmd *cobra.Command, args []string) error {
 			}
 			dispatchInfo += "]"
 		}
-		fmt.Printf("%-12s  %-14s  %-14s  %-20s  %s%s\n",
+		fmt.Printf("%-12s  %-14s  %-14s  %-22s  %s%s\n",
 			shortID, agentDisplay, truncate(m.Type, 14), timeStr, msgText, dispatchInfo)
 	}
 
@@ -142,35 +143,24 @@ func runMessagesList(cmd *cobra.Command, args []string) error {
 }
 
 func runMessagesRead(cmd *cobra.Command, args []string) error {
-	hasID := len(args) > 0
-
-	if !hasID && !messagesReadAll {
-		return fmt.Errorf("provide a message ID or use --all to mark all messages as read")
-	}
-	if hasID && messagesReadAll {
-		return fmt.Errorf("provide either a message ID or --all, not both")
-	}
-
-	_, client, err := requireHubClient()
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if messagesReadAll {
-		if err := client.Messages().MarkAllRead(ctx); err != nil {
-			return fmt.Errorf("failed to mark messages as read: %w", err)
-		}
-		fmt.Println("All messages marked as read.")
-		return nil
-	}
-
-	msgID := args[0]
-	if err := client.Messages().MarkRead(ctx, msgID); err != nil {
-		return fmt.Errorf("failed to mark message as read: %w", err)
-	}
-	fmt.Printf("Message %s marked as read.\n", msgID)
-	return nil
+	return runHubAllOrOne(
+		args,
+		messagesReadAll,
+		"provide a message ID or use --all to mark all messages as read",
+		"provide either a message ID or --all, not both",
+		func(ctx context.Context, client hubclient.Client) error {
+			if err := client.Messages().MarkAllRead(ctx); err != nil {
+				return fmt.Errorf("failed to mark messages as read: %w", err)
+			}
+			fmt.Println("All messages marked as read.")
+			return nil
+		},
+		func(ctx context.Context, client hubclient.Client, msgID string) error {
+			if err := client.Messages().MarkRead(ctx, msgID); err != nil {
+				return fmt.Errorf("failed to mark message as read: %w", err)
+			}
+			fmt.Printf("Message %s marked as read.\n", msgID)
+			return nil
+		},
+	)
 }

@@ -21,157 +21,11 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/knadh/koanf/providers/confmap"
-	"github.com/knadh/koanf/v2"
 )
-
-// setEnvForTest sets an env var and returns a cleanup function.
-func setEnvForTest(t *testing.T, key, value string) {
-	t.Helper()
-	t.Setenv(key, value)
-}
 
 // --- fake HubSettingStore ---
 
-type fakeHubSettingStore struct {
-	mu       sync.Mutex
-	settings map[string]*store.HubSetting
-	nextRev  map[string]int64
-}
-
-func newFakeHubSettingStore() *fakeHubSettingStore {
-	return &fakeHubSettingStore{
-		settings: make(map[string]*store.HubSetting),
-		nextRev:  make(map[string]int64),
-	}
-}
-
-func (f *fakeHubSettingStore) GetHubSetting(_ context.Context, section string) (*store.HubSetting, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s, ok := f.settings[section]
-	if !ok {
-		return nil, store.ErrNotFound
-	}
-	return s, nil
-}
-
-func (f *fakeHubSettingStore) ListHubSettings(_ context.Context) ([]store.HubSetting, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]store.HubSetting, 0, len(f.settings))
-	for _, s := range f.settings {
-		out = append(out, *s)
-	}
-	return out, nil
-}
-
-func (f *fakeHubSettingStore) UpsertHubSetting(_ context.Context, section string, value json.RawMessage, updatedBy string, expectedRevision int64, origin string) (*store.HubSetting, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	existing, ok := f.settings[section]
-	if ok {
-		if expectedRevision > 0 && existing.Revision != expectedRevision {
-			return nil, store.ErrRevisionConflict
-		}
-		if expectedRevision == 0 {
-			return nil, store.ErrRevisionConflict
-		}
-	} else {
-		if expectedRevision > 0 {
-			return nil, store.ErrRevisionConflict
-		}
-	}
-
-	rev := int64(1)
-	if existing != nil {
-		rev = existing.Revision + 1
-	}
-	s := &store.HubSetting{
-		ID:        section,
-		Section:   section,
-		Value:     value,
-		Revision:  rev,
-		UpdatedBy: updatedBy,
-		Origin:    origin,
-	}
-	f.settings[section] = s
-	return s, nil
-}
-
-func (f *fakeHubSettingStore) DeleteHubSetting(_ context.Context, section string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, ok := f.settings[section]; !ok {
-		return store.ErrNotFound
-	}
-	delete(f.settings, section)
-	return nil
-}
-
-func (f *fakeHubSettingStore) BackfillOrigin(_ context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for section, s := range f.settings {
-		if section == "_meta" {
-			continue
-		}
-		if s.UpdatedBy != "seed" && s.Origin == "seeded" {
-			s.Origin = "managed"
-		}
-	}
-	return nil
-}
-
-// helper to seed a section directly.
-func (f *fakeHubSettingStore) seed(section string, doc json.RawMessage) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.settings[section] = &store.HubSetting{
-		ID:       section,
-		Section:  section,
-		Value:    doc,
-		Revision: 1,
-	}
-}
-
-func (f *fakeHubSettingStore) seedWithOrigin(section string, doc json.RawMessage, origin string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.settings[section] = &store.HubSetting{
-		ID:       section,
-		Section:  section,
-		Value:    doc,
-		Revision: 1,
-		Origin:   origin,
-	}
-}
-
 // --- helpers ---
-
-func newFileKoanf(t *testing.T, flat map[string]interface{}) *koanf.Koanf {
-	t.Helper()
-	k := koanf.New(".")
-	if err := k.Load(confmap.Provider(flat, "."), nil); err != nil {
-		t.Fatalf("failed to build file koanf: %v", err)
-	}
-	return k
-}
-
-func newEnvKoanf(t *testing.T, flat map[string]interface{}) *koanf.Koanf {
-	t.Helper()
-	k := koanf.New(".")
-	if err := k.Load(confmap.Provider(flat, "."), nil); err != nil {
-		t.Fatalf("failed to build env koanf: %v", err)
-	}
-	return k
-}
-
-func emptyKoanf() *koanf.Koanf {
-	return koanf.New(".")
-}
 
 // --- Tests ---
 
@@ -523,6 +377,130 @@ func TestApplySnapshot_UserAccessModeCleared(t *testing.T) {
 	}
 }
 
+// Regression test for review finding F3 (ptone/scion#2270 round 1): for
+// EnforceBrokerQuotas, nil is a meaningful value (the fail-safe "enforced"
+// default), not "leave whatever is currently in memory alone". A snapshot
+// that clears the switch (DELETE the section, or PUT {}) must flip a
+// previously-set false back to enforced, not leave the hub silently
+// fail-open while every read surface (GET, the UI) reports "enforced".
+func TestApplySnapshot_EnforceBrokerQuotasClearedResetsToEnforced(t *testing.T) {
+	off := false
+	srv := &Server{
+		config:      ServerConfig{EnforceBrokerQuotas: &off},
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	if srv.brokerQuotasEnforced() {
+		t.Fatal("test setup: expected brokerQuotasEnforced()=false before applying the cleared snapshot")
+	}
+
+	// A snapshot with EnforceBrokerQuotas==nil represents the section being
+	// absent (deleted, reset to bootstrap, or PUT as {}) — not "unchanged".
+	ApplySnapshot(srv, Layer1Snapshot{EnforceBrokerQuotas: nil})
+
+	if srv.config.EnforceBrokerQuotas != nil {
+		t.Errorf("want EnforceBrokerQuotas=nil after applying a cleared snapshot, got %v", *srv.config.EnforceBrokerQuotas)
+	}
+	if !srv.brokerQuotasEnforced() {
+		t.Error("want brokerQuotasEnforced()=true after applying a cleared snapshot (fail-safe default)")
+	}
+}
+
+// TestApplySnapshot_EnforceBrokerQuotasAppliedTracking asserts that the
+// "applied" list correctly reports a change both when the value flips
+// between concrete booleans and when it clears to nil, but not when the
+// snapshot repeats the same value (idempotent re-apply, e.g. from a
+// duplicate propagation event).
+func TestApplySnapshot_EnforceBrokerQuotasAppliedTracking(t *testing.T) {
+	on := true
+	off := false
+
+	srv := &Server{maintenance: NewMaintenanceState(false, "")}
+
+	result := ApplySnapshot(srv, Layer1Snapshot{EnforceBrokerQuotas: &off})
+	applied, _ := result["applied"].([]string)
+	if !containsString(applied, "enforce_broker_quotas") {
+		t.Errorf("nil -> false should be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{EnforceBrokerQuotas: &off})
+	applied, _ = result["applied"].([]string)
+	if containsString(applied, "enforce_broker_quotas") {
+		t.Errorf("false -> false (idempotent re-apply) should not be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{EnforceBrokerQuotas: &on})
+	applied, _ = result["applied"].([]string)
+	if !containsString(applied, "enforce_broker_quotas") {
+		t.Errorf("false -> true should be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{EnforceBrokerQuotas: nil})
+	applied, _ = result["applied"].([]string)
+	if !containsString(applied, "enforce_broker_quotas") {
+		t.Errorf("true -> nil (cleared) should be reported as applied, got %v", applied)
+	}
+}
+
+// TestApplySnapshot_AgentSecretsUserScopeOnlyClearedResetsToPermissive
+// mirrors TestApplySnapshot_EnforceBrokerQuotasClearedResetsToEnforced: for
+// AgentSecretsUserScopeOnly, nil is a meaningful value (the permissive
+// default), not "leave whatever is currently in memory alone". A snapshot
+// that clears the switch (DELETE the section, or PUT {}) must flip a
+// previously-set true back to permissive, turning live enforcement off
+// without a restart (design ptone/scion#2291 §5).
+func TestApplySnapshot_AgentSecretsUserScopeOnlyClearedResetsToPermissive(t *testing.T) {
+	on := true
+	srv := &Server{
+		config:      ServerConfig{AgentSecretsUserScopeOnly: &on},
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	if !srv.agentSecretsUserScopeOnly() {
+		t.Fatal("test setup: expected agentSecretsUserScopeOnly()=true before applying the cleared snapshot")
+	}
+
+	ApplySnapshot(srv, Layer1Snapshot{AgentSecretsUserScopeOnly: nil})
+
+	if srv.config.AgentSecretsUserScopeOnly != nil {
+		t.Errorf("want AgentSecretsUserScopeOnly=nil after applying a cleared snapshot, got %v", *srv.config.AgentSecretsUserScopeOnly)
+	}
+	if srv.agentSecretsUserScopeOnly() {
+		t.Error("want agentSecretsUserScopeOnly()=false after applying a cleared snapshot (permissive default)")
+	}
+}
+
+// TestApplySnapshot_AgentSecretsUserScopeOnlyAppliedTracking mirrors
+// TestApplySnapshot_EnforceBrokerQuotasAppliedTracking.
+func TestApplySnapshot_AgentSecretsUserScopeOnlyAppliedTracking(t *testing.T) {
+	on := true
+	off := false
+
+	srv := &Server{maintenance: NewMaintenanceState(false, "")}
+
+	result := ApplySnapshot(srv, Layer1Snapshot{AgentSecretsUserScopeOnly: &on})
+	applied, _ := result["applied"].([]string)
+	if !containsString(applied, "agent_secrets_user_scope_only") {
+		t.Errorf("nil -> true should be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{AgentSecretsUserScopeOnly: &on})
+	applied, _ = result["applied"].([]string)
+	if containsString(applied, "agent_secrets_user_scope_only") {
+		t.Errorf("true -> true (idempotent re-apply) should not be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{AgentSecretsUserScopeOnly: &off})
+	applied, _ = result["applied"].([]string)
+	if !containsString(applied, "agent_secrets_user_scope_only") {
+		t.Errorf("true -> false should be reported as applied, got %v", applied)
+	}
+
+	result = ApplySnapshot(srv, Layer1Snapshot{AgentSecretsUserScopeOnly: nil})
+	applied, _ = result["applied"].([]string)
+	if !containsString(applied, "agent_secrets_user_scope_only") {
+		t.Errorf("false -> nil (cleared) should be reported as applied, got %v", applied)
+	}
+}
+
 func TestBuildLayer1SnapshotFromFile(t *testing.T) {
 	telEnabled := true
 	gc := &config.GlobalConfig{
@@ -554,6 +532,22 @@ func TestBuildLayer1SnapshotFromFile(t *testing.T) {
 	}
 	if snap.GitHubAppID != 99 {
 		t.Errorf("GitHubAppID: want 99, got %d", snap.GitHubAppID)
+	}
+}
+
+// TestBuildLayer1SnapshotFromFile_AgentSecrets verifies that
+// AgentSecretsUserScopeOnly is read from GlobalConfig, so a file-mode admin
+// save takes effect without a restart (design ptone/scion#2291 §5).
+func TestBuildLayer1SnapshotFromFile_AgentSecrets(t *testing.T) {
+	on := true
+	gc := &config.GlobalConfig{
+		AgentSecretsUserScopeOnly: &on,
+	}
+
+	snap := BuildLayer1SnapshotFromFile(gc)
+
+	if snap.AgentSecretsUserScopeOnly == nil || !*snap.AgentSecretsUserScopeOnly {
+		t.Errorf("AgentSecretsUserScopeOnly: want true, got %v", snap.AgentSecretsUserScopeOnly)
 	}
 }
 
@@ -592,6 +586,22 @@ func TestSnapshot_TelemetryFromDB(t *testing.T) {
 	}
 	if snap.TelemetryConfig == nil {
 		t.Fatal("want non-nil TelemetryConfig")
+	}
+}
+
+// TestSnapshot_AgentSecretsFromDB mirrors TestSnapshot_TelemetryFromDB and
+// exercises buildSnapshotFromKoanf's handling of the agent_secrets section
+// via the DB-backed Refresh path.
+func TestSnapshot_AgentSecretsFromDB(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("agent_secrets", json.RawMessage(`{"user_scope_only":true}`))
+
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	_, _ = ops.Refresh(context.Background())
+
+	snap := ops.Snapshot()
+	if snap.AgentSecretsUserScopeOnly == nil || !*snap.AgentSecretsUserScopeOnly {
+		t.Error("want AgentSecretsUserScopeOnly true")
 	}
 }
 
@@ -950,5 +960,195 @@ func TestBuildLayer1SnapshotFromFile_NoFederation(t *testing.T) {
 	snap := BuildLayer1SnapshotFromFile(gc)
 	if snap.FederationConfig != nil {
 		t.Error("want nil FederationConfig when federation is disabled and no issuers")
+	}
+}
+
+// --- Consolidated envelope switch tests (AC-9-7 acceptance criteria) ---
+//
+// Phase 9a: conversation_read_switch and conversation_write_deny_switch are
+// replaced by a single conversation_envelope_switch that defaults ON when
+// absent or omitted, and OFF when the document is malformed (DEF-92).
+
+func TestConversationEnvelopeSwitch_AC97_AbsentRow(t *testing.T) {
+	// AC-9-7: no messaging row at all → ON (compiled default).
+	fakeStore := newFakeHubSettingStore()
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want true (absent row → compiled default ON), got false")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97_KeyOmitted(t *testing.T) {
+	// AC-9-7: row present, key omitted (e.g. {}) → ON (compiled default).
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`{}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want true (empty doc → key omitted → default ON), got false")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97_ExplicitlyFalse(t *testing.T) {
+	// AC-9-7: row present, key explicitly false → OFF.
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`{"conversation_envelope_switch":false}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want false (explicitly false), got true")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97_ExplicitlyTrue(t *testing.T) {
+	// AC-9-7: row present, key explicitly true → ON.
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`{"conversation_envelope_switch":true}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want true (explicitly true), got false")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97_MalformedJSON(t *testing.T) {
+	// AC-9-7: malformed JSON → OFF, and an error is logged at Refresh.
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`not valid json`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want false (malformed JSON → fail-closed), got true")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97a_StaleKeysCutoverToON(t *testing.T) {
+	// AC-9-7a: a hub whose messaging row contains ONLY the two stale keys
+	// (conversation_read_switch, conversation_write_deny_switch), both false,
+	// cuts over to ON after upgrade with no migration run.
+	//
+	// This is the single most important test in Phase 9a: it is the one that
+	// would have caught key reuse. The new key is absent, so the getter takes
+	// the compiled default (ON). The stale keys are ignored by the new getter.
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`{"conversation_read_switch":false,"conversation_write_deny_switch":false}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want true (stale keys only → new key absent → compiled default ON), got false")
+	}
+}
+
+func TestConversationEnvelopeSwitch_AC97b_MalformedLoggedOncePerRefresh(t *testing.T) {
+	// AC-9-7b: the malformed-JSON error is logged once per refresh, not once
+	// per getter call. We assert this by counting: after one Refresh and N
+	// getter calls, the error should have been logged exactly once (at Refresh).
+	//
+	// The log is emitted by Refresh via slog.Error. Since we cannot easily
+	// intercept slog in this test, we verify the structural guarantee: the
+	// Malformed flag is set at Refresh time and the getter reads it without
+	// re-parsing. We call the getter N times and verify it returns the same
+	// result (OFF) without panicking — the parse-time-only property is
+	// asserted by code structure (Refresh sets Malformed; getter reads it).
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`not valid json`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Call the getter N times — each must return false (fail-closed).
+	const N = 10
+	for i := 0; i < N; i++ {
+		if ops.ConversationEnvelopeSwitch() {
+			t.Fatalf("getter call %d: want false (malformed → fail-closed), got true", i)
+		}
+	}
+
+	// Verify the Malformed flag is set on the cached state.
+	ops.mu.RLock()
+	state, ok := ops.cache["messaging"]
+	ops.mu.RUnlock()
+	if !ok {
+		t.Fatal("messaging section not in cache after Refresh")
+	}
+	if !state.Malformed {
+		t.Error("expected Malformed=true on cached messaging section")
+	}
+}
+
+func TestConversationEnvelopeSwitch_TypeMismatch_DetectedAtRefresh(t *testing.T) {
+	// A document like {"conversation_envelope_switch":"yes"} is valid JSON but
+	// fails to unmarshal into *bool. Without the type-mismatch check at ingest
+	// time, this would fall through to the compiled default (ON), silently
+	// enabling the switch on a hub where an operator made a typo.
+	//
+	// With the fix, Refresh detects the unmarshal failure, sets Malformed=true,
+	// and the getter returns OFF.
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("messaging", json.RawMessage(`{"conversation_envelope_switch":"yes"}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	if _, err := ops.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if ops.ConversationEnvelopeSwitch() {
+		t.Error("ConversationEnvelopeSwitch: want false (type-mismatch → fail-closed), got true")
+	}
+
+	// Verify Malformed is set.
+	ops.mu.RLock()
+	state, ok := ops.cache["messaging"]
+	ops.mu.RUnlock()
+	if !ok {
+		t.Fatal("messaging section not in cache after Refresh")
+	}
+	if !state.Malformed {
+		t.Error("expected Malformed=true for type-mismatch document")
+	}
+}
+
+// Design D6: ApplySnapshot normalizes any default_user_role other than
+// member/viewer to member, so the live config never holds garbage.
+func TestApplySnapshot_DefaultUserRoleNormalized(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantCfg  string
+		wantRole string
+	}{
+		{in: "superuser", wantCfg: "member", wantRole: "member"},
+		{in: "admin", wantCfg: "member", wantRole: "member"},
+		{in: "VIEWER", wantCfg: "member", wantRole: "member"},
+		{in: "viewer", wantCfg: "viewer", wantRole: "viewer"},
+		{in: "member", wantCfg: "member", wantRole: "member"},
+		{in: "", wantCfg: "", wantRole: "member"},
+	}
+	for _, tt := range tests {
+		t.Run("in="+tt.in, func(t *testing.T) {
+			srv := &Server{
+				config:      ServerConfig{DefaultUserRole: "viewer"},
+				maintenance: NewMaintenanceState(false, ""),
+			}
+			ApplySnapshot(srv, Layer1Snapshot{DefaultUserRole: tt.in})
+			if srv.config.DefaultUserRole != tt.wantCfg {
+				t.Errorf("config.DefaultUserRole = %q, want %q", srv.config.DefaultUserRole, tt.wantCfg)
+			}
+			if got := srv.DefaultUserRole(); got != tt.wantRole {
+				t.Errorf("DefaultUserRole() = %q, want %q", got, tt.wantRole)
+			}
+		})
 	}
 }

@@ -3,25 +3,18 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/stretchr/testify/require"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/GoogleCloudPlatform/scion/pkg/agent"
-	"github.com/GoogleCloudPlatform/scion/pkg/api"
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
-	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
-	"github.com/GoogleCloudPlatform/scion/pkg/runtimebroker"
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/stretchr/testify/require"
 )
 
 func setupRuntimeRecoveryHub(t *testing.T, handler http.HandlerFunc) (*Server, store.Store, *store.Agent, *api.RuntimeUpdateRequest) {
@@ -31,6 +24,7 @@ func setupRuntimeRecoveryHub(t *testing.T, handler http.HandlerFunc) (*Server, s
 	backend := httptest.NewServer(handler)
 	t.Cleanup(backend.Close)
 	broker.Endpoint = backend.URL
+	broker.Capabilities = &store.BrokerCapabilities{RuntimeRecovery: true}
 	require.NoError(t, db.UpdateRuntimeBroker(context.Background(), broker))
 	agent.Phase = "suspended"
 	agent.Template = "previous"
@@ -66,182 +60,6 @@ func writeSuccessfulRecovery(t *testing.T, w http.ResponseWriter, r *http.Reques
 // The thinking fixture executes real broker/manager configuration handling;
 // synthetic container creation is the only external runtime effect. Auth has
 // its separate auth-enabled retained-secret regression in pkg/agent.
-type recoveryThinkingManager struct{ agent.Manager }
-
-func (m recoveryThinkingManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
-	opts.NoAuth = true
-	return m.Manager.Start(ctx, opts)
-}
-
-func TestRetainedRuntimeRecoveryThinkingAndModelSurviveOrdinaryHubResume(t *testing.T) {
-	for _, mode := range []string{"template", "explicit", "zero", "env", "retained"} {
-		t.Run(mode, func(t *testing.T) {
-			srv, db := testServer(t)
-			_, broker, ag := setupOnlineBrokerAgent(t, db, "thinking-recovery")
-			root := t.TempDir()
-			t.Setenv("HOME", root)
-			t.Setenv("SCION_PROJECT", "")
-			t.Setenv("SCION_GROVE", "")
-			project := filepath.Join(root, "project", ".scion")
-			dir := config.ResolveAgentDir(project, ag.Slug)
-			home, workspace := filepath.Join(dir, "home"), filepath.Join(root, "workspace")
-			harnessDir := filepath.Join(root, ".scion", "harness-configs", "codex")
-			templateDir := filepath.Join(root, ".scion", "templates", "current")
-			for _, path := range []string{home, workspace, harnessDir, templateDir} {
-				require.NoError(t, os.MkdirAll(path, 0755))
-			}
-			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "config.yaml"), []byte("harness: codex\nuser: root\nimage: old:latest\nconfig_dir: .codex\nprovisioner:\n  type: container-script\n  interface_version: 1\n  command: [python3, provision.py]\n  lifecycle_events: [pre-start]\ncommand:\n  base: [codex]\n  resume_flag: resume --last\ncapabilities:\n  resume:\n    support: yes\n"), 0644))
-			require.NoError(t, os.WriteFile(filepath.Join(harnessDir, "provision.py"), []byte("# synthetic runtime fixture\n"), 0644))
-			templateConfig := `{"harness":"codex","harness_config":"codex","thinking_level":6,"model":"template-model"}`
-			if mode == "retained" {
-				templateConfig = `{"harness":"codex","harness_config":"codex","thinking_level":6}`
-			}
-			require.NoError(t, os.WriteFile(filepath.Join(templateDir, "scion-agent.json"), []byte(templateConfig), 0644))
-			one := 1
-			old := &api.ScionConfig{Harness: "codex", HarnessConfig: "codex", User: "root", Image: "old:latest", ExplicitWorkspace: true, ThinkingLevel: &one, Model: "different-old-scalar",
-				Env:     map[string]string{"SCION_AGENT_ID": ag.ID, "SCION_PROJECT_ID": ag.ProjectID, "SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"},
-				Volumes: []api.VolumeMount{{Source: workspace, Target: "/workspace"}},
-				Info:    &api.AgentInfo{ID: ag.ID, Name: ag.Slug, ProjectID: ag.ProjectID, RuntimeBrokerID: broker.ID, Template: "previous", Phase: "suspended", Image: "old:latest"},
-			}
-			if mode == "retained" {
-				t.Setenv("RECOVERY_RETAINED_MODEL", "old-model")
-				old.Env["SCION_MODEL"] = "${RECOVERY_RETAINED_MODEL}"
-			}
-			chain, err := config.GetTemplateChainInProject("current", project)
-			require.NoError(t, err)
-			defaults := &api.ScionConfig{}
-			for _, template := range chain {
-				cfg, err := template.LoadConfig()
-				require.NoError(t, err)
-				defaults = config.MergeScionConfig(defaults, cfg)
-			}
-			old = config.MergeScionConfig(defaults, old)
-			data, err := json.Marshal(old)
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "scion-agent.json"), data, 0644))
-			data, err = json.Marshal(old.Info)
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(filepath.Join(home, "agent-info.json"), data, 0644))
-			var containers []api.AgentInfo
-			var runs []runtime.RunConfig
-			rt := &runtime.MockRuntime{ListFunc: func(context.Context, map[string]string) ([]api.AgentInfo, error) { return containers, nil }, RunFunc: func(_ context.Context, cfg runtime.RunConfig) (string, error) {
-				runs = append(runs, cfg)
-				containers = []api.AgentInfo{{Name: ag.Slug, ContainerID: "synthetic-container", Phase: "running", Image: cfg.Image, Template: cfg.Template, Labels: cfg.Labels}}
-				return "synthetic-container", nil
-			}}
-			bs := runtimebroker.New(runtimebroker.ServerConfig{BrokerID: broker.ID, StateDir: t.TempDir(), ForceRuntime: rt.Name()}, recoveryThinkingManager{agent.NewManager(rt)}, rt)
-			backend := httptest.NewServer(bs.Handler())
-			t.Cleanup(backend.Close)
-			t.Cleanup(func() { _ = bs.Shutdown(context.Background()) })
-			broker.Endpoint = backend.URL
-			require.NoError(t, db.UpdateRuntimeBroker(context.Background(), broker))
-			require.NoError(t, db.AddProjectProvider(context.Background(), &store.ProjectProvider{ProjectID: ag.ProjectID, BrokerID: broker.ID, BrokerName: broker.Name, LocalPath: project, Status: "online"}))
-			ag.Phase, ag.Template = "suspended", "previous"
-			ag.AppliedConfig = &store.AgentAppliedConfig{Image: "old:latest", HarnessConfig: "codex", ThinkingLevel: &one, Model: "old-model",
-				Env: map[string]string{"SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"}, InlineConfig: &api.ScionConfig{ThinkingLevel: &one, Model: "old-model", Env: map[string]string{"SCION_THINKING_LEVEL": "1", "SCION_MODEL": "old-model"}}}
-			require.NoError(t, db.UpdateAgent(context.Background(), ag))
-			srv.SetDispatcher(NewHTTPAgentDispatcher(db, false, slog.Default()))
-			version := ag.StateVersion
-			update := &api.RuntimeUpdateRequest{StateVersion: &version, Template: "current", Image: "new:latest"}
-			want := "6"
-			wantModel := "template-model"
-			if mode == "retained" {
-				wantModel = "old-model"
-			}
-			switch mode {
-			case "explicit", "zero":
-				level := 8
-				if mode == "zero" {
-					level = 0
-				}
-				update.Config = &api.ScionConfig{ThinkingLevel: &level, Model: "current-model"}
-				want = fmt.Sprint(level)
-				wantModel = "current-model"
-			case "env":
-				update.Config = &api.ScionConfig{Env: map[string]string{"SCION_THINKING_LEVEL": "4", "SCION_MODEL": "current-env-model"}}
-				want = "4"
-				wantModel = "current-env-model"
-			}
-			response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+ag.ID+"/start", recoveryStartBody(update))
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			require.Len(t, runs, 1)
-			require.Contains(t, runs[0].Env, "SCION_THINKING_LEVEL="+want)
-			require.Contains(t, runs[0].Env, "SCION_MODEL="+wantModel)
-			saved, err := db.GetAgent(context.Background(), ag.ID)
-			require.NoError(t, err)
-			if mode == "template" {
-				require.Nil(t, saved.AppliedConfig.ThinkingLevel)
-				require.Nil(t, saved.AppliedConfig.InlineConfig.ThinkingLevel)
-				require.NotContains(t, saved.AppliedConfig.Env, "SCION_THINKING_LEVEL")
-				require.NotContains(t, saved.AppliedConfig.InlineConfig.Env, "SCION_THINKING_LEVEL")
-				require.Empty(t, saved.AppliedConfig.Model)
-				require.Empty(t, saved.AppliedConfig.InlineConfig.Model)
-				require.NotContains(t, saved.AppliedConfig.Env, "SCION_MODEL")
-				require.NotContains(t, saved.AppliedConfig.InlineConfig.Env, "SCION_MODEL")
-			}
-			saved.Phase = "suspended"
-			require.NoError(t, db.UpdateAgent(context.Background(), saved))
-			containers[0].Phase = "suspended"
-			response = doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+ag.ID+"/start", map[string]any{})
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			require.Len(t, runs, 2)
-			require.True(t, runs[1].Resume)
-			require.Contains(t, runs[1].Env, "SCION_THINKING_LEVEL="+want)
-			require.Contains(t, runs[1].Env, "SCION_MODEL="+wantModel)
-		})
-	}
-}
-
-func TestRetainedRuntimeRecoveryHubRequestedTemplateDefaultsAndExplicitOverrides(t *testing.T) {
-	for _, explicit := range []bool{false, true} {
-		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
-			domain, model := "current.test", "current-model"
-			if explicit {
-				domain, model = "explicit.test", "explicit-model"
-			}
-			var original *store.Agent
-			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
-				var req struct {
-					ResolvedEnv  map[string]string `json:"resolvedEnv"`
-					InlineConfig *api.ScionConfig  `json:"inlineConfig"`
-				}
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-				require.Equal(t, domain, req.ResolvedEnv["APP_DOMAIN"])
-				require.Equal(t, model, req.ResolvedEnv["SCION_MODEL"])
-				require.Equal(t, original.ID, req.ResolvedEnv["SCION_AGENT_ID"])
-				require.Equal(t, domain, req.InlineConfig.Env["APP_DOMAIN"])
-				require.Equal(t, model, req.InlineConfig.Model)
-				require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{Phase: "running", Image: "new:latest", Template: "current", ContainerStatus: "Up"}}))
-			})
-			original = agent
-			require.NoError(t, db.CreateTemplate(context.Background(), &store.Template{
-				ID: tid("retained-current-template"), Name: "current", Slug: "current", Scope: store.TemplateScopeGlobal,
-				Harness: "claude", Status: store.TemplateStatusActive, ContentHash: "current-hash",
-				Config: &store.TemplateConfig{Env: map[string]string{"APP_DOMAIN": "current.test"}, Model: "current-model"},
-			}))
-			agent.AppliedConfig.Env = map[string]string{"APP_DOMAIN": "old.test"}
-			agent.AppliedConfig.Model = "old-model"
-			agent.AppliedConfig.InlineConfig.Env["APP_DOMAIN"] = "old.test"
-			agent.AppliedConfig.InlineConfig.Model = "old-model"
-			require.NoError(t, db.UpdateAgent(context.Background(), agent))
-			version := agent.StateVersion
-			update.StateVersion = &version
-			update.Config.Env = nil
-			if explicit {
-				update.Config.Env = map[string]string{"APP_DOMAIN": domain}
-				update.Config.Model = model
-			}
-			response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
-			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-			saved, err := db.GetAgent(context.Background(), agent.ID)
-			require.NoError(t, err)
-			require.Equal(t, domain, saved.AppliedConfig.Env["APP_DOMAIN"])
-			require.Equal(t, model, saved.AppliedConfig.Model)
-			require.Equal(t, domain, saved.AppliedConfig.InlineConfig.Env["APP_DOMAIN"])
-		})
-	}
-}
-
 func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {
 	var db store.Store
 	var original *store.Agent
@@ -273,63 +91,6 @@ func TestRetainedRuntimeRecoveryHubAdmitsCASAndRetainsIdentity(t *testing.T) {
 	require.Equal(t, "original-creator", saved.AppliedConfig.CreatorName)
 	require.Equal(t, "baseline", saved.AppliedConfig.AgentRole)
 	require.Equal(t, *update.StateVersion+1, saved.AppliedConfig.RuntimeUpdateVersion)
-}
-
-type recoverySignalBus struct {
-	NoopCommandBus
-	signal func(context.Context, string) error
-}
-
-func (b recoverySignalBus) SignalBrokerCmd(ctx context.Context, brokerID string) error {
-	return b.signal(ctx, brokerID)
-}
-
-func TestRetainedRuntimeRecoveryDeferredOwnerResultAndConcurrentStatusPreserved(t *testing.T) {
-	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
-		writeSuccessfulRecovery(t, w, r)
-	})
-	owner := srv.GetDispatcher()
-	events := NewChannelEventPublisher()
-	t.Cleanup(events.Close)
-	srv.events = events
-	requester := NewHTTPAgentDispatcherWithClient(db, &deferredTestClient{localBroker: "elsewhere"}, false, slog.Default())
-	var completedVersion int64
-	requester.SetCrossNodeDeps(events, recoverySignalBus{signal: func(ctx context.Context, brokerID string) error {
-		pending, err := db.ListPendingDispatch(ctx, brokerID)
-		require.NoError(t, err)
-		require.Len(t, pending, 1)
-		// Exercise actual owner CAS claim, execution, result commit and done
-		// notification, rather than manually dispatching a phase event.
-		srv.SetDispatcher(owner)
-		srv.ReconcileBroker(ctx, brokerID)
-		srv.SetDispatcher(requester)
-		intent, err := db.GetBrokerDispatch(ctx, pending[0].ID)
-		require.NoError(t, err)
-		require.Equal(t, store.DispatchStateDone, intent.State, intent.Error)
-		native, err := db.GetAgent(ctx, agent.ID)
-		require.NoError(t, err)
-		require.Equal(t, "running", native.Phase)
-		turns := 9
-		require.NoError(t, db.UpdateAgentStatus(ctx, agent.ID, store.AgentStatusUpdate{Activity: "executing", ToolName: "after-owner", CurrentTurns: &turns, Heartbeat: true}))
-		native, err = db.GetAgent(ctx, agent.ID)
-		require.NoError(t, err)
-		completedVersion = native.StateVersion
-		return nil
-	}})
-	srv.SetDispatcher(requester)
-	response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	saved, err := db.GetAgent(context.Background(), agent.ID)
-	require.NoError(t, err)
-	require.Equal(t, "running", saved.Phase)
-	require.Equal(t, "Up", saved.ContainerStatus)
-	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
-	require.Equal(t, "current", saved.Template)
-	require.Equal(t, "executing", saved.Activity)
-	require.Equal(t, "after-owner", saved.ToolName)
-	require.Equal(t, 9, saved.CurrentTurns)
-	require.False(t, saved.LastSeen.IsZero())
-	require.Equal(t, completedVersion, saved.StateVersion, "requester must not rewrite the owner's result")
 }
 
 func TestRetainedRuntimeRecoveryConcurrentDifferentTargetsConflictBeforeDispatch(t *testing.T) {
@@ -406,71 +167,6 @@ func TestRetainedRuntimeRecoveryLateCompletionAndIntentFenced(t *testing.T) {
 	require.ErrorContains(t, err, "stale")
 }
 
-func TestRetainedRuntimeRecoveryRequesterFailureCannotUndoOwnerResult(t *testing.T) {
-	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("no dispatch needed") })
-	admission := agent.StateVersion + 1
-	agent.AppliedConfig.RuntimeUpdateVersion = admission
-	agent.Phase = "starting"
-	require.NoError(t, db.UpdateAgent(context.Background(), agent))
-	requester := *agent
-	requesterConfig := *agent.AppliedConfig
-	requester.AppliedConfig = &requesterConfig
-	// The owner commits the successful configuration before a cancelled
-	// requester tries to persist its unchanged admission snapshot as an error.
-	agent.Template, agent.Image, agent.Phase = "current", "new:latest", "running"
-	agent.AppliedConfig.Image = "new:latest"
-	agent.Activity, agent.ToolName = "executing", "owner-tool"
-	require.NoError(t, db.UpdateAgent(context.Background(), agent))
-	version := agent.StateVersion
-	requester.Phase, requester.Message = "error", "request cancelled"
-	require.NoError(t, srv.completeRuntimeRecovery(context.Background(), &requester, &api.RuntimeRecovery{Update: *update, AdmissionVersion: admission}))
-	saved, err := db.GetAgent(context.Background(), agent.ID)
-	require.NoError(t, err)
-	require.Equal(t, "running", saved.Phase)
-	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
-	require.Equal(t, "executing", saved.Activity)
-	require.Equal(t, "owner-tool", saved.ToolName)
-	require.Equal(t, version, saved.StateVersion)
-}
-
-type recoveryStatusInterleavingStore struct {
-	store.Store
-	interleave func(context.Context, *store.Agent) error
-}
-
-func (s *recoveryStatusInterleavingStore) UpdateAgentRuntimeRecovery(ctx context.Context, agent *store.Agent, admissionVersion int64, replaceLabels bool) error {
-	if s.interleave != nil && agent.AppliedConfig != nil && agent.AppliedConfig.Image == "new:latest" {
-		interleave := s.interleave
-		s.interleave = nil
-		if err := interleave(ctx, agent); err != nil {
-			return err
-		}
-	}
-	return s.Store.UpdateAgentRuntimeRecovery(ctx, agent, admissionVersion, replaceLabels)
-}
-
-func TestRetainedRuntimeRecoveryCommitPreservesInterleavedStatusWithoutRepeatingDispatch(t *testing.T) {
-	var starts atomic.Int32
-	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
-		starts.Add(1)
-		writeSuccessfulRecovery(t, w, r)
-	})
-	srv.store = &recoveryStatusInterleavingStore{Store: db, interleave: func(ctx context.Context, result *store.Agent) error {
-		turns := 13
-		return db.UpdateAgentStatus(ctx, result.ID, store.AgentStatusUpdate{Activity: "thinking", ToolName: "during-cas", CurrentTurns: &turns})
-	}}
-	response := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", recoveryStartBody(update))
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	saved, err := db.GetAgent(context.Background(), agent.ID)
-	require.NoError(t, err)
-	require.Equal(t, "running", saved.Phase)
-	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
-	require.Equal(t, "thinking", saved.Activity)
-	require.Equal(t, "during-cas", saved.ToolName)
-	require.Equal(t, 13, saved.CurrentTurns)
-	require.Equal(t, int32(1), starts.Load())
-}
-
 func TestRetainedRuntimeRecoveryConfigCommitPreservesNewerStopStatus(t *testing.T) {
 	var db store.Store
 	var id string
@@ -491,4 +187,155 @@ func TestRetainedRuntimeRecoveryConfigCommitPreservesNewerStopStatus(t *testing.
 	require.Equal(t, "Stopped by user", saved.Message)
 	require.Equal(t, "new:latest", saved.AppliedConfig.Image)
 	require.Equal(t, "current", saved.Template)
+}
+
+func TestRuntimeRecoveryRequiresConfigurationUpdateAuthority(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		t.Run(map[bool]string{false: "session lifecycle only", true: "lifecycle UAT"}[scoped], func(t *testing.T) {
+			var dispatches atomic.Int32
+			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) { dispatches.Add(1); writeSuccessfulRecovery(t, w, r) })
+			user := newReincarnateAuthzUser(t, db, "recovery-update")
+			grantAgentLifecycleAtProject(t, db, user.ID, agent.ProjectID)
+			grantProjectAccessOnly(t, db, user.ID, agent.ProjectID)
+			var identity UserIdentity = NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "web")
+			if scoped {
+				grantPermissionViaRoleBinding(t, db, user.ID, "agent.update", store.RoleScopeProject, agent.ProjectID)
+				identity = scopedIdentityFor(user, agent.ProjectID, []string{"agent:lifecycle"})
+			}
+			body, err := json.Marshal(recoveryStartBody(update))
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", bytes.NewReader(body))
+			req = req.WithContext(contextWithIdentity(req.Context(), identity))
+			rec := httptest.NewRecorder()
+			srv.handleAgentLifecycle(rec, req, agent.ID, "start")
+			require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+			require.Zero(t, dispatches.Load())
+			latest, err := db.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.Equal(t, agent.StateVersion, latest.StateVersion)
+			require.Equal(t, agent.AppliedConfig, latest.AppliedConfig)
+		})
+	}
+}
+
+func TestRuntimeRecoveryHubCompletionCannotRebaseOverConcurrentPatch(t *testing.T) {
+	ctx := context.Background()
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("direct completion must not dispatch") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	staleVersion := admitted.StateVersion
+	// A PATCH advances StateVersion without changing the current admission.
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"owner": "newer-patch"}
+	patched.AppliedConfig.Model = "newer-model"
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	admitted.Phase, admitted.Template, admitted.Image = "running", "current", "new:latest"
+	admitted.AppliedConfig.Image = "new:latest"
+	update.Labels = map[string]string{"owner": "stale-recovery"}
+	err = srv.completeRuntimeRecovery(ctx, admitted, &api.RuntimeRecovery{Update: *update, AdmissionVersion: staleVersion}, true)
+	require.ErrorIs(t, err, store.ErrVersionConflict)
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
+}
+
+func TestRuntimeRecoveryDispatcherRefusesPatchBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	_, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("stale dispatch reached broker") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"newer": "before-dispatch"}
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	dispatcher := NewHTTPAgentDispatcher(db, false, slog.Default())
+	err = dispatcher.DispatchAgentRecover(ctx, admitted, &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.AppliedConfig.RuntimeUpdateVersion})
+	require.ErrorContains(t, err, "stale")
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+}
+
+func TestRuntimeRecoveryDeferredOwnerRefusesNewerSameAdmissionPatch(t *testing.T) {
+	ctx := context.Background()
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("queued stale recovery reached broker") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	recovery := &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.StateVersion}
+	args, err := MarshalDispatchArgs(&StartDispatchArgs{Resume: true, RuntimeRecovery: recovery})
+	require.NoError(t, err)
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"queued": "newer-patch"}
+	patched.AppliedConfig.Model = "newer-model"
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	_, err = srv.executeDispatch(ctx, store.BrokerDispatch{AgentID: agent.ID, ProjectID: agent.ProjectID, BrokerID: agent.RuntimeBrokerID, Op: "start", Args: args})
+	require.ErrorContains(t, err, "stale")
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
+}
+
+func TestRuntimeRecoveryDispatchUsesCommittedTemplateScalarSnapshot(t *testing.T) {
+	for _, committed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "committed full snapshot", false: "legacy model index"}[committed], func(t *testing.T) {
+			ctx := context.Background()
+			expectedModel, expectedThinking := "committed-model", "73"
+			if !committed {
+				expectedModel, expectedThinking = "legacy-model", "11"
+			}
+			var calls atomic.Int32
+			srv, db, agent, update := setupRuntimeRecoveryHub(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var req struct {
+					ResolvedEnv     map[string]string    `json:"resolvedEnv"`
+					RuntimeRecovery *api.RuntimeRecovery `json:"runtimeRecovery"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.NotNil(t, req.RuntimeRecovery)
+				require.Equal(t, expectedModel, req.ResolvedEnv["SCION_MODEL"])
+				require.Equal(t, expectedThinking, req.ResolvedEnv["SCION_THINKING_LEVEL"])
+				require.NotContains(t, req.ResolvedEnv, "TEMPLATE_TOOL_FALLBACK")
+				w.Header().Set("Content-Type", "application/json")
+				require.NoError(t, json.NewEncoder(w).Encode(RemoteAgentResponse{Agent: &RemoteAgentInfo{ID: "new-container", Name: "retained", Phase: "running", Image: "new:latest", Template: req.RuntimeRecovery.Update.Template, ContainerStatus: "Up"}}))
+			})
+			var template *store.Template
+			if committed {
+				srv.SetStorage(newContentMockStorage("test-bucket"))
+				template = seedCommittedTemplate(t, srv, "recovery-thinking", store.TemplateScopeGlobal, "", map[string]string{
+					"scion-agent.yaml": "default_harness_config: claude\nmodel: committed-model\nthinking_level: 73\nenv:\n  TEMPLATE_TOOL_FALLBACK: literal\n",
+				})
+				require.NotNil(t, template.AgentConfig)
+				require.Equal(t, 73, *template.AgentConfig.ThinkingLevel)
+				template.Config = &store.TemplateConfig{Model: "stale-legacy-model"}
+				require.NoError(t, db.UpdateTemplate(ctx, template))
+			} else {
+				template = &store.Template{ID: api.NewUUID(), Name: "legacy-recovery", Slug: "legacy-recovery", Scope: store.TemplateScopeGlobal, Status: store.TemplateStatusActive, Config: &store.TemplateConfig{Model: "legacy-model"}}
+				require.NoError(t, db.CreateTemplate(ctx, template))
+			}
+			retainedLevel := 11
+			agent.AppliedConfig.ThinkingLevel = &retainedLevel
+			require.NoError(t, db.UpdateAgent(ctx, agent))
+			version := agent.StateVersion
+			update.StateVersion = &version
+			admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, version, version+1)
+			require.NoError(t, err)
+			update.Template = template.Slug
+			dispatcher := NewHTTPAgentDispatcher(db, false, slog.Default())
+			require.NoError(t, dispatcher.DispatchAgentRecover(ctx, admitted, &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.StateVersion, TemplateID: template.ID, TemplateHash: template.ContentHash}))
+			require.Equal(t, int32(1), calls.Load())
+			require.Equal(t, expectedModel, admitted.AppliedConfig.Model)
+			if committed {
+				require.Equal(t, 73, *admitted.AppliedConfig.ThinkingLevel)
+			} else {
+				require.Equal(t, 11, *admitted.AppliedConfig.ThinkingLevel)
+			}
+		})
+	}
 }

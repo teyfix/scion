@@ -21,7 +21,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/spf13/cobra"
 )
@@ -114,27 +114,18 @@ func init() {
 }
 
 func getInviteClient() (hubclient.Client, error) {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	return getHubClient(settings)
+	_, client, err := loadHubClient()
+	return client, err
 }
 
 func runInviteCreate(cmd *cobra.Command, args []string) error {
 	if inviteExpires == "" {
-		return fmt.Errorf("--expires is required")
+		return newUsageError("--expires is required")
 	}
 
 	// Validate the duration
 	if _, err := time.ParseDuration(inviteExpires); err != nil {
-		return fmt.Errorf("invalid --expires duration: %w", err)
+		return newUsageError("invalid --expires duration: %w", err)
 	}
 
 	client, err := getInviteClient()
@@ -172,7 +163,7 @@ func runInviteCreate(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("  Code:     %s\n", resp.Code)
 	fmt.Printf("  Link:     %s\n", resp.InviteURL)
-	fmt.Printf("  Expires:  %s\n", resp.Invite.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("  Expires:  %s\n", clitime.Format(resp.Invite.ExpiresAt, clitime.Full))
 	fmt.Printf("  Max uses: %s\n", maxUsesLabel)
 	if resp.Invite.Note != "" {
 		fmt.Printf("  Note:     %s\n", resp.Invite.Note)
@@ -223,7 +214,7 @@ func runInviteList(cmd *cobra.Command, args []string) error {
 			inv.CodePrefix,
 			status,
 			uses,
-			inv.ExpiresAt.Format("2006-01-02 15:04 MST"),
+			clitime.Format(inv.ExpiresAt, clitime.Minute),
 			inv.Note,
 		)
 	}

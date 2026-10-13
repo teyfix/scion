@@ -118,7 +118,14 @@ func (r *Resolver) Resolve(ctx context.Context, ref string) (string, error) {
 		files[fileInfo.Path] = content
 	}
 
-	// Step 5: store in cache keyed by content hash.
+	// Step 5: store in cache keyed by content hash. The download response
+	// names the hash of the version its URLs were signed for; when present
+	// it is the key, because the metadata read in step 1 may be from a
+	// different version if a commit landed in between (ptone/scion#4221).
+	// Hubs that do not send it keep the previous behaviour.
+	if transfer.IsContentHash(downloadResp.ContentHash) {
+		contentHash = downloadResp.ContentHash
+	}
 	if contentHash == "" {
 		contentHash = computeContentHash(files)
 	}
@@ -129,14 +136,21 @@ func (r *Resolver) Resolve(ctx context.Context, ref string) (string, error) {
 	return cachePath, nil
 }
 
-// ResolveWithHash fetches a resource, using the provided hash for a fast cache
-// lookup that skips the metadata round-trip on a hit.
+// ResolveWithHash fetches a resource, always verifying the current content hash
+// with the hub to prevent serving stale cached content.
+//
+// Deprecated: ResolveWithHash now always verifies with the hub. Use Resolve
+// directly. The contentHash parameter is ignored.
+//
+// The caller's contentHash (from the dispatch) may be stale if the hub
+// re-bootstrapped the resource after the agent was created but before the
+// broker resolved it, or if the dispatch raced with a bootstrap. To guard
+// against this, ResolveWithHash always calls Resolve, which fetches the
+// current metadata from the hub and uses the authoritative content hash for
+// the cache lookup. On a cache hit with the current hash the cached directory
+// is returned immediately (no download); on a miss the resource is downloaded
+// and cached under the current hash.
 func (r *Resolver) ResolveWithHash(ctx context.Context, ref, contentHash string) (string, error) {
-	if contentHash != "" {
-		if cachedPath, ok := r.cache.Get(contentHash); ok {
-			return cachedPath, nil
-		}
-	}
 	return r.Resolve(ctx, ref)
 }
 

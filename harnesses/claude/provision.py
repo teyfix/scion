@@ -39,13 +39,19 @@ This script's job:
      format in .claude.json.
   5. Publish the resolved model (the SCION_MODEL env var, already resolved
      by the Go side) as ANTHROPIC_MODEL in the env overlay.
-  6. Write outputs/resolved-auth.json describing the chosen method.
-  7. Write outputs/env.json with env vars to project into the harness process
-     (e.g. ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_MODEL, or
-     Vertex AI vars).
+  6. Map SCION_THINKING_LEVEL through config.yaml's `thinking:` block and
+     publish the result as CLAUDE_CODE_EFFORT_LEVEL in the env overlay. With
+     no level set nothing is published, so Claude keeps its per-model default.
+  7. Write outputs/resolved-auth.json describing the chosen method.
+  8. Write outputs/env.json with env vars to project into the harness process
+     (e.g. ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_MODEL,
+     CLAUDE_CODE_EFFORT_LEVEL, or Vertex AI vars).
 
 The script is intentionally stdlib-only so it works on any container image
 that ships python3 (declared in config.yaml's required_image_tools).
+
+Design references below (section N, Dn) are to
+.design/hosted/usage-telemetry.md (ptone/scion#2053).
 """
 
 from __future__ import annotations
@@ -60,9 +66,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import scion_harness
 
-assert scion_harness.INTERFACE_VERSION >= 2, (
+assert scion_harness.INTERFACE_VERSION >= 3, (  # 3: resolve_thinking
     "scion_harness.py INTERFACE_VERSION is too old "
-    f"(got {scion_harness.INTERFACE_VERSION}, need >= 2); "
+    f"(got {scion_harness.INTERFACE_VERSION}, need >= 3); "
     "this is a staging bug — the host should have staged a compatible library"
 )
 
@@ -77,6 +83,25 @@ CLAUDE_AUTH_FILE = "~/.claude/.credentials.json"
 # requested model impossible to apply.
 DEFAULT_MODEL = "opus"
 
+# Claude Code < 2.1.280 rejects claude-opus-5-5* (and the "opus" alias, which
+# maps to Opus 5 in 2.1.270) with HTTP 400 `claude_code_version_too_old`.
+# When the container's `claude` binary is older than this threshold, fall back
+# to claude-opus-4-8 and emit a clear warning so agents do not boot into a
+# non-recoverable 400 loop.
+OPUS_5_5_MIN_CLAUDE_VERSION = (2, 1, 280)
+OPUS_5_5_FALLBACK_MODEL = "claude-opus-4-8"
+
+# Claude Code reads the session effort from this env var. It outranks the
+# --effort flag, /effort, and the effortLevel / modelSettings keys in
+# settings.json (https://code.claude.com/docs/en/model-config, "Precedence
+# Order"). Accepted values per https://code.claude.com/docs/en/env-vars; a
+# level the active model does not support falls back to the highest supported
+# level below it. The bundled table tops out at xhigh rather than max to avoid
+# max's excessive-token runs; max stays reachable via a preset env var or a
+# custom thinking table.
+EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+EFFORT_ENV_VALUES = frozenset({"low", "medium", "high", "xhigh", "max", "auto"})
+
 AUTH = scion_harness.AuthSpec(
     harness="claude",
     methods=[
@@ -86,8 +111,10 @@ AUTH = scion_harness.AuthSpec(
         scion_harness.file_method("auth-file", path=CLAUDE_AUTH_FILE, secret_key="CLAUDE_AUTH"),
         scion_harness.env_method("vertex-ai",
                                  all_of=["GOOGLE_CLOUD_PROJECT"],
-                                 any_of=["GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION"],
-                                 hint="provide GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION/GOOGLE_CLOUD_REGION "
+                                 # Shared precedence: LOCATION > REGION > CLOUD_ML_REGION.
+                                 # select_auth picks the first present key as env_key.
+                                 any_of=list(scion_harness.vertex_location_keys()),
+                                 hint="provide GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION/GOOGLE_CLOUD_REGION/CLOUD_ML_REGION "
                                       "(with ADC or GCP service account) for Vertex AI"),
     ],
 )
@@ -159,7 +186,30 @@ def _detect_claude_version() -> str:
     return ""
 
 
-def _update_project_paths(ctx: scion_harness.ProvisionContext) -> None:
+def _parse_semver(version: str) -> tuple[int, int, int] | None:
+    """Parse a (major, minor, patch) tuple from a version string like '2.1.270'."""
+    if not version:
+        return None
+    core = version.strip().lstrip("v").split("-", 1)[0].split("+", 1)[0]
+    parts = core.split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+def _requires_opus_5_5_min_version(model: str) -> bool:
+    """Return True if *model* requires Claude Code >= 2.1.280."""
+    lowered = model.strip().lower()
+    return lowered == "opus" or lowered.startswith("claude-opus-5-5")
+
+
+def _update_project_paths(
+    ctx: scion_harness.ProvisionContext,
+    claude_version: str | None = None,
+) -> str:
     """Update .claude.json project paths to point at the container workspace.
 
     Mirrors ClaudeCode.provisionClaudeJSON in claude_code.go. Takes the first
@@ -215,26 +265,56 @@ def _update_project_paths(ctx: scion_harness.ProvisionContext) -> None:
 
     cfg["projects"] = new_projects
 
-    version = _detect_claude_version()
+    version = _detect_claude_version() if claude_version is None else claude_version
     if version:
         cfg["lastReleaseNotesSeen"] = version
         cfg["lastOnboardingVersion"] = version
 
     scion_harness.atomic_write_json(claude_json_path, cfg)
+    return version
 
 
-def _apply_model(ctx: scion_harness.ProvisionContext, env: dict[str, str]) -> str:
+def _apply_model(
+    ctx: scion_harness.ProvisionContext,
+    env: dict[str, str],
+    claude_version: str = "",
+) -> str:
     """Read the resolved model from SCION_MODEL and publish as ANTHROPIC_MODEL.
 
-    SCION_MODEL arrives already resolved by the Go side (pkg/agent/provision.go
-    and pkg/hub/handlers_agent_create_helpers.go resolve size aliases before the
-    container starts). This function applies it as ANTHROPIC_MODEL and handles
-    the edge case where ANTHROPIC_MODEL is already set in the environment.
+    SCION_MODEL is expected to arrive already resolved by the Go side
+    (pkg/agent/provision.go and pkg/hub/handlers_agent_create_helpers.go
+    resolve size aliases before the container starts). This function applies
+    it as ANTHROPIC_MODEL and handles the edge case where ANTHROPIC_MODEL is
+    already set in the environment.
+
+    Defense in depth: if SCION_MODEL still carries a bare size alias (e.g.
+    "large") — which has happened on resume/restart paths where the Go side
+    had no alias table to resolve against — scion_harness.resolve_model maps
+    it using this harness's own config.yaml rather than exporting the alias
+    verbatim.
+
+    When *claude_version* is older than 2.1.280 and the resolved model is
+    ``opus`` or ``claude-opus-5-5*``, falls back to ``claude-opus-4-8`` with a
+    warning so agents do not boot into a 400 ``claude_code_version_too_old``
+    failure loop.
 
     Returns the concrete model name that was applied.
     """
     raw = os.environ.get("SCION_MODEL", "").strip()
-    model = raw or DEFAULT_MODEL
+    model = scion_harness.resolve_model(ctx) or DEFAULT_MODEL
+
+    parsed_version = _parse_semver(claude_version)
+    if parsed_version is not None and parsed_version < OPUS_5_5_MIN_CLAUDE_VERSION:
+        if _requires_opus_5_5_min_version(model):
+            ctx.warn(
+                f"Claude Code {claude_version} in container is older than "
+                f"2.1.280 and rejects model {model!r} with 400 "
+                f"claude_code_version_too_old; falling back to "
+                f"{OPUS_5_5_FALLBACK_MODEL!r}. Rebuild the scion-claude "
+                "container image with Claude Code >= 2.1.280 to use "
+                "claude-opus-5-5."
+            )
+            model = OPUS_5_5_FALLBACK_MODEL
 
     preset = os.environ.get("ANTHROPIC_MODEL", "").strip()
     if raw and preset and preset != model:
@@ -249,27 +329,91 @@ def _apply_model(ctx: scion_harness.ProvisionContext, env: dict[str, str]) -> st
     return model
 
 
+def _apply_effort(ctx: scion_harness.ProvisionContext, env: dict[str, str]) -> str | None:
+    """Resolve the thinking level and publish it as CLAUDE_CODE_EFFORT_LEVEL.
+
+    The level -> effort table lives in config.yaml's `thinking:` block, which
+    has no `default` on purpose: with no level set, nothing is published and
+    Claude Code keeps its own per-model default effort.
+
+    A CLAUDE_CODE_EFFORT_LEVEL already in the container environment (from a
+    template or harness-config `env:` entry) is an explicit pin. The
+    supervisor's MergeEnvOverlay drops any overlay key that is present in the
+    runtime env, even with an empty value, so presence (not truthiness) is
+    what counts: the pin is left alone and nothing is written.
+
+    Returns the effort value written to *env*, or None when none was written.
+    """
+    requested = bool(os.environ.get(scion_harness.THINKING_LEVEL_ENV, "").strip())
+    harness_cfg = ctx.harness_config if isinstance(ctx.harness_config, dict) else {}
+    if requested and not harness_cfg.get("thinking"):
+        # Only when a level was asked for: a customized config.yaml without
+        # the block silently drops the request.
+        ctx.warn(
+            f"config.yaml has no thinking block; {EFFORT_ENV} not set "
+            "(copy the block from the bundled config.yaml or run "
+            "`scion harness-config upgrade claude`)"
+        )
+
+    if EFFORT_ENV in os.environ:
+        preset = os.environ[EFFORT_ENV]
+        if requested:
+            ctx.warn(
+                f"{EFFORT_ENV}={preset!r} is set in the container environment and "
+                "takes precedence over the requested thinking level. This usually "
+                "comes from an `env:` entry in your template or harness-config; "
+                "remove it there to let the agent's thinking level apply."
+            )
+        return None
+
+    effort = scion_harness.resolve_thinking(ctx)
+    if not effort:
+        return None
+    if effort not in EFFORT_ENV_VALUES:
+        ctx.warn(
+            f"thinking map value {effort!r} is not a documented {EFFORT_ENV} "
+            f"value ({', '.join(sorted(EFFORT_ENV_VALUES))}); Claude Code may ignore it"
+        )
+    env[EFFORT_ENV] = effort
+    return effort
+
+
 def _build_env_overlay(ctx: scion_harness.ProvisionContext, auth: scion_harness.ResolvedAuth) -> dict[str, str]:
     """Build the env vars overlay for outputs/env.json."""
     if auth.method == "api-key" and auth.env_key:
-        return {auth.env_key: _resolve(ctx, auth.env_key)}
-    if auth.method == "oauth-token":
-        return {"CLAUDE_CODE_OAUTH_TOKEN": _resolve(ctx, "CLAUDE_CODE_OAUTH_TOKEN")}
-    if auth.method == "vertex-ai":
+        env = {auth.env_key: _resolve(ctx, auth.env_key)}
+    elif auth.method == "oauth-token":
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": _resolve(ctx, "CLAUDE_CODE_OAUTH_TOKEN")}
+    elif auth.method == "vertex-ai":
         region_key = auth.env_key or "GOOGLE_CLOUD_REGION"
-        return {
+        # Read the sources selection and _resolve use: a staged secret file,
+        # else the process env for candidate keys (Claude then reads the
+        # env value through the ${VAR} placeholder).
+        scion_harness.warn_vertex_location_conflict(
+            lambda k: ctx.read_secret(k, env_fallback=k in ctx.env_keys),
+            ctx.warn,
+        )
+        env = {
             "CLAUDE_CODE_USE_VERTEX": "1",
             "ANTHROPIC_VERTEX_PROJECT_ID": _resolve(ctx, "GOOGLE_CLOUD_PROJECT"),
             "CLOUD_ML_REGION": _resolve(ctx, region_key),
         }
-    return {}
+    else:
+        env = {}
+
+    # Suppress model upgrade/fallback dialogs — Scion manages the provider.
+    env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
+    # Prevent non-root container process from failing background npm self-updates.
+    env["DISABLE_AUTOUPDATER"] = "1"
+
+    return env
 
 
 def provision(ctx: scion_harness.ProvisionContext) -> None:
     auth = ctx.select_auth(AUTH)
 
     try:
-        _update_project_paths(ctx)
+        claude_version = _update_project_paths(ctx)
     except OSError as exc:
         raise scion_harness.ProvisionError(f"failed to update project paths: {exc}") from exc
 
@@ -282,12 +426,53 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
                 ctx.warn(f"failed to write API key approval: {exc}")
 
     env = _build_env_overlay(ctx, auth)
-    model = _apply_model(ctx, env)
+    telemetry = ctx.telemetry
+    config = telemetry.get("telemetry") if isinstance(telemetry, dict) else None
+    enabled = isinstance(config, dict) and config.get("enabled", True)
+    source_env = telemetry.get("env", {}) if isinstance(telemetry, dict) else {}
+    cloud = config.get("cloud") if isinstance(config, dict) else None
+    configured_provider = cloud.get("provider", "") if isinstance(cloud, dict) else ""
+    staged_provider = source_env.get("SCION_TELEMETRY_CLOUD_PROVIDER", "")
+    if enabled and configured_provider and staged_provider and configured_provider != staged_provider:
+        raise scion_harness.ProvisionError("conflicting telemetry cloud provider")
+    provider = staged_provider or configured_provider
+    if enabled and not provider:
+        # The receiver can infer GCP from credentials even when provider is
+        # absent. A credential path is only a reason to stop, not a selector.
+        has_credentials = bool(source_env.get("SCION_OTEL_GCP_CREDENTIALS")) or os.path.isfile(
+            os.path.join(ctx.home, ".scion", "telemetry-gcp-credentials.json")
+        )
+        generic_endpoint = (cloud.get("endpoint") if isinstance(cloud, dict) else None) or source_env.get("SCION_OTEL_ENDPOINT")
+        if has_credentials or not generic_endpoint:
+            raise scion_harness.ProvisionError("explicit telemetry cloud provider required")
+    port = str(source_env.get("SCION_OTEL_GRPC_PORT") or "4317")
+    if not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise scion_harness.ProvisionError("invalid local telemetry gRPC port")
+    env.update({
+        "SCION_NATIVE_TELEMETRY_POLICY": "enabled" if enabled else "disabled",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1" if enabled else "0",
+        "OTEL_METRICS_EXPORTER": "otlp" if enabled and provider != "gcp" else "none",
+        "OTEL_LOGS_EXPORTER": "otlp" if enabled else "none",
+        "OTEL_TRACES_EXPORTER": "none",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{port}",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": f"http://127.0.0.1:{port}",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": f"http://127.0.0.1:{port}",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+    })
+    if enabled:
+        # Claude's usage (gen_ai.api.calls / scion.usage.tokens) is derived by
+        # sciontool's receiver from the native api_request/api_error log
+        # events (ptone/scion#2053 phase 1). This is narrow to usage only
+        # (D4): tool, session and turn hook telemetry are unaffected, and
+        # unset here means no usage is published at all (D10).
+        env["SCION_USAGE_SOURCE"] = "native"
+    model = _apply_model(ctx, env, claude_version=claude_version)
+    effort = _apply_effort(ctx, env)
     extra: dict[str, Any] | None = None
     if auth.method == "vertex-ai":
         extra = {"vertex_ai": True}
     ctx.write_outputs(auth, env=env, extra=extra)
-    ctx.info(f"method={auth.method} model={model}")
+    ctx.info(f"method={auth.method} model={model} effort={effort or '<claude default>'}")
 
     mcp_mapping = dict(CLAUDE_MCP_MAPPING)
     mcp_mapping["project_config_path"] = f"projects.{ctx.workspace}.mcpServers"

@@ -176,6 +176,7 @@ image: scion-claude:test
 provisioner:
   type: container-script
   interface_version: 1
+  command: ["python3", "/home/scion/.scion/harness/provision.py"]
 `)
 
 	code, body := dispatchAgent(t, srv, "scripted-envelope")
@@ -276,7 +277,7 @@ auth:
 			HarnessConfig: "custom-auth",
 		},
 	}
-	required, _, _ := srv.extractRequiredEnvKeys(req)
+	required, _, _, _ := srv.extractRequiredEnvKeys(req, "")
 
 	// Build a set for stable lookup.
 	got := make(map[string]bool)
@@ -314,7 +315,7 @@ auth:
 			HarnessConfig: "claude-legacy",
 		},
 	}
-	required, _, _ := srv.extractRequiredEnvKeys(req)
+	required, _, _, _ := srv.extractRequiredEnvKeys(req, "")
 
 	got := make(map[string]bool)
 	for _, k := range required {
@@ -336,8 +337,12 @@ func TestAgentResponseHarnessConfigRevision(t *testing.T) {
 		Name:                  "x",
 		HarnessConfig:         "claude",
 		HarnessConfigRevision: "sha256:deadbeef",
+		HarnessConfigSource:   "broker-local",
 	})
 	if resp.HarnessConfigRevision != "sha256:deadbeef" {
 		t.Errorf("HarnessConfigRevision lost in response conversion: got %q", resp.HarnessConfigRevision)
+	}
+	if resp.HarnessConfigSource != "broker-local" {
+		t.Errorf("HarnessConfigSource lost in response conversion: got %q", resp.HarnessConfigSource)
 	}
 }

@@ -301,3 +301,25 @@ func TestNvidiaGPUConfig(t *testing.T) {
 		t.Fatalf("lost explicit false: %s", data)
 	}
 }
+
+func TestValidateDockerConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config api.DockerConfig
+		bad    bool
+	}{
+		{name: "CDI", config: api.DockerConfig{Devices: []string{"nvidia.com/gpu=all"}}},
+		{name: "host device", config: api.DockerConfig{Devices: []string{"/dev/fuse:/dev/fuse:rwm"}}},
+		{name: "reserved ownership", config: api.DockerConfig{Labels: map[string]string{"scion.run_id": "replacement"}}, bad: true},
+		{name: "reserved identity", config: api.DockerConfig{Labels: map[string]string{"SCION.project_id": "replacement"}}, bad: true},
+		{name: "malformed CDI", config: api.DockerConfig{Devices: []string{"nvidia.com/gpu="}}, bad: true},
+		{name: "relative device", config: api.DockerConfig{Devices: []string{"dev/fuse"}}, bad: true},
+		{name: "empty network", config: api.DockerConfig{Networks: []string{" "}}, bad: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateDockerConfig(&tc.config); (err != nil) != tc.bad {
+				t.Fatalf("unexpected validation: %v", err)
+			}
+		})
+	}
+}

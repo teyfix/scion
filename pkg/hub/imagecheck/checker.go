@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,8 +22,7 @@ type ImageChecker interface {
 	Check(ctx context.Context, image string) CheckResult
 }
 
-// ValidateReference validates an explicitly requested image using the same
-// reference parser as the image availability checker.
+// ValidateReference validates a requested image with the availability checker's parser.
 func ValidateReference(image string) error {
 	if image == "" || strings.ContainsAny(image, " \t\r\n") || strings.Contains(image, "://") {
 		return fmt.Errorf("image reference is empty or contains whitespace")
@@ -32,8 +32,13 @@ func ValidateReference(image string) error {
 }
 
 type Checker struct {
-	local  LocalImageExister
-	client HTTPClient
+	// localMu guards local. SetLocal can run while Check and CheckAll are
+	// serving requests (the hub swaps the local runtime after it has started
+	// serving), so readers load local once through localExister and use only
+	// that value.
+	localMu sync.RWMutex
+	local   LocalImageExister
+	client  HTTPClient
 }
 
 type Option func(*Checker)
@@ -55,16 +60,27 @@ func NewChecker(opts ...Option) *Checker {
 	return c
 }
 
+// SetLocal sets the local image exister. Safe to call concurrently with
+// Check, CheckAll and CheckRemoteOnly.
 func (c *Checker) SetLocal(l LocalImageExister) {
+	c.localMu.Lock()
+	defer c.localMu.Unlock()
 	c.local = l
+}
+
+// localExister returns the current local image exister, or nil.
+func (c *Checker) localExister() LocalImageExister {
+	c.localMu.RLock()
+	defer c.localMu.RUnlock()
+	return c.local
 }
 
 func (c *Checker) Check(ctx context.Context, image string) CheckResult {
 	now := time.Now()
 
 	var localErr error
-	if c.local != nil {
-		if result, found, err := checkLocalImage(ctx, c.local, image, now); found {
+	if local := c.localExister(); local != nil {
+		if result, found, err := checkLocalImage(ctx, local, image, now); found {
 			return result
 		} else if err != nil {
 			localErr = err
@@ -170,15 +186,15 @@ func (c *Checker) CheckAll(ctx context.Context, shortImage, longImage string) Th
 	result.LocalLong.Image = longImage
 	result.Remote.Image = longImage
 
-	if c.local != nil {
+	if local := c.localExister(); local != nil {
 		if shortImage != "" {
-			shortExists, err := c.local.ImageExists(ctx, shortImage)
+			shortExists, err := local.ImageExists(ctx, shortImage)
 			if err != nil {
 				slog.Warn("local image check failed", "image", shortImage, "error", err)
 			}
 			result.LocalShort.Exists = shortExists
 			if shortExists {
-				if ider, ok := c.local.(LocalImageIDer); ok {
+				if ider, ok := local.(LocalImageIDer); ok {
 					if id, err := ider.ImageID(ctx, shortImage); err == nil {
 						result.LocalShort.Hash = id
 					}
@@ -187,13 +203,13 @@ func (c *Checker) CheckAll(ctx context.Context, shortImage, longImage string) Th
 		}
 
 		if longImage != "" {
-			longExists, err := c.local.ImageExists(ctx, longImage)
+			longExists, err := local.ImageExists(ctx, longImage)
 			if err != nil {
 				slog.Warn("local image check failed", "image", longImage, "error", err)
 			}
 			result.LocalLong.Exists = longExists
 			if longExists {
-				if ider, ok := c.local.(LocalImageIDer); ok {
+				if ider, ok := local.(LocalImageIDer); ok {
 					if id, err := ider.ImageID(ctx, longImage); err == nil {
 						result.LocalLong.Hash = id
 					}

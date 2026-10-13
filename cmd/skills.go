@@ -27,6 +27,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/spf13/cobra"
 )
@@ -43,8 +44,24 @@ var skillsListCmd = &cobra.Command{
 	RunE:  runSkillsList,
 }
 
+// skillsListTags returns every --tags value given to skills list, whether
+// the flag was repeated (--tags a --tags b) or comma-separated (--tags a,b),
+// trimmed and with empty entries dropped. Before ptone/scion#2863 the flag
+// was a single-value string, so a repeated --tags silently kept only the
+// last value.
+func skillsListTags(cmd *cobra.Command) []string {
+	raw, _ := cmd.Flags().GetStringSlice("tags")
+	var tags []string
+	for _, t := range raw {
+		if t = strings.TrimSpace(t); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
+}
+
 func runSkillsList(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -54,34 +71,43 @@ func runSkillsList(cmd *cobra.Command, args []string) error {
 
 	scope, _ := cmd.Flags().GetString("scope")
 	search, _ := cmd.Flags().GetString("search")
-	tags, _ := cmd.Flags().GetString("tags")
 
 	opts := &hubclient.ListSkillsOptions{
 		Scope:  scope,
 		Search: search,
 		Status: "active",
-	}
-	if tags != "" {
-		opts.Tags = strings.Split(tags, ",")
+		Tags:   skillsListTags(cmd),
 	}
 
-	resp, err := hubCtx.Client.Skills().List(ctx, opts)
-	if err != nil {
-		return fmt.Errorf("failed to list skills: %w", err)
+	// The list endpoint applies the caller's read-scope boundary before
+	// paginating (ptone/scion#1901 pagination follow-up), so a single page
+	// is no longer guaranteed to contain every skill the caller can see —
+	// follow nextCursor until the server reports no more pages.
+	var skills []hubclient.Skill
+	for {
+		resp, err := hubCtx.Client.Skills().List(ctx, opts)
+		if err != nil {
+			return fmt.Errorf("failed to list skills: %w", err)
+		}
+		skills = append(skills, resp.Skills...)
+		if !resp.Page.HasMore() {
+			break
+		}
+		opts.Page.Cursor = resp.Page.NextCursor
 	}
 
 	if isJSONOutput() {
-		return json.NewEncoder(os.Stdout).Encode(resp.Skills)
+		return json.NewEncoder(os.Stdout).Encode(skills)
 	}
 
-	if len(resp.Skills) == 0 {
+	if len(skills) == 0 {
 		fmt.Println("No skills found.")
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "NAME\tSCOPE\tSTATUS\tTAGS\tDESCRIPTION")
-	for _, s := range resp.Skills {
+	for _, s := range skills {
 		desc := s.Description
 		if len(desc) > 50 {
 			desc = desc[:47] + "..."
@@ -103,7 +129,7 @@ var skillsShowCmd = &cobra.Command{
 }
 
 func runSkillsShow(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -142,8 +168,7 @@ func runSkillsShow(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Tags: %s\n", strings.Join(skill.Tags, ", "))
 	}
 	fmt.Printf("Status: %s\n", skill.Status)
-	fmt.Printf("Visibility: %s\n", skill.Visibility)
-	fmt.Printf("Created: %s\n", skill.Created.Format(time.RFC3339))
+	fmt.Printf("Created: %s\n", clitime.Format(skill.Created, clitime.Full))
 
 	// Show versions
 	versions, err := hubCtx.Client.Skills().ListVersions(ctx, skill.ID)
@@ -221,7 +246,7 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 	skillID, _ := cmd.Flags().GetString("skill-id")
 
 	if version == "" {
-		return fmt.Errorf("--version is required")
+		return newUsageError("--version is required")
 	}
 
 	// Verify SKILL.md exists
@@ -274,7 +299,7 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("total size exceeds 50MB limit (%d bytes)", totalSize)
 	}
 
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -296,9 +321,20 @@ func runSkillsPublish(cmd *cobra.Command, args []string) error {
 			if scope == "" {
 				scope = "global"
 			}
+			var projectID string
+			if scope == "project" {
+				projectID, err = GetProjectID(hubCtx)
+				if err != nil {
+					return err
+				}
+				if projectID == "" {
+					return fmt.Errorf("cannot create project-scoped skill %q: could not determine the project ID (run 'scion hub link' to link this project with the Hub)", name)
+				}
+			}
 			createResp, err := skillSvc.Create(ctx, &hubclient.CreateSkillRequest{
-				Name:  name,
-				Scope: scope,
+				Name:    name,
+				Scope:   scope,
+				ScopeID: projectID,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create skill: %w", err)
@@ -419,7 +455,7 @@ var skillsDeleteCmd = &cobra.Command{
 }
 
 func runSkillsDelete(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -462,7 +498,7 @@ var skillsDeprecateCmd = &cobra.Command{
 }
 
 func runSkillsDeprecate(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -476,10 +512,10 @@ func runSkillsDeprecate(cmd *cobra.Command, args []string) error {
 	replacement, _ := cmd.Flags().GetString("replacement")
 
 	if version == "" {
-		return fmt.Errorf("--version is required")
+		return newUsageError("--version is required")
 	}
 	if message == "" {
-		return fmt.Errorf("--message is required")
+		return newUsageError("--message is required")
 	}
 
 	skillSvc := hubCtx.Client.Skills()
@@ -538,7 +574,7 @@ var skillsVersionsCmd = &cobra.Command{
 }
 
 func runSkillsVersions(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -581,7 +617,7 @@ func runSkillsVersions(cmd *cobra.Command, args []string) error {
 		if len(hash) > 20 {
 			hash = hash[:20] + "..."
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", v.Version, v.Status, v.Created.Format("2006-01-02"), hash)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", v.Version, v.Status, clitime.Format(v.Created, clitime.Date), hash)
 	}
 	return w.Flush()
 }
@@ -594,7 +630,7 @@ var skillsResolveCmd = &cobra.Command{
 }
 
 func runSkillsResolve(cmd *cobra.Command, args []string) error {
-	hubCtx, err := CheckHubAvailability(projectPath)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
@@ -653,7 +689,7 @@ func init() {
 	// Flags for list command
 	skillsListCmd.Flags().String("scope", "", "Filter by scope (core, global, project, user)")
 	skillsListCmd.Flags().String("search", "", "Search skills by name, description, or tags")
-	skillsListCmd.Flags().String("tags", "", "Filter by tags (comma-separated, AND semantics)")
+	skillsListCmd.Flags().StringSlice("tags", nil, "Filter by tags (repeatable or comma-separated, AND semantics; each value is parsed as CSV, so a tag containing a double quote must be CSV-quoted)")
 
 	// Flags for deprecate command
 	skillsDeprecateCmd.Flags().String("version", "", "Version to deprecate (required)")

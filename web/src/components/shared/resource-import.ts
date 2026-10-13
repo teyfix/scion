@@ -26,6 +26,8 @@
  *   workspace-path modes.
  * - Global scope posts to the unified `/api/v1/resources/import` endpoint and is
  *   URL-only (no project workspace to resolve).
+ * - User scope posts to the unified `/api/v1/resources/import` endpoint with
+ *   scope='user' and is URL-only (no user workspace to resolve).
  *
  * On a successful import it dispatches a `resource-imported` CustomEvent (with
  * `{ count }` detail) so the host page can refresh its resource list.
@@ -43,6 +45,8 @@ interface ImportEvent {
   type: 'discovered' | 'started' | 'completed' | 'failed' | 'skipped' | 'done' | 'error';
   name?: string;
   reason?: string;
+  /** Machine-readable error code on an `error` event, e.g. harness_config_unusable. */
+  code?: string;
   completed?: number;
   total?: number;
   names?: string[];
@@ -73,7 +77,7 @@ export class ScionResourceImport extends LitElement {
 
   /** Resource scope: 'project' or 'global'. */
   @property({ type: String })
-  scope: 'project' | 'global' = 'project';
+  scope: 'project' | 'global' | 'user' = 'project';
 
   /** Scope id (project id) — required for project scope, omitted for global. */
   @property({ type: String })
@@ -241,9 +245,9 @@ export class ScionResourceImport extends LitElement {
       let discoverEndpoint: string;
       let discoverBody: Record<string, string>;
 
-      if (this.scope === 'global') {
+      if (this.scope === 'global' || this.scope === 'user') {
         discoverEndpoint = '/api/v1/resources/discover';
-        discoverBody = { kind: this.kind, scope: 'global', sourceUrl: this.source };
+        discoverBody = { kind: this.kind, scope: this.scope, sourceUrl: this.source };
       } else {
         const path = this.kind === 'template' ? 'discover-templates' : 'discover-harness-configs';
         discoverEndpoint = `/api/v1/projects/${this.scopeId}/${path}`;
@@ -300,9 +304,9 @@ export class ScionResourceImport extends LitElement {
       let endpoint: string;
       let body: Record<string, unknown>;
 
-      if (this.scope === 'global') {
+      if (this.scope === 'global' || this.scope === 'user') {
         endpoint = '/api/v1/resources/import';
-        body = { kind: this.kind, scope: 'global', sourceUrl: this.source };
+        body = { kind: this.kind, scope: this.scope, sourceUrl: this.source };
       } else {
         const path = this.kind === 'template' ? 'import-templates' : 'import-harness-configs';
         endpoint = `/api/v1/projects/${this.scopeId}/${path}`;

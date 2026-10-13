@@ -32,6 +32,7 @@ output="$(bash "${script_dir}/../build-images.sh" --builder local-docker \
   --platform linux/amd64 --push --dry-run)"
 [[ "${output}" == *'scope=onprem-core-base'* ]]
 [[ "${output}" == *'scope=onprem-scion-base'* ]]
+[[ "${output}" == *'scope=onprem-scion-jcode'* ]]
 [[ "${output}" == *'BASE_IMAGE=ghcr.io/teyfix/core-base:'* ]]
 [[ "${output}" == *'BASE_IMAGE=ghcr.io/teyfix/scion-base:'* ]]
 printf 'PASS: optional per-image cache, amd64 push, and full graph dry run\n'

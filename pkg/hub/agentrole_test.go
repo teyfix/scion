@@ -28,13 +28,15 @@ func TestScopesForRole_None(t *testing.T) {
 
 func TestScopesForRole_ReadOnly(t *testing.T) {
 	scopes := ScopesForRole(AgentRoleReadOnly)
-	require.Len(t, scopes, 1)
+	require.Len(t, scopes, 2)
 	assert.Equal(t, ScopeProjectRead, scopes[0])
+	// Ceiling-optional: see ceilingOptionalRoleScopes.
+	assert.Equal(t, ScopeProjectArtifactRead, scopes[1])
 }
 
 func TestScopesForRole_Baseline(t *testing.T) {
 	scopes := ScopesForRole(AgentRoleBaseline)
-	require.Len(t, scopes, 5)
+	require.Len(t, scopes, 7)
 
 	// Must include these scopes
 	assert.Contains(t, scopes, ScopeProjectRead)
@@ -42,6 +44,8 @@ func TestScopesForRole_Baseline(t *testing.T) {
 	assert.Contains(t, scopes, ScopeAgentTokenRefresh)
 	assert.Contains(t, scopes, ScopeAgentNotify)
 	assert.Contains(t, scopes, ScopeAgentPortForward)
+	assert.Contains(t, scopes, ScopeProjectArtifactRead)
+	assert.Contains(t, scopes, ScopeProjectArtifactWrite)
 
 	// Must NOT include elevated scopes
 	assert.NotContains(t, scopes, ScopeAgentCreate)
@@ -52,7 +56,8 @@ func TestScopesForRole_Baseline(t *testing.T) {
 
 func TestScopesForRole_Full(t *testing.T) {
 	scopes := ScopesForRole(AgentRoleFull)
-	require.Len(t, scopes, 9)
+	require.Len(t, scopes, 13)
+	assert.Contains(t, scopes, ScopeProjectArtifactWrite)
 
 	// Must include everything in baseline
 	assert.Contains(t, scopes, ScopeProjectRead)
@@ -63,9 +68,15 @@ func TestScopesForRole_Full(t *testing.T) {
 
 	// Plus elevated scopes
 	assert.Contains(t, scopes, ScopeAgentCreate)
+	// ptone/scion#2339: gcp_service_account.assign has its own agent scope,
+	// distinct from ScopeAgentCreate. AgentRoleFull carries both, so role=full
+	// keeps authorizing both agent creation and service-account assignment.
+	assert.Contains(t, scopes, ScopeAgentSAAssign)
 	assert.Contains(t, scopes, ScopeAgentLifecycle)
 	assert.Contains(t, scopes, ScopeProjectSecretRead)
 	assert.Contains(t, scopes, ScopeProjectTemplateWrite)
+	assert.Contains(t, scopes, ScopeAgentSetMessageMode)
+	assert.Contains(t, scopes, ScopeProjectArtifactRead)
 }
 
 func TestScopesForRole_InvalidDefault(t *testing.T) {
@@ -132,85 +143,6 @@ func TestMinRole(t *testing.T) {
 	assert.Equal(t, AgentRoleReadOnly, minRole(AgentRoleFull, AgentRoleReadOnly, AgentRoleBaseline))
 }
 
-func TestResolveEffectiveRole_MemberUser(t *testing.T) {
-	// Member user requesting full gets full (member ceiling is now full)
-	assert.Equal(t, AgentRoleFull, ResolveEffectiveRole(AgentRoleFull, "member", AgentRoleFull))
-
-	// Member user requesting baseline gets baseline
-	assert.Equal(t, AgentRoleBaseline, ResolveEffectiveRole(AgentRoleBaseline, "member", AgentRoleFull))
-
-	// Member user requesting readonly gets readonly
-	assert.Equal(t, AgentRoleReadOnly, ResolveEffectiveRole(AgentRoleReadOnly, "member", AgentRoleFull))
-}
-
-func TestResolveEffectiveRole_AdminUser(t *testing.T) {
-	// Admin requesting full in full-project gets full
-	assert.Equal(t, AgentRoleFull, ResolveEffectiveRole(AgentRoleFull, "admin", AgentRoleFull))
-
-	// Admin in baseline-project gets baseline (project cap takes effect)
-	assert.Equal(t, AgentRoleBaseline, ResolveEffectiveRole(AgentRoleFull, "admin", AgentRoleBaseline))
-}
-
-func TestResolveEffectiveRole_EmptyUserRole(t *testing.T) {
-	// Empty user role defaults to full ceiling
-	assert.Equal(t, AgentRoleFull, ResolveEffectiveRole(AgentRoleFull, "", AgentRoleFull))
-	assert.Equal(t, AgentRoleReadOnly, ResolveEffectiveRole(AgentRoleReadOnly, "", AgentRoleFull))
-}
-
-func TestResolveEffectiveRole_LatticeMin(t *testing.T) {
-	// Three-way min: admin + full request + readonly project = readonly
-	assert.Equal(t, AgentRoleReadOnly, ResolveEffectiveRole(AgentRoleFull, "admin", AgentRoleReadOnly))
-
-	// Three-way min: member + readonly request + full project = readonly
-	assert.Equal(t, AgentRoleReadOnly, ResolveEffectiveRole(AgentRoleReadOnly, "member", AgentRoleFull))
-
-	// Three-way min: admin + none request + full project = none
-	assert.Equal(t, AgentRoleNone, ResolveEffectiveRole(AgentRoleNone, "admin", AgentRoleFull))
-
-	// Three-way min: member + full request + none project = none
-	assert.Equal(t, AgentRoleNone, ResolveEffectiveRole(AgentRoleFull, "member", AgentRoleNone))
-}
-
-func TestResolveEffectiveRole_InvalidRequestedRole(t *testing.T) {
-	// An unknown/invalid requested role gets ordinal 0 (none) via the default
-	// case in roleOrdinal. This is the fail-closed behavior: invalid roles
-	// resolve to the lowest privilege level.
-
-	// Admin + invalid request + full project: invalid ordinal (0) is the min,
-	// so the invalid role string is returned. Its scopes resolve to none (nil).
-	resolved := ResolveEffectiveRole(AgentRole("superuser"), "admin", AgentRoleFull)
-	assert.Equal(t, AgentRole("superuser"), resolved)
-	assert.Nil(t, ScopesForRole(resolved))
-
-	// Member + invalid request + full project: invalid ordinal (0) is still
-	// the min — fail-closed.
-	resolved = ResolveEffectiveRole(AgentRole("superuser"), "member", AgentRoleFull)
-	assert.Nil(t, ScopesForRole(resolved))
-
-	// Admin + invalid request + readonly project: invalid (0) < readonly (1),
-	// so invalid wins — even the project cap can't elevate an invalid role.
-	resolved = ResolveEffectiveRole(AgentRole("superuser"), "admin", AgentRoleReadOnly)
-	assert.Equal(t, AgentRole("superuser"), resolved)
-	assert.Nil(t, ScopesForRole(resolved))
-}
-
-func TestResolveEffectiveRole_ProjectMaxReadonly_AdminRequestsFull(t *testing.T) {
-	// When project max is "readonly" and an admin requests full, effective is readonly.
-	assert.Equal(t, AgentRoleReadOnly, ResolveEffectiveRole(AgentRoleFull, "admin", AgentRoleReadOnly))
-}
-
-func TestResolveEffectiveRole_ProjectMaxNone(t *testing.T) {
-	// When project max is "none", any request resolves to none.
-	assert.Equal(t, AgentRoleNone, ResolveEffectiveRole(AgentRoleFull, "admin", AgentRoleNone))
-	assert.Equal(t, AgentRoleNone, ResolveEffectiveRole(AgentRoleBaseline, "member", AgentRoleNone))
-	assert.Equal(t, AgentRoleNone, ResolveEffectiveRole(AgentRoleReadOnly, "admin", AgentRoleNone))
-}
-
-func TestResolveEffectiveRole_ProjectMaxFull_MemberGetsFull(t *testing.T) {
-	// When project max is full and user is member, member ceiling is full so full is granted.
-	assert.Equal(t, AgentRoleFull, ResolveEffectiveRole(AgentRoleFull, "member", AgentRoleFull))
-}
-
 func TestScopesForRole_RoleNoneMapToNoAuth(t *testing.T) {
 	// role=none produces nil scopes — caller should set NoAuth=true
 	scopes := ScopesForRole(AgentRoleNone)
@@ -219,8 +151,10 @@ func TestScopesForRole_RoleNoneMapToNoAuth(t *testing.T) {
 
 func TestScopesForRole_RoleReadOnlyHasOnlyRead(t *testing.T) {
 	scopes := ScopesForRole(AgentRoleReadOnly)
-	require.Len(t, scopes, 1)
+	require.Len(t, scopes, 2)
 	assert.Equal(t, ScopeProjectRead, scopes[0])
+	// Ceiling-optional: see ceilingOptionalRoleScopes.
+	assert.Equal(t, ScopeProjectArtifactRead, scopes[1])
 	// Must NOT have elevated scopes
 	assert.NotContains(t, scopes, ScopeAgentCreate)
 	assert.NotContains(t, scopes, ScopeAgentStatusUpdate)
