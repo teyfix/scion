@@ -74,13 +74,16 @@ const (
 // block; the container-side provisioner translates this into each harness's
 // native format (.claude.json, .gemini/settings.json, opencode.json, etc.).
 type MCPServerConfig struct {
-	Transport MCPTransport      `json:"transport" yaml:"transport"`
-	Command   string            `json:"command,omitempty" yaml:"command,omitempty"`
-	Args      []string          `json:"args,omitempty" yaml:"args,omitempty"`
-	Env       map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	URL       string            `json:"url,omitempty" yaml:"url,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
-	Scope     MCPScope          `json:"scope,omitempty" yaml:"scope,omitempty"`
+	// EnabledTools is a native tool allowlist for harnesses that support it
+	// (currently Codex). Nil inherits all tools; an explicit empty list enables none.
+	EnabledTools *[]string         `json:"enabled_tools,omitempty" yaml:"enabled_tools,omitempty"`
+	Transport    MCPTransport      `json:"transport" yaml:"transport"`
+	Command      string            `json:"command,omitempty" yaml:"command,omitempty"`
+	Args         []string          `json:"args,omitempty" yaml:"args,omitempty"`
+	Env          map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	URL          string            `json:"url,omitempty" yaml:"url,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Scope        MCPScope          `json:"scope,omitempty" yaml:"scope,omitempty"`
 }
 
 // ValidateMCPServers validates an MCP server map per the rules in
