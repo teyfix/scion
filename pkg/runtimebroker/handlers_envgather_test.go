@@ -202,8 +202,8 @@ func newTestServerWithProjectPath(t *testing.T, settingsYAML string) (*Server, *
 	cfg.ForceRuntime = "mock"
 
 	mgr := &envCapturingManager{}
-	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	// Match ForceRuntime so auth-gather tests use their mock manager.
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr, projectDir
 }
@@ -554,8 +554,8 @@ func newTestServerWithHarnessConfig(t *testing.T, harnessConfigName, configYAML,
 	cfg.ForceRuntime = "mock"
 
 	mgr := &envCapturingManager{}
-	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	// Match ForceRuntime so auth-gather tests use their mock manager.
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr, projectDir
 }

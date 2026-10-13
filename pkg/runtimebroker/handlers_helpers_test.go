@@ -486,8 +486,8 @@ func newTestServerWithEnvCapture() (*Server, *envCapturingManager) {
 
 	mgr := &envCapturingManager{}
 
-	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	// Match ForceRuntime so these manager-capture tests use their mock dependency.
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr
 }
@@ -549,8 +549,8 @@ func newTestServerWithProvisionCapture() (*Server, *provisionCapturingManager) {
 	cfg.ForceRuntime = "mock"
 
 	mgr := &provisionCapturingManager{}
-	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
-	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	// Match ForceRuntime so these manager-capture tests use their mock dependency.
+	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
 	return New(cfg, mgr, rt), mgr
 }

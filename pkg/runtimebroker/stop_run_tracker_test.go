@@ -507,7 +507,8 @@ func newHookListServer(t *testing.T) (*Server, *hookListManager) {
 	cfg := DefaultServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
-	return New(cfg, m, &runtime.MockRuntime{NameFunc: func() string { return "docker" }}), m
+	cfg.ForceRuntime = "mock"
+	return New(cfg, m, &runtime.MockRuntime{NameFunc: func() string { return "mock" }}), m
 }
 
 // Run-b's start finishes, creating c-b, between the stop's first lookup

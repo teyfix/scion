@@ -26,10 +26,20 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
-func TestResolveManagerForOpts_NoProfile(t *testing.T) {
+// Profile-resolution tests deliberately model a Docker broker and consult
+// settings; generic capture fixtures force the mock runtime instead.
+func newTestServerForDockerProfileResolution() *Server {
 	srv, _ := newTestServerWithProvisionCapture()
+	srv.config.ForceRuntime = ""
+	srv.runtime = &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
+	return srv
+}
+
+func TestResolveManagerForOpts_NoProfile(t *testing.T) {
+	srv := newTestServerForDockerProfileResolution()
 
 	opts := api.StartOptions{Name: "test-agent"}
 	mgr, _ := srv.resolveManagerForOpts(opts)
@@ -41,7 +51,7 @@ func TestResolveManagerForOpts_NoProfile(t *testing.T) {
 }
 
 func TestResolveManagerForOpts_ProfileNotInSettings(t *testing.T) {
-	srv, _ := newTestServerWithProvisionCapture()
+	srv := newTestServerForDockerProfileResolution()
 
 	opts := api.StartOptions{
 		Name:    "test-agent",
@@ -77,8 +87,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
-	srv.config.ForceRuntime = ""
+	srv := newTestServerForDockerProfileResolution()
 
 	opts := api.StartOptions{
 		Name:        "test-agent",
@@ -87,7 +96,7 @@ runtimes:
 	}
 	mgr, _ := srv.resolveManagerForOpts(opts)
 
-	// Profile specifies "container" runtime which differs from mock's "mock",
+	// Profile specifies "container" runtime which differs from the broker's "docker",
 	// so we should get a different manager
 	if mgr == srv.manager {
 		t.Error("expected a different manager when profile specifies a different runtime")
@@ -130,8 +139,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
-	srv.config.ForceRuntime = ""
+	srv := newTestServerForDockerProfileResolution()
 	srv.resolveAuxiliaryRuntime = nil
 
 	opts := api.StartOptions{
@@ -143,8 +151,8 @@ runtimes:
 	// Must not panic.
 	mgr, _ := srv.resolveManagerForOpts(opts)
 
-	// Profile specifies "container" runtime which differs from mock's
-	// "mock", so the fallback must have actually resolved a new manager
+	// Profile specifies "container" runtime which differs from the broker's
+	// "docker", so the fallback must have actually resolved a new manager
 	// rather than silently keeping the default.
 	if mgr == srv.manager {
 		t.Error("expected a different manager when the nil-resolver fallback resolves a different runtime")
@@ -172,7 +180,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
+	srv := newTestServerForDockerProfileResolution()
 
 	opts := api.StartOptions{
 		Name:        "test-agent",
@@ -232,8 +240,7 @@ runtimes:
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
-	srv.config.ForceRuntime = ""
+	srv := newTestServerForDockerProfileResolution()
 	var logBuf bytes.Buffer
 	srv.agentLifecycleLog = slog.New(slog.NewTextHandler(&logBuf, nil))
 
@@ -244,7 +251,7 @@ runtimes:
 	mgr, rtName := srv.resolveManagerForOpts(opts)
 
 	// The broker's default runtime is "docker" (see
-	// newTestServerWithProvisionCapture); the project's active profile
+	// newTestServerForDockerProfileResolution); the project's active profile
 	// resolves to "container", so the manager actually returned must run on
 	// "container" — not merely be some manager other than the default.
 	if rtName != "container" {
@@ -291,8 +298,7 @@ profiles: [not valid yaml
 		t.Fatal(err)
 	}
 
-	srv, _ := newTestServerWithProvisionCapture()
-	srv.config.ForceRuntime = ""
+	srv := newTestServerForDockerProfileResolution()
 	var logBuf bytes.Buffer
 	srv.agentLifecycleLog = slog.New(slog.NewTextHandler(&logBuf, nil))
 
