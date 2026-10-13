@@ -163,4 +163,3 @@ resource "google_project_iam_member" "agent_sa_project_roles" {
   role    = each.value
   member  = "serviceAccount:${google_service_account.agent.email}"
 }
-

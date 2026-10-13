@@ -113,6 +113,42 @@ func TestRedactDatabaseURL(t *testing.T) {
 			want:   "host=localhost user=scion password=xxxxx dbname=scion",
 		},
 		{
+			name:   "libpq unquoted password with escaped space",
+			driver: "postgres",
+			dsn:    "host=localhost user=scion password=prefix\\ secret-tail dbname=scion",
+			want:   "host=localhost user=scion password=xxxxx dbname=scion",
+		},
+		{
+			name:   "libpq unquoted password with escaped tab",
+			driver: "postgres",
+			dsn:    "host=localhost user=scion password=prefix\\\tsecret-tail dbname=scion",
+			want:   "host=localhost user=scion password=xxxxx dbname=scion",
+		},
+		{
+			name:   "libpq unquoted sslpassword with escaped space",
+			driver: "postgres",
+			dsn:    "host=localhost user=scion sslpassword=prefix\\ secret-tail dbname=scion",
+			want:   "host=localhost user=scion sslpassword=xxxxx dbname=scion",
+		},
+		{
+			name:   "libpq unquoted sslpassword with escaped tab",
+			driver: "postgres",
+			dsn:    "host=localhost user=scion sslpassword=prefix\\\tsecret-tail dbname=scion",
+			want:   "host=localhost user=scion sslpassword=xxxxx dbname=scion",
+		},
+		{
+			name:   "libpq single quoted password with escaped newline",
+			driver: "postgres",
+			dsn:    "host=localhost password='prefix\\\nsecret-tail with space' dbname=scion",
+			want:   "host=localhost password=xxxxx dbname=scion",
+		},
+		{
+			name:   "libpq double quoted sslpassword with escaped newline",
+			driver: "postgres",
+			dsn:    "host=localhost sslpassword=\"prefix\\\nsecret-tail with space\" dbname=scion",
+			want:   "host=localhost sslpassword=xxxxx dbname=scion",
+		},
+		{
 			name:   "libpq form with sslpassword",
 			driver: "postgres",
 			dsn:    "host=localhost user=scion sslpassword=" + fakePassword + " dbname=scion",
@@ -124,7 +160,7 @@ func TestRedactDatabaseURL(t *testing.T) {
 			// itself contain "=". The narrower [^=\s]+ alternative some
 			// reviewers suggest would stop at the first "=" and leak the
 			// tail, e.g. password=ab=cd would redact to password=xxxxx=cd.
-			// \S+ is required to mask the value in full.
+			// The scanner must mask the value in full, including "=".
 			name:   "libpq unquoted password containing = is masked in full",
 			driver: "postgres",
 			dsn:    "host=localhost user=scion password=" + fakePassword + "=tail dbname=scion",
@@ -153,6 +189,16 @@ func TestRedactDatabaseURL(t *testing.T) {
 			driver: "postgres",
 			dsn:    "host=localhost password= dbname=scion",
 			want:   "host=localhost password=xxxxx",
+		},
+		{name: "unterminated single quote", driver: "postgres", dsn: "host=localhost password='prefix secret-tail", want: redactedPlaceholder},
+		{name: "unterminated double quote", driver: "postgres", dsn: "host=localhost sslpassword=\"prefix secret-tail", want: redactedPlaceholder},
+		{name: "trailing escape", driver: "postgres", dsn: "host=localhost password=prefix\\", want: redactedPlaceholder},
+		{name: "trailing data after quote", driver: "postgres", dsn: "host=localhost password='prefix'leaked-tail", want: redactedPlaceholder},
+		{
+			name:   "unsupported connection shape with equals sign",
+			driver: "postgres",
+			dsn:    " postgres://scion:prefix-secret@db/scion?sslmode=disable",
+			want:   redactedPlaceholder,
 		},
 		{
 			name:   "unparseable dsn is fully masked",

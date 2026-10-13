@@ -16,7 +16,7 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, teyfix/onprem ]
   pull_request:
 
 # One run per PR: a new push to the same PR cancels the superseded run
