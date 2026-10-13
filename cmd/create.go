@@ -81,6 +81,10 @@ The agent is provisioned but not started, even when a task is given. Run
 			return createAgentViaHub(hubCtx, agentName, task)
 		}
 
+		if requireGPUFlag {
+			return newUsageError("--require-gpu requires Hub mode")
+		}
+
 		// Load inline config if --config was specified
 		var inlineCfg *api.ScionConfig
 		if inlineConfigPath != "" {
@@ -395,9 +399,11 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string) error 
 		HarnessConfig:   harnessConfigFlag,
 		HarnessAuth:     harnessAuthFlag,
 		RuntimeBrokerID: runtimeBrokerID,
+		RequireGPU:      requireGPUFlag,
 		Profile:         profile,
 		Task:            task,
 		Branch:          branch,
+		Workspace:       workspace,
 		Labels:          parsedLabels,
 		ProvisionOnly:   true,
 		AgentRole:       agentRoleFlag,
@@ -407,9 +413,31 @@ func createAgentViaHub(hubCtx *HubContext, agentName string, task string) error 
 	// Wire --service-account flag into the GCP identity assignment.
 	applyServiceAccountFlag(req, serviceAccountFlag)
 
+	if inlineConfigPath != "" {
+		inlineCfg, configDir, err := loadInlineConfig(inlineConfigPath)
+		if err != nil {
+			return err
+		}
+		if err := resolveInlineConfigContent(inlineCfg, configDir); err != nil {
+			return err
+		}
+		req.Config = inlineCfg
+		if req.Branch == "" {
+			req.Branch = inlineCfg.Branch
+		}
+	}
 	if agentImage != "" {
-		req.Config = &api.ScionConfig{
-			Image: agentImage,
+		if req.Config == nil {
+			req.Config = &api.ScionConfig{}
+		}
+		req.Config.Image = agentImage
+	}
+	if req.Config != nil {
+		if harnessConfigFlag != "" {
+			req.Config.HarnessConfig = harnessConfigFlag
+		}
+		if harnessAuthFlag != "" {
+			req.Config.AuthSelectedType = harnessAuthFlag
 		}
 	}
 
@@ -459,6 +487,7 @@ func init() {
 	createCmd.Flags().StringVarP(&branch, "branch", "b", "", "Git branch to use for the agent workspace")
 	createCmd.Flags().StringVarP(&workspace, "workspace", "w", "", "Host path or project-relative subdirectory to mount as /workspace")
 	createCmd.Flags().StringVar(&runtimeBrokerID, "broker", "", "Preferred runtime broker ID, name, or slug")
+	createCmd.Flags().BoolVar(&requireGPUFlag, "require-gpu", false, "Require an NVIDIA GPU-capable runtime broker (Hub mode)")
 	createCmd.Flags().StringVar(&harnessConfigFlag, "harness-config", "", "Named harness configuration to use")
 	createCmd.Flags().StringVar(&harnessConfigFlag, "harness", "", "Named harness configuration to use (alias for --harness-config)")
 

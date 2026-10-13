@@ -131,16 +131,22 @@ func resetHubStartGlobals(t *testing.T) {
 	t.Helper()
 	origNoAuth, origAttach, origForce := noAuth, attach, forceResume
 	origTemplate, origImage, origBroker := templateName, agentImage, runtimeBrokerID
+	origRequireGPU, origInlineConfig := requireGPUFlag, inlineConfigPath
+	origBranch, origWorkspace := branch, workspace
 	origHC, origHA, origLabels := harnessConfigFlag, harnessAuthFlag, labelFlags
 	origRole, origMM, origFormat := agentRoleFlag, messageModeFlag, outputFormat
 	t.Cleanup(func() {
 		noAuth, attach, forceResume = origNoAuth, origAttach, origForce
 		templateName, agentImage, runtimeBrokerID = origTemplate, origImage, origBroker
+		requireGPUFlag, inlineConfigPath = origRequireGPU, origInlineConfig
+		branch, workspace = origBranch, origWorkspace
 		harnessConfigFlag, harnessAuthFlag, labelFlags = origHC, origHA, origLabels
 		agentRoleFlag, messageModeFlag, outputFormat = origRole, origMM, origFormat
 	})
 	noAuth, attach, forceResume = false, false, false
 	templateName, agentImage, runtimeBrokerID = "", "", ""
+	requireGPUFlag, inlineConfigPath = false, ""
+	branch, workspace = "", ""
 	harnessConfigFlag, harnessAuthFlag, labelFlags = "", "", nil
 	agentRoleFlag, messageModeFlag, outputFormat = "", "", ""
 }

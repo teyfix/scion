@@ -238,6 +238,7 @@ type CreateAgentRequest struct {
 	HarnessConfig   string            `json:"harnessConfig,omitempty"` // Explicit harness config name (used during sync when template may not be on Hub)
 	HarnessAuth     string            `json:"harnessAuth,omitempty"`   // Late-binding override for auth_selected_type
 	RuntimeBrokerID string            `json:"runtimeBrokerId,omitempty"`
+	RequireGPU      bool              `json:"requireGpu,omitempty"` // Restrict placement to an NVIDIA GPU-capable runtime broker.
 	Profile         string            `json:"profile,omitempty"`
 	Task            string            `json:"task,omitempty"`
 	Branch          string            `json:"branch,omitempty"`

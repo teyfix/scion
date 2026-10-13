@@ -65,6 +65,7 @@ var isInteractiveTerminal = func() bool {
 var (
 	templateName          string
 	agentImage            string
+	requireGPUFlag        bool
 	noAuth                bool
 	attach                bool
 	forceResume           bool
@@ -892,6 +893,10 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		return startAgentViaHub(cmd, hubCtx, agentName, task, resume, inlineCfg)
 	}
 
+	if requireGPUFlag {
+		return newUsageError("--require-gpu requires Hub mode")
+	}
+
 	// Local mode
 	rt := runtime.GetRuntime(projectPath, profile)
 	mgr := agent.NewManager(rt)
@@ -1287,7 +1292,7 @@ func hubStartActionWord(phase string, resume, force bool) string {
 // no effect.
 var configFlagsNotAppliedToExistingAgent = []string{
 	"type", "harness-config", "harness", "harness-auth", "image", "model",
-	"thinking-level", "config", "broker", "label", "role", "message-mode",
+	"thinking-level", "config", "broker", "require-gpu", "label", "role", "message-mode",
 	"branch", "workspace", "service-account", "enable-telemetry",
 	"disable-telemetry", "no-auth", "profile", agentLogLevelFlagName,
 }
@@ -1388,6 +1393,7 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 		HarnessConfig:   harnessConfigFlag,
 		HarnessAuth:     harnessAuthFlag,
 		RuntimeBrokerID: runtimeBrokerID,
+		RequireGPU:      requireGPUFlag,
 		Profile:         profile,
 		Task:            task,
 		Branch:          branch,
@@ -1415,9 +1421,18 @@ func startAgentViaHub(cmd *cobra.Command, hubCtx *HubContext, agentName, task st
 	// The inline config is the base; CLI flags override specific fields.
 	if inlineCfg != nil {
 		req.Config = inlineCfg
+		if req.Branch == "" {
+			req.Branch = inlineCfg.Branch
+		}
 		// CLI flags override inline config fields
 		if agentImage != "" {
 			req.Config.Image = agentImage
+		}
+		if harnessConfigFlag != "" {
+			req.Config.HarnessConfig = harnessConfigFlag
+		}
+		if harnessAuthFlag != "" {
+			req.Config.AuthSelectedType = harnessAuthFlag
 		}
 	} else if agentImage != "" || agentLogLevel != "" || enableTelemetry || disableTelemetry {
 		// Build config from CLI flags alone
