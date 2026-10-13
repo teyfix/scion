@@ -2865,9 +2865,12 @@ func (s *Server) isMultiHubMode() bool {
 // hasRegisteredHubAuthority remains true while credentials are rebuilding
 // or invalid, so a scoped request cannot fall back to standalone config.
 func (s *Server) hasRegisteredHubAuthority() bool {
-	if !s.config.BrokerAuthEnabled {
-		return false
-	}
+	return s.config.BrokerAuthEnabled && s.hasConfiguredHubAuthority()
+}
+
+// hasConfiguredHubAuthority keeps a configured Hub create in the hosted
+// contract even when verification is disabled; it cannot become a local create.
+func (s *Server) hasConfiguredHubAuthority() bool {
 	s.hubMu.RLock()
 	defer s.hubMu.RUnlock()
 	for _, conn := range s.hubConnections {

@@ -784,7 +784,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	span.SetAttributes(attribute.String("scion.agent.name", req.Name))
 
 	// Validate required fields
-	if (req.ProjectID != "" || req.ID != "") && s.hasRegisteredHubAuthority() {
+	if s.hasConfiguredHubAuthority() {
 		if _, ok := authenticatedBrokerAuthority(r); !ok {
 			Unauthorized(w)
 			return
@@ -841,6 +841,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	if refusal := s.createRuntimeTargetRefusal(&req); refusal != nil {
 		span.SetStatus(codes.Error, refusal.code)
 		refusal.write(w)
+		return
+	}
+
+	if _, err := s.createDispatchAdmission(r, req.ID, req.ProjectID); err != nil {
+		s.writeStartContextError(w, err, "create agent")
 		return
 	}
 
