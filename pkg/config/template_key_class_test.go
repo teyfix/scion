@@ -30,6 +30,7 @@ func TestStripTemplateEnvironmentKeys_AllEnvironmentKeys(t *testing.T) {
 	cfg := &api.ScionConfig{
 		HarnessConfig: "claude",
 		Model:         "opus",
+		Docker:        &api.DockerConfig{},
 		Telemetry:     &api.TelemetryConfig{},
 		Hub:           &api.AgentHubConfig{},
 		Image:         "example.com/img:1",
@@ -58,6 +59,7 @@ func TestStripTemplateEnvironmentKeys_AllEnvironmentKeys(t *testing.T) {
 	// template env is a lowest-precedence fill applied by the agent, and TZ
 	// is handled by the hub-only rule there.
 	wantIgnored := []string{
+		"docker",
 		"env.SCION_HUB_URL",
 		"env.SCION_WORKSPACE_GIT",
 		"hub", "image", "kubernetes", "resources", "telemetry", "volumes",
@@ -65,7 +67,7 @@ func TestStripTemplateEnvironmentKeys_AllEnvironmentKeys(t *testing.T) {
 	if !reflect.DeepEqual(ignored, wantIgnored) {
 		t.Errorf("ignored = %v, want %v", ignored, wantIgnored)
 	}
-	if got.Telemetry != nil || got.Hub != nil || got.Image != "" || got.Resources != nil || got.Kubernetes != nil || got.Volumes != nil {
+	if got.Docker != nil || got.Telemetry != nil || got.Hub != nil || got.Image != "" || got.Resources != nil || got.Kubernetes != nil || got.Volumes != nil {
 		t.Errorf("environment keys survived: %+v", got)
 	}
 	wantEnv := map[string]string{
