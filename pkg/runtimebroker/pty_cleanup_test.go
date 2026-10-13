@@ -1347,9 +1347,28 @@ func filterSCIONEnv(env []string) []string {
 //   - Exports -e KEY=VALUE args into the process environment (Docker -e behavior)
 //   - For tmux commands: redirects through the fixture tmux socket
 //   - For sh commands: runs locally (used by cleanup PID lookup)
-func nonceTestAdapter(t *testing.T, dir string) string {
+func nonceTestAdapter(t *testing.T, dir string, candidatePIDs ...int) string {
 	t.Helper()
 	adapter := filepath.Join(dir, "runtime-exec")
+	// Production scans the container's PID namespace. A host-backed fixture
+	// can supply its complete client set while retaining real /proc identity
+	// checks and signals, instead of scanning unrelated host processes.
+	scopedDiscovery := ""
+	if len(candidatePIDs) > 0 {
+		paths := make([]string, 0, len(candidatePIDs))
+		for _, pid := range candidatePIDs {
+			require.Greater(t, pid, 0)
+			paths = append(paths, fmt.Sprintf("/proc/%d/environ", pid))
+		}
+		scopedDiscovery = fmt.Sprintf(`
+    sh)
+        if [ "${2:-}" = "-c" ]; then
+            script=$(printf '%%s' "$3" | sed 's|/proc/\[0-9\]\*/environ|%s|g')
+            exec sh -c "$script"
+        fi
+        exec "$@" ;;
+`, strings.Join(paths, " "))
+	}
 	require.NoError(t, os.WriteFile(adapter, []byte(`#!/bin/sh
 set -eu
 shift  # exec
@@ -1365,6 +1384,7 @@ done
 shift  # containerID
 case "$1" in
     tmux) shift; exec "$TW_CLEANUP_TMUX" -S "$TW_CLEANUP_SOCKET" "$@" ;;
+`+scopedDiscovery+`
     *) exec "$@" ;;
 esac
 `), 0700))
@@ -1577,6 +1597,7 @@ func TestPTYCleanup_NoncePIDLookup(t *testing.T) {
 	})
 
 	expectedPID := strconv.Itoa(attachCmd.Process.Pid)
+	adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 
 	// Wait for the attach to be visible
 	require.Eventually(t, func() bool {
@@ -1636,6 +1657,7 @@ func TestPTYCleanup_NoncePIDLookup(t *testing.T) {
 			return len(lines) >= 2
 		}, 5*time.Second, 50*time.Millisecond)
 
+		adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid, attachCmd2.Process.Pid)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		pid, startTime, err := findContainerPIDByNonce(ctx, adapter, "test-container", "scion", nonce)
@@ -1689,6 +1711,7 @@ func TestPTYCleanup_NonceStartTimeParsing(t *testing.T) {
 	})
 
 	expectedPID := strconv.Itoa(attachCmd.Process.Pid)
+	adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 
 	require.Eventually(t, func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1768,6 +1791,7 @@ func TestPTYCleanup_NonceVerifyAndKill(t *testing.T) {
 		}, 5*time.Second, 50*time.Millisecond)
 
 		// Get the start_time via findContainerPIDByNonce
+		adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		foundPID, startTime, err := findContainerPIDByNonce(ctx, adapter, "test-container", "scion", nonce)
@@ -1856,6 +1880,7 @@ func TestPTYCleanup_NonceVerifyAndKill(t *testing.T) {
 		}, 5*time.Second, 50*time.Millisecond)
 
 		// Get the real start_time
+		adapter = nonceTestAdapter(t, dir, attachCmd.Process.Pid)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, startTime, err := findContainerPIDByNonce(ctx, adapter, "test-container", "scion", nonce)
@@ -1920,9 +1945,7 @@ func TestPTYCleanup_NonceThreeClientTopology(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _, _ = tmuxCommand("kill-server") })
 
-	adapter := nonceTestAdapter(t, dir)
 	dockerBin := filepath.Join(dir, "docker")
-	require.NoError(t, os.Symlink(adapter, dockerBin))
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	t.Setenv("TW_CLEANUP_TMUX", tmux)
 	t.Setenv("TW_CLEANUP_SOCKET", socket)
@@ -1996,6 +2019,14 @@ func TestPTYCleanup_NonceThreeClientTopology(t *testing.T) {
 	pidA := strconv.Itoa(cmdA.Process.Pid)
 	pidB := strconv.Itoa(cmdB.Process.Pid)
 	pidC := strconv.Itoa(cmdC.Process.Pid)
+	adapter := nonceTestAdapter(t, dir, cmdA.Process.Pid, cmdB.Process.Pid, cmdC.Process.Pid)
+	require.NoError(t, os.Symlink(adapter, dockerBin))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	matchedPID, startTime, err := findContainerPIDByNonce(ctx, "docker", "test-container", "scion", nonceA)
+	cancel()
+	require.NoError(t, err)
+	require.Equal(t, pidA, matchedPID, "all three fixture clients participate in nonce selection")
+	require.NotEmpty(t, startTime)
 
 	// Run cleanup for A's nonce — should kill only A
 	cleanupContainerAttach("docker", "test-container", "scion", nonceA)
