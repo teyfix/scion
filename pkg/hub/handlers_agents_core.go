@@ -4738,7 +4738,9 @@ const configPatchPhaseMessage = "Config can only be updated for agents in 'creat
 // non-empty config key drops from the agent's inline config where the
 // broker's start-time merge would keep them: it unites env and mcp_servers
 // with the persisted maps and appends volumes to the persisted list, so a
-// removal applies only at the next reincarnation. An emptied key is
+// removal applies only at the next reincarnation. Docker also unites its
+// networks/devices and labels and preserves omitted boolean overrides, so
+// its removed entries are reported under nested docker keys. An emptied key is
 // reported by reincarnateOnlyConfigEdits instead. present holds the
 // request's lower-cased config keys. Auto-expose env keys, which the PATCH
 // treats as untouched when absent, and TZ, which config.env never sets, are
@@ -4788,6 +4790,38 @@ func removedConfigEntries(old, req *api.ScionConfig, present map[string]bool, ca
 		}
 		add("volumes", removed)
 	}
+
+	if present["docker"] && old.Docker != nil && req.Docker != nil && !startMergeKeepsBase("docker", req) {
+		removedList := func(before, after []string) []string {
+			kept := make(map[string]bool, len(after))
+			for _, entry := range after {
+				kept[entry] = true
+			}
+			var removed []string
+			for _, entry := range before {
+				if !kept[entry] {
+					removed = append(removed, entry)
+					kept[entry] = true
+				}
+			}
+			return removed
+		}
+		add("docker.networks", removedList(old.Docker.Networks, req.Docker.Networks))
+		add("docker.devices", removedList(old.Docker.Devices, req.Docker.Devices))
+		var labels []string
+		for key := range old.Docker.Labels {
+			if _, kept := req.Docker.Labels[key]; !kept {
+				labels = append(labels, key)
+			}
+		}
+		add("docker.labels", labels)
+		if old.Docker.Privileged != nil && req.Docker.Privileged == nil {
+			add("docker.privileged", []string{"override"})
+		}
+		if old.Docker.NvidiaGPU != nil && req.Docker.NvidiaGPU == nil {
+			add("docker.nvidia_gpu", []string{"override"})
+		}
+	}
 	return out
 }
 
@@ -4797,6 +4831,8 @@ func removedEntriesWarnings(removed map[string][]string) []string {
 	var out []string
 	for _, w := range []struct{ key, what string }{
 		{"env", "variables"}, {"mcp_servers", "MCP servers"}, {"volumes", "volumes"},
+		{"docker.networks", "Docker networks"}, {"docker.devices", "Docker devices"}, {"docker.labels", "Docker labels"},
+		{"docker.privileged", "privileged override"}, {"docker.nvidia_gpu", "NVIDIA GPU override"},
 	} {
 		if r := removed[w.key]; len(r) > 0 {
 			out = append(out, "config."+w.key+": removed "+strings.Join(r, ", ")+" now; the agent keeps those "+w.what+" until the next reincarnation (a plain start does not remove them)")

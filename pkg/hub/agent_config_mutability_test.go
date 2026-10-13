@@ -711,3 +711,59 @@ func TestStartMergeKeepsBase_ValuesThatApply(t *testing.T) {
 	assert.True(t, startMergeKeepsBase("not_a_key", &api.ScionConfig{}))
 	assert.True(t, startMergeKeepsBase("model", nil))
 }
+
+// A populated Docker edit can contain removals the additive start merge keeps.
+// Those entries, including omitted boolean overrides, wait for reincarnation.
+func TestRemovedDockerEntriesWarningsAndDisposition(t *testing.T) {
+	on, off := true, false
+	old := &api.ScionConfig{Docker: &api.DockerConfig{
+		Privileged: &on, NvidiaGPU: &off,
+		Networks: []string{"keep", "removed"}, Devices: []string{"/dev/keep", "/dev/removed"},
+		Labels: map[string]string{"keep": "value", "removed": "value"},
+	}}
+	req := &api.ScionConfig{Docker: &api.DockerConfig{
+		Networks: []string{"keep"}, Devices: []string{"/dev/keep"}, Labels: map[string]string{"keep": "value"},
+	}}
+	present := map[string]bool{"docker": true}
+	raw := rawConfigOf(t, `{"docker": {"networks":["keep"],"devices":["/dev/keep"],"labels":{"keep":"value"}}}`)
+	removed := removedConfigEntries(old, req, present, true)
+	assert.Equal(t, map[string][]string{
+		"docker.networks": {"removed"}, "docker.devices": {"/dev/removed"}, "docker.labels": {"removed"},
+		"docker.privileged": {"override"}, "docker.nvidia_gpu": {"override"},
+	}, removed)
+	warnings := removedEntriesWarnings(removed)
+	require.Len(t, warnings, 5)
+	for _, warning := range warnings {
+		assert.Contains(t, warning, "until the next reincarnation (a plain start does not remove them)")
+	}
+	provision, cleared := reincarnateOnlyConfigEdits(raw, req, old)
+	applied, held := configEditDisposition(raw, req, old, provision, cleared, removed)
+	assert.Empty(t, applied)
+	assert.Equal(t, []string{"config.docker"}, held)
+	assert.Empty(t, removedConfigEntries(old, req, map[string]bool{}, true), "an omitted Docker field is not an edit")
+
+	// Emptying the entire Docker block uses the existing root cleared warning.
+	empty := &api.ScionConfig{Docker: &api.DockerConfig{}}
+	assert.Empty(t, removedConfigEntries(old, empty, present, true))
+	_, cleared = reincarnateOnlyConfigEdits(rawConfigOf(t, `{"docker":{}}`), empty, old)
+	assert.Equal(t, []string{"config.docker"}, cleared)
+
+	// An explicit false is a value, not a removal, and applies at next start.
+	flagsOld := &api.ScionConfig{Docker: &api.DockerConfig{Privileged: &on, NvidiaGPU: &on}}
+	flagsReq := &api.ScionConfig{Docker: &api.DockerConfig{Privileged: &off, NvidiaGPU: &off}}
+	flagsRaw := rawConfigOf(t, `{"docker":{"privileged":false,"nvidia_gpu":false}}`)
+	removed = removedConfigEntries(flagsOld, flagsReq, present, true)
+	assert.Empty(t, removed)
+	provision, cleared = reincarnateOnlyConfigEdits(flagsRaw, flagsReq, flagsOld)
+	applied, held = configEditDisposition(flagsRaw, flagsReq, flagsOld, provision, cleared, removed)
+	assert.Equal(t, []string{"config.docker"}, applied)
+	assert.Empty(t, held)
+
+	// Runtime/profile attachments remain mandatory even after reincarnation
+	// drops the removed requester entries from the saved configuration.
+	defaults := &api.DockerConfig{Networks: []string{"required"}, Devices: []string{"/dev/required"}, Labels: map[string]string{"required": "value"}}
+	effective := config.MergeDockerConfig(defaults, req.Docker)
+	assert.Equal(t, []string{"required", "keep"}, effective.Networks)
+	assert.Equal(t, []string{"/dev/required", "/dev/keep"}, effective.Devices)
+	assert.Equal(t, map[string]string{"required": "value", "keep": "value"}, effective.Labels)
+}

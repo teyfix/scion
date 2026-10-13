@@ -588,7 +588,9 @@ func configEditDisposition(rawConfig map[string]json.RawMessage, req, stored *ap
 		held[k] = true
 	}
 	for k := range removed {
-		held[agentConfigKeyPrefix+k] = true
+		// Nested Docker removals belong to the root config.docker wire key.
+		root, _, _ := strings.Cut(k, ".")
+		held[agentConfigKeyPrefix+root] = true
 	}
 	for _, f := range configPatchKeys(rawConfig) {
 		if f.Tier == EditTierImmutable {
