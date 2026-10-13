@@ -16,6 +16,7 @@ package hub
 
 import (
 	"encoding/json"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"time"
 )
 
@@ -25,8 +26,9 @@ import (
 // DispatchAgentStart (all hub instances share the same store + secret
 // backend), so resolved env/secrets are NOT serialized here.
 type StartDispatchArgs struct {
-	Task   string `json:"task,omitempty"`
-	Resume bool   `json:"resume,omitempty"`
+	RuntimeRecovery *api.RuntimeRecovery `json:"runtimeRecovery,omitempty"`
+	Task            string               `json:"task,omitempty"`
+	Resume          bool                 `json:"resume,omitempty"`
 }
 
 // RestartDispatchArgs is intentionally empty — the owner's

@@ -52,6 +52,9 @@ type AgentService interface {
 	// asks for a force-resume; see agentService.Start.
 	Start(ctx context.Context, agentID string) (*LifecycleResponse, error)
 
+	// RecoverRuntime updates a retained runtime and continues its provider session.
+	RecoverRuntime(ctx context.Context, agentID string, update *api.RuntimeUpdateRequest) (*Agent, error)
+
 	// Stop stops a running agent.
 	Stop(ctx context.Context, agentID string) (*LifecycleResponse, error)
 
@@ -530,6 +533,20 @@ func withDeleteAgentQuery(path string, opts *DeleteAgentOptions) string {
 // (ptone/scion#2864).
 func (s *agentService) Start(ctx context.Context, agentID string) (*LifecycleResponse, error) {
 	return s.lifecycle(ctx, agentID, "start")
+}
+
+// RecoverRuntime admits an explicit update against the agent's state version.
+func (s *agentService) RecoverRuntime(ctx context.Context, agentID string, update *api.RuntimeUpdateRequest) (*Agent, error) {
+	if err := update.Validate(); err != nil {
+		return nil, err
+	}
+	resp, err := s.c.post(ctx, s.agentPath(agentID)+"/start", struct {
+		RuntimeUpdate *api.RuntimeUpdateRequest `json:"runtimeUpdate"`
+	}{update}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeResponse[Agent](resp)
 }
 
 // Stop stops a running agent.

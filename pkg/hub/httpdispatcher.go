@@ -3652,8 +3652,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 		// The owning node mints and records its own run ID.
 		d.revertRun(ctx, agent, runID, previousRunID)
 		return d.deferredStart(ctx, agent, &StartDispatchArgs{
-			Task:   task,
-			Resume: resume,
+			RuntimeRecovery: api.RuntimeRecoveryFromContext(ctx),
+			Task:            task,
+			Resume:          resume,
 		})
 	}
 	if err != nil && !isConfirmedStartNotActedOnError(err) {

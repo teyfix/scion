@@ -369,6 +369,8 @@ func (s *Server) withStartClaim(ctx context.Context, agent *store.Agent, kind st
 
 // StartOpts are the inputs of startAgentCore.
 type StartOpts struct {
+	// DispatchStart overrides the start operation while retaining its claim, lease and capacity fences.
+	DispatchStart func(context.Context) error
 	// Kind is the claim kind the start takes.
 	Kind store.StartClaimKind
 	// Existing is a claim the caller already holds (a restart's, taken
@@ -486,6 +488,9 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 			defer cancel()
 		}
 		dispatch := func(c context.Context) error {
+			if opts.DispatchStart != nil {
+				return opts.DispatchStart(c)
+			}
 			return dispatcher.DispatchAgentStart(c, agent, opts.Task, opts.Resume)
 		}
 		var err error

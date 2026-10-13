@@ -359,13 +359,17 @@ type ExposedPort struct {
 
 // AgentAppliedConfig stores the effective configuration of an agent.
 type AgentAppliedConfig struct {
-	Image         string            `json:"image,omitempty"`
-	HarnessConfig string            `json:"harnessConfig,omitempty"`
-	HarnessAuth   string            `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
-	Env           map[string]string `json:"env,omitempty"`
-	Model         string            `json:"model,omitempty"`
-	ThinkingLevel *int              `json:"thinkingLevel,omitempty"`
-	Profile       string            `json:"profile,omitempty"` // Settings profile for the runtime broker
+	Docker               *api.DockerConfig `json:"docker,omitempty"`
+	RequireGPU           bool              `json:"requireGpu,omitempty"`
+	NvidiaGPU            *bool             `json:"nvidiaGpu,omitempty"`
+	RuntimeUpdateVersion int64             `json:"runtimeUpdateVersion,omitempty"`
+	Image                string            `json:"image,omitempty"`
+	HarnessConfig        string            `json:"harnessConfig,omitempty"`
+	HarnessAuth          string            `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
+	Env                  map[string]string `json:"env,omitempty"`
+	Model                string            `json:"model,omitempty"`
+	ThinkingLevel        *int              `json:"thinkingLevel,omitempty"`
+	Profile              string            `json:"profile,omitempty"` // Settings profile for the runtime broker
 	// RuntimeTarget is the broker runtime target (runtime name, plus cluster
 	// context and namespace for Kubernetes) whose listing reported the agent.
 	// Recorded from heartbeats once two consecutive reports name the same
@@ -1094,9 +1098,11 @@ type RuntimeBroker struct {
 
 // BrokerCapabilities describes what a runtime broker can do.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
+	NvidiaGPU       bool `json:"nvidiaGpu,omitempty"`
+	RuntimeRecovery bool `json:"runtimeRecovery,omitempty"`
+	WebPTY          bool `json:"webPty"`
+	Sync            bool `json:"sync"`
+	Attach          bool `json:"attach"`
 	// Reprovision indicates the broker supports the reincarnation reprovision
 	// primitive. The hub gates `scion reincarnate` on this, returning 412 when
 	// unset (design /scion-volumes/scratchpad/projects/agent-migrate/design.md
@@ -1132,11 +1138,16 @@ type BrokerCapabilities struct {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
-	Type      string `json:"type"` // docker, kubernetes, apple
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`   // K8s context
-	Namespace string `json:"namespace,omitempty"` // K8s namespace
+	Privileged *bool             `json:"privileged,omitempty"`
+	Networks   []string          `json:"networks,omitempty"`
+	Devices    []string          `json:"devices,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	LabelVars  []string          `json:"labelVars,omitempty"`
+	Name       string            `json:"name"` // Profile name (e.g., "docker-default", "k8s-prod")
+	Type       string            `json:"type"` // docker, kubernetes, apple
+	Available  bool              `json:"available"`
+	Context    string            `json:"context,omitempty"`   // K8s context
+	Namespace  string            `json:"namespace,omitempty"` // K8s namespace
 	// Attach reports whether this profile's runtime supports interactive
 	// attach, mirrored from pkg/runtimebroker.BrokerProfile.Attach. A
 	// pointer, not a plain bool: a profile recorded from an older broker

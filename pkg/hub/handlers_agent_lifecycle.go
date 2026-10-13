@@ -15,7 +15,9 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -541,7 +543,8 @@ func (s *Server) swapRunIntent(ctx context.Context, agent *store.Agent, intent s
 // one. See resumeInPlaceDecision for the equivalent semantics on the
 // create-agent resume path.
 type AgentLifecycleStartRequest struct {
-	ForceResume bool `json:"forceResume,omitempty"`
+	RuntimeUpdate json.RawMessage `json:"runtimeUpdate,omitempty"`
+	ForceResume   bool            `json:"forceResume,omitempty"`
 }
 
 func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id, action string) {
@@ -553,6 +556,13 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
+	var startReq AgentLifecycleStartRequest
+	if action == api.AgentActionStart && r.Body != nil && r.ContentLength != 0 {
+		if err := readJSON(r, &startReq); err != nil {
+			BadRequest(w, "invalid start request: "+err.Error())
+			return
+		}
+	}
 	// Start gate (design ptone/scion#2483 §2.1). Authz already ran in the
 	// caller. This runs before the managed-runtime branch so managed agents
 	// get the same answers. Restart is checked here, before its stop leg,
@@ -573,7 +583,7 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			var warnings []string
 			if action == api.AgentActionRestart {
 				warnings = []string{launchRestartNotPerformedWarning}
-			} else if lifecycleStartHasInputs(r) {
+			} else if startReq.ForceResume || len(startReq.RuntimeUpdate) != 0 {
 				warnings = []string{launchInFlightInputsWarning}
 			}
 			s.writeLaunchingAgent(ctx, w, agent, warnings)
@@ -598,6 +608,17 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 		}
 	}
 
+	if len(startReq.RuntimeUpdate) != 0 {
+		var update *api.RuntimeUpdateRequest
+		decoder := json.NewDecoder(bytes.NewReader(startReq.RuntimeUpdate))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&update); err != nil || update == nil {
+			BadRequest(w, "runtimeUpdate must contain an explicit supported recovery request")
+			return
+		}
+		s.recoverAgentRuntime(w, r, agent, update)
+		return
+	}
 	// Managed agent lifecycle: handle directly without broker dispatch.
 	if isManagedAgentRuntime(agent.Runtime) {
 		s.handleManagedAgentLifecycle(w, r, agent, action)
@@ -679,13 +700,6 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 			// phase: a running agent must not be recreated out from under
 			// itself, and a stopped agent restarts fresh even if asked to
 			// resume, matching the create-agent path's behavior.
-			var startReq AgentLifecycleStartRequest
-			if r.ContentLength > 0 {
-				if err := readJSON(r, &startReq); err != nil {
-					BadRequest(w, "invalid request body: "+err.Error())
-					return
-				}
-			}
 			forcedRecovery := agent.Phase == string(state.PhaseError) && startReq.ForceResume
 			if forcedRecovery {
 				s.agentLifecycleLog.Warn("Force-resuming agent from error phase via lifecycle start",

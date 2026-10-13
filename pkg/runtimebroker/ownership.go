@@ -88,15 +88,17 @@ type OwnedRun struct {
 
 // OwnershipRecord is the durable ownership record of one agent.
 type OwnershipRecord struct {
-	SchemaVersion   int        `json:"schemaVersion"`
-	Revision        int64      `json:"revision"`
-	RuntimeBrokerID string     `json:"runtimeBrokerId"`
-	ProjectID       string     `json:"projectId"`
-	AgentID         string     `json:"agentId"`
-	AgentSlug       string     `json:"agentSlug"`
-	State           string     `json:"state"`
-	Runs            []OwnedRun `json:"runs"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
+	// RuntimeRecoveryVersion fences delayed recovery dispatches within this existing ownership record.
+	RuntimeRecoveryVersion int64      `json:"runtimeRecoveryVersion,omitempty"`
+	SchemaVersion          int        `json:"schemaVersion"`
+	Revision               int64      `json:"revision"`
+	RuntimeBrokerID        string     `json:"runtimeBrokerId"`
+	ProjectID              string     `json:"projectId"`
+	AgentID                string     `json:"agentId"`
+	AgentSlug              string     `json:"agentSlug"`
+	State                  string     `json:"state"`
+	Runs                   []OwnedRun `json:"runs"`
+	UpdatedAt              time.Time  `json:"updatedAt"`
 	// FilesRemoved is set once a whole-agent delete removed the agent's
 	// files (the runtime delete and file removal succeeded); only then may
 	// the start-up reconciliation finish the record and release the slug.
@@ -1770,4 +1772,33 @@ func (s *Server) finishOwnedDelete(ctx context.Context, mgr agent.Manager, od *o
 	if err := s.ownership.ReleaseSlug(od.projectID, od.agentID); err != nil {
 		s.agentLifecycleLog.Warn("Agent delete: slug not released", "agent_id", od.agentID, "project_id", od.projectID, "error", err)
 	}
+}
+
+// AdmitRuntimeRecovery refuses unknown, foreign, deleting or superseded
+// retained state. The highest admission survives interrupted launches and
+// broker restarts; retrying the same admission remains idempotent.
+func (s *OwnershipStore) AdmitRuntimeRecovery(projectID, agentID, slug string, version int64) error {
+	if version <= 0 {
+		return fmt.Errorf("runtime recovery admission is invalid")
+	}
+	if err := s.agentConflict(projectID, agentID); err != nil {
+		return err
+	}
+	_, err := s.mutate(projectID, agentID, func(r *OwnershipRecord) error {
+		if r.RuntimeBrokerID != s.brokerID || r.AgentSlug != slug || r.State != OwnershipStateActive {
+			return fmt.Errorf("%w: runtime recovery requires this instance's live retained agent", ErrOwnershipNotRecorded)
+		}
+		if r.RuntimeRecoveryVersion > version {
+			return fmt.Errorf("runtime recovery admission has been superseded")
+		}
+		if r.RuntimeRecoveryVersion == version {
+			return errNoChange
+		}
+		r.RuntimeRecoveryVersion = version
+		return nil
+	})
+	if errors.Is(err, errNoChange) {
+		return nil
+	}
+	return err
 }

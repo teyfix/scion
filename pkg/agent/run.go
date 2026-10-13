@@ -94,6 +94,12 @@ func sortedEnvVarKeys(envVars map[string]string) []string {
 
 func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
 	ctx = m.withWorkspaceLock(ctx)
+	if _, err := ValidateCreateAdmission(opts); err != nil {
+		return nil, err
+	}
+	if completeCreateAdmission(opts.CreateAdmission) {
+		ctx = context.WithValue(ctx, createAdmissionContextKey{}, opts.CreateAdmission)
+	}
 	startEntry := time.Now()
 	// callerHubEndpoint is opts.Env's SCION_HUB_ENDPOINT exactly as the
 	// caller passed it in — captured before anything below ever writes to
@@ -129,6 +135,21 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			agentID = opts.Env["SCION_AGENT_ID"]
 		}
 		projectID = opts.Env["SCION_PROJECT_ID"]
+	}
+	if recovery := opts.RuntimeRecovery; recovery != nil {
+		if m.Runtime.Name() != "docker" && m.Runtime.Name() != "podman" && m.Runtime.Name() != "mock" {
+			return nil, fmt.Errorf("retained runtime updates require a Docker-compatible runtime")
+		}
+		if (agentID != opts.Name && agentID != recovery.AgentID) || (projectID != "" && projectID != recovery.ProjectID) {
+			return nil, fmt.Errorf("runtime recovery dispatch identity does not match")
+		}
+		if m.owner != nil && m.owner.RuntimeBrokerID != recovery.RuntimeBrokerID {
+			return nil, fmt.Errorf("runtime recovery belongs to another broker instance")
+		}
+		agentID, projectID = recovery.AgentID, recovery.ProjectID
+		opts.Resume, opts.Image, opts.TemplateName = true, recovery.Update.Image, recovery.Update.Template
+	} else if admission := opts.CreateAdmission; completeCreateAdmission(admission) {
+		agentID, projectID = admission.AgentID, admission.ProjectID
 	}
 	// Snapshot the dispatch-provided project ID now, before any
 	// settings-driven env merging (resolveAuthEnvOverlay copying
@@ -173,9 +194,23 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 
 	// 0. Check if container already exists (scoped to this project)
 	slug := api.Slugify(opts.Name)
+	if recovery := opts.RuntimeRecovery; recovery != nil && m.owner != nil {
+		all, err := m.Runtime.List(ctx, map[string]string{"scion.name": slug})
+		if err != nil {
+			return nil, fmt.Errorf("inspect recovery runtime ownership: %w", err)
+		}
+		for _, candidate := range all {
+			if matchAgentProject(candidate, projectName, projectID) && candidate.Labels[api.LabelRuntimeBrokerID] != recovery.RuntimeBrokerID {
+				return nil, ErrNotOwned
+			}
+		}
+	}
 	// Owner-filtered on a flat instance (listRuntime): a pre-clean never sees, or removes, another instance's object.
 	agents, listErr := m.listRuntime(ctx, map[string]string{"scion.name": slug})
-	if listErr == nil {
+	if listErr != nil && opts.RuntimeRecovery != nil {
+		return nil, fmt.Errorf("read retained containers: %w", listErr)
+	}
+	if listErr == nil && opts.RuntimeRecovery == nil {
 		for _, a := range agents {
 			// Skip agents from a different project
 			if !matchAgentProject(a, projectName, projectID) {
@@ -222,7 +257,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// successful create, which proves the name was free.
 	recordAfterCreate := listErr != nil
 	runIDNeedsHomeRepair := false
-	if listErr == nil {
+	if listErr == nil && opts.RuntimeRecovery == nil {
 		ctx = api.ContextWithRunID(ctx, opts.RunID)
 		if err := SetSavedRunID(opts.Name, opts.ProjectPath, opts.RunID); errors.Is(err, fs.ErrPermission) {
 			// The agent home is not writable by the agent runtime
@@ -233,7 +268,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			slog.Warn("Start: failed to record the run ID in agent-info.json; a delete for this run may leave the agent's files behind",
 				"agent", opts.Name, "run_id", opts.RunID, "error", err)
 		}
-	} else {
+	} else if listErr != nil {
 		slog.Warn("Start: could not list existing runtime entries; leaving the recorded owner of the agent's files unchanged until the create succeeds",
 			"agent", opts.Name, "run_id", opts.RunID, "error", listErr)
 	}
@@ -293,9 +328,57 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// Collect the warnings for template environment keys GetAgent ignores
 	// (ptone/scion#4524); they join the start warnings below.
 	ctx, templateEnvWarns := withTemplateEnvWarnings(ctx)
-	agentDir, agentHome, agentWorkspace, finalScionCfg, err := GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "", opts.Branch, opts.Workspace, startInlineConfig)
+	var agentDir, agentHome, agentWorkspace string
+	var finalScionCfg *api.ScionConfig
+	var recoveryState *retainedRuntimeState
+	if opts.RuntimeRecovery != nil {
+		recoveryState, err = loadRuntimeRecovery(opts, projectDir, agents)
+		if err == nil {
+			agentDir, agentHome, agentWorkspace, finalScionCfg = recoveryState.dir, recoveryState.home, recoveryState.workspace, recoveryState.config
+			hash, hashErr := runtimeConfigHash(finalScionCfg)
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			for _, a := range agents {
+				if !matchAgentProject(a, projectName, projectID) {
+					continue
+				}
+				if a.Labels[api.LabelAgentID] != agentID {
+					return nil, fmt.Errorf("retained container identity does not match")
+				}
+				if a.Phase == string(state.PhaseRunning) {
+					if a.Image == opts.RuntimeRecovery.Update.Image && a.Template == opts.RuntimeRecovery.Update.Template && a.Labels[runtimeConfigHashLabel] == hash {
+						recoveryState.config.Info.Phase = string(state.PhaseRunning)
+						if err := writeRuntimeRecoveryState(recoveryState); err != nil {
+							return nil, fmt.Errorf("record verified runtime recovery: %w", err)
+						}
+						return &a, nil
+					}
+					return nil, fmt.Errorf("runtime recovery cannot replace a running container; suspend it first")
+				}
+			}
+			exists, imageErr := m.Runtime.ImageExists(ctx, opts.RuntimeRecovery.Update.Image)
+			if imageErr != nil {
+				return nil, imageErr
+			}
+			if !exists {
+				if err := m.Runtime.PullImage(ctx, opts.RuntimeRecovery.Update.Image); err != nil {
+					return nil, fmt.Errorf("prepare recovery image: %w", err)
+				}
+			}
+		}
+	} else {
+		agentDir, agentHome, agentWorkspace, finalScionCfg, err = GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "", opts.Branch, opts.Workspace, startInlineConfig)
+	}
+
 	if err != nil {
 		return nil, err
+	}
+	if recoveryState != nil {
+		opts.Env, err = recoveryDispatchEnv(opts.Env, recoveryState.requested)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if opts.FreshProvision {
 		recordNFSAgentDir(agentDir, opts.Name)
@@ -374,6 +457,17 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	unixUsername := "root"
 	profileName := opts.Profile
 
+	if finalScionCfg != nil {
+		if recoveryState == nil {
+			finalScionCfg.Docker = resolveDockerConfig(settings, profileName, finalScionCfg.Docker)
+		}
+		if err := config.ValidateDockerConfig(finalScionCfg.Docker); err != nil {
+			return nil, err
+		}
+		if err := validateDockerDeviceRuntime(m.Runtime.Name(), config.ResolveDockerDevices(finalScionCfg.Docker)); err != nil {
+			return nil, err
+		}
+	}
 	util.Debugf("image resolution: starting, harnessConfigName=%s", harnessConfigName)
 
 	// Resolve the template chain unconditionally: it drives both the
@@ -552,7 +646,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// policy are resolved separately (pickImage / pickPullPolicy below);
 	// volumes and resources are applied here.
 	ownEnv := environmentOf(finalScionCfg)
-	if persisted, ok := readPersistedAgentEnvironment(agentDir); ok {
+	if persisted, ok := readPersistedAgentEnvironment(agentDir); ok && recoveryState == nil {
 		ownEnv = persisted
 	}
 	if finalScionCfg != nil {
@@ -561,8 +655,10 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			envProfile = finalScionCfg.Info.Profile
 		}
 		finalScionCfg = withEnvironment(finalScionCfg, ownEnv.clone())
-		finalScionCfg.Volumes = mergeEnvironmentVolumes(settingsVolumes, fileVolumes, ownEnv.Volumes)
-		applyEnvironmentResources(ctx, finalScionCfg, settings, envProfile, harnessConfigName)
+		if recoveryState == nil {
+			finalScionCfg.Volumes = mergeEnvironmentVolumes(settingsVolumes, fileVolumes, ownEnv.Volumes)
+			applyEnvironmentResources(ctx, finalScionCfg, settings, envProfile, harnessConfigName)
+		}
 	}
 
 	// Telemetry tiers applied per start: broker settings telemetry < hub
@@ -1071,8 +1167,10 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// will not fire, so the hook would silently not run — worse than aborting.
 	// Called unconditionally: with an empty script the helper clears any file
 	// staged by an earlier occupant of this agent home.
-	if err := writeAgentHome(ctx, func() error { return harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript) }); err != nil {
-		return nil, fmt.Errorf("re-stage project pre-start hook: %w", err)
+	if opts.RuntimeRecovery == nil || opts.ProjectPreStartHookScript != "" {
+		if err := writeAgentHome(ctx, func() error { return harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript) }); err != nil {
+			return nil, fmt.Errorf("re-stage project pre-start hook: %w", err)
+		}
 	}
 
 	// Resolve auth metadata for the config-driven env var pipeline.
@@ -1513,7 +1611,7 @@ authDone:
 			return nil, fmt.Errorf("failed to marshal agent config: %w", marshalErr)
 		}
 		configPath := filepath.Join(agentDir, "scion-agent.json")
-		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+		if writeErr := writeStartConfig(configPath, cfgData, opts.RuntimeRecovery != nil); writeErr != nil {
 			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
 		}
 	} else if finalScionCfg != nil && harness.IsHarnessImplementationName(finalScionCfg.AuthSelectedType) {
@@ -1524,7 +1622,7 @@ authDone:
 			return nil, fmt.Errorf("failed to marshal repaired agent config: %w", marshalErr)
 		}
 		configPath := filepath.Join(agentDir, "scion-agent.json")
-		if writeErr := os.WriteFile(configPath, cfgData, 0644); writeErr != nil {
+		if writeErr := writeStartConfig(configPath, cfgData, opts.RuntimeRecovery != nil); writeErr != nil {
 			return nil, fmt.Errorf("failed to write agent config %s: %w", configPath, writeErr)
 		}
 	}
@@ -2282,7 +2380,36 @@ authDone:
 		return nil, err
 	}
 
+	var dockerConfig *api.DockerConfig
+	if finalScionCfg != nil {
+		dockerConfig = finalScionCfg.Docker
+	}
+	labelEnv := make(map[string]string)
+	for key, value := range templateFallbackEnv {
+		labelEnv[key] = value
+	}
+	for _, entry := range agentEnv {
+		key, value, _ := strings.Cut(entry, "=")
+		labelEnv[key] = value
+	}
+	var dockerLabels map[string]string
+	if dockerConfig != nil {
+		dockerLabels, err = ExpandAndValidateDockerLabels(dockerConfig.Labels, BuildScopedLabelVars(opts.Name, agentID, projectName, projectID, labelEnv))
+		if err != nil {
+			return nil, fmt.Errorf("resolve Docker labels: %w", err)
+		}
+	}
 	runCfg := runtime.RunConfig{
+		Privileged: dockerConfig != nil && dockerConfig.Privileged != nil && *dockerConfig.Privileged,
+		Networks: func() []string {
+			if dockerConfig == nil {
+				return nil
+			}
+			return dockerConfig.Networks
+		}(),
+		Devices:      config.ResolveDockerDevices(dockerConfig),
+		DockerLabels: dockerLabels,
+
 		Name:                 containerName(projectName, opts.Name),
 		Template:             template,
 		UnixUsername:         unixUsername,
@@ -2533,6 +2660,35 @@ authDone:
 		// dropCheckedSharedDirs saves the record; nothing reads it after this.
 		_ = dropCheckedSharedDirs(agentDir, sharedDirRecord, passed, opts.Name)
 	}
+	if recoveryState != nil {
+		recoveryState.config = finalScionCfg
+		recoveryState.config.Info.RunID = runID
+		hash, err := runtimeConfigHash(finalScionCfg)
+		if err != nil {
+			return nil, err
+		}
+		runCfg.Labels[runtimeConfigHashLabel] = hash
+		if opts.Checkpoint != nil {
+			if err := opts.Checkpoint(ctx, runtime.CheckpointStepPreClean); err != nil {
+				return nil, err
+			}
+		}
+		if err := writeRuntimeRecoveryState(recoveryState); err != nil {
+			return nil, fmt.Errorf("install recovery configuration: %w", err)
+		}
+		recoveryProvenance := imageProvenance{RequestImage: opts.RuntimeRecovery.Update.Image, Template: opts.RuntimeRecovery.Update.Template, TemplateHash: opts.RuntimeRecovery.TemplateHash, Profile: profileName}
+		if err := writeImageProvenance(agentDir, recoveryProvenance); err != nil {
+			return nil, fmt.Errorf("install recovery image provenance: %w", err)
+		}
+		for _, a := range agents {
+			if !matchAgentProject(a, projectName, projectID) {
+				continue
+			}
+			if err := m.Runtime.Delete(ctx, runtime.RunRef{ID: runtime.AgentOperationID(a), RunID: a.RunID}); err != nil {
+				return nil, fmt.Errorf("replace retained container: %w", err)
+			}
+		}
+	}
 	// Record the running phase, runtime and profile before the container
 	// starts rather than after it: some runtimes do not let the host write
 	// files in the container (ptone/scion#4766). Once up, the container
@@ -2549,7 +2705,7 @@ authDone:
 	// text is derived independently at the CLI layer (see displayStatus in
 	// cmd/common.go), so it does not need to be encoded in Phase.
 	status := string(state.PhaseRunning)
-	if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, status, m.Runtime.Name(), profileName); updateErr != nil {
+	if updateErr := updateStartStatus(opts, recoveryState, status, m.Runtime.Name(), profileName); updateErr != nil {
 		util.Debugf("Start: failed to update local agent status to %q: %v", status, updateErr)
 	}
 	id, err := m.Runtime.Run(ctx, runCfg)
@@ -2560,7 +2716,7 @@ authDone:
 		// report a phantom agent forever. This write comes after Run, so on a
 		// runtime whose Run fails after creating the container it may run
 		// while the container exists; tracked in ptone/scion#4815.
-		if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, "error", m.Runtime.Name(), profileName); updateErr != nil {
+		if updateErr := updateStartStatus(opts, recoveryState, "error", m.Runtime.Name(), profileName); updateErr != nil {
 			util.Debugf("Start: failed to mark agent error in local config: %v", updateErr)
 		}
 		return nil, classifyLaunchRuntimeError(err, resolvedImage)
@@ -2580,6 +2736,9 @@ authDone:
 	allAgents, err := m.listRuntime(ctx, map[string]string{"scion.name": slug})
 	if err == nil {
 		for _, a := range allAgents {
+			if recoveryState != nil && (a.ContainerID != id || a.Labels[api.LabelAgentID] != agentID || !matchAgentProject(a, projectName, projectID)) {
+				continue
+			}
 			matched := a.ContainerID == id || strings.EqualFold(a.Name, opts.Name)
 			// An owned (flat instance) manager matches by name only within
 			// the agent's project, never another project's same-named agent.
@@ -2609,6 +2768,9 @@ authDone:
 		}
 	}
 
+	if recoveryState != nil {
+		return nil, fmt.Errorf("recovered container could not be verified as running")
+	}
 	// Container ID returned but not found in listing — it may have exited and been removed
 	warnings = append(warnings, "Container started but could not be verified as running")
 	return &api.AgentInfo{

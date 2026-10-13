@@ -357,7 +357,27 @@ func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
 			continue
 		}
 
+		docker := config.MergeDockerConfig(rtCfg.Docker, vs.Profiles[name].Docker)
 		profiles = append(profiles, BrokerProfile{
+			Privileged: func() *bool {
+				if docker == nil {
+					return nil
+				}
+				return docker.Privileged
+			}(),
+			Networks: func() []string {
+				if docker == nil {
+					return nil
+				}
+				return docker.Networks
+			}(),
+			Devices: config.ResolveDockerDevices(docker),
+			Labels: func() map[string]string {
+				if docker == nil {
+					return nil
+				}
+				return docker.Labels
+			}(),
 			Name:      name,
 			Type:      rtType,
 			Available: true,
@@ -1312,6 +1332,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		RunID:              req.RunID,
 		HTTPRequest:        r,
 		Operation:          opCreate,
+		Reprovision:        req.Reprovision,
 		// Threaded only for the workspace-source checks; the download
 		// itself runs after buildStartContext (below, or in runLaunch).
 		WorkspaceStoragePath: req.WorkspaceStoragePath,
@@ -1554,6 +1575,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 				s.writeUnusableProvisioner(w, ue, "provision agent", req.ID, nil)
 				return
 			}
+			if errors.Is(err, agent.ErrCreateAdmissionConflict) {
+				markAttemptFailed(http.StatusConflict, "CREATE admission conflict")
+				Conflict(w, err.Error())
+				return
+			}
 			markAttemptFailed(http.StatusInternalServerError, "failed to provision agent")
 			s.writeRuntimeOpError(w, ctx, "provision agent", err, "agent_id", req.ID)
 			return
@@ -1610,6 +1636,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	agentInfo, err := sc.Manager.Start(ctx, opts)
 	err = s.completeOwnedStart(ctx, sc.Manager, opts.RunID, err, true)
 	if err != nil {
+		if errors.Is(err, agent.ErrCreateAdmissionConflict) {
+			markAttemptFailed(http.StatusConflict, "CREATE admission conflict")
+			Conflict(w, err.Error())
+			return
+		}
 		// An unresolvable named resource (harness-config or template) is a
 		// naming problem the caller can act on, not an infrastructure
 		// failure — track and report it as a 404 instead of folding it into
@@ -1656,7 +1687,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		// not the hub's agent record.
 		// The files must also still be this run's (ptone/scion#2675): a
 		// newer run recorded in agent-info.json owns them otherwise.
-		if opts.ProjectPath != "" {
+		if opts.FreshProvision && opts.ProjectPath != "" {
 			// The ownership checks and the removal run under the
 			// process-wide workspace lock on the agent's files.
 			func() {
@@ -2781,6 +2812,11 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 }
 
 func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlockLifecycle, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlockLifecycle()
 	// Tracked until Manager.Start and Run's deferred cleanup have returned.
 	// The run comes from the runId query parameter when the hub sends it,
 	// so the start carries its run from the moment it is tracked
@@ -2818,6 +2854,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 
 	// Read optional task, projectPath, projectSlug, harnessConfig, and resolvedEnv from request body
 	var startReq struct {
+		RuntimeRecovery    *api.RuntimeRecovery   `json:"runtimeRecovery,omitempty"`
 		Task               string                 `json:"task"`
 		ProjectPath        string                 `json:"projectPath"`
 		ProjectSlug        string                 `json:"projectSlug"`
@@ -2894,6 +2931,27 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 			s.agentLifecycleLog.Debug("No task in start request body (ignoring decode error)", "agent_id", id, "error", err)
 		}
 	}
+	if recovery := startReq.RuntimeRecovery; recovery != nil {
+		if err := recovery.Update.Validate(); err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		authority, ok := authenticatedBrokerAuthority(r)
+		if !ok || authority.brokerID != recovery.RuntimeBrokerID || recovery.AgentID != startReq.ResolvedEnv["SCION_AGENT_ID"] || recovery.ProjectID != projectID || recovery.ProjectID != startReq.ResolvedEnv["SCION_PROJECT_ID"] || recovery.AdmissionVersion <= *recovery.Update.StateVersion {
+			writeError(w, http.StatusConflict, ErrCodeConflict, "Runtime recovery authority or identity does not match", nil)
+			return
+		}
+		if s.ownership != nil {
+			if err := s.ownership.AdmitRuntimeRecovery(projectID, recovery.AgentID, id, recovery.AdmissionVersion); err != nil {
+				writeError(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil)
+				return
+			}
+		}
+		// The requested template is hydrated through upstream's current Hub
+		// transport; retained workspace inputs never reach its provisioning paths.
+		startReq.Image = recovery.Update.Image
+		startReq.GitClone, startReq.SharedWorkspaceClone, startReq.Branch = nil, nil, ""
+	}
 	// The expected runtime target is checked before beginSyncStart and any
 	// runtime call. A start without it is accepted: it can only use the
 	// server's own target.
@@ -2937,6 +2995,13 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		}
 	}
 
+	if recovery := startReq.RuntimeRecovery; recovery != nil {
+		if cfg == nil {
+			cfg = &CreateAgentConfig{}
+		}
+		cfg.Template, cfg.TemplateID, cfg.TemplateHash = recovery.Update.Template, recovery.TemplateID, recovery.TemplateHash
+		cfg.Image = recovery.Update.Image
+	}
 	// Parity with the create path: populate the dedicated AgentToken field from
 	// the hub-minted token in ResolvedEnv so buildStartContext treats it as an
 	// explicit token rather than relying on the resolvedEnv-kept fallback. The
@@ -3029,6 +3094,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		TemplateHash:             startReq.TemplateHash,
 		HTTPRequest:              r,
 		Operation:                opHTTPStart,
+		RuntimeRecovery:          startReq.RuntimeRecovery,
 	})
 	if err != nil {
 		span.SetStatus(codes.Error, startContextSpanText(err))
@@ -3113,7 +3179,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	}
 
 	// Apply updated InlineConfig to scion-agent.json before starting.
-	if startReq.InlineConfig != nil && opts.ProjectPath != "" {
+	if startReq.RuntimeRecovery == nil && startReq.InlineConfig != nil && opts.ProjectPath != "" {
 		s.applyInlineConfigUpdate(id, opts.ProjectPath, startReq.InlineConfig, startReq.SharedWorkspace)
 	}
 
@@ -3880,6 +3946,11 @@ func (s *Server) panicFailureDetails(ctx context.Context, mgr agent.Manager, id,
 }
 
 func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	unlockLifecycle, locked := s.lockAgentLifecycle(w, r, id, projectID)
+	if !locked {
+		return
+	}
+	defer unlockLifecycle()
 	// Tracked until the start leg, including Run's deferred cleanup, has
 	// returned, with its run from the runId query parameter as on start.
 	queryRunID := r.URL.Query().Get("runId")

@@ -373,9 +373,11 @@ type RuntimeBroker struct {
 
 // BrokerCapabilities describes runtime broker capabilities.
 type BrokerCapabilities struct {
-	WebPTY bool `json:"webPty"`
-	Sync   bool `json:"sync"`
-	Attach bool `json:"attach"`
+	NvidiaGPU       bool `json:"nvidiaGpu,omitempty"`
+	RuntimeRecovery bool `json:"runtimeRecovery,omitempty"`
+	WebPTY          bool `json:"webPty"`
+	Sync            bool `json:"sync"`
+	Attach          bool `json:"attach"`
 	// Reprovision indicates the broker supports the reincarnation
 	// reprovision primitive (design §3.4; store.BrokerCapabilities.Reprovision
 	// and runtimebroker.BrokerCapabilities.Reprovision are its counterparts).
@@ -411,11 +413,16 @@ type BrokerCapabilities struct {
 
 // BrokerProfile describes a runtime profile available on a broker.
 type BrokerProfile struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Available bool   `json:"available"`
-	Context   string `json:"context,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
+	Privileged *bool             `json:"privileged,omitempty"`
+	Networks   []string          `json:"networks,omitempty"`
+	Devices    []string          `json:"devices,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	LabelVars  []string          `json:"labelVars,omitempty"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	Available  bool              `json:"available"`
+	Context    string            `json:"context,omitempty"`
+	Namespace  string            `json:"namespace,omitempty"`
 	// Attach reports whether this profile's runtime supports interactive
 	// attach, mirroring store.BrokerProfile.Attach. A pointer: nil means
 	// the field was never reported (an older broker or profile record),
