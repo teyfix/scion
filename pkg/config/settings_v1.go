@@ -2573,6 +2573,7 @@ type V1SubstrateConfig struct {
 // Env is parsed and round-tripped but not applied to agent containers; no
 // code reads it.
 type V1RuntimeConfig struct {
+	Docker            *api.DockerConfig `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 	Type              string            `json:"type,omitempty" yaml:"type,omitempty" koanf:"type"`
 	Host              string            `json:"host,omitempty" yaml:"host,omitempty" koanf:"host"`
 	Context           string            `json:"context,omitempty" yaml:"context,omitempty" koanf:"context"`
@@ -2840,6 +2841,7 @@ type V1HarnessOverride struct {
 
 // V1ProfileConfig extends ProfileConfig with new fields for versioned settings.
 type V1ProfileConfig struct {
+	Docker               *api.DockerConfig            `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 	Runtime              string                       `json:"runtime" yaml:"runtime" koanf:"runtime"`
 	DefaultTemplate      string                       `json:"default_template,omitempty" yaml:"default_template,omitempty" koanf:"default_template"`
 	DefaultHarnessConfig string                       `json:"default_harness_config,omitempty" yaml:"default_harness_config,omitempty" koanf:"default_harness_config"`
@@ -4337,6 +4339,7 @@ func AdaptLegacySettings(legacy *Settings) (*VersionedSettings, []string) {
 		vs.Runtimes = make(map[string]V1RuntimeConfig, len(legacy.Runtimes))
 		for name, rc := range legacy.Runtimes {
 			vs.Runtimes[name] = V1RuntimeConfig{
+				Docker:    CloneDockerConfig(rc.Docker),
 				Type:      name,
 				Host:      rc.Host,
 				Context:   rc.Context,
@@ -4368,6 +4371,7 @@ func AdaptLegacySettings(legacy *Settings) (*VersionedSettings, []string) {
 		vs.Profiles = make(map[string]V1ProfileConfig, len(legacy.Profiles))
 		for name, pc := range legacy.Profiles {
 			profile := V1ProfileConfig{
+				Docker:    CloneDockerConfig(pc.Docker),
 				Runtime:   pc.Runtime,
 				Volumes:   pc.Volumes,
 				Resources: pc.Resources,
@@ -4454,6 +4458,7 @@ func convertVersionedToLegacy(vs *VersionedSettings) *Settings {
 		s.Runtimes = make(map[string]RuntimeConfig, len(vs.Runtimes))
 		for name, rc := range vs.Runtimes {
 			s.Runtimes[name] = RuntimeConfig{
+				Docker:    CloneDockerConfig(rc.Docker),
 				Host:      rc.Host,
 				Context:   rc.Context,
 				Namespace: rc.Namespace,
@@ -4483,6 +4488,7 @@ func convertVersionedToLegacy(vs *VersionedSettings) *Settings {
 		s.Profiles = make(map[string]ProfileConfig, len(vs.Profiles))
 		for name, pc := range vs.Profiles {
 			profile := ProfileConfig{
+				Docker:    CloneDockerConfig(pc.Docker),
 				Runtime:   pc.Runtime,
 				Volumes:   pc.Volumes,
 				Resources: pc.Resources,

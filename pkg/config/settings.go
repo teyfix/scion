@@ -32,6 +32,7 @@ import (
 // Environment variables with SCION_ prefix override top-level settings.
 
 type RuntimeConfig struct {
+	Docker    *api.DockerConfig `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 	Host      string            `json:"broker,omitempty" yaml:"host,omitempty" koanf:"host"`
 	Context   string            `json:"context,omitempty" yaml:"context,omitempty" koanf:"context"`
 	Namespace string            `json:"namespace,omitempty" yaml:"namespace,omitempty" koanf:"namespace"`
@@ -57,6 +58,7 @@ type HarnessOverride struct {
 }
 
 type ProfileConfig struct {
+	Docker           *api.DockerConfig          `json:"docker,omitempty" yaml:"docker,omitempty" koanf:"docker"`
 	Runtime          string                     `json:"runtime" yaml:"runtime" koanf:"runtime"`
 	Volumes          []api.VolumeMount          `json:"volumes,omitempty" yaml:"volumes,omitempty" koanf:"volumes"`
 	Resources        *api.ResourceSpec          `json:"resources,omitempty" yaml:"resources,omitempty" koanf:"resources"`
