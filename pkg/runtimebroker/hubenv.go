@@ -141,7 +141,7 @@ func resolveEffectiveHubEndpoint(ctx context.Context, in hubEndpointInputs) (end
 	}
 
 	if in.RequestEndpointUntrusted && in.ReqHubEndpoint != "" &&
-		!(isLocalhostEndpoint(in.ReqHubEndpoint) && in.ConnectionHubEndpoint != "" && !isLocalhostEndpoint(in.ConnectionHubEndpoint)) {
+		(!isLocalhostEndpoint(in.ReqHubEndpoint) || in.ConnectionHubEndpoint == "" || isLocalhostEndpoint(in.ConnectionHubEndpoint)) {
 		trusted = false
 	}
 

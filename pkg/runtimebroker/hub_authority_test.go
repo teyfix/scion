@@ -681,7 +681,7 @@ func TestHubAuthority_RevocationCancelsHealthyDirectAttach(t *testing.T) {
 			}()
 			select {
 			case err := <-transitionDone:
-				if err != nil && !(operation == "shutdown" && errors.Is(err, context.DeadlineExceeded)) {
+				if err != nil && (operation != "shutdown" || !errors.Is(err, context.DeadlineExceeded)) {
 					t.Fatal(err)
 				}
 			case <-time.After(2 * time.Second):
