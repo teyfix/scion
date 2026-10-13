@@ -33,6 +33,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
@@ -2325,7 +2326,11 @@ func brokerRegistrationCapabilities() []string {
 	// asyncLaunch matches the broker's heartbeat (runtimebroker.StaticCapabilities),
 	// so the Hub knows it from the join on, before the first heartbeat
 	// (ptone/scion#2918).
-	return []string{"sync", "attach", "reprovision", "asyncLaunch", "emptyPerAgentWorkspace", "agentMove", "reprovisionEmptyPerAgent"}
+	caps := []string{"sync", "attach", "reprovision", "asyncLaunch", "emptyPerAgentWorkspace", "agentMove", "reprovisionEmptyPerAgent", "runtimeRecovery"}
+	if os.Getenv("SCION_NVIDIA_GPU") == "true" {
+		caps = append(caps, "gpu")
+	}
+	return caps
 }
 
 // buildBrokerProfiles builds BrokerProfile objects from settings.Profiles.
@@ -2366,12 +2371,28 @@ func buildBrokerProfiles(settings *config.Settings) []hubclient.BrokerProfile {
 			}
 		}
 
+		var runtimeDocker *api.DockerConfig
+		if rtCfg, ok := settings.Runtimes[profileCfg.Runtime]; ok {
+			runtimeDocker = rtCfg.Docker
+		}
+		docker := config.MergeDockerConfig(runtimeDocker, profileCfg.Docker)
+		var privileged *bool
+		var networks, devices []string
+		var labels map[string]string
+		if docker != nil {
+			privileged = docker.Privileged
+			networks, devices, labels = docker.Networks, config.ResolveDockerDevices(docker), docker.Labels
+		}
 		profiles = append(profiles, hubclient.BrokerProfile{
 			Name:                   name,
 			Type:                   runtimeType,
 			Available:              true,
 			Context:                context,
 			Namespace:              namespace,
+			Privileged:             privileged,
+			Networks:               networks,
+			Devices:                devices,
+			Labels:                 labels,
 			ServiceAccountMappings: mappings,
 			MappingsReported:       reported,
 		})

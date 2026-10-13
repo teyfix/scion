@@ -167,6 +167,8 @@ func storeBrokerCapabilities(c *hubclient.BrokerCapabilities) *store.BrokerCapab
 	}
 	return &store.BrokerCapabilities{
 		WebPTY:                   c.WebPTY,
+		NvidiaGPU:                c.NvidiaGPU,
+		RuntimeRecovery:          c.RuntimeRecovery,
 		Sync:                     c.Sync,
 		Attach:                   c.Attach,
 		Reprovision:              c.Reprovision,
