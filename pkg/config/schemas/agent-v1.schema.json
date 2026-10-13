@@ -286,6 +286,11 @@
       "required": ["transport"],
       "description": "Universal MCP server entry. Field rules: transport=stdio requires command and forbids url/headers; transport=sse|streamable-http requires url and forbids command/args/env.",
       "properties": {
+        "enabled_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Native tool allowlist for supported harnesses (currently Codex). Omit to inherit all tools; an empty list enables none."
+        },
         "transport": {
           "type": "string",
           "enum": ["stdio", "sse", "streamable-http"],
