@@ -91,7 +91,7 @@ export class ScionPageAgentCreate extends LitElement {
   @state() private notify = true;
 
   @state() private dockerPrivileged: 'inherit' | 'enabled' | 'disabled' = 'inherit';
-  @state() private requireGpu = false;
+  @state() private requireGpu: boolean | undefined;
   @state() private dockerNetworks: string[] = [];
   @state() private dockerDevices: string[] = [];
   @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
@@ -826,7 +826,7 @@ export class ScionPageAgentCreate extends LitElement {
   private buildDockerConfig() {
     const docker = buildDockerRuntimeConfig(
       {
-        nvidia_gpu: this.requireGpu,
+        ...(this.requireGpu === undefined ? {} : { nvidia_gpu: this.requireGpu }),
         ...(this.dockerPrivileged === 'inherit'
           ? {}
           : { privileged: this.dockerPrivileged === 'enabled' }),
@@ -835,7 +835,7 @@ export class ScionPageAgentCreate extends LitElement {
       this.dockerNetworks,
       this.dockerLabelEntries
     );
-    return { docker };
+    return docker ? { docker } : {};
   }
 
   private async handleSubmit(_e: Event): Promise<void> {
@@ -1057,7 +1057,7 @@ export class ScionPageAgentCreate extends LitElement {
             },
             (next) => {
               this.dockerPrivileged = next.privileged;
-              this.requireGpu = next.gpu === true;
+              this.requireGpu = next.gpu;
               this.dockerNetworks = next.networks;
               this.dockerDevices = next.devices;
               this.dockerLabelEntries = next.labels;
@@ -1251,9 +1251,12 @@ export class ScionPageAgentCreate extends LitElement {
             >
               ${b.name}
               (${b.status})${hasGpu
-                ? html` <scion-status-badge status="neutral" icon="gpu" size="small"
-                    >GPU</scion-status-badge
-                  >`
+                ? html` <scion-status-badge
+                    status="neutral"
+                    icon="gpu"
+                    size="small"
+                    label="GPU"
+                  ></scion-status-badge>`
                 : ''}
             </sl-option>`;
           })}

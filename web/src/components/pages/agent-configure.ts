@@ -2281,11 +2281,11 @@ export class ScionPageAgentConfigure extends LitElement {
           labels: this.dockerLabelEntries,
         },
         (next) => {
-          const base = {
-            ...this.dockerConfigBase,
-            ...(next.gpu === undefined ? {} : { nvidia_gpu: next.gpu }),
-            devices: next.devices,
-          };
+          const base = { ...this.dockerConfigBase };
+          if (next.gpu === undefined) delete base.nvidia_gpu;
+          else base.nvidia_gpu = next.gpu;
+          if (next.devices.length) base.devices = next.devices;
+          else delete base.devices;
           if (next.privileged === 'inherit') delete base.privileged;
           else base.privileged = next.privileged === 'enabled';
           this.dockerConfigBase = base;

@@ -87,6 +87,7 @@ describe('harnessDisplayName', () => {
     expect(harnessDisplayName('codex')).toBe('Codex');
     expect(harnessDisplayName('copilot')).toBe('Copilot');
     expect(harnessDisplayName('opencode')).toBe('OpenCode');
+    expect(harnessDisplayName('jcode')).toBe('jcode');
   });
 
   it('passes unknown identifiers through unchanged', () => {

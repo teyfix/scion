@@ -49,12 +49,25 @@ export function renderDockerRuntimeEditor(
     <div class="form-field">
       <sl-checkbox
         .checked=${state.gpu === true}
+        .indeterminate=${state.gpu === undefined}
         @sl-change=${(e: Event) =>
           change({ ...state, gpu: (e.target as HTMLElement & { checked: boolean }).checked })}
         >Attach NVIDIA GPU</sl-checkbox
       >
+      <sl-button
+        size="small"
+        variant="text"
+        aria-label="Inherit GPU settings"
+        ?disabled=${state.gpu === undefined}
+        @click=${() => change({ ...state, gpu: undefined })}
+        >Inherit</sl-button
+      >
       <div class="hint">
-        Attach configured NVIDIA devices, or nvidia.com/gpu=all. Requires a GPU-capable broker.
+        ${state.gpu === undefined
+          ? 'Inherit GPU settings. Changing the checkbox records an explicit attachment choice.'
+          : state.gpu
+            ? 'Attach configured NVIDIA devices, or nvidia.com/gpu=all. Requires a GPU-capable broker.'
+            : 'Disable NVIDIA device grants, including inherited devices.'}
       </div>
     </div>
     <div class="form-field">

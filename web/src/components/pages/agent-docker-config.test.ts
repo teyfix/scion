@@ -23,11 +23,13 @@ import { ScionPageAgentCreate } from './agent-create.js';
 import { ScionPageAgentDetail } from './agent-detail.js';
 
 interface TestableCreatePage {
+  loading: boolean;
+  render(): unknown;
   labelEntries: Array<{ key: string; value: string }>;
   dockerLabelEntries: Array<{ key: string; value: string }>;
   dockerNetworks: string[];
   dockerPrivileged: 'inherit' | 'enabled' | 'disabled';
-  requireGpu: boolean;
+  requireGpu: boolean | undefined;
   buildDockerConfig(): Record<string, unknown>;
 }
 
@@ -36,6 +38,7 @@ interface TestableConfigurePage {
   dockerLabelEntries: Array<{ key: string; value: string }>;
   dockerNetworks: string[];
   buildConfig(): { docker?: DockerRuntimeConfig };
+  renderEnvironmentTab(): unknown;
 }
 
 interface TestableDetailPage {
@@ -48,19 +51,69 @@ describe('agent Docker configuration forms', () => {
     page.dockerLabelEntries = [{ key: 'traefik.enable', value: 'true' }];
     page.dockerNetworks = ['traefik_proxy'];
     expect(page.buildDockerConfig().docker).toEqual({
-      nvidia_gpu: false,
       networks: ['traefik_proxy'],
       labels: { 'traefik.enable': 'true' },
     });
   });
 
-  it('sends an explicit NVIDIA attachment choice, including unchecked', () => {
+  it('omits untouched NVIDIA settings and sends explicit true or false', () => {
     const page = new ScionPageAgentCreate() as unknown as TestableCreatePage;
-    expect(page.buildDockerConfig().docker).toEqual({ nvidia_gpu: false });
+    expect(page.buildDockerConfig()).toEqual({});
     page.requireGpu = true;
     expect(page.buildDockerConfig().docker).toEqual({ nvidia_gpu: true });
     page.requireGpu = false;
     expect(page.buildDockerConfig().docker).toEqual({ nvidia_gpu: false });
+  });
+
+  it('does not pin GPU settings when another runtime control changes', () => {
+    const page = new ScionPageAgentCreate() as unknown as TestableCreatePage;
+    page.loading = false;
+    const container = document.createElement('div');
+    render(page.render(), container);
+    const networks = container.querySelector<HTMLElement & { value: string }>(
+      'sl-textarea[label="Docker Networks"]'
+    );
+    expect(networks).not.toBeNull();
+    networks!.value = 'backend';
+    networks!.dispatchEvent(new Event('sl-input'));
+    expect(page.buildDockerConfig().docker).toEqual({ networks: ['backend'] });
+  });
+
+  it('returns to inherited GPU settings without discarding other Docker controls', () => {
+    const page = new ScionPageAgentCreate() as unknown as TestableCreatePage;
+    page.dockerNetworks = ['backend'];
+    page.requireGpu = false;
+    expect(page.buildDockerConfig().docker).toEqual({ nvidia_gpu: false, networks: ['backend'] });
+    page.requireGpu = undefined;
+    expect(page.buildDockerConfig().docker).toEqual({ networks: ['backend'] });
+  });
+
+  it('preserves omitted and explicit GPU values when editing a provisioned agent', () => {
+    const page = new ScionPageAgentConfigure() as unknown as TestableConfigurePage;
+    expect(page.buildConfig()).not.toHaveProperty('docker');
+    for (const policy of [false, true]) {
+      page.dockerConfigBase = { nvidia_gpu: policy };
+      expect(page.buildConfig().docker).toEqual({ nvidia_gpu: policy });
+    }
+  });
+
+  it('clears an edited GPU override through the Inherit control', () => {
+    const page = new ScionPageAgentConfigure() as unknown as TestableConfigurePage;
+    page.dockerConfigBase = { nvidia_gpu: false, privileged: false };
+    page.dockerNetworks = ['backend'];
+    const container = document.createElement('div');
+    render(page.renderEnvironmentTab(), container);
+    const inherit = container.querySelector<HTMLElement>(
+      'sl-button[aria-label="Inherit GPU settings"]'
+    );
+    expect(inherit).not.toBeNull();
+    inherit!.click();
+    expect(page.buildConfig().docker).toEqual({ privileged: false, networks: ['backend'] });
+    page.dockerConfigBase = { nvidia_gpu: true };
+    page.dockerNetworks = [];
+    render(page.renderEnvironmentTab(), container);
+    container.querySelector<HTMLElement>('sl-button[aria-label="Inherit GPU settings"]')!.click();
+    expect(page.buildConfig().docker).toEqual({});
   });
 
   it('preserves unrelated Docker fields when a provisioned agent config is edited', () => {
