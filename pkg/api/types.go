@@ -96,6 +96,13 @@ func ValidateMCPServers(servers map[string]MCPServerConfig) error {
 		if !isValidMCPName(name) {
 			return fmt.Errorf("mcp_servers[%q]: invalid name (must be alphanumeric with hyphens or underscores)", name)
 		}
+		if srv.EnabledTools != nil {
+			for _, tool := range *srv.EnabledTools {
+				if strings.TrimSpace(tool) == "" || strings.ContainsFunc(tool, func(r rune) bool { return r < 32 || r == 127 }) {
+					return fmt.Errorf("mcp_servers[%q]: enabled_tools requires nonempty names without control characters", name)
+				}
+			}
+		}
 		switch srv.Transport {
 		case MCPTransportStdio:
 			if srv.Command == "" {

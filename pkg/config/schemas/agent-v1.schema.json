@@ -288,7 +288,7 @@
       "properties": {
         "enabled_tools": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "type": "string", "minLength": 1 },
           "description": "Native tool allowlist for supported harnesses (currently Codex). Omit to inherit all tools; an empty list enables none."
         },
         "transport": {

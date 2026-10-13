@@ -43,6 +43,7 @@ import (
 
 // Environment keys of api.ScionConfig, by their scion-agent.yaml name.
 const (
+	TemplateEnvKeyDocker     = "docker"
 	TemplateEnvKeyTelemetry  = "telemetry"
 	TemplateEnvKeyHub        = "hub"
 	TemplateEnvKeyImage      = "image"
@@ -105,6 +106,9 @@ func StripTemplateEnvironmentKeys(cfg *api.ScionConfig) (*api.ScionConfig, []str
 		return nil, nil
 	}
 	var ignored []string
+	if cfg.Docker != nil {
+		ignored = append(ignored, TemplateEnvKeyDocker)
+	}
 	if cfg.Telemetry != nil {
 		ignored = append(ignored, TemplateEnvKeyTelemetry)
 	}
@@ -134,6 +138,7 @@ func StripTemplateEnvironmentKeys(cfg *api.ScionConfig) (*api.ScionConfig, []str
 	}
 
 	out := *cfg
+	out.Docker = nil
 	out.Telemetry = nil
 	out.Hub = nil
 	out.Image = ""
