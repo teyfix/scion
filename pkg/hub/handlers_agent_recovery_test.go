@@ -241,3 +241,43 @@ func TestRuntimeRecoveryHubCompletionCannotRebaseOverConcurrentPatch(t *testing.
 	require.Equal(t, patched.Labels, latest.Labels)
 	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
 }
+
+func TestRuntimeRecoveryDispatcherRefusesPatchBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	_, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("stale dispatch reached broker") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"newer": "before-dispatch"}
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	dispatcher := NewHTTPAgentDispatcher(db, false, slog.Default())
+	err = dispatcher.DispatchAgentRecover(ctx, admitted, &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.AppliedConfig.RuntimeUpdateVersion})
+	require.ErrorContains(t, err, "stale")
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+}
+
+func TestRuntimeRecoveryDeferredOwnerRefusesNewerSameAdmissionPatch(t *testing.T) {
+	ctx := context.Background()
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("queued stale recovery reached broker") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	recovery := &api.RuntimeRecovery{Update: *update, AgentID: agent.ID, ProjectID: agent.ProjectID, RuntimeBrokerID: agent.RuntimeBrokerID, AdmissionVersion: admitted.StateVersion}
+	args, err := MarshalDispatchArgs(&StartDispatchArgs{Resume: true, RuntimeRecovery: recovery})
+	require.NoError(t, err)
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"queued": "newer-patch"}
+	patched.AppliedConfig.Model = "newer-model"
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	_, err = srv.executeDispatch(ctx, store.BrokerDispatch{AgentID: agent.ID, ProjectID: agent.ProjectID, BrokerID: agent.RuntimeBrokerID, Op: "start", Args: args})
+	require.ErrorContains(t, err, "stale")
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
+}

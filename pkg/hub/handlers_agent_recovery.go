@@ -184,14 +184,14 @@ func (s *Server) completeRuntimeRecoveryAttempt(ctx context.Context, agent *stor
 }
 
 func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *store.Agent, recovery *api.RuntimeRecovery) error {
-	if agent.ID != recovery.AgentID || agent.ProjectID != recovery.ProjectID || agent.RuntimeBrokerID != recovery.RuntimeBrokerID || agent.AppliedConfig == nil || agent.AppliedConfig.RuntimeUpdateVersion != recovery.AdmissionVersion {
+	if agent.StateVersion != recovery.AdmissionVersion || agent.ID != recovery.AgentID || agent.ProjectID != recovery.ProjectID || agent.RuntimeBrokerID != recovery.RuntimeBrokerID || agent.AppliedConfig == nil || agent.AppliedConfig.RuntimeUpdateVersion != recovery.AdmissionVersion {
 		return fmt.Errorf("runtime recovery admission is stale or identity does not match")
 	}
 	latest, err := d.store.GetAgent(ctx, agent.ID)
 	if err != nil {
 		return err
 	}
-	if latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != recovery.AdmissionVersion || latest.RuntimeBrokerID != recovery.RuntimeBrokerID || latest.ProjectID != recovery.ProjectID {
+	if latest.StateVersion != recovery.AdmissionVersion || latest.AppliedConfig == nil || latest.AppliedConfig.RuntimeUpdateVersion != recovery.AdmissionVersion || latest.RuntimeBrokerID != recovery.RuntimeBrokerID || latest.ProjectID != recovery.ProjectID {
 		return fmt.Errorf("runtime recovery admission is stale or identity does not match")
 	}
 	working := *agent

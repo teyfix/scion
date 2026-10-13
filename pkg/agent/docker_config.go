@@ -109,6 +109,17 @@ func EffectiveStartDockerConfig(ctx context.Context, opts api.StartOptions, owne
 			return nil, err
 		}
 	}
+	if stored != nil && stored.RuntimeUpdateVersion > 0 {
+		dir, _, err := AgentStateDir(projectDir, opts.Name, opts.SharedWorkspace, opts.HubProjectID, opts.BrokerMode || opts.HubProjectID != "")
+		if err != nil {
+			return nil, err
+		}
+		if requester, recorded, err := requesterDockerFromSnapshot(dir, stored); err != nil {
+			return nil, err
+		} else if recorded {
+			own = requester
+		}
+	}
 	if opts.InlineConfig != nil {
 		own = config.MergeDockerConfig(own, opts.InlineConfig.Docker)
 	}

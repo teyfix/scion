@@ -23,20 +23,22 @@ const runtimeEnvironmentSnapshotRequiredFile = "runtime-environment-required.jso
 // ownership claim. It lives in broker-side state beside image provenance,
 // and deliberately contains no environment map, credentials or secrets.
 type runtimeEnvironmentSnapshot struct {
-	Version              int               `json:"version"`
-	AgentID              string            `json:"agentId"`
-	ProjectID            string            `json:"projectId"`
-	RuntimeBrokerID      string            `json:"runtimeBrokerId"`
-	RunID                string            `json:"runId"`
-	RuntimeUpdateVersion int64             `json:"runtimeUpdateVersion,omitempty"`
-	Docker               *api.DockerConfig `json:"docker,omitempty"`
-	Volumes              []api.VolumeMount `json:"volumes,omitempty"`
-	User                 string            `json:"user,omitempty"`
-	Model                string            `json:"model,omitempty"`
-	ThinkingLevel        *int              `json:"thinkingLevel,omitempty"`
+	Version                 int               `json:"version"`
+	AgentID                 string            `json:"agentId"`
+	ProjectID               string            `json:"projectId"`
+	RuntimeBrokerID         string            `json:"runtimeBrokerId"`
+	RunID                   string            `json:"runId"`
+	RuntimeUpdateVersion    int64             `json:"runtimeUpdateVersion,omitempty"`
+	Docker                  *api.DockerConfig `json:"docker,omitempty"`
+	RequesterDocker         *api.DockerConfig `json:"requesterDocker,omitempty"`
+	RequesterDockerRecorded bool              `json:"requesterDockerRecorded,omitempty"`
+	Volumes                 []api.VolumeMount `json:"volumes,omitempty"`
+	User                    string            `json:"user,omitempty"`
+	Model                   string            `json:"model,omitempty"`
+	ThinkingLevel           *int              `json:"thinkingLevel,omitempty"`
 }
 
-func writeRuntimeEnvironmentSnapshot(dir string, cfg *api.ScionConfig, run runtime.RunConfig, agentID, projectID, brokerID string) error {
+func writeRuntimeEnvironmentSnapshot(dir string, cfg *api.ScionConfig, run runtime.RunConfig, agentID, projectID, brokerID string, requesterDocker *api.DockerConfig) error {
 	// Local agents without a complete hosted identity have no admitted
 	// retained-recovery operation. Do not manufacture a hosted identity.
 	if cfg == nil || agentID == "" || projectID == "" || brokerID == "" {
@@ -45,6 +47,7 @@ func writeRuntimeEnvironmentSnapshot(dir string, cfg *api.ScionConfig, run runti
 	snapshot := runtimeEnvironmentSnapshot{
 		Version: 1, AgentID: agentID, ProjectID: projectID, RuntimeBrokerID: brokerID, RunID: run.Labels[api.LabelRunID],
 		RuntimeUpdateVersion: cfg.RuntimeUpdateVersion, Docker: config.CloneDockerConfig(cfg.Docker),
+		RequesterDocker: config.CloneDockerConfig(requesterDocker), RequesterDockerRecorded: true,
 		Volumes: append([]api.VolumeMount(nil), cfg.Volumes...), User: run.UnixUsername, Model: cfg.Model, ThinkingLevel: cfg.ThinkingLevel,
 	}
 	for _, entry := range run.Env {
@@ -150,4 +153,47 @@ func normalizeRuntimeSelection(cfg *api.ScionConfig, env []string) {
 			}
 		}
 	}
+}
+
+// requesterDockerFromSnapshot keeps the recovery's full installed effective
+// config from ranking as requester intent on a later ordinary start.
+func requesterDockerFromSnapshot(dir string, cfg *api.ScionConfig, allowOlder ...bool) (*api.DockerConfig, bool, error) {
+	data, err := os.ReadFile(filepath.Join(dir, runtimeEnvironmentSnapshotFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var snapshot runtimeEnvironmentSnapshot
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshot); err != nil {
+		return nil, false, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, false, fmt.Errorf("retained snapshot has trailing data")
+	}
+	agentID, projectID, brokerID := cfg.Env["SCION_AGENT_ID"], cfg.Env["SCION_PROJECT_ID"], cfg.Env["SCION_BROKER_ID"]
+	if cfg.Info != nil {
+		if cfg.Info.ID != "" {
+			agentID = cfg.Info.ID
+		}
+		if cfg.Info.ProjectID != "" {
+			projectID = cfg.Info.ProjectID
+		}
+		if cfg.Info.RuntimeBrokerID != "" {
+			brokerID = cfg.Info.RuntimeBrokerID
+		}
+	}
+	if snapshot.Version != 1 || snapshot.AgentID != agentID || snapshot.ProjectID != projectID || snapshot.RuntimeBrokerID != brokerID || runtime.ValidateRunID(snapshot.RunID) != nil {
+		return nil, false, fmt.Errorf("retained requester Docker snapshot identity does not match")
+	}
+	if snapshot.RuntimeUpdateVersion < cfg.RuntimeUpdateVersion && !(len(allowOlder) > 0 && allowOlder[0]) {
+		return nil, false, fmt.Errorf("complete interrupted runtime recovery before an ordinary start")
+	}
+	if snapshot.RuntimeUpdateVersion > cfg.RuntimeUpdateVersion {
+		return nil, false, fmt.Errorf("retained requester Docker snapshot admission does not match")
+	}
+	return config.CloneDockerConfig(snapshot.RequesterDocker), snapshot.RequesterDockerRecorded, nil
 }
