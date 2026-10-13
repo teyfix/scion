@@ -805,6 +805,8 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context, startsBefore
 			ContainerStatus: ag.ContainerStatus,
 			HarnessAuth:     ag.HarnessAuth,
 			Profile:         heartbeatAgentProfile(ag, s.flat),
+			Privileged:      ag.Privileged,
+			NvidiaGPU:       ag.NvidiaGPU,
 			ExitCode:        ag.ExitCode,
 			ExitReason:      ag.ExitReason,
 			RuntimeTarget:   agentTargets[heartbeatAgentKey(ag)],

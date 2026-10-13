@@ -148,11 +148,11 @@ func decodeTestKey(t *testing.T, encoded string) []byte {
 	return key
 }
 
-// TestCredentialReload_InEffectMatchesConnectionAfterFailedStep changes a
+// TestCredentialReload_FailedStepRevokesAuthority changes a
 // connection's credential file to a set whose reinitialize fails after the
-// new credential is stored on the connection (a transport mode without an
-// audience). What is in effect must still match what the connection holds.
-func TestCredentialReload_InEffectMatchesConnectionAfterFailedStep(t *testing.T) {
+// credential is requested (a transport mode without an audience). Neither
+// the old key nor a partially prepared replacement may authorize requests.
+func TestCredentialReload_FailedStepRevokesAuthority(t *testing.T) {
 	t.Setenv(transportauth.EnvTransportMode, "")
 	t.Setenv(transportauth.EnvTransportAudience, "")
 
@@ -220,15 +220,21 @@ func TestCredentialReload_InEffectMatchesConnectionAfterFailedStep(t *testing.T)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		failed := conn.GetStatus() == ConnectionStatusError
-		holdsNew := string(conn.snapshot().SecretKey) == string(newKey)
-		if failed && holdsNew && status(newKey) == http.StatusOK {
+		revoked := !conn.authorityReady.Load() && len(conn.snapshot().SecretKey) == 0
+		if failed && revoked && status(newKey) == http.StatusUnauthorized {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("after a failed reinitialize: failed=%v connection holds new credential=%v, new credential got %d, want %d",
-				failed, holdsNew, status(newKey), http.StatusOK)
+			t.Fatalf("after a failed reinitialize: failed=%v revoked=%v, new credential got %d, want %d",
+				failed, revoked, status(newKey), http.StatusUnauthorized)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if got := status(decodeTestKey(t, oldCreds.SecretKey)); got != http.StatusUnauthorized {
+		t.Errorf("old credential after failed rotation got %d, want %d", got, http.StatusUnauthorized)
+	}
+	if snap := conn.snapshot(); snap.Credentials == nil || snap.Credentials.SecretKey != newCreds.SecretKey {
+		t.Fatal("failed credential set was not retained for retry")
 	}
 }
 

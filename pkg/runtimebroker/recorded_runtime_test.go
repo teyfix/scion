@@ -496,7 +496,7 @@ func TestRecordedRuntime_SignatureCoversParam(t *testing.T) {
 		srv, defaultMgr, _ := newRecordedRuntimeServer(t, false)
 		defaultMgr.agents = nil
 		mw := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
-		mw.UpdateKeys([]secretKeyEntry{{hubName: "hub", secretKey: secret}})
+		mw.UpdateKeys([]secretKeyEntry{{hubName: "hub", brokerID: "test-broker-id", secretKey: secret}})
 		srv.brokerAuthMiddleware.Store(mw)
 		return srv, defaultMgr
 	}
