@@ -16,6 +16,7 @@
 package runtimebroker
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -30,8 +31,8 @@ import (
 // authenticatingHubConnCtxKey is the context key MultiKeyBrokerAuthMiddleware
 // uses to record which hub connection's key authenticated an incoming
 // request (design t1-async-create-v11.md §3.8.5 routing rule 2). It is the
-// second-priority source (after the X-Scion-Hub-Connection header) the
-// broker uses to pick which hub connection owns a launch, so later reports
+// authenticated source the broker uses to pick which hub connection owns
+// a launch, so later reports
 // for it are sent directly to that connection instead of fanning out.
 type authenticatingHubConnCtxKey struct{}
 
@@ -178,8 +179,30 @@ func (m *BrokerAuthMiddleware) SetEnabled(enabled bool) {
 
 // secretKeyEntry associates a secret key with a hub connection name.
 type secretKeyEntry struct {
-	hubName   string
-	secretKey []byte
+	hubName     string
+	brokerID    string
+	hubEndpoint string
+	generation  uint64
+	secretKey   []byte
+	connection  *HubConnection
+}
+
+type brokerRequestAuthority struct {
+	hubName     string
+	brokerID    string
+	hubEndpoint string
+	generation  uint64
+	connection  *HubConnection
+}
+
+type brokerRequestAuthorityKey struct{}
+
+func authenticatedBrokerAuthority(r *http.Request) (*brokerRequestAuthority, bool) {
+	if r == nil {
+		return nil, false
+	}
+	authority, ok := r.Context().Value(brokerRequestAuthorityKey{}).(*brokerRequestAuthority)
+	return authority, ok && authority != nil
 }
 
 // MultiKeyBrokerAuthMiddleware provides HMAC-based authentication that supports
@@ -205,7 +228,11 @@ func NewMultiKeyBrokerAuthMiddleware(enabled bool, maxClockSkew time.Duration, a
 func (m *MultiKeyBrokerAuthMiddleware) UpdateKeys(keys []secretKeyEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.keys = keys
+	m.keys = make([]secretKeyEntry, len(keys))
+	for i := range keys {
+		m.keys[i] = keys[i]
+		m.keys[i].secretKey = append([]byte(nil), keys[i].secretKey...)
+	}
 }
 
 // Middleware returns an HTTP middleware handler that validates HMAC signatures
@@ -221,7 +248,7 @@ func (m *MultiKeyBrokerAuthMiddleware) ServeWith(w http.ResponseWriter, r *http.
 	m.mu.RLock()
 	enabled := m.enabled
 	allowUnauth := m.allowUnauthenticated
-	keys := m.keys
+	keys := append([]secretKeyEntry(nil), m.keys...)
 	maxSkew := m.maxClockSkew
 	m.mu.RUnlock()
 
@@ -293,19 +320,56 @@ func (m *MultiKeyBrokerAuthMiddleware) ServeWith(w http.ResponseWriter, r *http.
 	// Build canonical string
 	canonical := apiclient.BuildCanonicalString(r, timestamp, nonce)
 
-	// Try each key until one matches
+	// Broker ID and connection headers are not part of the HMAC canonical
+	// string. Bind them to exactly one matching signing authority.
+	var matches []secretKeyEntry
 	for _, entry := range keys {
 		if apiclient.VerifyHMAC(entry.secretKey, canonical, sigBytes) {
-			if entry.hubName != "" {
-				r = r.WithContext(context.WithValue(r.Context(), authenticatingHubConnCtxKey{}, entry.hubName))
-			}
-			next.ServeHTTP(w, r)
-			return
+			matches = append(matches, entry)
 		}
 	}
-
-	// No key matched
-	m.writeError(w, "invalid signature")
+	if len(matches) == 0 {
+		m.writeError(w, "invalid signature")
+		return
+	}
+	if len(matches) != 1 {
+		m.writeError(w, "ambiguous signing authority")
+		return
+	}
+	entry := matches[0]
+	if entry.brokerID == "" || brokerID != entry.brokerID {
+		m.writeError(w, "broker identity does not match signing authority")
+		return
+	}
+	if requested := r.Header.Get("X-Scion-Hub-Connection"); requested != "" && requested != entry.hubName {
+		m.writeError(w, "hub connection does not match signing authority")
+		return
+	}
+	if entry.connection != nil {
+		// Keep admission separate from hc.mu: handlers may take snapshots
+		// under hc.mu while a credential transition waits for this lease.
+		conn := entry.connection
+		conn.authorityMu.RLock()
+		conn.mu.RLock()
+		current := conn.authorityReady.Load() &&
+			conn.authorityGeneration.Load() == entry.generation &&
+			conn.Name == entry.hubName && conn.BrokerID == entry.brokerID &&
+			conn.HubEndpoint == entry.hubEndpoint && bytes.Equal(conn.SecretKey, entry.secretKey)
+		conn.mu.RUnlock()
+		if !current {
+			conn.authorityMu.RUnlock()
+			m.writeError(w, "stale signing authority")
+			return
+		}
+		defer conn.authorityMu.RUnlock()
+	}
+	authority := &brokerRequestAuthority{
+		hubName: entry.hubName, brokerID: entry.brokerID, hubEndpoint: entry.hubEndpoint,
+		generation: entry.generation, connection: entry.connection,
+	}
+	ctx := context.WithValue(r.Context(), brokerRequestAuthorityKey{}, authority)
+	ctx = context.WithValue(ctx, authenticatingHubConnCtxKey{}, entry.hubName)
+	next.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // writeError writes an authentication error response.

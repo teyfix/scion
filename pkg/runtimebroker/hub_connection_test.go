@@ -170,8 +170,8 @@ func TestMultiKeyBrokerAuth_MatchesAnyKey(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret1},
-		{hubName: "hub-2", secretKey: secret2},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret1},
+		{hubName: "hub-2", brokerID: "broker-1", secretKey: secret2},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -221,8 +221,8 @@ func TestMultiKeyBrokerAuth_SetsAuthenticatingHubConnContextValue(t *testing.T) 
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret1},
-		{hubName: "hub-2", secretKey: secret2},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret1},
+		{hubName: "hub-2", brokerID: "broker-1", secretKey: secret2},
 	})
 
 	var gotHubName string
@@ -300,7 +300,7 @@ func TestMultiKeyBrokerAuth_AllowUnauthenticated(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, true)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -323,7 +323,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: oldSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: oldSecret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +341,7 @@ func TestMultiKeyBrokerAuth_UpdateKeys(t *testing.T) {
 
 	// Update keys to new secret only
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: newSecret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: newSecret},
 	})
 
 	// Request with old key should now fail
@@ -367,7 +367,7 @@ func TestMultiKeyBrokerAuth_ExpiredTimestamp(t *testing.T) {
 	secret := []byte("test-secret-key-32bytes!12345678")
 	middleware := NewMultiKeyBrokerAuthMiddleware(true, 5*time.Minute, false)
 	middleware.UpdateKeys([]secretKeyEntry{
-		{hubName: "hub-1", secretKey: secret},
+		{hubName: "hub-1", brokerID: "broker-1", secretKey: secret},
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
