@@ -271,6 +271,8 @@ func TestRuntimeRecoverySnapshotRetryAfterInstalledConfigAndFailedRun(t *testing
 
 func TestLegacyHostedOrdinaryStartsDoNotManufactureImageProvenance(t *testing.T) {
 	f := newRecoveryFixture(t)
+	legacyHook := filepath.Join(f.state.home, ".scion", "hooks", "pre-start.d", "30-project-custom")
+	delete(f.sentinels, legacyHook) // Ordinary Start removes unmanaged legacy hooks.
 	f.state.config.Info.ExplicitImage = "legacy-explicit:latest"
 	f.state.config.Info.Template = "previous"
 	require.NoError(t, writeRuntimeRecoveryState(f.state))
@@ -286,6 +288,7 @@ func TestLegacyHostedOrdinaryStartsDoNotManufactureImageProvenance(t *testing.T)
 		require.Nil(t, provenance, "legacy fallback must remain authoritative across ordinary restarts")
 		f.containers[0].Phase = "stopped"
 	}
+	require.NoFileExists(t, legacyHook)
 	f.assertPreserved(t)
 }
 
@@ -324,6 +327,9 @@ func TestOrdinaryStartAfterRecoveryRefreshesInheritedDockerDefaults(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, []string{"original-profile", "preview"}, f.runConfig.Networks)
 	require.Equal(t, []string{"/dev/kvm"}, f.runConfig.Devices)
+	f.assertPreserved(t) // Recovery must preserve even the unmanaged hook.
+	legacyHook := filepath.Join(f.state.home, ".scion", "hooks", "pre-start.d", "30-project-custom")
+	delete(f.sentinels, legacyHook) // Subsequent ordinary Start applies upstream cleanup.
 	// A normal start reads current defaults, retaining only explicit requester
 	// additions from recovery rather than freezing its full effective grants.
 	require.NoError(t, os.WriteFile(filepath.Join(os.Getenv("HOME"), ".scion", "settings.yaml"), []byte(`schema_version: "1"
@@ -352,10 +358,12 @@ profiles:
 	require.Equal(t, []string{"/dev/fuse"}, f.runConfig.Devices)
 	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
 	require.NoError(t, err)
+	require.Equal(t, f.opts.RuntimeRecovery.AdmissionVersion, saved.RuntimeUpdateVersion)
 	require.Equal(t, []string{"preview", "patched"}, saved.Docker.Networks)
 	require.False(t, f.runConfig.Privileged)
 	require.Equal(t, "explicit", f.runConfig.DockerLabels["patched"])
 	require.Empty(t, saved.Docker.Devices)
+	require.NoFileExists(t, legacyHook)
 	f.assertPreserved(t)
 }
 
