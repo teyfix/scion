@@ -223,6 +223,36 @@ class JcodeProvisionTest(unittest.TestCase):
             self.assertEqual(mcp["mcpServers"]["files"]["type"], "stdio")
             self.assertEqual(mcp["mcpServers"]["files"]["command"], "mcp-files")
 
+    def test_populated_empty_broker_envelope_honors_no_auth_allow(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, bundle = make_context(root, candidates={
+                "schema_version": 1, "explicit_type": "", "resolved_method": "none",
+                "env_vars": [], "env_secret_files": {}, "file_secret_files": {}, "files": [],
+            })
+            with temporary_home(home):
+                provision.provision(ctx)
+            with open(os.path.join(bundle, "outputs", "resolved-auth.json"), encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["method"], "none")
+
+    def test_explicit_missing_auth_never_falls_back_to_allow(self) -> None:
+        for auth_type in ("api-key", "auth-file"):
+            with self.subTest(auth_type=auth_type), tempfile.TemporaryDirectory() as root:
+                ctx, home, _ = make_context(root, candidates={
+                    "schema_version": 1, "explicit_type": auth_type,
+                    "env_vars": [], "env_secret_files": {}, "file_secret_files": {}, "files": [],
+                })
+                with temporary_home(home), self.assertRaises(scion_harness.ProvisionError):
+                    provision.provision(ctx)
+
+    def test_advertised_missing_api_key_is_not_no_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            ctx, home, _ = make_context(root, candidates={
+                "env_vars": ["OPENAI_API_KEY"],
+                "env_secret_files": {"OPENAI_API_KEY": os.path.join(root, "missing")},
+            })
+            with temporary_home(home), self.assertRaises(scion_harness.ProvisionError):
+                provision.provision(ctx)
+
     def test_auth_and_outputs_follow_runtime_directory_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             ctx, home, bundle = make_context(root, candidates={

@@ -51,6 +51,10 @@ AUTH = scion_harness.AuthSpec(
             secret_key="CODEX_AUTH",
         ),
     ],
+    # The broker stages an envelope even when it has no credentials. Honor
+    # no_auth for that implicit case; select_auth still rejects every
+    # explicit invalid or unsatisfied type before this fallback.
+    fallback_to_none_on_error=True,
 )
 
 
