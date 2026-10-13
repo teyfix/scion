@@ -1,0 +1,7 @@
+{
+  "name": "scion-jcode-mcp-remote",
+  "private": true,
+  "dependencies": {
+    "mcp-remote": "0.1.38"
+  }
+}

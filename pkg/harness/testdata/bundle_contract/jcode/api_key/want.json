@@ -1,0 +1,13 @@
+{
+  "exit_code": 0,
+  "resolved_auth": {
+    "method": "api-key",
+    "harness": "jcode",
+    "env_var": "OPENAI_API_KEY"
+  },
+  "env": {
+    "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+    "JCODE_ALLOW_CODEX_LEGACY_AUTH": "1",
+    "JCODE_NO_TELEMETRY": "1"
+  }
+}

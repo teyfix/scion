@@ -91,6 +91,15 @@ builder_build() {
     cmd+=(--platform "${platforms}")
   fi
 
+  # Opt-in GitHub Actions cache. Stable per-image scopes prevent a later
+  # image from overwriting another image's cache; max includes builder stages.
+  # Inline Actions steps must expose ACTIONS_RUNTIME_TOKEN/ACTIONS_RESULTS_URL.
+  if [[ -n "${SCION_GHA_CACHE_SCOPE_PREFIX:-}" ]]; then
+    local cache_scope="${SCION_GHA_CACHE_SCOPE_PREFIX}-${image_name}"
+    cmd+=(--cache-from "type=gha,version=2,scope=${cache_scope}")
+    cmd+=(--cache-to "type=gha,version=2,scope=${cache_scope},mode=max")
+  fi
+
   local IFS=','
   read -ra tag_list <<<"${tags}"
   unset IFS

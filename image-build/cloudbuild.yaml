@@ -126,6 +126,14 @@ steps:
       - 'PATH=/builder/home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
   - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-scion-jcode'
+    dir: 'harnesses/jcode'
+    args: ['buildx', 'build', '--platform', 'linux/amd64,linux/arm64', '--build-arg', 'BASE_IMAGE=$_REGISTRY/scion-base:$_SHORT_SHA', '-t', '$_REGISTRY/scion-jcode:$_SHORT_SHA', '-t', '$_REGISTRY/scion-jcode:$_TAG', '-f', 'Dockerfile', '--pull', '--push', '.']
+    env:
+      - 'DOCKER_CLI_EXPERIMENTAL=enabled'
+      - 'PATH=/builder/home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+  - name: 'gcr.io/cloud-builders/docker'
     id: 'build-scion-muse-code'
     dir: 'harnesses/muse-code'
     args: ['buildx', 'build', '--platform', 'linux/amd64,linux/arm64', '--build-arg', 'BASE_IMAGE=$_REGISTRY/scion-base:$_SHORT_SHA', '-t', '$_REGISTRY/scion-muse-code:$_SHORT_SHA', '-t', '$_REGISTRY/scion-muse-code:$_TAG', '-f', 'Dockerfile', '--pull', '--push', '.']
