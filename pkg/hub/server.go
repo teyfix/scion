@@ -1494,6 +1494,8 @@ type RemoteEnvRequirementsResponse struct {
 
 // RemoteAgentInfo contains agent information from a remote runtime broker.
 type RemoteAgentInfo struct {
+	Privileged      *bool  `json:"privileged,omitempty"`
+	NvidiaGPU       *bool  `json:"nvidiaGpu,omitempty"`
 	ID              string `json:"id"`          // Hub UUID
 	Slug            string `json:"slug"`        // URL-safe identifier
 	ContainerID     string `json:"containerId"` // Runtime container ID

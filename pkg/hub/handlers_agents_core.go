@@ -229,6 +229,7 @@ type ListAgentsStats struct {
 }
 
 type CreateAgentRequest struct {
+	RequireGPU      bool              `json:"requireGpu,omitempty"`
 	Name            string            `json:"name"`
 	ProjectID       string            `json:"projectId"`
 	RuntimeBrokerID string            `json:"runtimeBrokerId,omitempty"` // Optional: uses project's default if not specified
@@ -1688,7 +1689,13 @@ func (s *Server) createAgentInProject(
 	}
 
 	// Resolve the runtime broker
-	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project)
+	if req.Config != nil {
+		if err := config.ValidateDockerConfig(req.Config.Docker); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
+			return
+		}
+	}
+	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project, req.RequireGPU)
 	if err != nil {
 		// Error response already written by resolveRuntimeBroker
 		return
@@ -4367,6 +4374,10 @@ func (s *Server) applyAgentUpdate(w http.ResponseWriter, r *http.Request, agent 
 			agent.AppliedConfig = &store.AgentAppliedConfig{}
 		}
 		cfg := updates.Config
+		if err := config.ValidateDockerConfig(cfg.Docker); err != nil {
+			ValidationError(w, err.Error(), nil)
+			return
+		}
 		if cfg.ThinkingLevel != nil {
 			if tl := *cfg.ThinkingLevel; tl < 0 || tl > 100 {
 				BadRequest(w, "thinking_level must be between 0 and 100")

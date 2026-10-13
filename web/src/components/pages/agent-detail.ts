@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { isAgentPrivileged, agentUsesNvidiaGPU } from '../../shared/types.js';
 
 /**
  * Agent detail page component
@@ -2591,9 +2592,26 @@ export class ScionPageAgentDetail extends LitElement {
     // card shows the runtime target instead.
     const profile = agent.pinnedRuntimeTarget ? undefined : agent.appliedConfig?.profile;
 
+    const isPrivileged = agent.appliedConfig?.docker?.privileged ?? inline?.docker?.privileged;
+    const nvidiaGpu = agent.appliedConfig?.nvidiaGpu;
+    const requireGpu = agent.appliedConfig?.requireGpu;
+    const dockerNetworks = inline?.docker?.networks ?? [];
+    const dockerDevices = inline?.docker?.devices ?? [];
+    const dockerLabels = Object.entries(inline?.docker?.labels ?? {}).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+
     return html`
       <div class="card">
-        <h3 class="card-title">Runtime Environment</h3>
+        <h3 class="card-title">
+          Runtime Environment
+          ${isAgentPrivileged(agent) ? html`<sl-badge variant="neutral">Privileged</sl-badge>` : ''}
+          ${agentUsesNvidiaGPU(agent)
+            ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                >GPU</scion-status-badge
+              >`
+            : ''}
+        </h3>
         <div class="info-grid">
           ${agent.runtimeBrokerId
             ? html`
@@ -2627,6 +2645,28 @@ export class ScionPageAgentDetail extends LitElement {
                 </div>
               `
             : ''}
+          <div class="info-item">
+            <span class="info-label">Privileged</span>
+            <span class="info-value">
+              ${isPrivileged !== undefined
+                ? isPrivileged
+                  ? html`<sl-badge variant="warning">Privileged</sl-badge>`
+                  : html`<sl-badge variant="neutral">Unprivileged</sl-badge>`
+                : html`<span style="color: var(--scion-text-muted, #888);">Default</span>`}
+            </span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">NVIDIA GPU</span>
+            <span class="info-value">
+              ${nvidiaGpu !== undefined
+                ? nvidiaGpu
+                  ? html`<sl-badge variant="primary">Attached</sl-badge>`
+                  : html`<span style="color: var(--scion-text-muted, #888);">Not attached</span>`
+                : requireGpu
+                  ? html`<sl-badge variant="neutral">Required; not reported</sl-badge>`
+                  : html`<span style="color: var(--scion-text-muted, #888);">Not reported</span>`}
+            </span>
+          </div>
           ${image
             ? html`
                 <div class="info-item">
@@ -2640,6 +2680,40 @@ export class ScionPageAgentDetail extends LitElement {
                 <div class="info-item">
                   <span class="info-label">Branch</span>
                   <span class="info-value mono">${branch}</span>
+                </div>
+              `
+            : ''}
+          ${dockerNetworks.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Networks</span>
+                  <span class="info-value tag-list">
+                    ${dockerNetworks.map(
+                      (network) => html`<span class="tag-item">${network}</span>`
+                    )}
+                  </span>
+                </div>
+              `
+            : ''}
+          ${dockerDevices.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Devices</span>
+                  <span class="info-value tag-list">
+                    ${dockerDevices.map((device) => html`<span class="tag-item">${device}</span>`)}
+                  </span>
+                </div>
+              `
+            : ''}
+          ${dockerLabels.length > 0
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Configured Docker Labels</span>
+                  <span class="info-value tag-list">
+                    ${dockerLabels.map(
+                      ([key, value]) => html`<span class="tag-item">${key}=${value}</span>`
+                    )}
+                  </span>
                 </div>
               `
             : ''}

@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import type { Agent } from './types.js';
+import { isAgentPrivileged, agentUsesNvidiaGPU } from './types.js';
 
 /**
  * Tests for the best-effort resume lifecycle action (#1868): the shared
@@ -120,5 +122,20 @@ describe('projectWorkspaceModeIcon', () => {
     expect(projectWorkspaceModeIcon(project({ labels: mode('per-agent') })).icon).not.toBe(
       projectWorkspaceModeIcon(project({})).icon
     );
+  });
+});
+
+describe('effective Docker facts', () => {
+  it('observed false overrides requested true', () => {
+    const agent = {
+      appliedConfig: {
+        docker: { privileged: false },
+        nvidiaGpu: false,
+        requireGpu: true,
+        inlineConfig: { docker: { privileged: true } },
+      },
+    } as Agent;
+    expect(isAgentPrivileged(agent)).toBe(false);
+    expect(agentUsesNvidiaGPU(agent)).toBe(false);
   });
 });

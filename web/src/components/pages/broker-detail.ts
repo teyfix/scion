@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { isAgentPrivileged, agentUsesNvidiaGPU } from '../../shared/types.js';
 
 /**
  * Broker detail page component
@@ -943,6 +944,7 @@ export class ScionPageBrokerDetail extends LitElement {
           <span class="capability-tag ${capabilities.webPTY ? 'enabled' : ''}">WebPTY</span>
           <span class="capability-tag ${capabilities.sync ? 'enabled' : ''}">Sync</span>
           <span class="capability-tag ${capabilities.attach ? 'enabled' : ''}">Attach</span>
+          ${capabilities.nvidiaGpu ? html`<span class="capability-tag enabled">GPU</span>` : ''}
         </div>
       </div>
     `;
@@ -959,6 +961,9 @@ export class ScionPageBrokerDetail extends LitElement {
             (profile) => html`
               <span class="profile-tag ${profile.available ? 'available' : ''}">
                 ${profile.name}
+                ${profile.privileged === true
+                  ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                  : ''}
                 <span class="profile-type">${profile.type}</span>
               </span>
             `
@@ -1027,6 +1032,14 @@ export class ScionPageBrokerDetail extends LitElement {
             <h3 class="agent-name">
               <sl-icon name="cpu"></sl-icon>
               <span>${agent.name}</span>
+              ${isAgentPrivileged(agent)
+                ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                : ''}
+              ${agentUsesNvidiaGPU(agent)
+                ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                    >GPU</scion-status-badge
+                  >`
+                : ''}
             </h3>
             <div class="agent-meta"><sl-icon name="code-square"></sl-icon> ${agent.template}</div>
           </div>

@@ -147,6 +147,7 @@ var agentEditFields = []agentEditField{
 	{Key: "config.max_model_calls", Tier: EditTierContainer},
 	{Key: "config.max_duration", Tier: EditTierContainer},
 	{Key: "config.resources", Tier: EditTierContainer},
+	{Key: "config.docker", Tier: EditTierContainer},
 	{Key: "config.env", Tier: EditTierContainer},
 	{Key: "config.telemetry", Tier: EditTierContainer},
 	{Key: "config.mcp_servers", Tier: EditTierContainer},
@@ -169,6 +170,7 @@ var agentEditFields = []agentEditField{
 	{Key: "gcp_identity", Tier: EditTierPrincipal, CreatedDisposition: EditNow},
 
 	// TX: immutable.
+	{Key: "config.runtime_update_version", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "projectId", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "template", Tier: EditTierImmutable, LockedReason: editReasonImmutable},
 	{Key: "harnessConfig", Tier: EditTierImmutable, LockedReason: editReasonImmutable},

@@ -917,6 +917,8 @@ type brokerProjectHeartbeat struct {
 
 // brokerAgentHeartbeat is per-agent status in a heartbeat.
 type brokerAgentHeartbeat struct {
+	Privileged *bool `json:"privileged,omitempty"`
+	NvidiaGPU  *bool `json:"nvidiaGpu,omitempty"`
 	// RuntimeTarget is the inventory target that listed the agent.
 	RuntimeTarget string `json:"runtimeTarget,omitempty"`
 
@@ -1571,6 +1573,9 @@ func (s *Server) handleBrokerHeartbeat(w http.ResponseWriter, r *http.Request, i
 					agent.Runtime = rt
 					needsUpdate = true
 				}
+			}
+			if applyAgentRuntimeFacts(agent, agentHB.Privileged, agentHB.NvidiaGPU) {
+				needsUpdate = true
 			}
 			if needsUpdate {
 				if err := s.store.UpdateAgent(ctx, agent); err != nil {

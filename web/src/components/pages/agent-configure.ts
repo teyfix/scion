@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import type { DockerRuntimeConfig } from '../../shared/types.js';
+import { buildDockerRuntimeConfig } from '../../shared/docker-runtime.js';
+import { renderDockerRuntimeEditor, editorPrivileged } from '../shared/docker-runtime-editor.js';
 
 /**
  * Advanced agent configuration page.
@@ -55,6 +58,7 @@ import '../shared/timezone-picker.js';
 import '../shared/message-mode-badge.js';
 
 interface ScionConfigPayload {
+  docker?: DockerRuntimeConfig;
   image?: string;
   model?: string;
   user?: string;
@@ -198,6 +202,7 @@ interface AppliedConfig {
   harnessConfig?: string;
   harnessAuth?: string;
   task?: string;
+  profile?: string;
   env?: Record<string, string>;
   gcpIdentity?: GCPIdentityConfig;
   inlineConfig?: ScionConfigPayload & {
@@ -206,8 +211,6 @@ interface AppliedConfig {
   agentRole?: string;
   /** The requester's explicit inputs, which reincarnate re-derives from. */
   createInputs?: { inlineConfig?: { env?: Record<string, string> } };
-  /** The runtime profile this agent was dispatched with, if any (api/types.go RunConfig.Profile). */
-  profile?: string;
   /** The agent's pinned container timezone (IANA name), if any. */
   explicitTimezone?: string;
   /** True when explicitTimezone was adopted from a TZ an older hub saved in env. */
@@ -289,6 +292,9 @@ export class ScionPageAgentConfigure extends LitElement {
   @state() private disk = '';
 
   // Form fields — Environment
+  @state() private dockerNetworks: string[] = [];
+  @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
+  private dockerConfigBase: DockerRuntimeConfig | undefined;
   @state() private envEntries: EnvEntry[] = [];
   @state() private requiredEnvKeys: string[] = [];
 
@@ -895,6 +901,12 @@ export class ScionPageAgentConfigure extends LitElement {
     if (!this.agent) return;
     const ac = this.agent.appliedConfig;
     const ic = ac?.inlineConfig;
+    this.dockerConfigBase = ic?.docker ? { ...ic.docker } : undefined;
+    this.dockerNetworks = [...(ic?.docker?.networks ?? [])];
+    this.dockerLabelEntries = Object.entries(ic?.docker?.labels ?? {}).map(([key, value]) => ({
+      key,
+      value,
+    }));
 
     // AppliedConfig.Env is the live env: the custom env rows and the
     // auto-expose controls both read it.
@@ -1181,6 +1193,15 @@ export class ScionPageAgentConfigure extends LitElement {
     ) {
       config.telemetry = { enabled: this.telemetryEnabled };
     }
+
+    // Docker config
+    const dockerConfig = buildDockerRuntimeConfig(
+      this.dockerConfigBase,
+      this.dockerNetworks,
+      this.dockerLabelEntries
+    );
+    if (dockerConfig) config.docker = dockerConfig;
+    else if (this.dockerConfigBase) config.docker = {};
 
     return config;
   }
@@ -2251,6 +2272,29 @@ export class ScionPageAgentConfigure extends LitElement {
 
   private renderEnvironmentTab() {
     return html`
+      ${renderDockerRuntimeEditor(
+        {
+          privileged: editorPrivileged(this.dockerConfigBase),
+          gpu: this.dockerConfigBase?.nvidia_gpu,
+          networks: this.dockerNetworks,
+          devices: this.dockerConfigBase?.devices ?? [],
+          labels: this.dockerLabelEntries,
+        },
+        (next) => {
+          const base = {
+            ...this.dockerConfigBase,
+            ...(next.gpu === undefined ? {} : { nvidia_gpu: next.gpu }),
+            devices: next.devices,
+          };
+          if (next.privileged === 'inherit') delete base.privileged;
+          else base.privileged = next.privileged === 'enabled';
+          this.dockerConfigBase = base;
+          this.dockerNetworks = next.networks;
+          this.dockerLabelEntries = next.labels;
+          this.requestUpdate();
+        }
+      )}
+
       <div class="hint env-tz-hint">
         TZ is not set here: the agent's timezone is managed by the Timezone row on the General tab.
       </div>

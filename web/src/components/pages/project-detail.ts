@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { isAgentPrivileged, agentUsesNvidiaGPU } from '../../shared/types.js';
 
 /**
  * Project detail page component
@@ -3447,6 +3448,14 @@ export class ScionPageProjectDetail extends LitElement {
           <span class="name-cell">
             <sl-icon name="cpu"></sl-icon>
             <a href="/agents/${agent.id}">${agent.name}</a>
+            ${isAgentPrivileged(agent)
+              ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+              : nothing}
+            ${agentUsesNvidiaGPU(agent)
+              ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                  >GPU</scion-status-badge
+                >`
+              : nothing}
           </span>
         </td>
         <td class="hide-mobile">${agent.template}</td>
@@ -3623,6 +3632,14 @@ export class ScionPageProjectDetail extends LitElement {
               <a href="/agents/${agent.id}" style="color: inherit; text-decoration: none;">
                 ${agent.name}
               </a>
+              ${isAgentPrivileged(agent)
+                ? html`<sl-badge variant="neutral">Privileged</sl-badge>`
+                : nothing}
+              ${agentUsesNvidiaGPU(agent)
+                ? html`<scion-status-badge status="neutral" icon="gpu" size="small"
+                    >GPU</scion-status-badge
+                  >`
+                : nothing}
             </h3>
             <div class="agent-meta">
               <div><sl-icon name="code-square"></sl-icon> ${agent.template}</div>

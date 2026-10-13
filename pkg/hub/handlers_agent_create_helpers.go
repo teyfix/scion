@@ -185,6 +185,7 @@ func (s *Server) buildAppliedConfig(req CreateAgentRequest, creatorName string, 
 		Workspace:     req.Workspace,
 		CreatorName:   creatorName,
 		AgentRole:     string(effectiveRole),
+		RequireGPU:    req.RequireGPU,
 	}
 
 	ac.NoAuth = req.NoAuth
@@ -1892,7 +1893,15 @@ func (s *Server) handleExistingAgent(
 //  5. No providers - returns error
 //
 // Returns the runtime broker ID or an error (after writing the HTTP error response).
-func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter, requestedBrokerID string, project *store.Project) (string, error) {
+func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter, requestedBrokerID string, project *store.Project, requireGPU ...bool) (string, error) {
+	needGPU := len(requireGPU) > 0 && requireGPU[0]
+	hasGPU := func(b *store.RuntimeBroker) bool {
+		return b != nil && b.Capabilities != nil && b.Capabilities.NvidiaGPU
+	}
+	refuseGPU := func() (string, error) {
+		writeError(w, http.StatusBadRequest, ErrCodeValidationError, "Requested runtime broker does not support NVIDIA GPU", map[string]interface{}{"field": "requireGpu"})
+		return "", store.ErrNotFound
+	}
 	// Get ALL providers for this project (regardless of status)
 	allProviders, err := s.store.GetProjectProviders(ctx, project.ID)
 	if err != nil {
@@ -1905,6 +1914,16 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return "", err
+	}
+
+	if needGPU {
+		filtered := availableBrokers[:0]
+		for _, b := range availableBrokers {
+			if hasGPU(&b) {
+				filtered = append(filtered, b)
+			}
+		}
+		availableBrokers = filtered
 	}
 
 	slog.Debug("Resolving runtime broker",
@@ -1960,6 +1979,9 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 					"status", rec.Status, "project_id", project.ID)
 				RuntimeBrokerUnavailable(w, requestedBrokerID, usableBrokers())
 				return "", store.ErrNotFound
+			}
+			if needGPU && !hasGPU(rec) {
+				return refuseGPU()
 			}
 			return brokerID, nil
 		}
@@ -2076,6 +2098,9 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 				return "", store.ErrNotFound
 			}
 
+			if needGPU && !hasGPU(broker) {
+				return refuseGPU()
+			}
 			provider := &store.ProjectProvider{
 				ProjectID:  project.ID,
 				BrokerID:   broker.ID,
@@ -2160,7 +2185,7 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 	// exactly one provider and its broker is online and dispatchable.
 	if len(allProviders) == 1 {
 		broker, brokerErr := s.store.GetRuntimeBroker(ctx, allProviders[0].BrokerID)
-		if brokerErr == nil && broker.Status == store.BrokerStatusOnline && s.canUseBrokerForProject(ctx, broker, project) {
+		if brokerErr == nil && broker.Status == store.BrokerStatusOnline && s.canUseBrokerForProject(ctx, broker, project) && (!needGPU || hasGPU(broker)) {
 			return allProviders[0].BrokerID, nil
 		}
 		if brokerErr == nil && broker.Status == store.BrokerStatusOnline {

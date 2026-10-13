@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import { buildDockerRuntimeConfig } from '../../shared/docker-runtime.js';
+import { renderDockerRuntimeEditor } from '../shared/docker-runtime-editor.js';
 
 /**
  * Unified agent creation page component
@@ -88,6 +90,11 @@ export class ScionPageAgentCreate extends LitElement {
   @state() private task = '';
   @state() private notify = true;
 
+  @state() private dockerPrivileged: 'inherit' | 'enabled' | 'disabled' = 'inherit';
+  @state() private requireGpu = false;
+  @state() private dockerNetworks: string[] = [];
+  @state() private dockerDevices: string[] = [];
+  @state() private dockerLabelEntries: Array<{ key: string; value: string }> = [];
   // ── Additional Options ──────────────────────────────────────────
   /** The hub's public settings, for the hub-tier placeholders. */
   @state() private hubSettings: HubPublicDefaults = {};
@@ -816,6 +823,21 @@ export class ScionPageAgentCreate extends LitElement {
   /**
    * Create the agent and start it, then navigate to the agent detail page.
    */
+  private buildDockerConfig() {
+    const docker = buildDockerRuntimeConfig(
+      {
+        nvidia_gpu: this.requireGpu,
+        ...(this.dockerPrivileged === 'inherit'
+          ? {}
+          : { privileged: this.dockerPrivileged === 'enabled' }),
+        ...(this.dockerDevices.length ? { devices: this.dockerDevices } : {}),
+      },
+      this.dockerNetworks,
+      this.dockerLabelEntries
+    );
+    return { docker };
+  }
+
   private async handleSubmit(_e: Event): Promise<void> {
     if (!this.name.trim()) {
       this.error = 'Agent name is required.';
@@ -857,13 +879,14 @@ export class ScionPageAgentCreate extends LitElement {
       if (this.brokerId) body.runtimeBrokerId = this.brokerId;
       if (this.profile) body.profile = this.profile;
       if (this.task.trim()) body.task = this.task.trim();
+      if (this.requireGpu) body.requireGpu = true;
 
       // Additional Options: only what the user set. Everything else
       // (including gcp_identity with no explicit pick) is left to the hub's
       // own precedence instead of being pinned client-side.
       if (form) {
         Object.assign(body, form.collectTopLevel());
-        const config = form.collectConfigPatch();
+        const config = { ...form.collectConfigPatch(), ...this.buildDockerConfig() };
         if (Object.keys(config).length > 0) body.config = config;
       } else {
         const gcpIdentity = this.gcp.toRequest();
@@ -1024,6 +1047,29 @@ export class ScionPageAgentCreate extends LitElement {
             !isSharedWorkspace(this.selectedProject)}
             ?disabled=${this.submitting}
           ></scion-agent-config-form>
+          ${renderDockerRuntimeEditor(
+            {
+              privileged: this.dockerPrivileged,
+              gpu: this.requireGpu,
+              networks: this.dockerNetworks,
+              devices: this.dockerDevices,
+              labels: this.dockerLabelEntries,
+            },
+            (next) => {
+              this.dockerPrivileged = next.privileged;
+              this.requireGpu = next.gpu === true;
+              this.dockerNetworks = next.networks;
+              this.dockerDevices = next.devices;
+              this.dockerLabelEntries = next.labels;
+              if (
+                this.requireGpu &&
+                !this.brokers.find((b) => b.id === this.brokerId)?.capabilities?.nvidiaGpu
+              ) {
+                this.brokerId = '';
+                this.profile = '';
+              }
+            }
+          )}
         </sl-details>
 
         <!-- ═══════ Form Actions ═══════ -->
@@ -1194,14 +1240,32 @@ export class ScionPageAgentCreate extends LitElement {
             this.autoSelectProfile();
           }}
         >
-          ${this.brokers.map(
-            (b) =>
-              html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
-                ${b.name} (${b.status})
-              </sl-option>`
-          )}
+          ${this.brokers.map((b) => {
+            const hasGpu = Boolean(
+              b.capabilities?.nvidiaGpu ||
+              (b._capabilities as unknown as { nvidiaGpu?: boolean })?.nvidiaGpu
+            );
+            const isGpuDisabled = this.requireGpu && !hasGpu;
+            const disabled = b.status === 'offline' || isGpuDisabled;
+            return html`<sl-option
+              value=${b.id}
+              ?disabled=${disabled}
+              title=${isGpuDisabled ? 'Requires GPU support' : ''}
+            >
+              ${b.name}
+              (${b.status})${hasGpu
+                ? html` <scion-status-badge status="neutral" icon="gpu" size="small"
+                    >GPU</scion-status-badge
+                  >`
+                : ''}
+            </sl-option>`;
+          })}
         </sl-select>
-        <div class="hint">The compute node that will run this agent.</div>
+        <div class="hint">
+          ${this.requireGpu
+            ? 'The compute node that will run this agent (brokers without GPU support are disabled).'
+            : 'The compute node that will run this agent.'}
+        </div>
       </div>
 
       <!-- Runtime Profile (conditional: broker has profiles) -->

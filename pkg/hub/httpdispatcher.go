@@ -1454,6 +1454,7 @@ func validWorkspacePlacementReport(placement string) bool {
 // applyBrokerAgentConfig copies the non-status fields of a broker's agent
 // answer (template, harness, image, profile, runtime) onto agent.
 func applyBrokerAgentConfig(agent *store.Agent, info *RemoteAgentInfo) {
+	applyAgentRuntimeFacts(agent, info.Privileged, info.NvidiaGPU)
 	if info.Template != "" {
 		agent.Template = info.Template
 	}
@@ -1487,6 +1488,36 @@ func applyBrokerAgentConfig(agent *store.Agent, info *RemoteAgentInfo) {
 	if info.Runtime != "" {
 		agent.Runtime = info.Runtime
 	}
+}
+
+// applyAgentRuntimeFacts stores values observed by the runtime separately from
+// the inline request. This keeps inherited profile settings and Docker-wrapper
+// additions visible without turning them into explicit agent overrides.
+func applyAgentRuntimeFacts(agent *store.Agent, privileged, nvidiaGPU *bool) bool {
+	if agent == nil || (privileged == nil && nvidiaGPU == nil) {
+		return false
+	}
+	if agent.AppliedConfig == nil {
+		agent.AppliedConfig = &store.AgentAppliedConfig{}
+	}
+
+	changed := false
+	if privileged != nil {
+		if agent.AppliedConfig.Docker == nil {
+			agent.AppliedConfig.Docker = &api.DockerConfig{}
+		}
+		if agent.AppliedConfig.Docker.Privileged == nil || *agent.AppliedConfig.Docker.Privileged != *privileged {
+			value := *privileged
+			agent.AppliedConfig.Docker.Privileged = &value
+			changed = true
+		}
+	}
+	if nvidiaGPU != nil && (agent.AppliedConfig.NvidiaGPU == nil || *agent.AppliedConfig.NvidiaGPU != *nvidiaGPU) {
+		value := *nvidiaGPU
+		agent.AppliedConfig.NvidiaGPU = &value
+		changed = true
+	}
+	return changed
 }
 
 // forgetRuntimeTarget drops the agent's recorded runtime target (and any

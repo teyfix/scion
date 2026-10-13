@@ -588,6 +588,7 @@ export interface TelemetryConfig {
  * and accepts it in the agent PATCH body's `config` object.
  */
 export interface AgentInlineConfig {
+  docker?: DockerRuntimeConfig;
   harness?: string;
   harness_config?: string;
   default_harness_config?: string;
@@ -669,6 +670,14 @@ export interface AgentSkillReference {
   scope?: string;
 }
 
+export interface DockerRuntimeConfig {
+  nvidia_gpu?: boolean;
+  privileged?: boolean;
+  networks?: string[];
+  devices?: string[];
+  labels?: Record<string, string>;
+}
+
 export type SupportLevel = 'no' | 'partial' | 'yes';
 
 export interface CapabilityField {
@@ -705,6 +714,9 @@ export interface HarnessAdvancedCapabilities {
  * pkg/store/models.go): what the hub dispatches at the agent's next start.
  */
 export interface AgentAppliedConfig {
+  docker?: DockerRuntimeConfig;
+  requireGpu?: boolean;
+  nvidiaGpu?: boolean;
   image?: string;
   harnessConfig?: string;
   harnessAuth?: string;
@@ -1092,12 +1104,18 @@ export interface BrokerCapabilities {
   webPTY: boolean;
   sync: boolean;
   attach: boolean;
+  nvidiaGpu?: boolean;
 }
 
 /**
  * Runtime profile available on a broker
  */
 export interface BrokerProfile {
+  privileged?: boolean;
+  networks?: string[];
+  devices?: string[];
+  labels?: Record<string, string>;
+  labelVars?: string[];
   name: string;
   type: string;
   available: boolean;
@@ -1860,4 +1878,17 @@ export interface ProjectSessionMetricsSummary {
   activeAgents: number;
   mostUsedTools: ToolUsageSummary[];
   mostUsedModels: ModelUsageSummary[];
+}
+
+export function isAgentPrivileged(agent: Agent): boolean {
+  return (
+    agent.appliedConfig?.docker?.privileged ??
+    agent.appliedConfig?.inlineConfig?.docker?.privileged ??
+    false
+  );
+}
+
+/** Effective NVIDIA GPU attachment, with the scheduling requirement as a legacy fallback. */
+export function agentUsesNvidiaGPU(agent: Agent): boolean {
+  return agent.appliedConfig?.nvidiaGpu ?? agent.appliedConfig?.requireGpu ?? false;
 }
