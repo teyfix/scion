@@ -217,3 +217,27 @@ func TestRuntimeRecoveryRequiresConfigurationUpdateAuthority(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeRecoveryHubCompletionCannotRebaseOverConcurrentPatch(t *testing.T) {
+	ctx := context.Background()
+	srv, db, agent, update := setupRuntimeRecoveryHub(t, func(http.ResponseWriter, *http.Request) { t.Fatal("direct completion must not dispatch") })
+	admitted, err := db.AdmitAgentRuntimeRecovery(ctx, agent.ID, agent.StateVersion, agent.StateVersion+1)
+	require.NoError(t, err)
+	staleVersion := admitted.StateVersion
+	// A PATCH advances StateVersion without changing the current admission.
+	patched, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	patched.Labels = map[string]string{"owner": "newer-patch"}
+	patched.AppliedConfig.Model = "newer-model"
+	require.NoError(t, db.UpdateAgent(ctx, patched))
+	admitted.Phase, admitted.Template, admitted.Image = "running", "current", "new:latest"
+	admitted.AppliedConfig.Image = "new:latest"
+	update.Labels = map[string]string{"owner": "stale-recovery"}
+	err = srv.completeRuntimeRecovery(ctx, admitted, &api.RuntimeRecovery{Update: *update, AdmissionVersion: staleVersion}, true)
+	require.ErrorIs(t, err, store.ErrVersionConflict)
+	latest, err := db.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	require.Equal(t, patched.StateVersion, latest.StateVersion)
+	require.Equal(t, patched.Labels, latest.Labels)
+	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
+}
