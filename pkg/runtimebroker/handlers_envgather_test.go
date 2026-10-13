@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
@@ -2335,6 +2336,11 @@ runtimes:
   kubernetes:
     type: kubernetes
 `)
+	// This preflight test classifies the dispatch from its settings profile.
+	srv.config.ForceRuntime = ""
+	if got := srv.resolveRuntimeNameForOpts(api.StartOptions{ProjectPath: projectDir, Profile: "default"}); got != "kubernetes" {
+		t.Fatalf("expected Kubernetes dispatch classification, got %q", got)
+	}
 
 	req := CreateAgentRequest{
 		Name:        "test-agent-vertex-k8s-implicit",
@@ -2392,6 +2398,11 @@ runtimes:
   docker:
     type: docker
 `)
+	// Keep the Docker counterpart on the same settings-resolution path.
+	srv.config.ForceRuntime = ""
+	if got := srv.resolveRuntimeNameForOpts(api.StartOptions{ProjectPath: projectDir, Profile: "default"}); got != "docker" {
+		t.Fatalf("expected Docker dispatch classification, got %q", got)
+	}
 
 	req := CreateAgentRequest{
 		Name:        "test-agent-vertex-docker-resolvedenv-passthrough",
