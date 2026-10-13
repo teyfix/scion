@@ -26,6 +26,7 @@ type retainedRuntimeState struct {
 	dir, home, workspace string
 	config               *api.ScionConfig
 	requested            *api.ScionConfig
+	requesterDocker      *api.DockerConfig
 }
 
 // loadRuntimeRecovery reads retained state without GetAgent's fresh provisioning
@@ -107,6 +108,9 @@ func loadRuntimeRecovery(ctx context.Context, opts api.StartOptions, projectDir 
 	effective.Info = info
 	state.config = effective
 	state.requested = requested
+	if recovery.Update.Config != nil {
+		state.requesterDocker = config.MergeDockerConfig(state.requesterDocker, recovery.Update.Config.Docker)
+	}
 	return state, nil
 }
 
@@ -190,6 +194,15 @@ func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containe
 	if err := verifyRetainedRuntimeIdentity(opts, old, &info, containers); err != nil {
 		return nil, err
 	}
+	old.Info = &info
+	requesterDocker := config.CloneDockerConfig(old.Docker)
+	// An older snapshot can belong to an interrupted full-config install;
+	// its requester provenance remains the base of this admitted retry.
+	if own, recorded, err := requesterDockerFromSnapshot(dir, old, true); err != nil {
+		return nil, err
+	} else if recorded {
+		requesterDocker = own
+	}
 	if err := restoreRuntimeEnvironmentSnapshot(dir, opts, old, &info, owner); err != nil {
 		return nil, err
 	}
@@ -204,7 +217,7 @@ func readRetainedRuntimeState(opts api.StartOptions, projectDir string, containe
 		return nil, fmt.Errorf("retained workspace is missing: %s", workspace)
 	}
 	old.Info = &info
-	return &retainedRuntimeState{dir: dir, home: home, workspace: workspace, config: old}, nil
+	return &retainedRuntimeState{dir: dir, home: home, workspace: workspace, config: old, requesterDocker: requesterDocker}, nil
 }
 
 func verifyRetainedRuntimeIdentity(opts api.StartOptions, old *api.ScionConfig, info *api.AgentInfo, containers []api.AgentInfo) error {

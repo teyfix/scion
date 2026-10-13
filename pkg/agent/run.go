@@ -352,6 +352,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 						if err := writeRuntimeRecoveryState(recoveryState); err != nil {
 							return nil, fmt.Errorf("record verified runtime recovery: %w", err)
 						}
+						if err := writeRuntimeEnvironmentSnapshot(agentDir, finalScionCfg, runtime.RunConfig{Labels: a.Labels, UnixUsername: finalScionCfg.User}, opts.RuntimeRecovery.AgentID, opts.RuntimeRecovery.ProjectID, opts.RuntimeRecovery.RuntimeBrokerID, recoveryState.requesterDocker); err != nil {
+							return nil, err
+						}
 						return &a, nil
 					}
 					return nil, fmt.Errorf("runtime recovery cannot replace a running container; suspend it first")
@@ -646,6 +649,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		ownEnv = persisted
 	}
 	if finalScionCfg != nil {
+		if recoveryState == nil && finalScionCfg.RuntimeUpdateVersion > 0 {
+			if own, recorded, err := requesterDockerFromSnapshot(agentDir, finalScionCfg); err != nil {
+				return nil, err
+			} else if recorded {
+				ownEnv.Docker = own
+				if opts.InlineConfig != nil {
+					ownEnv.Docker = config.MergeDockerConfig(ownEnv.Docker, opts.InlineConfig.Docker)
+				}
+			}
+		}
 		envProfile := opts.Profile
 		if envProfile == "" && finalScionCfg.Info != nil {
 			envProfile = finalScionCfg.Info.Profile
@@ -2677,6 +2690,7 @@ authDone:
 		_ = dropCheckedSharedDirs(agentDir, sharedDirRecord, passed, opts.Name)
 	}
 	if recoveryState != nil {
+		finalScionCfg.User = runCfg.UnixUsername
 		normalizeRuntimeSelection(finalScionCfg, runCfg.Env)
 		recoveryState.config = finalScionCfg
 		recoveryState.config.Info.RunID = runID
@@ -2744,7 +2758,12 @@ authDone:
 		}
 		return nil, classifyLaunchRuntimeError(err, resolvedImage)
 	}
-	if err := writeRuntimeEnvironmentSnapshot(agentDir, finalScionCfg, runCfg, agentID, projectID, snapshotBrokerID); err != nil {
+	if err := writeRuntimeEnvironmentSnapshot(agentDir, finalScionCfg, runCfg, agentID, projectID, snapshotBrokerID, func() *api.DockerConfig {
+		if recoveryState != nil {
+			return recoveryState.requesterDocker
+		}
+		return ownEnv.Docker
+	}()); err != nil {
 		return nil, fmt.Errorf("record effective runtime configuration: %w", err)
 	}
 	slog.Info("agent start: runtime.Run complete", "agent", opts.Name,

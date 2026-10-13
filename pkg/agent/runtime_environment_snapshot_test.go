@@ -24,7 +24,7 @@ func saveSnapshotFixture(t *testing.T, f *recoveryFixture) {
 	require.NoError(t, writeRuntimeEnvironmentSnapshot(f.state.dir, f.state.config, runtime.RunConfig{
 		Labels: map[string]string{api.LabelRunID: snapshotFixtureRun}, UnixUsername: "root",
 		Env: []string{"SCION_MODEL=retained-effective-model", "SCION_THINKING_LEVEL=50", "SCION_AUTH_TOKEN=dummy-do-not-snapshot"},
-	}, "existing-agent", "existing-project", "existing-broker"))
+	}, "existing-agent", "existing-project", "existing-broker", nil))
 }
 
 func TestRuntimeRecoverySnapshotPreservesEffectiveDefaults(t *testing.T) {
@@ -313,4 +313,63 @@ func TestOrdinaryRestartUsesHydratedTemplateEnvironmentSourceImageAndDocker(t *t
 	saved, _ := persistedEnvAgentConfig(t, project)
 	require.Empty(t, saved.Image)
 	require.Nil(t, saved.Docker)
+}
+
+func TestOrdinaryStartAfterRecoveryRefreshesInheritedDockerDefaults(t *testing.T) {
+	f := newRecoveryFixture(t)
+	privileged := true
+	f.state.config.Docker = &api.DockerConfig{Privileged: &privileged, Networks: []string{"original-profile"}, Devices: []string{"/dev/kvm"}}
+	saveSnapshotFixture(t, f)
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, []string{"original-profile", "preview"}, f.runConfig.Networks)
+	require.Equal(t, []string{"/dev/kvm"}, f.runConfig.Devices)
+	// A normal start reads current defaults, retaining only explicit requester
+	// additions from recovery rather than freezing its full effective grants.
+	require.NoError(t, os.WriteFile(filepath.Join(os.Getenv("HOME"), ".scion", "settings.yaml"), []byte(`schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    runtime: docker
+    docker:
+      networks: [changed-profile]
+      devices: [/dev/fuse]
+      privileged: true
+`), 0644))
+	f.containers[0].Phase = "stopped"
+	f.rt.DeleteFunc = func(context.Context, runtime.RunRef) error { f.containers = nil; return nil }
+	ordinary := f.opts
+	ordinary.RuntimeRecovery, ordinary.Template, ordinary.Image = nil, "", ""
+	disabled := false
+	ordinary.InlineConfig = &api.ScionConfig{Docker: &api.DockerConfig{Privileged: &disabled, Networks: []string{"patched"}, Labels: map[string]string{"patched": "explicit"}}}
+	persisted, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	persisted = config.MergeScionConfig(persisted, ordinary.InlineConfig)
+	require.NoError(t, atomicRecoveryJSON(filepath.Join(f.state.dir, "scion-agent.json"), persisted))
+	_, err = NewManager(f.rt).Start(context.Background(), ordinary)
+	require.NoError(t, err)
+	require.Equal(t, []string{"changed-profile", "preview", "patched"}, f.runConfig.Networks)
+	require.Equal(t, []string{"/dev/fuse"}, f.runConfig.Devices)
+	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, []string{"preview", "patched"}, saved.Docker.Networks)
+	require.False(t, f.runConfig.Privileged)
+	require.Equal(t, "explicit", f.runConfig.DockerLabels["patched"])
+	require.Empty(t, saved.Docker.Devices)
+	f.assertPreserved(t)
+}
+
+func TestRuntimeRecoveryRetryHashesActualHarnessUser(t *testing.T) {
+	f := newRecoveryFixture(t)
+	f.state.config.User = ""
+	require.NoError(t, writeRuntimeRecoveryState(f.state))
+	_, err := NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, "root", f.runConfig.UnixUsername)
+	saved, err := (&config.Template{Path: f.state.dir}).LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "root", saved.User)
+	_, err = NewManager(f.rt).Start(context.Background(), f.opts)
+	require.NoError(t, err)
+	require.Equal(t, 1, f.runs)
 }
