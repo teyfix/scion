@@ -1578,8 +1578,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Stop all hub connections for good, without s.hubMu held (see
 	// Start). A Start or reinitialize still queued on a connection does
 	// nothing once it is closed.
+	var closing []<-chan struct{}
 	for _, conn := range s.hubConnectionList() {
-		conn.close()
+		closing = append(closing, conn.closeAsync())
+	}
+	for _, done := range closing {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	if srv == nil {
@@ -2732,8 +2740,7 @@ func (s *Server) checkAndReloadCredentials(ctx context.Context) error {
 		detached := s.hubConnections[conn.Name] == conn
 		if detached {
 			delete(s.hubConnections, conn.Name)
-			conn.authorityReady.Store(false)
-			conn.authorityGeneration.Add(1)
+			conn.revokeAuthority()
 		}
 		s.hubMu.Unlock()
 		if detached {
