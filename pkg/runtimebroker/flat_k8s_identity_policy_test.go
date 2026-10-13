@@ -72,7 +72,54 @@ func newFlatKubernetesStartServer(t *testing.T, target config.V1RuntimeTargetCon
 		Instance: config.V1RuntimeBrokerInstanceConfig{Key: "k8s-a", Name: "k8s-a", RuntimeTarget: &target},
 	}
 	srv.flatK8sIdentity = newFlatKubernetesIdentityPolicy(srv.config.FlatInstance)
+	configureAuthorityTestConnection(t, srv, "flat-identity", "http://127.0.0.1:1",
+		srv.config.FlatInstance.Identity.RuntimeBrokerID, []byte("flat-identity-test-key"))
 	return srv
+}
+
+// Direct identity-policy tests pass through the same signed authority
+// admission as a Hub dispatch before exercising buildStartContext.
+func buildFlatIdentityStartContext(t *testing.T, srv *Server, in startContextInputs) (*startContext, error) {
+	t.Helper()
+	if !srv.isFlat() {
+		return srv.buildStartContext(context.Background(), in)
+	}
+	in.AgentID = "agent-id-" + in.Name
+	in.ProjectID = flatTestProjectID
+	if in.ProjectPath == "" {
+		var err error
+		in.ProjectPath, err = config.GetResolvedProjectDir("")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := in.HTTPRequest
+	if req == nil {
+		req = httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
+	}
+	srv.hubMu.RLock()
+	conn := srv.hubConnections["flat-identity"]
+	srv.hubMu.RUnlock()
+	if conn == nil {
+		t.Fatal("flat identity fixture has no registered Hub connection")
+	}
+	authority := conn.snapshot()
+	req.Header.Set("X-Scion-Hub-Connection", conn.Name)
+	signRequest(req, authority.BrokerID, authority.SecretKey)
+	var sc *startContext
+	var buildErr error
+	reached := false
+	handler := srv.loadBrokerMiddleware().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		in.HTTPRequest = r
+		sc, buildErr = srv.buildStartContext(r.Context(), in)
+	}))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if !reached {
+		t.Fatalf("flat identity fixture auth refused: %d %s", w.Code, w.Body.String())
+	}
+	return sc, buildErr
 }
 
 func flatStartInputs(name string, in startContextInputs) startContextInputs {
@@ -111,7 +158,7 @@ func TestFlatKubernetesIdentity_BlockWithInstanceServiceAccount(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{KubernetesBlockServiceAccount: "instance-block"})
 			newTestGlobalSettings(t, globalPolicyThatMustNotApply)
-			sc, err := srv.buildStartContext(context.Background(), flatStartInputs("flat-block-"+strings.ReplaceAll(name, "_", "-"), in))
+			sc, err := buildFlatIdentityStartContext(t, srv, flatStartInputs("flat-block-"+strings.ReplaceAll(name, "_", "-"), in))
 			if err != nil {
 				t.Fatalf("buildStartContext: %v", err)
 			}
@@ -130,7 +177,7 @@ func TestFlatKubernetesIdentity_BlockWithInstanceServiceAccount(t *testing.T) {
 func TestFlatKubernetesIdentity_BlockOmittedUsesNamespaceDefault(t *testing.T) {
 	srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{})
 	newTestGlobalSettings(t, globalPolicyThatMustNotApply)
-	sc, err := srv.buildStartContext(context.Background(), flatStartInputs("flat-block-default", startContextInputs{
+	sc, err := buildFlatIdentityStartContext(t, srv, flatStartInputs("flat-block-default", startContextInputs{
 		Config: &CreateAgentConfig{GCPIdentity: &GCPIdentityConfig{MetadataMode: "block"}}, Operation: opCreate}))
 	if err != nil {
 		t.Fatalf("buildStartContext: %v", err)
@@ -144,7 +191,7 @@ func TestFlatKubernetesIdentity_BlockOmittedUsesNamespaceDefault(t *testing.T) {
 func TestFlatKubernetesIdentity_BlockInvalidOrConflictingRefused(t *testing.T) {
 	t.Run("invalid configured", func(t *testing.T) {
 		srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{KubernetesBlockServiceAccount: "Bad_SA"})
-		_, err := srv.buildStartContext(context.Background(), flatStartInputs("flat-block-bad", startContextInputs{
+		_, err := buildFlatIdentityStartContext(t, srv, flatStartInputs("flat-block-bad", startContextInputs{
 			Config: &CreateAgentConfig{GCPIdentity: &GCPIdentityConfig{MetadataMode: "block"}}, Operation: opCreate}))
 		if got := startContextStatus(t, err); got != http.StatusBadRequest {
 			t.Fatalf("status %d, want 400", got)
@@ -152,7 +199,7 @@ func TestFlatKubernetesIdentity_BlockInvalidOrConflictingRefused(t *testing.T) {
 	})
 	t.Run("explicit conflicting", func(t *testing.T) {
 		srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{KubernetesBlockServiceAccount: "instance-block"})
-		_, err := srv.buildStartContext(context.Background(), flatStartInputs("flat-block-conflict", startContextInputs{
+		_, err := buildFlatIdentityStartContext(t, srv, flatStartInputs("flat-block-conflict", startContextInputs{
 			Config: &CreateAgentConfig{GCPIdentity: &GCPIdentityConfig{MetadataMode: "block"},
 				Kubernetes: &api.KubernetesConfig{ServiceAccountName: "other-ksa"}}, Operation: opCreate}))
 		if got := startContextStatus(t, err); got != http.StatusBadRequest {
@@ -176,7 +223,7 @@ func TestFlatKubernetesIdentity_AssignUsesInstanceMapping(t *testing.T) {
 	srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{
 		KubernetesServiceAccountMappings: map[string]string{flatTestGSA: "instance-ksa"}})
 	newTestGlobalSettings(t, globalPolicyThatMustNotApply)
-	sc, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign", nil))
+	sc, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign", nil))
 	if err != nil {
 		t.Fatalf("buildStartContext: %v", err)
 	}
@@ -199,7 +246,7 @@ func TestFlatKubernetesIdentity_AssignRefusals(t *testing.T) {
 	t.Run("unmapped", func(t *testing.T) {
 		srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{})
 		newTestGlobalSettings(t, globalPolicyThatMustNotApply)
-		_, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign-unmapped", nil))
+		_, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign-unmapped", nil))
 		var sce *startContextError
 		if !errors.As(err, &sce) || sce.Status != http.StatusBadRequest || sce.Code != ErrCodeIdentityNotMapped {
 			t.Fatalf("want 400 %s, got %v", ErrCodeIdentityNotMapped, err)
@@ -208,7 +255,7 @@ func TestFlatKubernetesIdentity_AssignRefusals(t *testing.T) {
 	mapped := config.V1RuntimeTargetConfig{KubernetesServiceAccountMappings: map[string]string{flatTestGSA: "instance-ksa"}}
 	t.Run("explicit ServiceAccount", func(t *testing.T) {
 		srv := newFlatKubernetesStartServer(t, mapped)
-		_, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign-ksa", func(c *CreateAgentConfig) {
+		_, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign-ksa", func(c *CreateAgentConfig) {
 			c.Kubernetes = &api.KubernetesConfig{ServiceAccountName: "other-ksa"}
 		}))
 		var sce *startContextError
@@ -218,7 +265,7 @@ func TestFlatKubernetesIdentity_AssignRefusals(t *testing.T) {
 	})
 	t.Run("explicit namespace", func(t *testing.T) {
 		srv := newFlatKubernetesStartServer(t, mapped)
-		_, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign-ns", func(c *CreateAgentConfig) {
+		_, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign-ns", func(c *CreateAgentConfig) {
 			c.Kubernetes = &api.KubernetesConfig{Namespace: "elsewhere"}
 		}))
 		if got := startContextStatus(t, err); got != http.StatusBadRequest {

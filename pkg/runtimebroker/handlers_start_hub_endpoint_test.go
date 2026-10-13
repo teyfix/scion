@@ -524,7 +524,7 @@ func TestHTTPStartAndRestart_ConnectionHeaderRescuesLocalhostDispatch(t *testing
 	// also be the settings-resolved runtime type, or resolveManagerForOpts
 	// detects a mismatch against the injected mock runtime and builds a real
 	// auxiliary manager instead of using the capturing mock.
-	newSrv := func(t *testing.T) (*Server, *envCapturingManager) {
+	newSrv := func(t *testing.T) (*Server, *envCapturingManager, string) {
 		t.Helper()
 		t.Setenv("HOME", t.TempDir())
 
@@ -568,12 +568,12 @@ runtimes:
 		cfg.HubEnabled = true
 		cfg.HubEndpoint = "http://localhost:8080" // combo broker's own (loopback) view
 		cfg.InMemoryCredentials = creds
-		cfg.BrokerAuthEnabled = false
+		cfg.BrokerAuthEnabled, cfg.BrokerAuthStrictMode = true, true
 		cfg.ForceRuntime = "kubernetes"
 
 		mgr := &envCapturingManager{}
 		rt := &runtime.MockRuntime{NameFunc: func() string { return "kubernetes" }}
-		return New(cfg, mgr, rt), mgr
+		return New(cfg, mgr, rt), mgr, dotScion
 	}
 
 	assertRescued := func(t *testing.T, mgr *envCapturingManager) {
@@ -584,11 +584,12 @@ runtimes:
 	}
 
 	t.Run("create", func(t *testing.T) {
-		srv, mgr := newSrv(t)
-		body := fmt.Sprintf(`{"name": "test-agent", "hubEndpoint": %q}`, dispatchLocal)
+		srv, mgr, projectPath := newSrv(t)
+		body := fmt.Sprintf(`{"name": "test-agent", "id": "test-agent-id", "projectId": "test-project-id", "projectPath": %q, "hubEndpoint": %q}`, projectPath, dispatchLocal)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Scion-Hub-Connection", connectionName)
+		signRequest(req, srv.config.BrokerID, srv.hubConnections[connectionName].snapshot().SecretKey)
 		w := httptest.NewRecorder()
 
 		srv.Handler().ServeHTTP(w, req)
@@ -600,11 +601,12 @@ runtimes:
 	})
 
 	t.Run("http-start", func(t *testing.T) {
-		srv, mgr := newSrv(t)
+		srv, mgr, _ := newSrv(t)
 		body := fmt.Sprintf(`{"hubEndpoint": %q, "resolvedEnv": {"SCION_HUB_ENDPOINT": %q}}`, dispatchLocal, dispatchLocal)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/test-agent/start", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Scion-Hub-Connection", connectionName)
+		signRequest(req, srv.config.BrokerID, srv.hubConnections[connectionName].snapshot().SecretKey)
 		w := httptest.NewRecorder()
 
 		srv.Handler().ServeHTTP(w, req)
@@ -616,11 +618,12 @@ runtimes:
 	})
 
 	t.Run("http-restart", func(t *testing.T) {
-		srv, mgr := newSrv(t)
+		srv, mgr, _ := newSrv(t)
 		body := fmt.Sprintf(`{"hubEndpoint": %q, "resolvedEnv": {"SCION_HUB_ENDPOINT": %q}}`, dispatchLocal, dispatchLocal)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/test-agent/restart", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Scion-Hub-Connection", connectionName)
+		signRequest(req, srv.config.BrokerID, srv.hubConnections[connectionName].snapshot().SecretKey)
 		w := httptest.NewRecorder()
 
 		srv.Handler().ServeHTTP(w, req)

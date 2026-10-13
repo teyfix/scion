@@ -797,7 +797,7 @@ func TestBoundHubAuthorityPinsHydrationAndBrokerIdentityWithDistinctCallback(t *
 			t.Fatal("Hub A request selected Hub B hydration")
 		}
 		sc, err := srv.buildStartContext(r.Context(), startContextInputs{
-			Name: "bound-agent", AgentID: "agent-a", ProjectPath: filepath.Join(t.TempDir(), "project"), Operation: opCreate,
+			Name: "bound-agent", AgentID: "agent-a", ProjectID: "project-a", ProjectPath: filepath.Join(t.TempDir(), "project"), Operation: opCreate,
 			HubEndpoint: "https://distinct-valid-callback.example", Config: &CreateAgentConfig{Template: "current"},
 			Prehydrated: prehydratedBundle{TemplateDone: true, TemplatePath: template}, HTTPRequest: r,
 		})

@@ -15,7 +15,6 @@
 package runtimebroker
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -51,7 +50,7 @@ func flatDiscoveryProbe(srv *Server) *int {
 func TestFlatKubernetesIdentity_UnmappedIgnoresAnnotatedKSA(t *testing.T) {
 	srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{})
 	calls := flatDiscoveryProbe(srv)
-	_, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign-annotated", nil))
+	_, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign-annotated", nil))
 	var sce *startContextError
 	if !errors.As(err, &sce) || sce.Status != http.StatusBadRequest || sce.Code != ErrCodeIdentityNotMapped {
 		t.Fatalf("want 400 %s, got %v", ErrCodeIdentityNotMapped, err)
@@ -68,7 +67,7 @@ func TestFlatKubernetesIdentity_MappingWinsOverAnnotations(t *testing.T) {
 	srv := newFlatKubernetesStartServer(t, config.V1RuntimeTargetConfig{
 		KubernetesServiceAccountMappings: map[string]string{flatTestGSA: "instance-ksa"}})
 	calls := flatDiscoveryProbe(srv)
-	sc, err := srv.buildStartContext(context.Background(), assignInputs("flat-assign-mapped", nil))
+	sc, err := buildFlatIdentityStartContext(t, srv, assignInputs("flat-assign-mapped", nil))
 	if err != nil {
 		t.Fatalf("buildStartContext: %v", err)
 	}

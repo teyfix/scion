@@ -141,6 +141,8 @@ func newPodFixture(t *testing.T, key string, target config.V1RuntimeTargetConfig
 		Instance: config.V1RuntimeBrokerInstanceConfig{Key: key, Name: key, RuntimeTarget: &target},
 	}
 	f.srv.flatK8sIdentity = newFlatKubernetesIdentityPolicy(f.srv.config.FlatInstance)
+	configureAuthorityTestConnection(t, f.srv, "flat-identity", "http://127.0.0.1:1",
+		f.srv.config.FlatInstance.Identity.RuntimeBrokerID, []byte("flat-identity-test-key"))
 	return f
 }
 
@@ -148,7 +150,7 @@ func newPodFixture(t *testing.T, key string, target config.V1RuntimeTargetConfig
 // through the real agent manager, returning the pod the runtime submitted.
 func (f *flatPodFixture) start(t *testing.T, name string, gcp *GCPIdentityConfig, k8sCfg *api.KubernetesConfig) (*corev1.Pod, error) {
 	t.Helper()
-	sc, sce := f.srv.buildStartContext(context.Background(), startContextInputs{
+	sc, sce := buildFlatIdentityStartContext(t, f.srv, startContextInputs{
 		Name: name, ProjectPath: f.projectDir, Operation: opCreate,
 		Config:      &CreateAgentConfig{GCPIdentity: gcp, Kubernetes: k8sCfg},
 		HTTPRequest: httptest.NewRequest("POST", "/api/v1/agents", nil),

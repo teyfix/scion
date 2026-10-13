@@ -65,11 +65,14 @@ func TestFlatOwnership_CreateWithoutAgentIDRefused(t *testing.T) {
 	f := newFlatInstanceTestServer(t, flatInstanceOpts{hubInProcess: true})
 	w := serveFlat(f.srv, http.MethodPost, "/api/v1/agents", flatCreateBody("req-no-id", "flat-agent",
 		map[string]interface{}{"id": "", "expectedRuntimeTargetId": f.identity.RuntimeTarget.ID}))
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 before ownership admission: %s", w.Code, w.Body.String())
 	}
 	if n := mgrStartCalls(f); n != 0 {
 		t.Fatalf("runtime started: %d", n)
+	}
+	if records, err := f.srv.ownership.List(); err != nil || len(records) != 0 {
+		t.Fatalf("incomplete identity created ownership records: %v err=%v", records, err)
 	}
 }
 

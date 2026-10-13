@@ -577,15 +577,20 @@ func TestGlobalProjectRejection_MultiHub(t *testing.T) {
 	srv.hubMu.Lock()
 	srv.hubConnections["hub-prod"] = conn2
 	srv.hubMu.Unlock()
+	srv.config.BrokerAuthEnabled, srv.config.BrokerAuthStrictMode = true, true
+	srv.buildAuthMiddleware()
 
 	if !srv.isMultiHubMode() {
 		t.Fatal("expected multi-hub mode with 2 connections")
 	}
 
-	// Try to create an agent with empty projectID (global project)
-	body := `{"name": "global-agent", "config": {"template": "claude"}}`
+	// A signed Hub create needs complete identity; the global project
+	// sentinel keeps this request subject to the multi-hub global guard.
+	body := `{"name": "global-agent", "id": "global-agent-id", "projectId": "global", "config": {"template": "claude"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Hub-Connection", "local")
+	signRequest(req, srv.config.BrokerID, srv.hubConnections["local"].snapshot().SecretKey)
 	w := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(w, req)
@@ -1474,15 +1479,19 @@ func TestColocated_GlobalProjectRejection_ComboMode(t *testing.T) {
 	srv.hubMu.Lock()
 	srv.hubConnections["hub-prod"] = conn
 	srv.hubMu.Unlock()
+	srv.config.BrokerAuthEnabled, srv.config.BrokerAuthStrictMode = true, true
+	srv.buildAuthMiddleware()
 
 	if !srv.isMultiHubMode() {
 		t.Fatal("expected multi-hub mode with local + remote")
 	}
 
 	// Try to create a global project agent
-	body := `{"name": "global-agent", "config": {"template": "claude"}}`
+	body := `{"name": "global-agent", "id": "global-agent-id", "projectId": "global", "config": {"template": "claude"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Hub-Connection", "local")
+	signRequest(req, srv.config.BrokerID, srv.hubConnections["local"].snapshot().SecretKey)
 	w := httptest.NewRecorder()
 
 	srv.Handler().ServeHTTP(w, req)
