@@ -17,6 +17,8 @@ package fsutil
 import (
 	"bufio"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -95,5 +97,49 @@ func TestCheckMountSourceReader_HandlesOctalEncodedPaths(t *testing.T) {
 func TestCheckMountSource_NoOpForNonMountPoint(t *testing.T) {
 	if err := CheckMountSource("/definitely/not/a/mount/point/for/this/test"); err != nil {
 		t.Fatalf("CheckMountSource = %v, want nil", err)
+	}
+}
+
+func TestRootFSBindMountEvidence(t *testing.T) {
+	const source = "/var/lib/scion-agent-state/workspace"
+	const root = "20 1 0:22 / / rw - overlay overlay rw\n"
+	const state = "21 20 0:22 /var/lib/scion-agent-state/workspace /workspace/.state rw - overlay overlay rw\n"
+	for _, tc := range []struct {
+		name, target, document string
+		want                   bool
+	}{
+		{"local bind", "/workspace/.state", root + state, true},
+		{"escaped target", "/work space/.state", root + strings.ReplaceAll(state, "/workspace/", "/work\\040space/"), true},
+		{"ordinary directory", "/workspace/.state", root, false},
+		{"missing root", "/workspace/.state", state, false},
+		{"wrong source", "/workspace/.state", root + strings.ReplaceAll(state, source, "/host/project/.state"), false},
+		{"host device", "/workspace/.state", root + strings.ReplaceAll(state, "0:22", "8:1"), false},
+		{"source beneath host bind", "/workspace/.state", root + state + "22 20 8:1 /host/state /var/lib/scion-agent-state rw - ext4 /dev/sda rw\n", false},
+		{"source is separate mount", "/workspace/.state", root + state + "22 20 0:22 /other /var/lib/scion-agent-state/workspace rw - overlay overlay rw\n", false},
+		{"ambiguous target", "/workspace/.state", root + state + state, false},
+		{"ambiguous root", "/workspace/.state", root + root + state, false},
+		{"non-root filesystem origin", "/workspace/.state", strings.Replace(root, " / / ", " /host/root / ", 1) + state, false},
+		{"malformed record", "/workspace/.state", root + state + "incomplete\n", false},
+		{"unreadable tail", "/workspace/.state", root + state + strings.Repeat("x", bufio.MaxScanTokenSize+1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRootFSBindMountReader(tc.target, source, strings.NewReader(tc.document)); got != tc.want {
+				t.Fatalf("mount evidence = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRootFSBindMountDoesNotTrustDirectoryAliases(t *testing.T) {
+	source, target := t.TempDir(), t.TempDir()
+	if IsRootFSBindMount(target, source) || IsRootFSBindMount(source, source) {
+		t.Fatal("ordinary directories are not proven root-filesystem binds")
+	}
+	link := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(source, link); err != nil {
+		t.Fatal(err)
+	}
+	if IsRootFSBindMount(link, source) || IsRootFSBindMount(source, link) {
+		t.Fatal("symlinks must never establish state mount identity")
 	}
 }
