@@ -28,6 +28,75 @@ import (
 // instead call checkMountSourceReader directly with fabricated content.
 const mountInfoPath = "/proc/self/mountinfo"
 
+// IsRootFSBindMount proves target is a bind of source from this process's
+// root filesystem. Symlinked paths, a separately mounted source, missing or
+// ambiguous mount records, and unreadable evidence never establish identity.
+func IsRootFSBindMount(target, source string) bool {
+	for _, path := range []string{target, source} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return false
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || resolved != path {
+			return false
+		}
+	}
+	targetInfo, err := os.Stat(target)
+	if err != nil || !targetInfo.IsDir() {
+		return false
+	}
+	sourceInfo, err := os.Stat(source)
+	if err != nil || !sourceInfo.IsDir() || !os.SameFile(targetInfo, sourceInfo) {
+		return false
+	}
+	f, err := os.Open(mountInfoPath)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	return isRootFSBindMountReader(target, source, f)
+}
+
+func isRootFSBindMountReader(target, source string, r io.Reader) bool {
+	var rootDevice, targetDevice, targetRoot string
+	var rootCount, targetCount int
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		separator := -1
+		for i, field := range fields {
+			if field == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator < 6 || len(fields) != separator+4 {
+			return false
+		}
+		mountRoot, mountPoint := decodeMountField(fields[3]), decodeMountField(fields[4])
+		if !filepath.IsAbs(mountRoot) || !filepath.IsAbs(mountPoint) {
+			return false
+		}
+		if mountPoint == "/" {
+			if mountRoot != "/" {
+				return false
+			}
+			rootCount++
+			rootDevice = fields[2]
+		} else if source == mountPoint || strings.HasPrefix(source, mountPoint+string(filepath.Separator)) {
+			// The canonical source must live directly in the local root
+			// filesystem, never beneath a volume or host-backed bind.
+			return false
+		}
+		if mountPoint == target {
+			targetCount++
+			targetDevice, targetRoot = fields[2], mountRoot
+		}
+	}
+	return scanner.Err() == nil && rootCount == 1 && targetCount == 1 &&
+		rootDevice == targetDevice && targetRoot == source
+}
+
 // CheckMountSource inspects the current process's mount table and, if root
 // is itself a mount point, refuses when the mount's bind source (the path
 // within its own filesystem that root's mount makes visible — mountinfo

@@ -3671,10 +3671,13 @@ func writeEnvFile(agentHome string, uid, gid int) {
 	log.Debug("Wrote %d env vars to %s", len(lines)-1, envPath)
 }
 
-// isWorkspaceEmpty returns true if the directory doesn't exist or contains
-// only provisioning marker entries (e.g. .scion/, .scion-volumes/). A workspace
-// with only marker directories is considered empty for git-clone purposes so
-// that sciontool proceeds with cloning rather than skipping it.
+// isAgentLocalStateBind observes the kernel mount boundary; tests replace only
+// this external observation, while retaining the real directory and Git paths.
+var isAgentLocalStateBind = fsutil.IsRootFSBindMount
+
+// isWorkspaceEmpty returns true for a missing directory, provisioning markers,
+// or an empty, verified agent-local state bind. Ordinary and nonempty .state
+// directories remain workspace content; broker/retained marker rules stay intact.
 func isWorkspaceEmpty(path string) bool {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -3686,6 +3689,14 @@ func isWorkspaceEmpty(path string) bool {
 	for _, e := range entries {
 		if api.IsWorkspaceMarker(e.Name()) {
 			continue
+		}
+		if e.Name() == ".state" && e.IsDir() {
+			statePath := filepath.Join(path, e.Name())
+			stateEntries, stateErr := os.ReadDir(statePath)
+			if stateErr == nil && len(stateEntries) == 0 &&
+				isAgentLocalStateBind(statePath, "/var/lib/scion-agent-state/workspace") {
+				continue
+			}
 		}
 		log.Debug("Workspace not empty: found %q in %s", e.Name(), path)
 		return false
