@@ -229,9 +229,15 @@ func TestRuntimeRecoveryHubCompletionCannotRebaseOverConcurrentPatch(t *testing.
 	require.NoError(t, err)
 	patched.Labels = map[string]string{"owner": "newer-patch"}
 	patched.AppliedConfig.Model = "newer-model"
+	patched.Image = "newer:latest"
+	patched.AppliedConfig.Image = "newer:latest"
+	patched.AppliedConfig.InlineConfig.Image = "newer:latest"
+	patched.AppliedConfig.CreateInputs = &store.AgentCreateInputs{InlineConfig: &api.ScionConfig{Image: "newer:latest"}}
 	require.NoError(t, db.UpdateAgent(ctx, patched))
 	admitted.Phase, admitted.Template, admitted.Image = "running", "current", "new:latest"
 	admitted.AppliedConfig.Image = "new:latest"
+	admitted.AppliedConfig.InlineConfig.Image = "new:latest"
+	admitted.AppliedConfig.CreateInputs = &store.AgentCreateInputs{InlineConfig: &api.ScionConfig{Image: "new:latest"}}
 	update.Labels = map[string]string{"owner": "stale-recovery"}
 	err = srv.completeRuntimeRecovery(ctx, admitted, &api.RuntimeRecovery{Update: *update, AdmissionVersion: staleVersion}, true)
 	require.ErrorIs(t, err, store.ErrVersionConflict)
@@ -239,6 +245,9 @@ func TestRuntimeRecoveryHubCompletionCannotRebaseOverConcurrentPatch(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, patched.StateVersion, latest.StateVersion)
 	require.Equal(t, patched.Labels, latest.Labels)
+	require.Equal(t, "newer:latest", latest.Image)
+	require.Equal(t, "newer:latest", latest.AppliedConfig.InlineConfig.Image)
+	require.Equal(t, "newer:latest", explicitDispatchImage(latest.AppliedConfig))
 	require.Equal(t, patched.AppliedConfig, latest.AppliedConfig)
 }
 
