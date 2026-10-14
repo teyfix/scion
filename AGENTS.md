@@ -59,8 +59,10 @@ verify that only the host coordinator remains. Establish and retain exactly one
 five-minute trigger targeting the active coordinator session, without launching
 a competing container to obtain a timer. Until jcode and shared Basic Memory
 are implemented and live, the ceiling is four SCION agents, excluding the host
-coordinator; count launches and reserved slots, monitor resources, lower
-concurrency under pressure, and reassess after those features are live.
+coordinator; count launches and reserved slots, and reassess after those
+features are live. Use fixed per-agent defaults of 2 CPU and 4 GiB RAM. Do not
+proactively monitor, sample, or tune CPU/RAM usage unless explicitly requested
+or needed to diagnose a concrete failure.
 
 Routine reading, writing, recovery, and cleanup of agent leftovers requires no
 human interaction. Delegate filesystem work, recover unpublished deliverables,

@@ -241,6 +241,20 @@ func (d *HTTPAgentDispatcher) DispatchAgentRecover(ctx context.Context, agent *s
 		}
 	}
 	applied.InlineConfig = config.MergeScionConfig(applied.InlineConfig, requested)
+	// runtimeUpdate makes an explicit image choice, including when an older
+	// recovery already applied it but left dispatch/display inputs stale.
+	applied.InlineConfig.Image = recovery.Update.Image
+	if applied.CreateInputs != nil {
+		inputs := *applied.CreateInputs
+		inline := api.ScionConfig{}
+		if inputs.InlineConfig != nil {
+			inline = *inputs.InlineConfig
+		}
+		inline.Image = recovery.Update.Image
+		inputs.InlineConfig = &inline
+		applied.CreateInputs = &inputs
+	}
+	working.Image = recovery.Update.Image
 	applied.Env = config.MergeScionConfig(&api.ScionConfig{Env: applied.Env}, &api.ScionConfig{Env: requested.Env}).Env
 	applied.Docker = config.MergeDockerConfig(applied.Docker, requested.Docker)
 	applied.Image = recovery.Update.Image
