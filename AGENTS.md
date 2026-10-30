@@ -1,4 +1,11 @@
+---
+title: Scion project context
+summary: Scion product architecture, fork controls, Animatrix coordination exceptions and project development guidance.
+---
+
 # Scion Project Context
+
+Read the [central entrypoint](/home/dixie/git/teyfix/memory/AGENTS.md) and only relevant owners. [Workflow](/home/dixie/git/teyfix/memory/rules/workflow.md) owns execution, agent selection, checkout/writer coordination and delivery evidence; [operator authority](/home/dixie/git/teyfix/memory/rules/operator-authority.md) owns settled intent. Use [session continuity](/home/dixie/git/teyfix/memory/rules/session-continuity.md) for recovery, [runtime](/home/dixie/git/teyfix/memory/rules/runtime.md) for disposable artifacts and tooling, and [agent-memory](/home/dixie/git/teyfix/memory/.agents/skills/tooling/agent-memory/SKILL.md) for discovery and durable findings.
 
 ## Overview
 > **Note**: This project is currently in a pre-release/alpha stage.
@@ -24,13 +31,7 @@ Subdirectories contain domain-specific agent instructions for their respective a
 
 ## Coordinator and operator role
 
-Coordinator/operator agents only coordinate, regardless of environment: host,
-WSL2, or SCION container. They never write or review code, implement corrections,
-or make orchestration hot-fixes. Delegate implementation, code inspection/review,
-verification, documentation changes, host repairs, and SCION project work to
-agents with explicit ownership. Inspect GitHub acceptance, published evidence,
-and agent/broker state to route work; a failed dispatcher does not change the
-role. Delegate difficult diagnosis to an Astra agent with high reasoning.
+Coordinator/operator agents use the shared [project-coordinator skill](/home/dixie/git/teyfix/memory/.agents/skills/workflow/project-coordinator/SKILL.md). Its role boundary applies on the host, WSL2 and SCION containers, including when the dispatcher fails. The workstream controls below remain project-specific.
 
 For Animatrix, the canonical ongoing coordination issue is
 [teyfix/animatrix#375](https://github.com/teyfix/animatrix/issues/375); follow that
@@ -169,57 +170,21 @@ Do not commit changes in the project's own `.scion` folder to git as part of com
 
 Likewise, do not mess with any active agents while testing the tool, such as creating or deleting test agents, or other running agents inside this project.
 
-## Git Workflow Protocol: Sandbox & Worktree Environment
+## Sandbox development notes
 
-You are operating in a restricted, non-interactive sandbox environment. Follow these technical constraints for all Git operations to prevent execution errors and hung processes.
+Use the fork target above and the shared workflow's checkout/publication guidance. Do not treat the historical sandbox's local `main` or missing credentials as a universal branch or remote-operation restriction.
 
-### 1. Prefer Local-Only Operations
-* **Restriction:** The environment may likely be in a worktree in a container, without the credentials to work with `origin`. Commands like `git fetch`, `git pull`, or `git push` may fail.
-* **Directive:** Always assume the local `main` branch is the source of truth.
-* **Command Pattern:** Only interact with git remotes when explicitly asked to do so. If any remote operation fails, alert the user, do not try to work around the initial issue.
-
-### 2. Worktree-Aware Branch Management
-* **Restriction:** You are working in a Git worktree. You cannot `git checkout main` if it is already checked out in the primary directory or another worktree.
-* **Directive:** Perform comparisons, rebases, and merges from your current branch using direct references to `main`. Do not attempt to switch branches to inspect code.
-* **Reference Patterns:**
-    * **Comparison:** `git diff main...HEAD` (to see changes in your branch).
-    * **File Inspection:** `git show main:path/to/file.ext` (to view content on main without switching).
-    * **Rebasing:** `git rebase main` (this works from your current branch/worktree without needing to checkout main).
-
-### 3. Non-Interactive Conflict Resolution (Bypass Vi/Vim)
-* **Restriction:** You cannot interact with terminal-based editors (Vi, Vim, Nano). Any command that triggers an editor will cause the process to hang.
-* **Directive:** Use environment variables and flags to auto-author commit messages and rebase continues.
-* **Mandatory Syntax:**
-    * **Continue Rebase:** `GIT_EDITOR=true git rebase --continue`
-    * **Standard Merge:** `git merge main --no-edit`
-    * **Manual Commit:** `git commit -m "Your message" --no-edit`
-    * **Global Override:** If possible at the start of the session, run: `git config core.editor true`
-
-### 4. Conflict Resolution Loop
-If a rebase or merge results in conflicts:
-1.  Identify conflicted files via `git status`.
-2.  Resolve conflicts in the source files.
-3.  Stage changes: `git add <resolved-files>`.
-4.  Finalize: `GIT_EDITOR=true git rebase --continue`.
-
-### 5. Sandbox gotchas (Go toolchain, CI, worktrees)
+### Go toolchain and sandbox behavior
 Learned the hard way; these are specific to running inside this container.
 
 * **Go toolchain & `gofmt`:** the project targets **Go 1.26.1** (`go.mod`), which matches the `core-base` build image (`image-build/core-base/Dockerfile` `GO_VERSION`) and the sandbox toolchain; CI installs it via `go-version-file: go.mod` (see `.github/workflows/ci.yml`). So the toolchain is aligned everywhere — but `fmt-check` failures are still usually genuine, not noise: the grove→project rename widened struct fields (e.g. `groveId`→`projectId`) without re-running `gofmt`, leaving neighboring fields misaligned. Fix with `make fmt`, and eyeball the diff to confirm it is *pure alignment* before committing. (Note: the `extras/*` submodules are separate Go modules still on older `go` directives / `golang:1.25.x` Dockerfile pins — bump those in a coordinated change if needed.)
 * **`go build ./...` fails with `error obtaining VCS status: exit status 128`** inside a worktree. Use `go build -buildvcs=false ./...`.
-* **Inspecting `main` without disturbing it:** you cannot `git worktree add` the `main` *branch* — it is already checked out in the primary repo dir (e.g. `/repo-root`), which may not even be a usable module root. To run or read code at main's tip, add a **detached** worktree at the commit SHA: `git worktree add --detach /tmp/check <main-sha>`, then `git worktree remove --force /tmp/check` when done. Prefer `git show main:path/to/file` for quick single-file reads.
 * **`golangci-lint` can OOM (exit 137)** over `./...` in the sandbox. Scope it to the packages you touched and lower GC pressure, e.g. `GOGC=40 golangci-lint run --new-from-rev=main --concurrency=1 ./pkg/foo/... ./cmd/...`. The `--new-from-rev=main` filter (what `make golangci-lint` uses) hides pre-existing issues so you only see what your change introduced.
 * **Leaked `SCION_*` env vars:** the container exports `SCION_PROJECT`, `SCION_GROVE`, `SCION_CREATOR`, etc. Tests that don't clear the environment can pick these up. They are rarely the real cause of a failure, but when a config/hub/sync test behaves oddly, rule them in or out with `env -u SCION_GROVE -u SCION_PROJECT … go test …`.
-* **Getting the latest `main`:** you cannot `git fetch`/`git pull` from a worktree. The human pulls `origin/main` into the primary repo dir; once they have, `git rebase main` from your branch sees the updated tip with no network access. A green local result can still hide a CI-only gap if `main` itself was committed red — when fixing a test, re-check whether the same test already fails on `main` (via a detached worktree) so you fix main's current version, not a stale local one.
 
 ## General workflow
 
-1.  Work on the given task until it is complete
-1.  Add or modify tests to ensure function is working as intended
-1.  Run the local CI checks before committing: `make ci` for fast checks (format, vet, tests, build), or `make ci-full` for the complete GitHub Actions mirror (adds web build, typecheck, and golangci-lint).
-1.  Commit your work to git as you go to capture changes as appropriate
-1.  When you are finished, rebase your branch on main, favoring main, running tests again if you had to resolve conflicts
-1.  Notify the user you have completed the task
+Use [workflow](/home/dixie/git/teyfix/memory/rules/workflow.md#evidence-and-completion) for proportional verification and completion. The project check entrypoints are `make ci` for fast checks (format, vet, tests, build), and `make ci-full` for the complete GitHub Actions mirror (adds web build, typecheck, and golangci-lint). Preserve the guidance-only check exception above.
 
 
 ## What NOT to commit
@@ -238,9 +203,7 @@ When in doubt, check `.gitignore` before staging. If a new category of generated
 
 ## Agent memory & durable notes (IMPORTANT)
 
-**Do not rely on any harness's built-in / native memory feature.** This applies to every harness (Claude, Gemini, etc.), not just one. The per-agent memory directory is **ephemeral — it is not persisted across container restarts**, so anything written there is silently lost between sessions and gives a false sense of continuity.
-
-**Persist durable guidance, learnings, and project notes only in committed project files** — this `AGENTS.md`, the `.design/` docs, or other tracked files. If you discover something worth remembering for future sessions, write it here (or in the relevant design doc) and commit it.
+SCION's per-agent native memory directory is ephemeral across container restarts. Keep project architecture and durable findings in tracked `.design/` or other owning project documents using [agent-memory](/home/dixie/git/teyfix/memory/.agents/skills/tooling/agent-memory/SKILL.md); use the shared session-continuity owner for disposable recovery checkpoints.
 
 ### Working learnings (migrated here from ephemeral agent memory)
 - **Lean forward on "project" over legacy "grove".** The grove→project rename is the product direction and is still ongoing — actively prefer `project` naming in new/edited code, tests, and fixtures (e.g. the settings key `project_id`, not legacy `grove_id`). When a test or fixture still uses a legacy `grove_id` key, updating it to `project_id` is the preferred fix over propping up legacy-key compat. Known gap: the legacy *top-level* `grove_id` *file* key no longer resolves to `project_id` in config loading (only `SCION_GROVE_ID` env and v1 `hub.grove_id` are remapped) — surfaced via two tests that were red on `main` and fixed by moving their fixtures to `project_id`.
