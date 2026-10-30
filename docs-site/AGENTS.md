@@ -1,6 +1,11 @@
+---
+title: Scion documentation site instructions
+summary: Operational-mode information architecture, product vocabulary, D2 diagrams and Starlight publication integration.
+---
+
 # Scion Documentation Meta-Guide
 
-This guide outlines the organizational philosophy, architecture, and curation standards for the Scion documentation project. It serves as a blueprint for both human and AI contributors to ensure a consistent and navigable documentation experience.
+Read [root project instructions](../AGENTS.md) and shared [documentation ownership](/../memory/rules/documentation.md). Use shared [workflow](/../memory/rules/workflow.md) for proportional checks. This file owns Scion's information architecture and site-specific publishing requirements.
 
 ## 1. The Primary Axis: Operational Mode
 
@@ -117,19 +122,12 @@ writes YAML by default. The JSON schema lives at
 
 ## 5. Curation Standards
 
-1. **Code-First Truth**: Documentation should be updated in the same PR as the feature
-   implementation. Docs follow code — if they diverge, fix the docs and flag it.
-2. **Source of Truth**:
-   - `GLOSSARY.md` (root) for terminology and the mode spine.
-   - `.design/` for architectural intent.
-   - `pkg/` for implementation details; verify CLI flags in `cmd/`.
-3. **Mode-Specific Placement**: Put a page in the mode it belongs to. When a topic
-   spans modes, place it in the most logical one and cross-link — do not duplicate.
-4. **Tone**: *User docs* are practical and task-oriented; *admin docs* are technical
-   and detail-oriented; *reference docs* are exhaustive and dry.
-5. **Diagrams**: Use **D2** in `d2` code blocks within Markdown files.
-6. **Cross-Linking**: Link from high-level guides to specific references to avoid
-   duplication. Internal links use the absolute form `/scion/<slug>/`.
+Shared documentation rules own canonical sources, correction routing and duplication. Scion's source map is `GLOSSARY.md` for terminology and the mode spine, `.design/` for architectural intent, and `pkg/` for implementation; verify CLI flags in `cmd/`.
+
+- **Placement**: Put pages under their operational mode. Shared hosted-user content lives once under `hosted/user/` and is linked from both tiers.
+- **Audience**: User docs are practical and task-oriented; admin docs are technical; reference docs describe the complete relevant interface.
+- **Diagrams**: This site uses **D2** in `d2` fenced blocks through `astro-d2`, rather than the shared Markdown default.
+- **Links**: Internal links use the absolute form `/scion/<slug>/`.
 
 ## 6. Verification
 

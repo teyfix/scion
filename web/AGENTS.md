@@ -1,6 +1,11 @@
+---
+title: Scion web frontend instructions
+summary: Lit and Shoelace contracts, experiment flags, backend integration and project browser-validation setup.
+---
+
 # Scion Web Frontend - Agent Instructions
 
-This document provides instructions for AI agents working on the Scion Web Frontend.
+Read [root project instructions](../AGENTS.md). Use shared [workflow](/../memory/rules/workflow.md) for execution and proportional checks, [visual review](/../memory/rules/visual-review.md) for rendered validation, and [browser operations](/../memory/rules/tool-discovery.md#browser-and-chatgpt-operations) for browser selection, authentication and recovery. This file owns Scion frontend contracts and setup.
 
 ## Design Documents
 
@@ -61,12 +66,7 @@ Note: The Vite dev server only serves client assets. API calls and SSE require t
 
 ### Verifying Changes
 
-After making changes, verify:
-
-1. **Type checking passes:** `npm run typecheck`
-2. **Linting passes:** `npm run lint`
-3. **Tests pass:** `npm run test`
-4. **Client builds:** `npm run build`
+Use the shared workflow's proportional verification boundary with the project-native typecheck, lint, test and build commands listed above. Real-time/API validation additionally needs the Go backend; a standalone Vite page does not establish those behaviors.
 
 ## Project Structure
 
@@ -266,12 +266,9 @@ When working in a containerized or sandboxed agent environment (e.g., scion agen
 - **Use `--dev-auth` for local testing.** When a Go server is available, `--dev-auth` bypasses OAuth and auto-creates a dev session, which is the simplest way to test the frontend end-to-end. See the README for details.
 - **Go server** the golang server can be started as a background process, but OAuth flows cannot be used in a container.
 
-### Tool pitfalls in sandboxed environments
+### Tool ownership
 
-- **Testing with Vitest.** Run `npm run test` to execute the Vitest test suite. Use the specific verification commands listed in [Common Commands](#common-commands) (`npm run typecheck`, `npm run lint`, `npm run test`) for full verification.
-- **Never use `npx tsc`.** There is a completely unrelated npm package called `tsc` (v2.x) that `npx` will download and run instead of TypeScript's compiler. Always use `npm run typecheck` which invokes the correct local TypeScript binary via the project's package.json script.
-- **TypeScript may not be installed globally.** Do not assume `tsc` or `./node_modules/.bin/tsc` are available. The project's `npm run typecheck` script is the only reliable way to type-check.
-- **For CSS-only changes**, if `npm run typecheck` is unavailable, `npm run build` is the next best verification — Vite will surface any import or syntax errors during bundling.
+Use the existing package scripts listed above rather than resolving an unrelated same-name package through an ad-hoc runner. Shared [TypeScript runtime guidance](/../memory/.agents/skills/languages/typescript/SKILL.md) owns executable/tool resolution; changing this project's checked-in toolchain requires scoped work.
 
 ## Tips for End-to-End Web Validation
 
@@ -301,12 +298,9 @@ data: {"subject":"project.xxx.agent.created","data":{"agentId":"...","projectId"
 
 The client `SSEClient` listens for `event: update` and the `StateManager` parses the `subject` field to route events. If the event type is changed or the subject is used as the SSE event type directly, the client will silently drop events.
 
-### Browser testing with Playwright
+### Browser testing
 
-- Use `waitUntil: 'domcontentloaded'` instead of `'networkidle'` — the SSE connection keeps the network perpetually active, so `networkidle` will time out.
-- Chromium needs `--no-sandbox --disable-setuid-sandbox` flags in containerized environments.
-- Console logging via `page.on('console', ...)` is essential for debugging SSE connection state — the `[SSE] Connected` log confirms the EventSource opened.
-- To validate real-time updates: take a screenshot, make an API call, wait 2-3 seconds, take another screenshot. Compare visually.
+Follow the shared browser operations' long-lived-connection readiness guidance for Scion's SSE pages. Inspect the `[SSE] Connected` console event and the actual resulting UI state when validating API-driven updates. Use the project test scripts above for the supported browser fixture setup.
 
 ### Common failure modes
 
@@ -316,7 +310,7 @@ The client `SSEClient` listens for `event: update` and the `StateManager` parses
 
 ## Browser-Based QA with Chrome DevTools MCP
 
-When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `click`, `fill`, etc.) to validate the web UI, follow these guidelines.
+Use shared browser operations and rendered visual review; the following setup and component details are Scion-specific.
 
 ### Starting the Go server
 
@@ -329,12 +323,10 @@ When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `c
    ```
    Without `schema_version`, the settings file is silently ignored and the server exits with `image_registry is not configured`.
 
-2. **Run the server with `&` in a regular Bash call**, not with `run_in_background`. Background tasks can be hard to retrieve output from. Instead:
+2. **Start the Go server with the fixture's built binary and client assets**, using the current tool's supported process/session handling:
    ```bash
    /tmp/scion-test server start --enable-hub --enable-web --dev-auth \
-     --web-assets-dir ./web/dist/client --foreground 2>&1 &
-   sleep 4
-   ss -tlnp | grep 8080  # verify it's listening
+     --web-assets-dir ./web/dist/client --foreground
    ```
 
 3. **Capture the dev token** from the server startup output. It appears as:
@@ -349,20 +341,9 @@ When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `c
 - **Navigate directly to `http://localhost:8080`** — dev-auth mode sets a session cookie automatically on the first page load, no manual cookie setup needed.
 - **For API calls via curl**, use the dev token as `Authorization: Bearer scion_dev_...` to get a `scion_sess` cookie, then pass it to subsequent requests.
 
-### Taking screenshots and snapshots
+### Project QA captures and dialogs
 
-- **Prefer `take_snapshot` (a11y tree) over `take_screenshot`** for finding element UIDs to interact with. Screenshots are for visual validation; snapshots give you the clickable UIDs.
-- **Resize the viewport early.** The default headless viewport (800x600) is too small for most pages. Resize to at least 1024x800, or 1280x800 for full table views:
-  ```
-  resize_page(width=1280, height=800)
-  ```
-- **Save screenshots to `.scratch/`** with numbered, descriptive filenames (e.g., `01-initial-page.png`, `07-token-reveal.png`) to create a clear audit trail.
-- **Read screenshots back** with the `Read` tool to visually inspect them — the tool renders images inline.
-
-### Interacting with dialogs
-
-- **Native `confirm()`/`alert()` dialogs block clicks.** When a component uses `confirm()` (e.g., revoke/delete actions), the `click` call will time out. This is expected. After the timeout error, call `handle_dialog` with `action: "accept"` (or `"dismiss"`) to proceed.
-- **Shoelace `<sl-dialog>` modals** are part of the DOM and work normally with `click`/`fill` — they don't trigger the native dialog handler.
+Store Scion QA screenshots under ignored `.scratch/` and follow shared visual review for inspection and relevant viewport/theme states. Shoelace `<sl-dialog>` modals are DOM components; distinguish them from browser-native confirmation dialogs when choosing the available tool operation.
 
 ### Filling forms in Lit/Shoelace components
 
@@ -371,13 +352,3 @@ When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `c
 - **`<sl-select>` with a single option** may auto-select; verify via snapshot before filling.
 - **After form submission**, take a snapshot to confirm the dialog closed and the list updated.
 
-### Recommended QA workflow
-
-1. Build assets (`npm run build`) and start the server
-2. Resize viewport to 1280x800
-3. Navigate to the target page, screenshot the initial state
-4. Test the primary flow (e.g., create → reveal → list → revoke → delete)
-5. Screenshot after each state transition
-6. Test dark mode (click the theme toggle) and screenshot
-7. Test mobile (resize to 480x800) and screenshot
-8. All screenshots go in `.scratch/` for review
