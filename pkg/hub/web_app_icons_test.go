@@ -32,7 +32,7 @@ import (
 // appIconContentTypes lists every app icon path with the Content-Type it
 // must be served with.
 var appIconContentTypes = map[string]string{
-	"/favicon.ico":           "image/x-icon",
+	"/favicon.webp":           "image/webp",
 	"/favicon.svg":           "image/svg+xml",
 	"/apple-touch-icon.webp":  "image/webp",
 	"/icon-192.webp":          "image/webp",
