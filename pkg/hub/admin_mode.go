@@ -192,7 +192,7 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 // maintenance-mode login page too. Keep this list exact rather than
 // allowing every root-level file.
 var appIconPaths = map[string]bool{
-	"/favicon.ico":           true,
+	"/favicon.webp":           true,
 	"/favicon.svg":           true,
 	"/apple-touch-icon.webp":  true,
 	"/icon-192.webp":          true,
