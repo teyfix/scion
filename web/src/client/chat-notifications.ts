@@ -438,7 +438,7 @@ export class ChatNotificationDispatcher {
     const popup = this.notify(chatMessageTitle(n, info), {
       body: chatMessageBody(n),
       tag: chatMessageTag(n),
-      icon: '/scion-notification-icon.png',
+      icon: '/scion-notification-icon.webp',
     });
 
     if (popup && path) {

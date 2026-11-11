@@ -7,9 +7,9 @@ marks are drawn with paths only (no emoji `<text>`) on a 512x512 canvas.
 
 | File | Use |
 |------|-----|
-| `logo.svg` | Direction C, 112 px corner radius. A subtle lighter inner edge keeps the tile visible on dark backgrounds. Used for `icon-192.png` and `icon-512.png`. |
+| `logo.svg` | Direction C, 112 px corner radius. A subtle lighter inner edge keeps the tile visible on dark backgrounds. Used for `icon-192.webp` and `icon-512.webp`. |
 | `logo-small.svg` | Simplified for 16-48 px: flat colours, no midrib, thicker stem, larger leaf, lighter edge. Used for `favicon.svg` and `favicon.ico`. |
-| `logo-maskable.svg` | Full-bleed square, mark scaled to 86% so it stays inside the central 80% safe-zone circle. Used for `icon-maskable-512.png` and `apple-touch-icon.png` (iOS applies its own corner mask). |
+| `logo-maskable.svg` | Full-bleed square, mark scaled to 86% so it stays inside the central 80% safe-zone circle. Used for `icon-maskable-512.webp` and `apple-touch-icon.webp` (iOS applies its own corner mask). |
 
 ## Regenerating the icons
 
@@ -20,8 +20,8 @@ web/design/app-logo/generate-icons.sh
 This rasterizes the SVGs with headless Chromium (`CHROME` overrides the
 binary) and packs `favicon.ico` (16/32/48 PNG entries) with a short
 standard-library `python3` snippet. It writes into `web/public/`:
-`favicon.svg`, `favicon.ico`, `apple-touch-icon.png` (180),
-`icon-192.png`, `icon-512.png` and `icon-maskable-512.png`. Commit the
+`favicon.svg`, `favicon.ico`, `apple-touch-icon.webp` (180),
+`icon-192.webp`, `icon-512.webp` and `icon-maskable-512.webp`. Commit the
 outputs after editing any `logo*.svg`.
 
 ## Rendering previews
