@@ -34,10 +34,10 @@ import (
 var appIconContentTypes = map[string]string{
 	"/favicon.ico":           "image/x-icon",
 	"/favicon.svg":           "image/svg+xml",
-	"/apple-touch-icon.png":  "image/png",
-	"/icon-192.png":          "image/png",
-	"/icon-512.png":          "image/png",
-	"/icon-maskable-512.png": "image/png",
+	"/apple-touch-icon.webp":  "image/png",
+	"/icon-192.webp":          "image/png",
+	"/icon-512.webp":          "image/png",
+	"/icon-maskable-512.webp": "image/png",
 	"/manifest.webmanifest":  "application/manifest+json",
 }
 
