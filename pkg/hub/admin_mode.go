@@ -194,10 +194,10 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 var appIconPaths = map[string]bool{
 	"/favicon.ico":           true,
 	"/favicon.svg":           true,
-	"/apple-touch-icon.png":  true,
-	"/icon-192.png":          true,
-	"/icon-512.png":          true,
-	"/icon-maskable-512.png": true,
+	"/apple-touch-icon.webp":  true,
+	"/icon-192.webp":          true,
+	"/icon-512.webp":          true,
+	"/icon-maskable-512.webp": true,
 	"/manifest.webmanifest":  true,
 }
 

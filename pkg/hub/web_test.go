@@ -484,7 +484,7 @@ func TestRootLevelStaticFile_Disk(t *testing.T) {
 	// served as static assets rather than falling through to the SPA shell.
 	tmpDir := t.TempDir()
 	iconContent := "fake-png-data"
-	if err := os.WriteFile(filepath.Join(tmpDir, "scion-notification-icon.png"), []byte(iconContent), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "scion-notification-icon.webp"), []byte(iconContent), 0644); err != nil {
 		t.Fatalf("failed to write test icon: %v", err)
 	}
 
@@ -492,7 +492,7 @@ func TestRootLevelStaticFile_Disk(t *testing.T) {
 		AssetsDir: tmpDir,
 	})
 
-	req := httptest.NewRequest("GET", "/scion-notification-icon.png", nil)
+	req := httptest.NewRequest("GET", "/scion-notification-icon.webp", nil)
 	rec := httptest.NewRecorder()
 
 	ws.Handler().ServeHTTP(rec, req)
@@ -1822,7 +1822,7 @@ func TestIsPublicRoute(t *testing.T) {
 		{"/auth/debug", true},
 		{"/login", true},
 		{"/favicon.ico", true},
-		{"/scion-notification-icon.png", true},
+		{"/scion-notification-icon.webp", true},
 		{"/robots.txt", true},
 		{"/api/v1/projects", true},
 		{"/api/v1/agents", true},
