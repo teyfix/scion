@@ -310,7 +310,7 @@ export class ScionNotificationTray extends LitElement {
     new window.Notification(title, {
       body: n.message,
       tag: n.id, // deduplicate if the same notification is seen again
-      icon: '/scion-notification-icon.png',
+      icon: '/scion-notification-icon.webp',
     });
   }
 
