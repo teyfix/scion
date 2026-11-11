@@ -371,11 +371,11 @@ func TestAdminModeWebMiddleware_APIRoutesPassThrough(t *testing.T) {
 func TestAdminModeWebMiddleware_StaticAssetsPassThrough(t *testing.T) {
 	ws := newTestWebServerWithMaintenance(true, "")
 	ws.mux.HandleFunc("/assets/main.js", passthrough)
-	ws.mux.HandleFunc("/favicon.ico", passthrough)
+	ws.mux.HandleFunc("/favicon.webp", passthrough)
 
 	handler := ws.adminModeWebMiddleware(ws.mux)
 
-	for _, path := range []string{"/assets/main.js", "/favicon.ico"} {
+	for _, path := range []string{"/assets/main.js", "/favicon.webp"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)

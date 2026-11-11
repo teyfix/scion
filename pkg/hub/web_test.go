@@ -215,7 +215,7 @@ func writeFingerprintFixture(t *testing.T, manifest string) string {
 		"assets/settings-AbCdEfGh.js":              "// not in the manifest",
 		"assets/chunk-abc12345.js":                 "// hex name",
 		"assets/shoelace-B3-XBhED.js.map":          "{}",
-		"favicon.ico":                              "icon",
+		"favicon.webp":                              "icon",
 		"shoelace/assets/icons/cloud-download.svg": "<svg/>",
 	}
 	if manifest != "" {
@@ -269,7 +269,7 @@ func TestStaticAssetFingerprintedCaching(t *testing.T) {
 		"/assets/entry-AbCdEfGh.js":                 "no-cache", // an entry, even with a hash-like name
 		"/assets/settings-AbCdEfGh.js":              "no-cache", // looks hashed, not in the manifest
 		"/assets/shoelace-B3-XBhED.js.map":          "no-cache", // source map
-		"/favicon.ico":                              "no-cache", // public file
+		"/favicon.webp":                              "no-cache", // public file
 		"/shoelace/assets/icons/cloud-download.svg": "no-cache",
 	}
 	dir := writeFingerprintFixture(t, fingerprintManifest)
@@ -1821,7 +1821,7 @@ func TestIsPublicRoute(t *testing.T) {
 		{"/auth/logout", true},
 		{"/auth/debug", true},
 		{"/login", true},
-		{"/favicon.ico", true},
+		{"/favicon.webp", true},
 		{"/scion-notification-icon.webp", true},
 		{"/robots.txt", true},
 		{"/api/v1/projects", true},
@@ -4456,7 +4456,7 @@ func TestSPAShellCacheControl(t *testing.T) {
 	for name, data := range map[string]string{
 		"assets/app-entry.js":      "// entry",
 		"assets/chunk-abc12345.js": "// chunk",
-		"favicon.ico":              "icon",
+		"favicon.webp":              "icon",
 	} {
 		require.NoError(t, os.WriteFile(filepath.Join(tmpDir, filepath.FromSlash(name)), []byte(data), 0o644))
 	}
@@ -4493,7 +4493,7 @@ func TestSPAShellCacheControl(t *testing.T) {
 		{"invite shell", "/invite", "no-store", "__SCION_DATA__"},
 		{"hashed asset", "/assets/chunk-abc12345.js", "public, max-age=86400", "// chunk"},
 		{"non-hashed asset", "/assets/app-entry.js", "no-cache", "// entry"},
-		{"root static file", "/favicon.ico", "no-cache", "icon"},
+		{"root static file", "/favicon.webp", "no-cache", "icon"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
