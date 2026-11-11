@@ -297,7 +297,7 @@ var spaShellTemplate = `<!DOCTYPE html>
     <title>Scion</title>
 
     <!-- app-icons:start -- kept identical to web/index.html; see TestSPAShellAppIconTags. -->
-    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" href="/favicon.webp" sizes="32x32" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.webp" />
     <link rel="manifest" href="/manifest.webmanifest" />
